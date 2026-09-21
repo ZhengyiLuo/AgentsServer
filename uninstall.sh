@@ -122,6 +122,25 @@ while (($#)); do
   esac
 done
 
+# The split lifecycle validates its installed layout, obtains an exact idle
+# execution hold, and owns the shared lock through both native service stops
+# and filesystem removal. Keep legacy uninstall unchanged for old layouts.
+if [[ -f "$INSTALL_ROOT/execution-layout.json" && ! -L "$INSTALL_ROOT/execution-layout.json" ]]; then
+  UNINSTALL_SOURCE="$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+  UNINSTALL_PYTHON="$UNINSTALL_SOURCE/.venv/bin/python"
+  if [[ ! -x "$UNINSTALL_PYTHON" ]]; then
+    UNINSTALL_PYTHON="$(command -v python3 || true)"
+  fi
+  if [[ -z "$UNINSTALL_PYTHON" || ! -f "$UNINSTALL_SOURCE/execution_uninstall.py" || -L "$UNINSTALL_SOURCE/execution_uninstall.py" ]]; then
+    echo "Cannot uninstall the separate gateway/execution layout: its maintained Python helper is unavailable; no services were changed." >&2
+    exit 1
+  fi
+  execution_arguments=(--root "$INSTALL_ROOT" --config-root "$CONFIG_ROOT" --state-root "$STATE_ROOT" --home "$HOME")
+  [[ "$ASSUME_YES" != "true" ]] || execution_arguments+=(--yes)
+  [[ "$PURGE_STATE" != "true" ]] || execution_arguments+=(--purge-state)
+  exec "$UNINSTALL_PYTHON" -B "$UNINSTALL_SOURCE/execution_uninstall.py" "${execution_arguments[@]}"
+fi
+
 refuse_execution_layout() {
   local marker=""
   for marker in "$INSTALL_ROOT/execution-layout.json" "$INSTALL_ROOT/.execution-transaction"; do

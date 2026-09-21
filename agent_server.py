@@ -70102,6 +70102,7 @@ SERVER_UPDATE_ATTEMPT_FIELDS = (
     "started_at", "finished_at", "updated_at",
 )
 SERVER_UPDATE_PER_RUN_STATUS_FIELDS = (
+    "preparation_id", "preparation_phase", "preparation_heartbeat_at", "preparation_runner_pid",
     "schedule_id",
     "update_id",
     "target_version",
@@ -70128,6 +70129,7 @@ SERVER_UPDATE_PER_RUN_STATUS_FIELDS = (
     "retryable",
 )
 SERVER_UPDATE_PRIVATE_PER_RUN_STATUS_FIELDS = (
+    "_prepared_update", "_execution_handoff", "_activation_recovery",
     "_npm_release",
     "_force_restart_request_id",
     "_force_restart_requested_at",
@@ -72046,6 +72048,7 @@ def public_server_update_status(status: dict[str, Any]) -> dict[str, Any]:
             key: value
             for key, value in status.items()
             if key not in {
+                "_prepared_update", "_execution_handoff", "_activation_recovery",
                 "_npm_release",
                 "_force_restart_request_id",
                 "_force_restart_requested_at",
@@ -72424,6 +72427,10 @@ def _reconcile_server_update_team_hub_fence(status: dict[str, Any]) -> None:
 def finalize_abandoned_server_update(status: dict[str, Any]) -> dict[str, Any]:
     """Release a stale update drain after its detached runner disappeared."""
 
+    if status.get("_activation_recovery"):
+        from update_recovery import journal_present
+        if journal_present(Path(os.environ["AGENTS_SERVER_INSTALL_DIR"]).expanduser().resolve()):
+            raise RuntimeError("interrupted activation requires its retained installer recovery")
     expected_update_id = str(status.get("update_id") or "")
     with server_update_status_lock(SERVER_UPDATE_STATUS_FILE):
         current = read_server_update_status()
@@ -72450,10 +72457,27 @@ def finalize_abandoned_server_update(status: dict[str, Any]) -> dict[str, Any]:
         # phase. Once the target binary may be installed, retain the stronger
         # identity verification before declaring recovery complete.
         target_version = str(current.get("target_version") or "")
-        if target_version == SERVER_VERSION:
+        completed = target_version == SERVER_VERSION
+        maintenance = globals().get("EXECUTION_MAINTENANCE")
+        if completed and (maintenance is not None or current.get("_execution_handoff")):
+            # A same-version repair can lose its runner with the original
+            # worker still sealed, or before the paired gateway is activated.
+            # A matching API version alone proves neither completion nor
+            # restored admission. Keep the exact handoff available for retry.
+            from execution_update_status import current_components
+            try:
+                completed = maintenance is not None and current_components(
+                    Path(os.environ["AGENTS_SERVER_INSTALL_DIR"]).expanduser().resolve(),
+                    target_version=target_version,
+                    expected_server_identity=server_identity(),
+                    expected_worker_instance=maintenance.worker_instance_id,
+                )
+            except Exception:
+                completed = False
+        if completed:
             _verify_server_update_team_hub_identity(current)
         _clear_exact_server_update_team_hub_fence(current)
-        if target_version == SERVER_VERSION:
+        if completed:
             return _write_server_update_status_unlocked(
                 phase="complete",
                 update_available=False,
@@ -72476,6 +72500,9 @@ def finalize_abandoned_server_update(status: dict[str, Any]) -> dict[str, Any]:
             heartbeat_at=None,
             elapsed_seconds=None,
             runner_pid=None,
+            **({"error_code": "server_update_handoff_release_failed", "retryable": True,
+                "error_action": "Retry the update to finish releasing its execution hold."}
+               if current.get("_execution_handoff") else {}),
             finished_at=update_utc_now(),
         )
 
@@ -72591,6 +72618,9 @@ async def reconcile_server_update_status_after_startup() -> dict[str, Any]:
     async with SERVER_UPDATE_OPERATION_LOCK:
         status = read_server_update_status()
         try:
+            recovered = await resume_server_update_activation(status)
+            if recovered is not None:
+                return recovered
             await asyncio.to_thread(
                 _reconcile_server_update_team_hub_fence,
                 status,
@@ -72832,6 +72862,9 @@ def restore_pending_server_update_after_provider_quiesce_timeout(
             "beta" if reservation.get("track") == "beta" else "stable"
         )
         return _write_fresh_server_update_status_unlocked(
+            **{name: reservation.get(name) for name in (
+                "preparation_id", "preparation_phase", "preparation_heartbeat_at",
+                "preparation_runner_pid", "_prepared_update")},
             schedule_id=schedule_id,
             phase=SERVER_UPDATE_PENDING_PHASE,
             track=track,
@@ -73808,7 +73841,22 @@ async def lifespan(app: FastAPI):
     # Retain the descriptor until process exit: bounded shutdown can leave
     # finalizers alive after this lifespan returns.
     acquire_state_ownership(STATE_DIR)
-    global SERVER_SHUTTING_DOWN, QUEUE_RECOVERY_TASK
+    global SERVER_SHUTTING_DOWN, QUEUE_RECOVERY_TASK, EXECUTION_MAINTENANCE
+    install_root = os.environ.get("AGENTS_SERVER_INSTALL_DIR")
+    if EXECUTION_MAINTENANCE is None and install_root:
+        # A legacy unit may restart after current switched but before the
+        # installer replaces that unit. It must not admit work in this window.
+        root = Path(install_root).expanduser().resolve()
+        journal = root / ".activation-transaction"
+        if journal.exists() or journal.is_symlink():
+            from activation_transaction import pending_execution_worker_operation
+            operation = pending_execution_worker_operation(root, SERVER_ROOT.resolve())
+            if operation is not None:
+                from execution_maintenance import ExecutionMaintenance
+                EXECUTION_MAINTENANCE = ExecutionMaintenance(
+                    STATE_DIR / "admin" / "execution-maintenance.json", SERVER_INSTANCE_ID,
+                )
+                EXECUTION_MAINTENANCE.hold_for_startup(operation)
     SERVER_SHUTTING_DOWN = False
     await STORE.load()
     # Prime the managed-service ownership proof once, off the loop, so the
@@ -77648,6 +77696,7 @@ async def health() -> dict[str, Any]:
                 "transports": ["npm"],
                 "package": "@agentsdock/server",
                 "api_contract_policy": "exact",
+                "activation_recovery": True,
             },
             "tmux": tmux,
             "workspace_files": {
@@ -80417,10 +80466,9 @@ async def server_update_status(
             )
             if updater_stale:
                 try:
-                    status = await asyncio.to_thread(
-                        finalize_abandoned_server_update,
-                        status,
-                    )
+                    recovered = await resume_server_update_activation(status) if status.get("_activation_recovery") else None
+                    status = recovered if recovered is not None else await asyncio.to_thread(
+                        finalize_abandoned_server_update, status)
                 except Exception as exc:
                     logger.error(
                         "server update finalization failed error_type=%s",
@@ -80550,6 +80598,149 @@ async def check_server_update(
         )
 
 
+async def resume_server_update_activation(
+    status: dict[str, Any], *, explicit: bool = False,
+) -> dict[str, Any] | None:
+    """Re-arm only an existing admitted journal under the operation lock."""
+    if not status.get("_activation_recovery"):
+        return None
+    from update_recovery import recovery_context
+    root = Path(os.environ["AGENTS_SERVER_INSTALL_DIR"]).expanduser().resolve()
+    context = await asyncio.to_thread(recovery_context, root, status, server_identity=server_identity())
+    if context is None:
+        return None
+    from execution_recovery import resume_owner
+    native_owner = await asyncio.to_thread(resume_owner, root, context["transaction_id"])
+    if native_owner is not None:
+        # The independent native owner also operates while both application
+        # services are stopped. Joining it prevents a restarting worker from
+        # launching a competing tmux recovery over the same journal. Finish
+        # an interrupted registration before joining; a service file alone
+        # does not prove that a native recovery process can make progress.
+        return status
+    failed_recovery = status.get("error_code") in {
+        "server_update_recovery_failed", "server_update_recovery_launch_failed"}
+    if (await asyncio.to_thread(server_update_is_active, status)
+            or (not failed_recovery and status.get("phase") in SERVER_UPDATE_ACTIVE_PHASES
+                and server_update_status_age_seconds(status) < SERVER_UPDATE_START_GRACE_SECONDS)):
+        return status
+    if (status.get("phase") == "failed" or failed_recovery) and not explicit:
+        return status
+    await asyncio.to_thread(ensure_managed_update_tmux_isolated)
+    update_id = str(status["update_id"])
+    token_file = SERVER_UPDATE_STATUS_FILE.with_name(f".server-recovery-{update_id}-{uuid.uuid4().hex}.auth.json")
+    command = [sys.executable, str(SERVER_UPDATE_RUNNER), "--recover-only",
+        "--recovery-transaction", context["transaction_id"],
+        "--status-file", str(SERVER_UPDATE_STATUS_FILE), "--public-key", str(SERVER_UPDATE_PUBLIC_KEY),
+        "--port", str(SERVER_PORT), "--bind", SERVER_BIND_ADDRESS,
+        "--expected-version", context["release_version"], "--track", status["track"],
+        "--expected-server-identity", server_identity(), "--update-id", update_id,
+        "--auth-token-file", str(token_file)]
+    environment = {**server_update_runner_environment(), "AGENTS_SERVER_INSTALL_DIR": str(root)}
+    for name in ("AGENTS_SERVER_CONFIG_DIR", "AGENTSDOCK_STATE_DIR"):
+        if os.environ.get(name):
+            environment[name] = os.environ[name]
+    command = ["env", *(f"{name}={value}" for name, value in environment.items()), *command]
+    with server_update_status_lock(SERVER_UPDATE_STATUS_FILE):
+        current = read_server_update_status()
+        if current != status:
+            return current
+        atomic_update_json(token_file, {"token": AGENT_TOKEN})
+        status = _write_server_update_status_unlocked(phase="restarting", runner_pid=None,
+            heartbeat_at=update_utc_now(), error_code=None, error_action=None, retryable=None,
+            message="Resuming the interrupted server activation.")
+    shell = f"{shlex.quote(tmux_bin())} set-option -w remain-on-exit off >/dev/null 2>&1 && exec {shlex.join(command)}"
+    launch = asyncio.create_task(asyncio.to_thread(run_tmux, ["new-session", "-d", "-s",
+        f"agents_server_recovery_{update_id[:20]}_{uuid.uuid4().hex[:8]}", shell]))
+    try:
+        await asyncio.shield(launch)
+    except asyncio.CancelledError as cancellation:
+        await join_task_despite_caller_cancellation(launch)
+        raise cancellation
+    except Exception as exc:
+        token_file.unlink(missing_ok=True)
+        with server_update_status_lock(SERVER_UPDATE_STATUS_FILE):
+            current = read_server_update_status()
+            if current == status:
+                _write_server_update_status_unlocked(phase="installing", runner_pid=None,
+                    error_code="server_update_recovery_launch_failed", retryable=True,
+                    error_action="Retry recovery from the application update settings.",
+                    message="The server could not start activation recovery.", finished_at=update_utc_now())
+        raise HTTPException(503, "could not resume the interrupted server activation") from exc
+    return status
+
+
+async def prepare_scheduled_server_update(
+    status: dict[str, Any], *, requested: str, track: str,
+    npm_release: dict[str, str] | None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Join/resume one preparation without taking turn or mutation admission."""
+    from update_preparation import preparation_is_active, verify_prepared_status
+
+    maintenance = globals().get("EXECUTION_MAINTENANCE")
+    if maintenance is not None and maintenance.is_held():
+        raise HTTPException(409, "AgentsServer maintenance must finish before an update can be prepared")
+    root = Path(os.environ["AGENTS_SERVER_INSTALL_DIR"]).expanduser().resolve()
+    if status.get("phase") != SERVER_UPDATE_PENDING_PHASE or not status.get("preparation_id"):
+        status = write_fresh_server_update_status(
+            phase=SERVER_UPDATE_PENDING_PHASE, schedule_id=status.get("schedule_id") or uuid.uuid4().hex,
+            preparation_id=uuid.uuid4().hex, preparation_phase="checking", preparation_heartbeat_at=None,
+            target_version=requested, latest_version=requested, track=track,
+            current_track=server_release_track(SERVER_VERSION), when_idle=True, cancelable=True,
+            update_available=True, pending_at=status.get("pending_at") or update_utc_now(),
+            _npm_release=npm_release, message="Preparing the server update; agents can keep working.",
+        )
+    if status.get("preparation_phase") == "ready":
+        # Candidate hashing is potentially expensive. A busy worker needs only
+        # the durable ready receipt; validate all bytes once work has drained.
+        provider_snapshot = await prepare_provider_background_work_snapshot()
+        async with ACTIVE_LOCK:
+            async with QUEUE_LOCK:
+                async with UNSAFE_HTTP_MUTATION_ADMISSION_LOCK:
+                    blockers = server_update_blocker_counts(
+                        server_update_active_session_ids_locked(), update_blocking_queued_turn_count_locked(),
+                        provider_background_work_labels_from_snapshot(provider_snapshot), unsafe_http_mutation_count_locked(),
+                    )
+        if server_update_has_blockers(blockers):
+            return write_server_update_status(blocker_counts=blockers,
+                message=server_update_pending_message(requested, blockers)), None
+        try:
+            prepared = await asyncio.to_thread(verify_prepared_status, status, root=root, public_key=SERVER_UPDATE_PUBLIC_KEY)
+        except Exception:
+            failed = write_server_update_status(phase="failed", retryable=True,
+                error_code="server_update_preparation_invalid",
+                error_action="Retry the update to prepare a new verified candidate.",
+                message="Prepared server update validation failed; running agents were left untouched.",
+                finished_at=update_utc_now())
+            return failed, None
+        return status, prepared
+    preparation_id = str(status["preparation_id"])
+    active = await asyncio.to_thread(preparation_is_active, root, preparation_id)
+    timestamp = status.get("preparation_heartbeat_at")
+    recent = bool(timestamp and server_update_status_age_seconds({"updated_at": timestamp}) < SERVER_UPDATE_START_GRACE_SECONDS)
+    if active or recent:
+        return status, None
+    command = [sys.executable, str(SERVER_ROOT / "update_preparation.py"),
+        "--status-file", str(SERVER_UPDATE_STATUS_FILE), "--install-root", str(root),
+        "--public-key", str(SERVER_UPDATE_PUBLIC_KEY), "--preparation-id", preparation_id]
+    environment = {**server_update_runner_environment(), "AGENTS_SERVER_INSTALL_DIR": str(root)}
+    # The long-lived tmux environment may belong to another configured server.
+    for name in ("AGENTS_SERVER_CONFIG_DIR", "AGENTSDOCK_STATE_DIR"):
+        if os.environ.get(name):
+            environment[name] = os.environ[name]
+    command = ["env", *(f"{name}={value}" for name, value in environment.items()), *command]
+    status = write_server_update_status(preparation_heartbeat_at=update_utc_now())
+    shell = f"{shlex.quote(tmux_bin())} set-option -w remain-on-exit off >/dev/null 2>&1 && exec {shlex.join(command)}"
+    launch = asyncio.create_task(asyncio.to_thread(run_tmux,
+        ["new-session", "-d", "-s", f"agents_server_prepare_{preparation_id}", shell]))
+    try:
+        await asyncio.shield(launch)
+    except asyncio.CancelledError as cancellation:
+        await join_task_despite_caller_cancellation(launch)
+        raise cancellation
+    return status, None
+
+
 async def _start_server_update(
     body: ServerUpdateRequest,
     *,
@@ -80588,12 +80779,61 @@ async def _start_server_update(
         if ensure:
             if npm_manifest is None:
                 raise HTTPException(400, "a signed npm release descriptor is required")
+            if status.get("phase") == "failed" and status.get("error_code") == "server_update_handoff_release_failed":
+                from update_handoff import retry_failed_handoff
+                try:
+                    await asyncio.to_thread(retry_failed_handoff,
+                        Path(os.environ["AGENTS_SERVER_INSTALL_DIR"]).expanduser().resolve(),
+                        SERVER_UPDATE_STATUS_FILE, status)
+                except Exception as exc:
+                    raise HTTPException(503, server_update_error_detail(
+                        "server_update_handoff_release_failed",
+                        "The previous update's execution hold could not be released safely.",
+                        action="Retry after the previous update has settled.", retryable=True)) from exc
+                with server_update_status_lock(SERVER_UPDATE_STATUS_FILE):
+                    current = read_server_update_status()
+                    if current != status:
+                        return {**current, "reconciliation": "pending"}
+                    status = _write_server_update_status_unlocked(
+                        _execution_handoff=None, error_code=None, error_action=None, retryable=None,
+                        message="The previous update's execution hold was released.")
+            if status.get("_activation_recovery"):
+                recovered = await resume_server_update_activation(status, explicit=True)
+                if recovered is not None:
+                    return {**recovered, "reconciliation": "started"}
             if version_key(SERVER_VERSION) >= version_key(npm_manifest["version"]):
                 if API_CONTRACT_VERSION != npm_manifest["api_contract_version"]:
                     raise HTTPException(409, server_update_error_detail(
                         "server_update_incompatible", "The installed server uses a different API contract.",
                         action="Use a compatible application release.", retryable=False,
                     ))
+                maintenance = globals().get("EXECUTION_MAINTENANCE")
+                if maintenance is not None:
+                    from execution_update_status import current_components
+                    try:
+                        components_current = await asyncio.to_thread(
+                            current_components,
+                            Path(os.environ["AGENTS_SERVER_INSTALL_DIR"]).expanduser().resolve(),
+                            target_version=npm_manifest["version"],
+                            expected_server_identity=server_identity(),
+                            expected_worker_instance=maintenance.worker_instance_id,
+                        )
+                    except Exception:
+                        components_current = False
+                    if not components_current:
+                        # A candidate worker can start before its paired gateway
+                        # or the outer installer transaction has finished.
+                        if ((status.get("phase") in SERVER_UPDATE_ACTIVE_PHASES
+                                or managed_server_update_is_pending(status))
+                                and status.get("track") == body.track
+                                and status.get("target_version") == npm_manifest["version"]):
+                            return {**status, "reconciliation": "pending" if managed_server_update_is_pending(status) else "started"}
+                        raise HTTPException(409, server_update_error_detail(
+                            "server_update_recovery_required",
+                            "The paired server update has not finished activating.",
+                            action="Reconnect to resume the existing update or retry its recovery.",
+                            retryable=True,
+                        ))
                 return {
                     **status, "phase": "current", "reconciliation": "current",
                     "update_available": False, "message": f"AgentsServer {SERVER_VERSION} satisfies this application release.",
@@ -80770,6 +81010,16 @@ async def _start_server_update(
         service_cgroup = await asyncio.to_thread(
             ensure_managed_update_tmux_isolated
         )
+        prepared_update: dict[str, Any] | None = None
+        if (body.when_idle and os.environ.get("AGENTS_SERVER_INSTALL_DIR")
+                and (SERVER_ROOT / "update_preparation.py").is_file()):
+            status, prepared_update = await prepare_scheduled_server_update(
+                status, requested=requested, track=track, npm_release=npm_release,
+            )
+            if prepared_update is None:
+                return status
+            pending_schedule_id = str(status["schedule_id"])
+            pending_reservation = dict(status)
         provider_work_snapshot = (
             await prepare_provider_background_work_snapshot()
         )
@@ -80780,6 +81030,7 @@ async def _start_server_update(
         auth_token_file: Path | None = None
         channel_switch = track != server_release_track(SERVER_VERSION)
         hub_snapshot: Path | None = None
+        execution_handoff: dict[str, Any] | None = None
         # Close admission and establish the durable update phase while holding
         # the same lock used to reserve turns.  This removes the race where a
         # turn could start after an idle check but before the detached updater
@@ -80812,6 +81063,13 @@ async def _start_server_update(
                         provider_work_labels,
                         mutation_count,
                     )
+                    maintenance = globals().get("EXECUTION_MAINTENANCE")
+                    if maintenance is not None:
+                        blocker_counts.update(
+                            session_deletions=len(DELETING_SESSIONS),
+                            goals_reconfiguration=int(CODEX_GOALS_RECONFIGURING),
+                            execution_maintenance=int(maintenance.is_held()),
+                        )
                     if server_update_has_blockers(blocker_counts):
                         if body.when_idle:
                             schedule_id = (
@@ -80835,6 +81093,9 @@ async def _start_server_update(
                                 and managed_server_force_update_is_pending(status)
                             )
                             pending_status = write_fresh_server_update_status(
+                                **{name: status.get(name) for name in (
+                                    "preparation_id", "preparation_phase", "preparation_heartbeat_at",
+                                    "preparation_runner_pid", "_prepared_update")},
                                 _npm_release=npm_release,
                                 schedule_id=schedule_id,
                                 phase=SERVER_UPDATE_PENDING_PHASE,
@@ -80897,6 +81158,9 @@ async def _start_server_update(
                     ]
                     if npm_release is not None:
                         command.append("--npm-descriptor")
+                    if prepared_update is not None and prepared_update.get("receipt"):
+                        command.extend(["--prepared-receipt", prepared_update["receipt"],
+                                        "--prepared-receipt-sha256", status["_prepared_update"]["receipt_sha256"]])
                     if service_cgroup is not None:
                         command.extend(
                             ["--expected-service-cgroup", service_cgroup]
@@ -81075,7 +81339,29 @@ async def _start_server_update(
                             ]
                         )
                     try:
+                        if maintenance is not None:
+                            operation_id = str(uuid.UUID(hex=update_id))
+                            acquired = maintenance.apply("acquire", operation_id, None, 120, blocker_counts)
+                            execution_handoff = {
+                                "schema": 1, "operation_id": operation_id,
+                                "worker_instance_id": maintenance.worker_instance_id,
+                                "lease_id": acquired["lease"]["lease_id"],
+                                "expected_server_identity": expected_server_identity,
+                            }
+                            maintenance.apply("seal", operation_id, execution_handoff["lease_id"], 120, blocker_counts)
+                            from update_preparation import preparation_directory
+                            handoff_dir = preparation_directory(
+                                Path(os.environ["AGENTS_SERVER_INSTALL_DIR"]).expanduser().resolve(),
+                                str(status.get("preparation_id") or update_id), create=True,
+                            )
+                            handoff_file = handoff_dir / f"handoff-{update_id}.json"
+                            atomic_update_json(handoff_file, execution_handoff)
+                            command.extend(["--execution-handoff-file", str(handoff_file)])
                         status = write_fresh_server_update_status(
+                            **{name: status.get(name) for name in (
+                                "preparation_id", "preparation_phase", "preparation_heartbeat_at",
+                                "preparation_runner_pid", "_prepared_update")},
+                            _execution_handoff=execution_handoff,
                             _npm_release=npm_release,
                             schedule_id=(pending_schedule_id or None),
                             update_id=update_id,
@@ -81127,6 +81413,7 @@ async def _start_server_update(
                             finished_at=None,
                         )
                     except BaseException:
+                        hub_cleared = False
                         try:
                             if hub_snapshot is not None:
                                 await TEAM_HUB_RUNTIME.clear_maintenance(
@@ -81134,8 +81421,12 @@ async def _start_server_update(
                                     update_id,
                                     hub_snapshot,
                                 )
+                            hub_cleared = True
                         finally:
                             await TEAM_HUB_RUNTIME.reopen_admission()
+                            if hub_cleared and execution_handoff is not None:
+                                maintenance.apply("release", execution_handoff["operation_id"],
+                                    execution_handoff["lease_id"], 120, {})
                         raise
                     # The durable starting phase now closes unsafe mutation
                     # admission. Reads may resume while the detached updater
@@ -81202,6 +81493,12 @@ async def _start_server_update(
             finally:
                 await TEAM_HUB_RUNTIME.reopen_admission()
             if not fence_clear_failed:
+                if execution_handoff is not None:
+                    # Provider stragglers retain their separate authoritative
+                    # fence until cleanup finishes; releasing this exact lease
+                    # cannot permit a replacement provider through that fence.
+                    maintenance.apply("release", execution_handoff["operation_id"],
+                        execution_handoff["lease_id"], 120, {})
                 await TERMINAL_ATTACHMENTS.reopen_admission()
                 # A failed detached launch reopened normal work admission.
                 # Resume durable queues now instead of leaving them parked
@@ -81259,6 +81556,9 @@ async def _start_server_update(
 
         try:
             runner_environment = server_update_runner_environment()
+            for name in ("AGENTS_SERVER_INSTALL_DIR", "AGENTS_SERVER_CONFIG_DIR", "AGENTSDOCK_STATE_DIR"):
+                if os.environ.get(name):
+                    runner_environment[name] = os.environ[name]
             if runner_environment:
                 command = [
                     "env",

@@ -64,6 +64,24 @@ class LeaseTests(unittest.TestCase):
 
 
 class HealthTests(unittest.IsolatedAsyncioTestCase):
+    async def test_maintenance_status_changes_after_commit_without_a_new_boot(self):
+        held = True
+        async def app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"application/json")]})
+            await send({"type": "http.response.body", "body": b'{"server_version":"new","server_instance_id":"same-run"}'})
+        wrapped = ComponentHealth(app, "execution_service", {"version": "new", "instance_id": "same-worker"},
+                                  lambda: {"maintenance_held": held})
+        for expected in (True, False):
+            held = expected
+            messages = []
+            async def send(message):
+                messages.append(message)
+            await wrapped({"type": "http", "path": "/api/health"}, None, send)
+            result = json.loads(messages[1]["body"])
+            self.assertEqual(result["execution_service"], {
+                "version": "new", "instance_id": "same-worker", "maintenance_held": expected})
+            self.assertEqual(result["server_instance_id"], "same-run")
+
     async def test_gateway_does_not_claim_older_execution_was_upgraded(self):
         async def app(scope, receive, send):
             await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"application/json")]})

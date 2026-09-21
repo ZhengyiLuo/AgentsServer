@@ -2,6 +2,8 @@
 import base64
 import hashlib
 import json
+import re
+import shlex
 from pathlib import Path
 import shutil
 import subprocess
@@ -12,6 +14,17 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent
 EXECUTION_MODULES = {
+    "execution_durability.py",
+    "execution_http.py",
+    "execution_recovery_status.py",
+    "execution_recovery.py",
+    "execution_uninstall.py",
+    "update_recovery.py",
+    "execution_activation.py",
+    "execution_preparation.py",
+    "execution_update_status.py",
+    "update_handoff.py",
+    "update_preparation.py",
     "execution_control.py", "execution_install.py", "execution_maintenance.py",
     "execution_manage.py", "execution_ownership.py", "execution_service.py", "execution_transport.py",
 }
@@ -46,6 +59,12 @@ class NpmReleasePackageTests(unittest.TestCase):
         for name in ("LICENSE", "NOTICE"):
             self.assertFalse((ROOT / name).is_symlink())
             self.assertEqual((ROOT / name).read_bytes(), (checkout / name).read_bytes())
+
+    def test_published_payload_matches_actual_installer_required_inventory(self):
+        installer = (ROOT / "install.sh").read_text()
+        required = shlex.split(re.search(r"^RELEASE_FILES=\((.*?)\)", installer, re.M | re.S)[1])
+        hub = shlex.split(re.search(r"^TEAM_HUB_RELEASE_FILES=\((.*?)\)", installer, re.M | re.S)[1])
+        self.assertEqual(set(package.runtime_files()), {*required, *(f"agentsdock_team_hub/{name}" for name in hub)})
 
     def test_exact_payload_no_tests_secrets_or_lifecycle_scripts(self):
         (self.root / ".env").write_text("must not ship")

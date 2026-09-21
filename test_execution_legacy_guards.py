@@ -76,15 +76,22 @@ class LegacyExecutionLayoutGuardTests(unittest.TestCase):
                     with self.subTest(script=script, marker=name, kind=kind):
                         marker = self.marker(name, kind)
                         before = marker.lstat()
-                        result = self.run_script(script, *(["--yes"] if script == "uninstall.sh" else []))
-                        self.assertNotEqual(result.returncode, 0, result.stdout)
-                        self.assertIn("does not support the separate gateway/execution layout", result.stderr)
-                        self.assertEqual(marker.lstat(), before)
-                        self.assertEqual(set(self.install.iterdir()), {marker})
-                        self.assertFalse((self.home / "config").exists())
-                        self.assertFalse((self.home / "state").exists())
-                        self.assertFalse(self.operations.exists())
-                        marker.rmdir() if kind == "directory" else marker.unlink()
+                        try:
+                            result = self.run_script(script, *(["--yes"] if script == "uninstall.sh" else []))
+                            self.assertNotEqual(result.returncode, 0, result.stdout)
+                            if script == "install.sh":
+                                # A valid installed layout is now supported;
+                                # these malformed files/links remain refusals.
+                                self.assertRegex(result.stderr, "execution (configuration|activation|layout)|execution-layout.json|separate gateway/execution layout")
+                            else:
+                                self.assertIn("separate gateway/execution layout", result.stderr)
+                            self.assertEqual(marker.lstat(), before)
+                            self.assertEqual(set(self.install.iterdir()), {marker})
+                            self.assertFalse((self.home / "config").exists())
+                            self.assertFalse((self.home / "state").exists())
+                            self.assertFalse(self.operations.exists())
+                        finally:
+                            marker.rmdir() if kind == "directory" else marker.unlink()
 
     def test_deploy_refuses_managed_current_and_direct_release_paths(self):
         release = self.install / "releases" / "1.2.3-beta.4"
@@ -133,7 +140,7 @@ class LegacyExecutionLayoutGuardTests(unittest.TestCase):
                 env={**self.environment, "INSTALL_ROOT": str(self.install)},
                 capture_output=True, text=True, timeout=10)
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("separate gateway/execution layout", result.stderr)
+            self.assertRegex(result.stderr, "execution (configuration|activation|layout)|separate gateway/execution layout")
             self.assertFalse(self.operations.exists())
             path.unlink()
 

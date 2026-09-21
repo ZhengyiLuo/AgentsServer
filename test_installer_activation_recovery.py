@@ -490,6 +490,39 @@ wait_for_health() {{ return 99; }}
 {body}
 """
 
+    def test_prelink_quiescence_rollback_never_stops_incumbent_or_restores_hub_snapshot(self) -> None:
+        for phase in ("quiescing","quiesced"):
+            body = """
+set -e
+ACTIVATION_TRANSACTION_PHASE=rolling-back
+ACTIVATION_ROLLBACK_FROM=__PHASE__
+clear_team_hub_operation_fence() { log clear-fence; }
+restore_previous_release_transaction
+! grep -q '^suppress$' "$LOG"
+! grep -q '^stop$' "$LOG"
+! grep -q '^restore-hub$' "$LOG"
+test "$(grep -c '^clear-fence$' "$LOG")" = 1
+test "$(grep -c '^restore-service$' "$LOG")" = 1
+test "$(grep -c '^health$' "$LOG")" = 1
+""".replace("__PHASE__",phase)
+            result=subprocess.run(["/bin/bash","-c",self._rollback_script(body)],text=True,capture_output=True)
+            self.assertEqual(result.returncode,0,result.stderr)
+
+    def test_resuming_restored_files_never_reenters_rollback_or_reapplies_snapshot(self) -> None:
+        body = """
+ACTIVATION_TRANSACTION_PHASE=rolled-back
+restore_previous_release_transaction
+test "$(grep -c '^record:rolling-back$' "$LOG" || true)" = 0
+test "$(grep -c '^restore-hub$' "$LOG" || true)" = 0
+test "$(grep -c '^restore-files$' "$LOG" || true)" = 0
+test "$(grep -c '^stop$' "$LOG" || true)" = 0
+test "$(grep -c '^health$' "$LOG")" = 1
+test "$(grep -c '^record:rollback-healthy$' "$LOG")" = 1
+"""
+        result = subprocess.run(["/bin/bash", "-c", self._rollback_script(body)],
+                                text=True, capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_rollback_receipt_is_consumed_only_after_durable_file_rollback(self) -> None:
         body = """
 restore_previous_release_transaction

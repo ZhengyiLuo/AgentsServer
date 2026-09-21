@@ -74,7 +74,7 @@ class InstallerContractTests(unittest.TestCase):
             }
             (root / "home").mkdir()
             result = subprocess.run(
-                ["/bin/bash", str(source / "install.sh"), "--no-team-hub-host"],
+                ["/bin/bash", str(source / "install.sh"), "--execution-mode", "legacy", "--no-team-hub-host"],
                 env=environment,
                 capture_output=True,
                 text=True,
@@ -255,7 +255,7 @@ class InstallerContractTests(unittest.TestCase):
                 "AGENTSDOCK_EXPECTED_SERVICE_CGROUP": "/valid/test.service",
             }
             rejected = subprocess.run(
-                ["/bin/bash", str(INSTALLER), "--show-token"],
+                ["/bin/bash", str(INSTALLER), "--execution-mode", "legacy", "--show-token"],
                 env=environment,
                 capture_output=True,
                 text=True,
@@ -270,7 +270,7 @@ class InstallerContractTests(unittest.TestCase):
             overridden = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--managed-update-id",
                     "update_test_cli_override",
                     "--expected-service-cgroup",
@@ -316,7 +316,7 @@ class InstallerContractTests(unittest.TestCase):
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--non-interactive",
                     "--expected-server-identity",
                     "server_test_identity_12345678",
@@ -390,7 +390,7 @@ exit 0
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--port",
                     "47850",
                     "--non-interactive",
@@ -471,7 +471,7 @@ exit 0
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--port",
                     "47850",
                     "--non-interactive",
@@ -1655,7 +1655,7 @@ exit 0
                 environment["AGENTSDOCK_SERVER_NAME"] = invalid
 
                 result = subprocess.run(
-                    ["/bin/bash", str(INSTALLER), "--non-interactive"],
+                    ["/bin/bash", str(INSTALLER), "--execution-mode", "legacy", "--non-interactive"],
                     env=environment,
                     capture_output=True,
                     text=True,
@@ -1673,7 +1673,7 @@ exit 0
 
     def test_help_does_not_modify_the_machine(self):
         result = subprocess.run(
-            ["bash", str(INSTALLER), "--help"],
+            ["bash", str(INSTALLER), "--execution-mode", "legacy", "--help"],
             capture_output=True,
             text=True,
             check=False,
@@ -1685,7 +1685,7 @@ exit 0
         result = subprocess.run(
             [
                 "/bin/bash",
-                str(INSTALLER),
+                str(INSTALLER), "--execution-mode", "legacy",
                 "--team-hub-host",
                 "--no-team-hub-host",
             ],
@@ -1706,7 +1706,7 @@ exit 0
                     result = subprocess.run(
                         [
                             "/bin/bash",
-                            str(INSTALLER),
+                            str(INSTALLER), "--execution-mode", "legacy",
                             "--team-hub-tailscale-serve-url",
                             f"https://sonic.example.ts.net:{port}/api/team-hub",
                         ],
@@ -1725,7 +1725,7 @@ exit 0
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--team-hub-tailscale-serve-url",
                 ],
                 env={**os.environ, "HOME": str(isolated_home)},
@@ -1754,7 +1754,7 @@ exit 0
                     result = subprocess.run(
                         [
                             "/bin/bash",
-                            str(INSTALLER),
+                            str(INSTALLER), "--execution-mode", "legacy",
                             "--team-hub-direct-ip-url",
                             hub_url,
                         ],
@@ -1773,7 +1773,7 @@ exit 0
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--team-hub-tailscale-serve-url",
                     "https://sonic.example.ts.net:9443/api/team-hub",
                 ],
@@ -1810,7 +1810,7 @@ exit 0
                     result = subprocess.run(
                         [
                             "/bin/bash",
-                            str(INSTALLER),
+                            str(INSTALLER), "--execution-mode", "legacy",
                             "--team-hub-tailscale-serve-url",
                             hub_url,
                         ],
@@ -1829,7 +1829,7 @@ exit 0
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--expected-server-identity",
                     "server_transport_contract_1234",
                     "--expected-team-hub-id",
@@ -1867,7 +1867,7 @@ exit 0
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--expected-server-identity", "server_transport_contract_1234",
                     "--expected-team-hub-id", "hub_transport_contract_1234567",
                     "--expected-team-hub-transport", "tailscale_serve",
@@ -1900,7 +1900,7 @@ exit 0
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--expected-server-identity", "server_transport_contract_1234",
                     "--expected-team-hub-id", "hub_transport_contract_1234567",
                     "--expected-team-hub-transport", "tailscale_serve",
@@ -1933,7 +1933,7 @@ exit 0
             before = self.snapshot_trees(home, install_root, config_root, state_root)
 
             result = subprocess.run(
-                ["/bin/bash", str(INSTALLER), "--show-token"],
+                ["/bin/bash", str(INSTALLER), "--execution-mode", "legacy", "--show-token"],
                 env=environment,
                 capture_output=True,
                 text=True,
@@ -1983,7 +1983,7 @@ exit 0
                     )
 
                 result = subprocess.run(
-                    ["/bin/bash", str(INSTALLER), "--show-token"],
+                    ["/bin/bash", str(INSTALLER), "--execution-mode", "legacy", "--show-token"],
                     env=environment,
                     capture_output=True,
                     text=True,
@@ -2006,7 +2006,7 @@ exit 0
             before = self.snapshot_trees(home, install_root, config_root, state_root)
 
             result = subprocess.run(
-                ["/bin/bash", str(INSTALLER), "--show-token"],
+                ["/bin/bash", str(INSTALLER), "--execution-mode", "legacy", "--show-token"],
                 env=environment,
                 capture_output=True,
                 text=True,
@@ -2047,7 +2047,7 @@ exit 0
                     os.chmod(env_path, 0o600)
 
                 result = subprocess.run(
-                    ["/bin/bash", str(INSTALLER), "--show-token"],
+                    ["/bin/bash", str(INSTALLER), "--execution-mode", "legacy", "--show-token"],
                     env=environment,
                     capture_output=True,
                     text=True,
@@ -2096,7 +2096,7 @@ chmod 755 "$project/.venv/bin/python"
 
             for attempt in range(2):
                 result = subprocess.run(
-                    ["bash", str(INSTALLER), "--port", "17850", "--non-interactive"],
+                    ["bash", str(INSTALLER), "--execution-mode", "legacy", "--port", "17850", "--non-interactive"],
                     env=environment,
                     capture_output=True,
                     text=True,
@@ -2150,7 +2150,7 @@ if [ "${1:-}" = "-" ]; then
   exec "$REAL_PYTHON" "$@"
 fi
 case "$*" in
-  *"-m activation_transaction "*) exec "$REAL_PYTHON" "$@" ;;
+  *"-m activation_transaction "*|*"/activation_transaction.py "*) exec "$REAL_PYTHON" "$@" ;;
 esac
 exit 0
 PYTHON
@@ -2184,7 +2184,7 @@ chmod 755 "$target/bin/python"
                 environment.pop(name, None)
 
             result = subprocess.run(
-                ["bash", str(INSTALLER), "--port", "17850", "--non-interactive"],
+                ["bash", str(INSTALLER), "--execution-mode", "legacy", "--port", "17850", "--non-interactive"],
                 env=environment,
                 capture_output=True,
                 text=True,
@@ -2233,7 +2233,7 @@ if env | grep -Eq '^(AGENTSDOCK_AGENT_TOKEN|ZENITHDOCK_AGENT_TOKEN|ZENITHBOT_AGE
 fi
 if [ "${1:-}" = "-" ]; then exec "$REAL_PYTHON" "$@"; fi
 case "$*" in
-  *"-m activation_transaction "*) exec "$REAL_PYTHON" "$@" ;;
+  *"-m activation_transaction "*|*"/activation_transaction.py "*) exec "$REAL_PYTHON" "$@" ;;
 esac
 exit 0
 PYTHON
@@ -2297,7 +2297,7 @@ esac
                 environment.pop(name, None)
 
             result = subprocess.run(
-                ["/bin/bash", str(INSTALLER), "--port", "17850", "--non-interactive"],
+                ["/bin/bash", str(INSTALLER), "--execution-mode", "legacy", "--port", "17850", "--non-interactive"],
                 env=environment,
                 capture_output=True,
                 text=True,
@@ -2318,7 +2318,7 @@ esac
             self.write_executable(fake_bin / "uv", "#!/bin/sh\nexit 0\n")
 
             result = subprocess.run(
-                ["/bin/bash", str(INSTALLER), "--non-interactive"],
+                ["/bin/bash", str(INSTALLER), "--execution-mode", "legacy", "--non-interactive"],
                 env=environment,
                 capture_output=True,
                 text=True,
@@ -2382,7 +2382,7 @@ chmod 755 "$project/.venv/bin/python"
                 environment.pop(name, None)
 
             result = subprocess.run(
-                ["bash", str(INSTALLER), "--port", "17850", "--non-interactive"],
+                ["bash", str(INSTALLER), "--execution-mode", "legacy", "--port", "17850", "--non-interactive"],
                 env=environment,
                 capture_output=True,
                 text=True,
@@ -2426,7 +2426,7 @@ chmod 755 "$project/.venv/bin/python"
             )
 
             result = subprocess.run(
-                ["/bin/bash", str(INSTALLER), "--port", "17850", "--non-interactive"],
+                ["/bin/bash", str(INSTALLER), "--execution-mode", "legacy", "--port", "17850", "--non-interactive"],
                 env=environment,
                 capture_output=True,
                 text=True,
@@ -2460,7 +2460,7 @@ chmod 755 "$project/.venv/bin/python"
             self.write_executable(fake_bin / "tmux", "#!/bin/sh\nexit 127\n")
             self.write_executable(fake_bin / "systemctl", "#!/bin/sh\nexit 1\n")
             result = subprocess.run(
-                ["/bin/bash", str(INSTALLER), "--non-interactive"],
+                ["/bin/bash", str(INSTALLER), "--execution-mode", "legacy", "--non-interactive"],
                 env={
                     **os.environ,
                     "HOME": str(home),
@@ -2511,7 +2511,7 @@ chmod 755 "$project/.venv/bin/python"
                 "#!/bin/sh\nif [ \"${1:-}\" = \"-m\" ]; then echo x86_64; else echo Darwin; fi\n",
             )
             result = subprocess.run(
-                ["/bin/bash", str(source / "install.sh"), "--non-interactive"],
+                ["/bin/bash", str(source / "install.sh"), "--execution-mode", "legacy", "--non-interactive"],
                 env={
                     **os.environ,
                     "HOME": str(home),
@@ -2575,7 +2575,7 @@ FAKE_NATIVE_ARCH=1 exec /bin/bash "$@"
             )
 
             result = subprocess.run(
-                ["/bin/bash", str(INSTALLER), "--help"],
+                ["/bin/bash", str(INSTALLER), "--execution-mode", "legacy", "--help"],
                 env={
                     **os.environ,
                     "HOME": str(home),
@@ -2591,7 +2591,7 @@ FAKE_NATIVE_ARCH=1 exec /bin/bash "$@"
             self.assertIn("Usage: ./install.sh", result.stdout)
             self.assertEqual(
                 arch_log.read_text().splitlines(),
-                ["-arm64", "/bin/bash", str(INSTALLER), "--help"],
+                ["-arm64", "/bin/bash", str(INSTALLER), "--execution-mode", "legacy", "--help"],
             )
 
     def test_explicit_port_is_pinned_without_allow_port_fallback(self):
@@ -2611,7 +2611,7 @@ FAKE_NATIVE_ARCH=1 exec /bin/bash "$@"
                 result = subprocess.run(
                     [
                         "/bin/bash",
-                        str(INSTALLER),
+                        str(INSTALLER), "--execution-mode", "legacy",
                         "--port",
                         str(port),
                         "--non-interactive",
@@ -2651,7 +2651,7 @@ FAKE_NATIVE_ARCH=1 exec /bin/bash "$@"
                 result = subprocess.run(
                     [
                         "/bin/bash",
-                        str(INSTALLER),
+                        str(INSTALLER), "--execution-mode", "legacy",
                         "--port",
                         str(port),
                         "--allow-port-fallback",
@@ -2709,7 +2709,7 @@ FAKE_NATIVE_ARCH=1 exec /bin/bash "$@"
             })
 
             result = subprocess.run(
-                ["/bin/bash", str(INSTALLER), "--non-interactive", "--port", str(port), "--allow-port-fallback"],
+                ["/bin/bash", str(INSTALLER), "--execution-mode", "legacy", "--non-interactive", "--port", str(port), "--allow-port-fallback"],
                 env=environment,
                 capture_output=True,
                 text=True,
@@ -2749,7 +2749,7 @@ FAKE_NATIVE_ARCH=1 exec /bin/bash "$@"
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--non-interactive",
                     "--port",
                     "17850",
@@ -2820,7 +2820,7 @@ FAKE_NATIVE_ARCH=1 exec /bin/bash "$@"
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--non-interactive",
                     "--port",
                     "17850",
@@ -2885,7 +2885,7 @@ FAKE_NATIVE_ARCH=1 exec /bin/bash "$@"
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--non-interactive",
                     "--port",
                     "17850",
@@ -2956,7 +2956,7 @@ FAKE_NATIVE_ARCH=1 exec /bin/bash "$@"
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--non-interactive",
                     "--port",
                     "17850",
@@ -3070,7 +3070,7 @@ FAKE_NATIVE_ARCH=1 exec /bin/bash "$@"
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--non-interactive",
                     "--port",
                     "17850",
@@ -3185,7 +3185,7 @@ FAKE_NATIVE_ARCH=1 exec /bin/bash "$@"
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--non-interactive",
                     "--port",
                     "17850",
@@ -3254,7 +3254,7 @@ FAKE_NATIVE_ARCH=1 exec /bin/bash "$@"
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--non-interactive",
                     "--port",
                     "17850",
@@ -3317,7 +3317,7 @@ FAKE_NATIVE_ARCH=1 exec /bin/bash "$@"
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--non-interactive",
                     "--port",
                     "17850",
@@ -3374,7 +3374,7 @@ FAKE_NATIVE_ARCH=1 exec /bin/bash "$@"
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--non-interactive",
                     "--port",
                     "17850",
@@ -3433,7 +3433,7 @@ FAKE_NATIVE_ARCH=1 exec /bin/bash "$@"
                 result = subprocess.run(
                     [
                         "/bin/bash",
-                        str(INSTALLER),
+                        str(INSTALLER), "--execution-mode", "legacy",
                         "--non-interactive",
                         "--port",
                         "17850",
@@ -3496,7 +3496,7 @@ FAKE_NATIVE_ARCH=1 exec /bin/bash "$@"
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--non-interactive",
                     "--port",
                     "17850",
@@ -3557,7 +3557,7 @@ FAKE_NATIVE_ARCH=1 exec /bin/bash "$@"
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--non-interactive",
                     "--port",
                     "17850",
@@ -3619,7 +3619,7 @@ FAKE_NATIVE_ARCH=1 exec /bin/bash "$@"
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--non-interactive",
                     "--port",
                     "17850",
@@ -3683,7 +3683,7 @@ FAKE_NATIVE_ARCH=1 exec /bin/bash "$@"
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--non-interactive",
                     "--port",
                     "17850",
@@ -3737,7 +3737,7 @@ FAKE_NATIVE_ARCH=1 exec /bin/bash "$@"
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--non-interactive",
                     "--port",
                     "17850",
@@ -3800,7 +3800,7 @@ FAKE_NATIVE_ARCH=1 exec /bin/bash "$@"
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--non-interactive",
                     "--port",
                     "17850",
@@ -3863,7 +3863,7 @@ exit 0
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--non-interactive",
                     "--port",
                     "17850",
@@ -3918,7 +3918,7 @@ exit 0
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--non-interactive",
                     "--port",
                     "17850",
@@ -3965,7 +3965,7 @@ exit 0
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--non-interactive",
                     "--port",
                     "17850",
@@ -4017,7 +4017,7 @@ exit 0
             )
 
             result = subprocess.run(
-                ["/bin/bash", str(INSTALLER), "--non-interactive", "--port", "17850"],
+                ["/bin/bash", str(INSTALLER), "--execution-mode", "legacy", "--non-interactive", "--port", "17850"],
                 env=environment,
                 capture_output=True,
                 text=True,
@@ -4090,7 +4090,7 @@ exit 0
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--non-interactive",
                     "--team-hub-direct-ip-url",
                     "http://100.73.184.23:7850/api/team-hub",
@@ -4154,7 +4154,7 @@ exit 0
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--non-interactive",
                     "--port",
                     "17850",
@@ -4568,7 +4568,7 @@ exit 0
             result = subprocess.run(
                 [
                     "/bin/bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--non-interactive",
                     "--port",
                     "17850",
@@ -5709,7 +5709,7 @@ exit 28
             })
 
             result = subprocess.run(
-                ["/bin/bash", str(INSTALLER), "--non-interactive"],
+                ["/bin/bash", str(INSTALLER), "--execution-mode", "legacy", "--non-interactive"],
                 env=environment,
                 capture_output=True,
                 text=True,
@@ -5743,7 +5743,7 @@ exit 4
             })
 
             result = subprocess.run(
-                ["/bin/bash", str(INSTALLER), "--non-interactive"],
+                ["/bin/bash", str(INSTALLER), "--execution-mode", "legacy", "--non-interactive"],
                 env=environment,
                 capture_output=True,
                 text=True,
@@ -5782,7 +5782,7 @@ wait
             })
 
             result = subprocess.run(
-                ["/bin/bash", str(INSTALLER), "--non-interactive"],
+                ["/bin/bash", str(INSTALLER), "--execution-mode", "legacy", "--non-interactive"],
                 env=environment,
                 capture_output=True,
                 text=True,
@@ -5817,7 +5817,7 @@ wait
             before = self.snapshot_trees(install_root)
 
             result = subprocess.run(
-                ["/bin/bash", str(INSTALLER), "--non-interactive"],
+                ["/bin/bash", str(INSTALLER), "--execution-mode", "legacy", "--non-interactive"],
                 env=environment,
                 capture_output=True,
                 text=True,
@@ -5866,7 +5866,7 @@ exit 97
             before = self.snapshot_trees(install_root, config_root, state_root)
 
             result = subprocess.run(
-                ["/bin/bash", str(INSTALLER), "--non-interactive"],
+                ["/bin/bash", str(INSTALLER), "--execution-mode", "legacy", "--non-interactive"],
                 env=environment,
                 capture_output=True,
                 text=True,
@@ -5932,7 +5932,7 @@ chmod 755 "$project/.venv/bin/python"
             }
 
             result = subprocess.run(
-                ["/bin/bash", str(INSTALLER), "--port", "17850", "--non-interactive"],
+                ["/bin/bash", str(INSTALLER), "--execution-mode", "legacy", "--port", "17850", "--non-interactive"],
                 env=environment,
                 capture_output=True,
                 text=True,
@@ -6185,7 +6185,7 @@ exit 2
             result = subprocess.run(
                 [
                     "bash",
-                    str(INSTALLER),
+                    str(INSTALLER), "--execution-mode", "legacy",
                     "--port",
                     "17850",
                     "--non-interactive",
@@ -6286,7 +6286,7 @@ exit 2
             })
 
             result = subprocess.run(
-                ["bash", str(INSTALLER), "--port", "17850", "--non-interactive"],
+                ["bash", str(INSTALLER), "--execution-mode", "legacy", "--port", "17850", "--non-interactive"],
                 env=environment,
                 capture_output=True,
                 text=True,
@@ -6370,7 +6370,7 @@ exit 2
             })
 
             result = subprocess.run(
-                ["bash", str(INSTALLER), "--port", "17850", "--non-interactive"],
+                ["bash", str(INSTALLER), "--execution-mode", "legacy", "--port", "17850", "--non-interactive"],
                 env=environment,
                 capture_output=True,
                 text=True,
@@ -6664,7 +6664,7 @@ if [ "${1:-}" = "-" ]; then
   exec "$REAL_PYTHON" "$@"
 fi
 case "$*" in
-  *"-m activation_transaction "*)
+  *"-m activation_transaction "*|*"/activation_transaction.py "*)
     exec "$REAL_PYTHON" "$@"
     ;;
   *"-m agentsdock_team_hub.cli begin-host-cold-handoff"*|*"-m agentsdock_team_hub.cli clear-host-cold-handoff"*|*"-m agentsdock_team_hub.cli adopt-host-reactivation-preflight"*|*"-m agentsdock_team_hub.cli abort-host-reactivation-preflight"*|*"-m agentsdock_team_hub.cli verify-server-identity"*)
@@ -7385,7 +7385,7 @@ exit 0
     ) -> list[str]:
         command = [
             "/bin/bash",
-            str(INSTALLER),
+            str(INSTALLER), "--execution-mode", "legacy",
             "--non-interactive",
             "--port",
             "17850",

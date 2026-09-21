@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# All generated dependency caches and journals stay private under any caller umask.
+umask 077
+export PYTHONDONTWRITEBYTECODE=1
 
 # A managed update can be launched by a long-lived tmux server that itself was
 # started from a translated Intel process. On Apple silicon that makes
@@ -49,6 +52,19 @@ PORT="7850"
 BIND_ADDRESS="0.0.0.0"
 RELEASE_VERSION=""
 EXPECTED_API_CONTRACT=""
+TOKEN=""
+EXECUTION_MODE="split"
+EXECUTION_MODE_EXPLICIT="false"
+EXECUTION_RECOVERY_PYTHON=""
+EXECUTION_RECOVERY_HELPER=""
+EXECUTION_HANDOFF_FILE=""
+PREPARE_ONLY="false"
+RECOVER_ONLY="false"
+EXPECTED_ACTIVATION_ID=""
+source_inventory=""
+PREPARED_RECEIPT=""
+ACTIVATE_PREPARED=""
+PREPARED_ARCHIVE_SHA256=""
 DEPENDENCY_SYNC_TIMEOUT_SECONDS="${AGENTS_SERVER_DEPENDENCY_TIMEOUT_SECONDS:-1200}"
 INSTALL_HEARTBEAT_SECONDS="${AGENTS_SERVER_INSTALL_HEARTBEAT_SECONDS:-15}"
 HEALTH_CHECK_ATTEMPTS="${AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS:-45}"
@@ -156,6 +172,14 @@ asking; use it for unattended/SSH-driven runs.
 service. The npm fresh-install command uses it; existing servers update through
 the authenticated managed updater. The check repeats under the install lock.
 
+--execution-mode split installs separately managed gateway and execution services.
+An existing split installation keeps this mode automatically.
+--prepare-only --prepared-receipt PATH stages a pinned immutable runtime without
+changing services/state. --activate-prepared PATH consumes that exact receipt.
+Both require --expected-api-contract and --prepared-archive-sha256 pins.
+--recover-only finishes only an existing split activation with matching release
+and API pins; it never creates a new installation.
+
 --expected-api-contract pins candidate health to the signed release descriptor.
 It is used by the coordinated updater before committing activation.
 
@@ -198,6 +222,14 @@ while (($#)); do
     --bind) BIND_ADDRESS="${2:-}"; BIND_EXPLICIT="true"; shift 2 ;;
     --release-version) RELEASE_VERSION="${2:-}"; shift 2 ;;
     --expected-api-contract) EXPECTED_API_CONTRACT="${2:-}"; shift 2 ;;
+    --execution-mode) EXECUTION_MODE="${2:-}"; EXECUTION_MODE_EXPLICIT="true"; shift 2 ;;
+    --execution-handoff-file) EXECUTION_HANDOFF_FILE="${2:-}"; shift 2 ;;
+    --prepare-only) PREPARE_ONLY="true"; shift ;;
+    --recover-only) RECOVER_ONLY="true"; shift ;;
+    --expected-activation-id) EXPECTED_ACTIVATION_ID="${2:-}"; shift 2 ;;
+    --prepared-receipt) PREPARED_RECEIPT="${2:-}"; shift 2 ;;
+    --activate-prepared) ACTIVATE_PREPARED="${2:-}"; shift 2 ;;
+    --prepared-archive-sha256) PREPARED_ARCHIVE_SHA256="${2:-}"; shift 2 ;;
     --non-interactive) NON_INTERACTIVE="true"; shift ;;
     --fresh-install-only) FRESH_INSTALL_ONLY="true"; shift ;;
     --allow-port-fallback) PORT_FALLBACK="true"; shift ;;
@@ -461,14 +493,32 @@ paths_overlap() {
 }
 
 refuse_execution_layout() {
-  local marker=""
-  for marker in "$INSTALL_ROOT/execution-layout.json" "$INSTALL_ROOT/.execution-transaction"; do
-    if [[ -e "$marker" || -L "$marker" ]]; then
-      echo "This installer does not support the separate gateway/execution layout or its pending transaction." >&2
-      echo "Use the execution-aware managed lifecycle; the pinned worker has not been changed." >&2
-      return 1
+  if [[ -e "$INSTALL_ROOT/.execution-uninstall.json" || -L "$INSTALL_ROOT/.execution-uninstall.json" ]]; then
+    echo "A pending split-service uninstall must finish before installation or preparation." >&2
+    return 1
+  fi
+  if [[ -e "$INSTALL_ROOT/.execution-transaction" || -L "$INSTALL_ROOT/.execution-transaction" ]]; then
+    echo "Recover the independent execution activation before using the managed installer." >&2
+    return 1
+  fi
+  if [[ -e "$INSTALL_ROOT/execution-layout.json" || -L "$INSTALL_ROOT/execution-layout.json" \
+    || -e "$INSTALL_ROOT/.activation-transaction" || -L "$INSTALL_ROOT/.activation-transaction" ]]; then
+    local detection_python=""
+    local detected=""
+    if [[ -x "$INSTALL_ROOT/current/.venv/bin/python" ]]; then
+      detection_python="$INSTALL_ROOT/current/.venv/bin/python"
+    else
+      detection_python="$(command -v python3)" || return 1
     fi
-  done
+    detected="$(PYTHONPATH="$SOURCE_DIR" "$detection_python" -B -m execution_activation detect --root "$INSTALL_ROOT")" || return 1
+    if [[ "$detected" == "split" ]]; then
+      if [[ "$EXECUTION_MODE_EXPLICIT" == "true" && "$EXECUTION_MODE" != "split" ]]; then
+        echo "An installed split layout cannot be replaced by the legacy service." >&2
+        return 1
+      fi
+      EXECUTION_MODE="split"
+    fi
+  fi
 }
 
 INSTALL_ROOT="$(normalize_managed_path AGENTS_SERVER_INSTALL_DIR "$INSTALL_ROOT")" \
@@ -496,6 +546,13 @@ if paths_overlap "$INSTALL_ROOT" "$CONFIG_ROOT" \
   || paths_overlap "$STATE_ROOT" "$LEGACY_STATE_GUARD"; then
   echo "Refusing overlapping install, configuration, and state roots; each must be a separate directory." >&2
   exit 2
+fi
+[[ "$EXECUTION_MODE" == "legacy" || "$EXECUTION_MODE" == "split" ]] || { echo "Invalid execution mode." >&2; exit 2; }
+if [[ "$PREPARE_ONLY" == "true" || -n "$ACTIVATE_PREPARED" ]]; then
+  [[ "$PREPARED_ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ && "$EXPECTED_API_CONTRACT" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "Preparation requires the exact signed archive/API pins." >&2; exit 2; }
+  [[ "$PREPARE_ONLY" != "true" || ( -n "$PREPARED_RECEIPT" && -z "$ACTIVATE_PREPARED" ) ]] \
+    || { echo "Preparation and activation flags conflict or lack a receipt." >&2; exit 2; }
 fi
 refuse_execution_layout || exit 1
 if [[ "$STATE_ROOT" == "$DEFAULT_STATE_GUARD" \
@@ -590,6 +647,8 @@ ENV_CONFIG_CAPTURED="false"
 SERVICE_CONFIG_BACKUP=""
 SERVICE_CONFIG_EXISTED="false"
 SERVICE_CONFIG_CAPTURED="false"
+PRIOR_GATEWAY_STATE="absent"
+PRIOR_GATEWAY_ENABLED="false"
 PRIOR_SERVICE_STATE="absent"
 PRIOR_SERVICE_ENABLED="false"
 PRIOR_LEGACY_SERVICE_STATE="absent"
@@ -1253,6 +1312,24 @@ SYSTEMD_SERVICE_FILE="$HOME/.config/systemd/user/$SERVICE_NAME.service"
 LABEL="com.agentsdock.server"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 
+validate_legacy_macos_update_roots() {
+  [[ "$OS_NAME" == "Darwin" && -n "$EXPECTED_SERVER_IDENTITY" ]] || return 0
+  [[ -f "$PLIST" && ! -L "$PLIST" && -O "$PLIST" ]] || return 0
+  [[ "$(stat -f '%Lp' "$PLIST")" == "600" ]] || return 0
+  launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1 || return 0
+  local native_install=""
+  local native_state=""
+  native_install="$(/usr/bin/plutil -extract EnvironmentVariables.AGENTS_SERVER_INSTALL_DIR raw -o - "$PLIST" 2>/dev/null || true)"
+  native_state="$(/usr/bin/plutil -extract EnvironmentVariables.AGENTSDOCK_STATE_DIR raw -o - "$PLIST" 2>/dev/null || true)"
+  if [[ ( -n "$native_install" && "$native_install" != "$INSTALL_ROOT" ) \
+    || ( -n "$native_state" && "$native_state" != "$STATE_ROOT" ) ]]; then
+    echo "The running macOS service uses different installation or state roots. This older updater did not preserve its custom paths." >&2
+    echo "Run this migration once with the original AGENTS_SERVER_INSTALL_DIR, AGENTS_SERVER_CONFIG_DIR and AGENTSDOCK_STATE_DIR explicitly set. The original configuration path cannot be inferred safely." >&2
+    return 1
+  fi
+}
+validate_legacy_macos_update_roots || exit 1
+
 fresh_install_scaffold_is_empty() {
   local root="$1"
   local allowed_child="${2:-}"
@@ -1598,7 +1675,8 @@ if [[ "$TEAM_HUB_OPERATION_PENDING" == "true" ]]; then
     exit 2
   fi
 fi
-if [[ "$TEAM_HUB_MODE" == "host" && "$TEAM_HUB_OPERATION_PENDING" != "true" ]]; then
+if [[ "$TEAM_HUB_MODE" == "host" && "$TEAM_HUB_OPERATION_PENDING" != "true" \
+  && "$PREPARE_ONLY" != "true" && "$RECOVER_ONLY" != "true" ]]; then
   TEAM_HUB_EXISTING_STATE="false"
   for candidate in \
     "$TEAM_HUB_CANONICAL_DATA_DIR/team-hub.sqlite3" \
@@ -1635,7 +1713,7 @@ if [[ "$TEAM_HUB_MODE" == "host" && "$TEAM_HUB_OPERATION_PENDING" != "true" ]]; 
   fi
 fi
 
-RELEASE_FILES=(activation_transaction.py execution_control.py execution_install.py execution_maintenance.py execution_manage.py execution_ownership.py execution_service.py execution_transport.py agent_server.py workspace_git.py team_hub_host.py secure_peer_runtime.py team_mail_runtime.py team_mail_websocket.py team_mail_grants.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py chat_mailbox.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py provider_commands.py claude_sdk_client.py claude_background_reconciliation.py codex_app_server.py codex_auth.py codex_provider.py side_questions.py title_generation.py codex_side_question.py claude_side_question.py cursor_agent_client.py cursor_process_guard.py claude_history_repair.py claude_history_provenance.py codex_history_repair.py public_chat_shares.py public_chat_transcript.py public_chat_share_routes.py interactive_chat_shares.py interactive_chat_share_routes.py interactive_chat_share_web.py interactive_chat_projection.py interactive_chat_runtime.py interactive_chat_native.py shared_chat_videos.py shared_chat_video_stream.py interactive_chat_controls.py install.sh uninstall.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem LICENSE NOTICE)
+RELEASE_FILES=(activation_transaction.py execution_activation.py execution_preparation.py update_preparation.py update_handoff.py update_recovery.py execution_update_status.py execution_uninstall.py execution_recovery.py execution_recovery_status.py execution_http.py execution_durability.py execution_control.py execution_install.py execution_maintenance.py execution_manage.py execution_ownership.py execution_service.py execution_transport.py agent_server.py workspace_git.py team_hub_host.py secure_peer_runtime.py team_mail_runtime.py team_mail_websocket.py team_mail_grants.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py chat_mailbox.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py provider_commands.py claude_sdk_client.py claude_background_reconciliation.py codex_app_server.py codex_auth.py codex_provider.py side_questions.py title_generation.py codex_side_question.py claude_side_question.py cursor_agent_client.py cursor_process_guard.py claude_history_repair.py claude_history_provenance.py codex_history_repair.py public_chat_shares.py public_chat_transcript.py public_chat_share_routes.py interactive_chat_shares.py interactive_chat_share_routes.py interactive_chat_share_web.py interactive_chat_projection.py interactive_chat_runtime.py interactive_chat_native.py shared_chat_videos.py shared_chat_video_stream.py interactive_chat_controls.py install.sh uninstall.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem LICENSE NOTICE)
 RELEASE_DIRECTORIES=(agentsdock_team_hub)
 TEAM_HUB_RELEASE_FILES=(
   __init__.py
@@ -1687,7 +1765,11 @@ for name in "${RELEASE_DIRECTORIES[@]}"; do
     echo "$name is missing beside install.sh or is not a real directory." >&2
     exit 1
   fi
-  if find "$SOURCE_DIR/$name" \( -type l -o -type f \( -name '*.pyc' -o -name '*.pyo' \) -o -type d -name '__pycache__' -o \( ! -type d ! -type f \) \) -print -quit | grep -q .; then
+  if find "$SOURCE_DIR/$name" \( -type l -o \( ! -type d ! -type f \) \) -print -quit | grep -q .; then
+    echo "$name contains unsafe linked or special entries and cannot be installed." >&2
+    exit 1
+  fi
+  if [[ -z "$ACTIVATE_PREPARED" && "$RECOVER_ONLY" != "true" ]] && find "$SOURCE_DIR/$name" \( -type f \( -name '*.pyc' -o -name '*.pyo' \) -o -type d -name '__pycache__' \) -print -quit | grep -q .; then
     echo "$name contains linked or generated entries and cannot be installed." >&2
     exit 1
   fi
@@ -1698,6 +1780,10 @@ for name in "${TEAM_HUB_RELEASE_FILES[@]}"; do
     exit 1
   fi
 done
+# Installed/prepared runtimes contain compiler output. Their complete tree is
+# bound by the receipt or owned recovery journal before activation; raw source
+# archives continue to require the exact clean allowlist.
+if [[ -z "$ACTIVATE_PREPARED" && "$RECOVER_ONLY" != "true" ]]; then
 TEAM_HUB_RELEASE_FILE_COUNT="$(find "$SOURCE_DIR/agentsdock_team_hub" -type f | wc -l)"
 TEAM_HUB_RELEASE_FILE_COUNT="${TEAM_HUB_RELEASE_FILE_COUNT//[[:space:]]/}"
 if [[ "$TEAM_HUB_RELEASE_FILE_COUNT" != "${#TEAM_HUB_RELEASE_FILES[@]}" ]]; then
@@ -1709,6 +1795,7 @@ TEAM_HUB_RELEASE_DIRECTORY_COUNT="${TEAM_HUB_RELEASE_DIRECTORY_COUNT//[[:space:]
 if [[ "$TEAM_HUB_RELEASE_DIRECTORY_COUNT" != "2" ]]; then
   echo "agentsdock_team_hub contains unexpected release directories." >&2
   exit 1
+fi
 fi
 
 current_release_binding() {
@@ -2131,6 +2218,104 @@ systemd_unit_snapshot() {
   printf '%s|%s|%s\n' "$active_state" "$enabled_state" "$load_state"
 }
 
+execution_activation_command() {
+  local operation="$1"
+  local preferred="${2:-$CANDIDATE_RUNTIME_ROOT}"
+  shift 2
+  local runtime=""
+  local candidate=""
+  for candidate in "$ACTIVATION_TRANSACTION_DIR/candidate.retired" "$preferred" "$STAGE_DIR" "$RELEASE_DIR" "$SOURCE_DIR"; do
+    if [[ -f "$candidate/execution_activation.py" && -x "$candidate/.venv/bin/python" ]]; then
+      runtime="$candidate"
+      break
+    fi
+  done
+  [[ -n "$runtime" ]] || { echo "The retained split activation helper is unavailable." >&2; return 1; }
+  run_without_server_secrets env PYTHONPATH="$runtime" \
+    "$runtime/.venv/bin/python" -B "$runtime/execution_activation.py" "$operation" \
+    --root "$INSTALL_ROOT" --config-root "$CONFIG_ROOT" --state-root "$STATE_ROOT" \
+    --home "$HOME" --platform "$OS_NAME" --release-dir "$RELEASE_DIR" \
+    --bind "$BIND_ADDRESS" --port "$PORT" \
+    --expected-server-identity "$EXPECTED_SERVER_IDENTITY" "$@"
+}
+
+execution_recovery_arm() {
+  local preferred="$1"
+  local runtime=""
+  local candidate=""
+  local receipt=""
+  local -a paths=()
+  for candidate in "$ACTIVATION_TRANSACTION_DIR/candidate.retired" "$preferred" "$STAGE_DIR" "$RELEASE_DIR" "$SOURCE_DIR"; do
+    if [[ -f "$candidate/execution_recovery.py" && -x "$candidate/.venv/bin/python" ]]; then
+      runtime="$candidate"
+      break
+    fi
+  done
+  [[ -n "$runtime" ]] || { echo "The retained activation recovery owner is unavailable." >&2; return 1; }
+  receipt="$(run_without_server_secrets "$runtime/.venv/bin/python" -B "$runtime/execution_recovery.py" arm \
+    --root "$INSTALL_ROOT" --source "$runtime" --home "$HOME" --platform "$OS_NAME" \
+    --bind "$BIND_ADDRESS" --port "$PORT" --expected-server-identity "$EXPECTED_SERVER_IDENTITY" \
+    --managed-update-id "$MANAGED_UPDATE_ID" --expected-service-cgroup "$EXPECTED_SERVICE_CGROUP")" || return 1
+  while IFS= read -r candidate; do paths[${#paths[@]}]="$candidate"; done <<< "$receipt"
+  if [[ "${#paths[@]}" != 2 || "${paths[0]}" != /* \
+    || "${paths[1]}" != "$INSTALL_ROOT/.activation-recovery/$ACTIVATION_TRANSACTION_ID/execution_recovery.py" ]]; then
+    echo "The activation recovery owner returned invalid executable paths." >&2
+    return 1
+  fi
+  EXECUTION_RECOVERY_PYTHON="${paths[0]}"
+  EXECUTION_RECOVERY_HELPER="${paths[1]}"
+}
+
+execution_recovery_command() {
+  [[ -x "$EXECUTION_RECOVERY_PYTHON" && -f "$EXECUTION_RECOVERY_HELPER" && ! -L "$EXECUTION_RECOVERY_HELPER" ]] || return 1
+  run_without_server_secrets "$EXECUTION_RECOVERY_PYTHON" -B "$EXECUTION_RECOVERY_HELPER" "$1" \
+    --root "$INSTALL_ROOT" --transaction-id "$ACTIVATION_TRANSACTION_ID"
+}
+
+execution_stop_services() {
+  local runtime="${1:-$CANDIDATE_RUNTIME_ROOT}"
+  local operation="${2:-stop}"
+  local health_file=""
+  local update_file=""
+  local native_pid=""
+  local status=0
+  local service="$SERVICE_NAME"
+  [[ "$OS_NAME" != "Darwin" ]] || service="$LABEL"
+  local -a proof=(--health-file "")
+  if [[ "$OS_NAME" == "Linux" ]] && service_manager_main_pid "$LEGACY_SERVICE_NAME" >/dev/null; then
+    echo "The renamed legacy service is running without a verified split handoff; refusing to stop it." >&2
+    return 1
+  fi
+  # Legacy monoliths do not implement the private sealed-lease protocol. Bind
+  # their existing authenticated durable idle drain over the PID-pinned socket.
+  if [[ ! -e "$STATE_ROOT/execution/worker.json" && ! -L "$STATE_ROOT/execution/worker.json" ]] \
+    && native_pid="$(service_manager_main_pid "$service")"; then
+    health_file="$(mktemp "$STATE_ROOT/admin/.execution-handoff.XXXXXXXX")" || return 1
+    chmod 600 "$health_file" || return 1
+    if ! fetch_managed_json "$PORT" /api/health core "$health_file" "$runtime" "$BIND_ADDRESS"; then
+      rm -f "$health_file"
+      return 1
+    fi
+    update_file="$(mktemp "$STATE_ROOT/admin/.execution-update-proof.XXXXXXXX")" || { rm -f "$health_file"; return 1; }
+    chmod 600 "$update_file" || { rm -f "$health_file" "$update_file"; return 1; }
+    if ! fetch_managed_json "$PORT" /api/admin/update native "$update_file" "$runtime" "$BIND_ADDRESS"; then
+      rm -f "$health_file" "$update_file"
+      return 1
+    fi
+    proof=(--health-file "$health_file" --update-file "$update_file" --expected-native-pid "$native_pid")
+  fi
+  if execution_activation_command "$operation" "$runtime" "${proof[@]}" \
+    --managed-update-id "$MANAGED_UPDATE_ID" --handoff-file "$EXECUTION_HANDOFF_FILE" \
+    --candidate-source "$runtime" --release-version "$RELEASE_VERSION" --api-contract "${EXPECTED_API_CONTRACT:-0}"; then
+    status=0
+  else
+    status=$?
+  fi
+  [[ -z "$health_file" ]] || rm -f "$health_file"
+  [[ -z "$update_file" ]] || rm -f "$update_file"
+  return "$status"
+}
+
 backup_runtime_configuration() {
   local activation_intent="ordinary"
   if [[ "$TEAM_HUB_OPERATION_PENDING" == "true" ]]; then
@@ -2274,6 +2459,28 @@ backup_runtime_configuration() {
   fi
   PREVIOUS_LINK_STATE_CAPTURED="true"
 
+  local -a execution_arguments=(--execution-runtime-dir "")
+  if [[ "${EXECUTION_MODE:-legacy}" == "split" ]]; then
+    local gateway_snapshot=""
+    local gateway_service=""
+    gateway_snapshot="$(execution_activation_command snapshot "$STAGE_DIR")" || return 1
+    PRIOR_GATEWAY_STATE="${gateway_snapshot%%|*}"
+    PRIOR_GATEWAY_ENABLED="${gateway_snapshot#*|}"
+    if [[ "$OS_NAME" == "Darwin" ]]; then
+      gateway_service="$HOME/Library/LaunchAgents/com.agentsdock.gateway.plist"
+    else
+      gateway_service="$HOME/.config/systemd/user/agents-server-gateway.service"
+    fi
+    if [[ ! -e "$INSTALL_ROOT/execution-layout.json" \
+      && ( "$PRIOR_GATEWAY_STATE" != "absent" || -e "$gateway_service" || -L "$gateway_service" ) ]]; then
+      echo "An existing gateway service has no owned execution layout; refusing takeover." >&2
+      return 1
+    fi
+    execution_arguments=(--execution-runtime-dir "$STATE_ROOT/execution" \
+      --gateway-service "$gateway_service" --gateway-state "$PRIOR_GATEWAY_STATE" \
+      --gateway-enabled "$PRIOR_GATEWAY_ENABLED" --execution-api-contract "${EXPECTED_API_CONTRACT:-0}")
+    [[ -z "$EXECUTION_HANDOFF_FILE" ]] || execution_arguments+=(--execution-handoff-file "$EXECUTION_HANDOFF_FILE")
+  fi
   ACTIVATION_TRANSACTION_ID="$(
     run_without_server_secrets env PYTHONPATH="$STAGE_DIR" \
       "$STAGE_DIR/.venv/bin/python" -m activation_transaction begin \
@@ -2294,7 +2501,8 @@ backup_runtime_configuration() {
       --prior-port "$PRIOR_PORT" \
       --prior-bind-address "$PRIOR_BIND_ADDRESS" \
       --intent "$activation_intent" \
-      --client-binding "$EXPECTED_TEAM_HUB_CLIENT_BINDING"
+      --client-binding "$EXPECTED_TEAM_HUB_CLIENT_BINDING" \
+      "${execution_arguments[@]}"
   )" || return
   if [[ ! "$ACTIVATION_TRANSACTION_ID" =~ ^activation-[0-9a-f]{24}$ \
     || "$ACTIVATION_TRANSACTION_ID" == *$'\n'* ]]; then
@@ -2335,7 +2543,7 @@ activation_transaction_command() {
   done
   [[ -n "$runtime_root" ]] || return 1
   run_without_server_secrets env PYTHONPATH="$runtime_root" \
-    "$runtime_root/.venv/bin/python" -m activation_transaction "$@"
+    "$runtime_root/.venv/bin/python" -B "$runtime_root/activation_transaction.py" "$@"
 }
 
 record_activation_phase() {
@@ -2490,6 +2698,10 @@ activate_transaction_files() {
 finish_activation_transaction() {
   local runtime_root="${1:-$CANDIDATE_RUNTIME_ROOT}"
   [[ -n "$ACTIVATION_TRANSACTION_ID" ]] || return 0
+  if [[ "${EXECUTION_MODE:-legacy}" == "split" ]]; then
+    execution_activation_command release "$runtime_root" || return 1
+    execution_recovery_command complete || return 1
+  fi
   if activation_transaction_command "$runtime_root" finish \
       --root "$INSTALL_ROOT" \
       --current "$CURRENT_LINK" \
@@ -2499,6 +2711,9 @@ finish_activation_transaction() {
       --release-dir "$RELEASE_DIR" \
       --release-version "$RELEASE_VERSION" \
       --transaction-id "$ACTIVATION_TRANSACTION_ID" >/dev/null; then
+    if [[ "${EXECUTION_MODE:-legacy}" == "split" ]]; then
+      execution_recovery_command finalized || return 1
+    fi
     ACTIVATION_TRANSACTION_ID=""
     ACTIVATION_TRANSACTION_PHASE=""
     ACTIVATION_ROLLBACK_FROM=""
@@ -2662,7 +2877,7 @@ install_lock_python() {
     "$(command -v python3 2>/dev/null || true)" \
     "/usr/bin/python3"; do
     [[ -n "$candidate" && -x "$candidate" ]] || continue
-    probe="$("$candidate" -c 'print("agentsdock-install-lock-v1")' 2>/dev/null || true)"
+    probe="$("$candidate" -B -c 'print("agentsdock-install-lock-v1")' 2>/dev/null || true)"
     [[ "$probe" == "agentsdock-install-lock-v1" ]] || continue
     printf '%s\n' "$candidate"
     return 0
@@ -2996,6 +3211,9 @@ cleanup() {
       echo "AgentsServer install failed before candidate health and could not restore local configuration; Team Hub remains fail-closed." >&2
     fi
   fi
+  if [[ -n "${source_inventory:-}" ]]; then
+    rm -f "$source_inventory"
+  fi
   release_install_lock
   if [[ -n "$STAGE_DIR_DEVICE" && -n "$STAGE_DIR_INODE" ]]; then
     local cleanup_python=""
@@ -3070,7 +3288,8 @@ validate_exclusive_install_state() {
     || -L "$ACTIVATION_TRANSACTION_DIR" ]]; then
     echo "The pending activation transaction path is unsafe." >&2
     return 1
-  elif ! validate_managed_team_hub_inputs "$CURRENT_LINK"; then
+  elif [[ "$PREPARE_ONLY" != "true" && "$RECOVER_ONLY" != "true" ]] \
+    && ! validate_managed_team_hub_inputs "$CURRENT_LINK"; then
     echo "Managed Team Hub inputs changed before the installer acquired exclusive ownership." >&2
     return 1
   fi
@@ -3161,6 +3380,17 @@ validate_staged_release_runtime() (
   "$STAGE_DIR/.venv/bin/python" -c 'import croniter, dateutil; from zoneinfo import ZoneInfo; ZoneInfo("America/Los_Angeles")' >/dev/null
   "$STAGE_DIR/.venv/bin/python" -m py_compile \
     "$STAGE_DIR/activation_transaction.py" \
+    "$STAGE_DIR/execution_activation.py" \
+    "$STAGE_DIR/execution_preparation.py" \
+    "$STAGE_DIR/update_preparation.py" \
+    "$STAGE_DIR/update_handoff.py" \
+    "$STAGE_DIR/update_recovery.py" \
+    "$STAGE_DIR/execution_uninstall.py" \
+    "$STAGE_DIR/execution_recovery.py" \
+    "$STAGE_DIR/execution_recovery_status.py" \
+    "$STAGE_DIR/execution_http.py" \
+    "$STAGE_DIR/execution_durability.py" \
+    "$STAGE_DIR/execution_update_status.py" \
     "$STAGE_DIR/execution_control.py" \
     "$STAGE_DIR/execution_install.py" \
     "$STAGE_DIR/execution_maintenance.py" \
@@ -3212,7 +3442,7 @@ validate_staged_release_runtime() (
     "$STAGE_DIR/interactive_chat_controls.py" \
     "$STAGE_DIR/update_runner.py"
   "$STAGE_DIR/.venv/bin/python" -m compileall -q "$STAGE_DIR/agentsdock_team_hub"
-  PYTHONPATH="$STAGE_DIR" "$STAGE_DIR/.venv/bin/python" -c 'import execution_control, execution_install, execution_maintenance, execution_manage, execution_ownership, execution_service, execution_transport; import workspace_git; import codex_auth, codex_provider, side_questions, title_generation, codex_side_question, claude_side_question, agentsdock_team_hub, cursor_agent_client, cursor_process_guard, secure_peer_delivery, secure_peer_runtime, team_mail_runtime, team_mail_websocket, team_mail_grants, team_hub_host, agentsdock_mail, agentsdock_team, claude_history_repair, claude_history_provenance, claude_background_reconciliation, codex_history_repair, public_chat_shares, public_chat_transcript, public_chat_share_routes, interactive_chat_shares, interactive_chat_share_routes, interactive_chat_share_web, interactive_chat_projection, interactive_chat_runtime, interactive_chat_native, shared_chat_videos, shared_chat_video_stream, interactive_chat_controls, chat_mailbox, provider_commands; from agentsdock_team_hub import secure_peer, secure_peer_hub' >/dev/null
+  PYTHONPATH="$STAGE_DIR" "$STAGE_DIR/.venv/bin/python" -c 'import execution_activation, execution_preparation, update_preparation, update_handoff, update_recovery, execution_update_status, execution_uninstall, execution_recovery, execution_recovery_status, execution_http, execution_durability, execution_control, execution_install, execution_maintenance, execution_manage, execution_ownership, execution_service, execution_transport; import workspace_git; import codex_auth, codex_provider, side_questions, title_generation, codex_side_question, claude_side_question, agentsdock_team_hub, cursor_agent_client, cursor_process_guard, secure_peer_delivery, secure_peer_runtime, team_mail_runtime, team_mail_websocket, team_mail_grants, team_hub_host, agentsdock_mail, agentsdock_team, claude_history_repair, claude_history_provenance, claude_background_reconciliation, codex_history_repair, public_chat_shares, public_chat_transcript, public_chat_share_routes, interactive_chat_shares, interactive_chat_share_routes, interactive_chat_share_web, interactive_chat_projection, interactive_chat_runtime, interactive_chat_native, shared_chat_videos, shared_chat_video_stream, interactive_chat_controls, chat_mailbox, provider_commands; from agentsdock_team_hub import secure_peer, secure_peer_hub' >/dev/null
 )
 
 abort_unclaimed_team_hub_reactivation() {
@@ -3465,6 +3695,44 @@ migrate_legacy_state() {
   fi
 }
 
+# Recovery never restages dependencies or creates configuration/state. An exact
+# target retry enters the retained transaction below after all functions exist.
+if [[ "$RECOVER_ONLY" == "true" ]]; then
+  [[ "$PREPARE_ONLY" != "true" && -z "$ACTIVATE_PREPARED" \
+    && "$ACTIVATION_TRANSACTION_RESUMED" == "true" && -n "$EXPECTED_API_CONTRACT" ]] || {
+    echo "Recovery requires an existing activation journal and exact release/API pins." >&2
+    exit 1
+  }
+  recovery_python="$(install_lock_python)" || exit 1
+  run_without_server_secrets env PYTHONPATH="$SOURCE_DIR" "$recovery_python" -B - \
+    "$INSTALL_ROOT" "$REQUESTED_RELEASE_VERSION" "$EXPECTED_API_CONTRACT" "$EXPECTED_ACTIVATION_ID" <<'PYRECOVER'
+from pathlib import Path
+import sys
+import activation_transaction as activation
+value = activation.execution_context(Path(sys.argv[1]))
+if (value is None or value["release_version"] != sys.argv[2]
+        or value["execution"]["api_contract"] != int(sys.argv[3])
+        or (sys.argv[4] and value["transaction_id"] != sys.argv[4])):
+    raise RuntimeError("recovery target does not match the pending split activation")
+PYRECOVER
+fi
+if [[ "$PREPARE_ONLY" == "true" && "$ACTIVATION_TRANSACTION_RESUMED" == "true" ]]; then
+  echo "Pending activation must recover before another release can be prepared." >&2
+  exit 1
+fi
+
+if [[ "$ACTIVATION_TRANSACTION_RESUMED" != "true" ]]; then
+if [[ -n "$ACTIVATE_PREPARED" ]]; then
+  prepared_python="$(install_lock_python)" || exit 1
+  STAGE_DIR="$(run_without_server_secrets env PYTHONPATH="$SOURCE_DIR" \
+    "$prepared_python" -B -m execution_preparation validate \
+    --root "$INSTALL_ROOT" --version "$RELEASE_VERSION" \
+    --api-contract "$EXPECTED_API_CONTRACT" --archive-sha256 "$PREPARED_ARCHIVE_SHA256" \
+    --receipt "$ACTIVATE_PREPARED")" || exit 1
+  CANDIDATE_RUNTIME_ROOT="$STAGE_DIR"
+  # The receipt owns this retained candidate. EXIT must not discard it after
+  # an unrelated preflight failure; activate-files will claim its exact inode.
+else
 echo "[1/7] Preparing the versioned AgentsServer runtime"
 if [[ ! -e "$RELEASES_ROOT" && ! -L "$RELEASES_ROOT" ]]; then
   (umask 077; mkdir -p "$RELEASES_ROOT")
@@ -3503,6 +3771,29 @@ for name in "${TEAM_HUB_RELEASE_FILES[@]}"; do
 done
 chmod 755 "$STAGE_DIR/agent_server.py" "$STAGE_DIR/agentsdock_jobs.py" "$STAGE_DIR/agentsdock_chats.py" "$STAGE_DIR/agentsdock_emergency.py" "$STAGE_DIR/agentsdock_publish.py" "$STAGE_DIR/agentsdock_mail.py" "$STAGE_DIR/agentsdock_team.py" "$STAGE_DIR/install.sh" "$STAGE_DIR/uninstall.sh" "$STAGE_DIR/update_runner.py"
 
+if [[ "$PREPARE_ONLY" == "true" ]]; then
+  source_inventory="$(mktemp "$INSTALL_ROOT/.prepared-inventory.XXXXXXXX")" || exit 1
+  chmod 600 "$source_inventory"
+  source_members=("${RELEASE_FILES[@]}")
+  for name in "${TEAM_HUB_RELEASE_FILES[@]}"; do source_members+=("agentsdock_team_hub/$name"); done
+  source_python="$(install_lock_python)" || exit 1
+  run_without_server_secrets "$source_python" -B - \
+    "$SOURCE_DIR" "$source_inventory" "${source_members[@]}" <<'PYINVENTORY'
+import hashlib, json, os
+from pathlib import Path
+import sys
+source, output = map(Path, sys.argv[1:3])
+files = {}
+for name in sys.argv[3:]:
+    payload = (source / name).read_bytes()
+    files[name] = {"sha256": hashlib.sha256(payload).hexdigest(), "size": len(payload)}
+with output.open("w") as stream:
+    json.dump({"format": 1, "files": files}, stream, sort_keys=True)
+    stream.flush()
+    os.fsync(stream.fileno())
+PYINVENTORY
+fi
+
 echo "[2/7] Resolving the release dependencies with uv"
 if run_timed_stage \
   "dependency resolution" \
@@ -3520,6 +3811,7 @@ if [[ ! -d "$STAGE_DIR/.venv" || -L "$STAGE_DIR/.venv" || ! -x "$STAGE_DIR/.venv
   exit 1
 fi
 validate_staged_release_runtime
+fi
 if ! validate_bind_address "$BIND_ADDRESS" "$STAGE_DIR/.venv/bin/python"; then
   echo "Bind address must be localhost or one canonical IPv4/IPv6 literal." >&2
   exit 2
@@ -3528,8 +3820,30 @@ if [[ "$INSTALL_LOCK_HELD" != "true" ]]; then
   acquire_install_lock || exit 1
   validate_exclusive_install_state || exit 1
 fi
+if [[ "$PREPARE_ONLY" == "true" ]]; then
+  # Freeze all dependency-generated files before taking the receipt. The
+  # trusted source inventory is separate from the candidate being measured.
+  prepared_candidate="$RELEASES_ROOT/.prepared-$RELEASE_VERSION-$$"
+  [[ ! -e "$prepared_candidate" && ! -L "$prepared_candidate" ]] || exit 1
+  mv "$STAGE_DIR" "$prepared_candidate"
+  STAGE_DIR="$prepared_candidate"
+  CANDIDATE_RUNTIME_ROOT="$STAGE_DIR"
+
+  preparation_status=0
+  run_without_server_secrets env PYTHONPATH="$SOURCE_DIR" \
+    "$STAGE_DIR/.venv/bin/python" -B -m execution_preparation write \
+    --root "$INSTALL_ROOT" --candidate "$STAGE_DIR" --version "$RELEASE_VERSION" \
+    --api-contract "$EXPECTED_API_CONTRACT" --archive-sha256 "$PREPARED_ARCHIVE_SHA256" \
+    --inventory "$source_inventory" --output "$PREPARED_RECEIPT" || preparation_status=$?
+  rm -f "$source_inventory"
+  [[ "$preparation_status" == "0" ]] || exit "$preparation_status"
+  STAGE_DIR_DEVICE=""
+  STAGE_DIR_INODE=""
+  echo "Prepared immutable runtime; active services and state were not changed."
+  exit 0
+fi
 migrate_legacy_state
-mkdir -p "$CONFIG_ROOT" "$STATE_ROOT" "$STATE_ROOT/admin"
+(umask 077; mkdir -p "$CONFIG_ROOT" "$STATE_ROOT" "$STATE_ROOT/admin")
 chmod 700 "$CONFIG_ROOT" "$STATE_ROOT" "$STATE_ROOT/admin"
 TOKEN="$(find_existing_token || true)"
 generate_token() {
@@ -3540,6 +3854,7 @@ generate_token() {
   fi
 }
 [[ "$TOKEN" =~ ^[A-Za-z0-9_-]{32,}$ ]] || TOKEN="$(generate_token)"
+fi # ordinary staging/activation; recovery reuses only retained runtime
 
 PRESERVE_SOURCE=""
 [[ -z "$LEGACY_ENV_FILE" || ( ! -e "$LEGACY_ENV_FILE" && ! -L "$LEGACY_ENV_FILE" ) ]] \
@@ -3728,6 +4043,15 @@ restart_managed_systemd_service_bounded() {
 }
 
 restart_service() {
+  if [[ "${EXECUTION_MODE:-legacy}" == "split" ]]; then
+    execution_stop_services || return 1
+    if [[ "$OS_NAME" == "Linux" && "$PRIOR_LEGACY_SERVICE_STATE" != "absent" ]]; then
+      # Old renamed services remain part of the outer rollback snapshot.
+      systemctl --user disable --now "$LEGACY_SERVICE_NAME.service" >/dev/null || return 1
+    fi
+    execution_activation_command start "$CANDIDATE_RUNTIME_ROOT"
+    return
+  fi
   if [[ "$OS_NAME" == "Linux" ]]; then
     local legacy_exists="false"
     local legacy_snapshot=""
@@ -3809,7 +4133,8 @@ restore_previous_release_transaction() {
       return 1
     fi
   fi
-  if [[ "$ACTIVATION_TRANSACTION_PHASE" != "rolling-back" ]]; then
+  if [[ "$ACTIVATION_TRANSACTION_PHASE" != "rolling-back" \
+    && "$ACTIVATION_TRANSACTION_PHASE" != "rolled-back" ]]; then
     if [[ "$ACTIVATION_TRANSACTION_PHASE" == "fencing" \
       && "$TEAM_HUB_OPERATION_PENDING" == "true" ]]; then
       TEAM_HUB_OPERATION_FENCE_DEVICE=""
@@ -3850,8 +4175,9 @@ restore_previous_release_transaction() {
       *) ;;
     esac
 
-    if [[ "$TEAM_HUB_OPERATION_PENDING" == "true" \
-      || "$TEAM_HUB_REACTIVATION_FENCE_PENDING" == "true" ]]; then
+    if [[ "$rollback_from_phase" != "quiescing" && "$rollback_from_phase" != "quiesced" ]] \
+      && { [[ "$TEAM_HUB_OPERATION_PENDING" == "true" ]] \
+        || [[ "$TEAM_HUB_REACTIVATION_FENCE_PENDING" == "true" ]]; }; then
       if ! restore_team_hub_snapshot; then
         echo "The verified Team Hub snapshot could not be restored; the previous release was not started." >&2
         return 1
@@ -3886,6 +4212,16 @@ restore_previous_release_transaction() {
     fi
   fi
 
+  if [[ "$rollback_from_phase" == "quiescing" || "$rollback_from_phase" == "quiesced" ]] \
+    && [[ "$TEAM_HUB_OPERATION_PENDING" == "true" ]]; then
+    # Candidate links/state were never exposed. Retire only this admitted fence;
+    # restoring an older Hub snapshot here could overwrite an incumbent's work.
+    if ! clear_team_hub_operation_fence "$rollback_control_runtime" true; then
+      echo "The pre-takeover Team Hub maintenance fence could not be retired." >&2
+      return 1
+    fi
+  fi
+
   if ! clear_team_hub_startup_authority "$rollback_control_runtime" true; then
     echo "The prior release was restored, but candidate startup authority could not be retired." >&2
     return 1
@@ -3901,7 +4237,7 @@ restore_previous_release_transaction() {
   fi
 
   case "$rollback_from_phase" in
-    linking|linked|stopping|stopped|fencing|fenced|authorizing|authority)
+    quiescing|quiesced|linking|linked|stopping|stopped|fencing|fenced|authorizing|authority)
     if [[ "$PRIOR_SERVICE_STATE" != "absent" ]]; then
       if ! restore_prior_service_state; then
         echo "The previous release configuration was restored, but its prior service state was not." >&2
@@ -3958,6 +4294,10 @@ restore_previous_release() {
 }
 
 stop_service() {
+  if [[ "${EXECUTION_MODE:-legacy}" == "split" ]]; then
+    execution_stop_services
+    return
+  fi
   if [[ "$OS_NAME" == "Linux" ]]; then
     if [[ -n "$MANAGED_UPDATE_ID" ]]; then
       stop_managed_systemd_service_bounded
@@ -3989,6 +4329,10 @@ stop_service() {
 }
 
 suppress_service_autostart_for_rollback() {
+  if [[ "${EXECUTION_MODE:-legacy}" == "split" ]]; then
+    execution_activation_command suppress "$CANDIDATE_RUNTIME_ROOT"
+    return
+  fi
   # Keep the rollback exclusion in the service manager, not only in the new
   # runtime.  An older release may not recognize the restore receipt; this
   # durable disable prevents reboot/autorestart between file restoration and
@@ -4001,6 +4345,18 @@ suppress_service_autostart_for_rollback() {
 }
 
 restore_prior_service_state() {
+  if [[ "${EXECUTION_MODE:-legacy}" == "split" ]]; then
+    execution_activation_command restore "$CANDIDATE_RUNTIME_ROOT" || return 1
+    if [[ "$OS_NAME" == "Linux" && "$PRIOR_LEGACY_SERVICE_STATE" != "absent" ]]; then
+      if [[ "$PRIOR_LEGACY_SERVICE_ENABLED" == "true" ]]; then
+        systemctl --user enable "$LEGACY_SERVICE_NAME.service" >/dev/null || return 1
+      else
+        systemctl --user disable "$LEGACY_SERVICE_NAME.service" >/dev/null || return 1
+      fi
+      [[ "$PRIOR_LEGACY_SERVICE_STATE" != "running" ]] || systemctl --user start "$LEGACY_SERVICE_NAME.service" || return 1
+    fi
+    return 0
+  fi
   # Links and configuration have already been restored from the journal. Keep
   # the pre-install running/enabled state exact; a failed first install must
   # not leave its candidate running, and a previously stopped service must not
@@ -4205,6 +4561,12 @@ describe_port_listener() {
 }
 
 write_service_files() {
+  if [[ "${EXECUTION_MODE:-legacy}" == "split" ]]; then
+    SERVICE_KIND="systemd-user"
+    [[ "$OS_NAME" != "Darwin" ]] || SERVICE_KIND="launch-agent"
+    execution_activation_command publish "$CANDIDATE_RUNTIME_ROOT"
+    return
+  fi
   local service_temp=""
   if [[ "$OS_NAME" == "Linux" ]]; then
     USER_SERVICE_DIR="$HOME/.config/systemd/user"
@@ -4413,8 +4775,10 @@ service_manager_owns_listener() {
   local -a services=()
   if [[ "$OS_NAME" == "Darwin" ]]; then
     services=("$LABEL")
+    [[ "$EXECUTION_MODE" != "split" ]] || services+=("com.agentsdock.gateway")
   else
     services=("$SERVICE_NAME" "${LEGACY_SERVICE_NAME:-}")
+    [[ "$EXECUTION_MODE" != "split" ]] || services+=("agents-server-gateway")
   fi
   for service in "${services[@]}"; do
     [[ -n "$service" ]] || continue
@@ -4445,14 +4809,16 @@ pinned_managed_http_get() {
   host="$(health_host_for_bind "$selected_bind")" || return 1
   [[ "$path" == /* && "$path" != *$'\n'* && "$path" != *$'\r'* ]] || return 1
   case "$authorization_kind" in
-    core|secure-peer) ;;
+    core|native|secure-peer) ;;
     *) return 1 ;;
   esac
   [[ -x "$runtime_root/.venv/bin/python" ]] || return 1
   if [[ "$OS_NAME" == "Darwin" ]]; then
     services=("$LABEL")
+    [[ "$EXECUTION_MODE" != "split" ]] || services+=("com.agentsdock.gateway")
   else
     services=("$SERVICE_NAME" "${LEGACY_SERVICE_NAME:-}")
+    [[ "$EXECUTION_MODE" != "split" ]] || services+=("agents-server-gateway")
   fi
   for service in "${services[@]}"; do
     [[ -n "$service" ]] || continue
@@ -5166,6 +5532,22 @@ release_health_check_once() {
     rm -f "$response_file" "$status_file" "$observed_binding_file"
     return 1
   fi
+  if [[ "$EXECUTION_MODE" == "split" && "$expected_version" == "$RELEASE_VERSION" \
+    && "$ACTIVATION_TRANSACTION_PHASE" != "rolling-back" \
+    && "$ACTIVATION_TRANSACTION_PHASE" != "rolled-back" \
+    && "$ACTIVATION_TRANSACTION_PHASE" != "rollback-healthy" ]]; then
+    if ! execution_activation_command verify "$runtime_root" --health-file "$response_file"; then
+      rm -f "$response_file" "$status_file" "$observed_binding_file"
+      return 1
+    fi
+  fi
+  if [[ "${EXECUTION_MODE:-legacy}" == "split" ]] && \
+    [[ "$ACTIVATION_TRANSACTION_PHASE" == "rolling-back" || "$ACTIVATION_TRANSACTION_PHASE" == "rolled-back" || "$ACTIVATION_TRANSACTION_PHASE" == "rollback-healthy" ]]; then
+    if ! execution_activation_command verify-restored "$runtime_root" --health-file "$response_file"; then
+      rm -f "$response_file" "$status_file" "$observed_binding_file"
+      return 1
+    fi
+  fi
   local response_size=""
   response_size="$(wc -c < "$response_file" 2>/dev/null || true)"
   response_size="${response_size//[[:space:]]/}"
@@ -5666,6 +6048,11 @@ wait_for_final_release_health() {
 wait_for_previous_release_health() {
   local previous_version=""
   local previous_release_root="${ROLLBACK_RELEASE_ROOT:-$OLD_TARGET}"
+  if [[ "${EXECUTION_MODE:-legacy}" == "split" ]]; then
+    local pinned_previous_worker=""
+    pinned_previous_worker="$(execution_activation_command previous-worker "$CANDIDATE_RUNTIME_ROOT")" || return 1
+    [[ -z "$pinned_previous_worker" ]] || previous_release_root="$pinned_previous_worker"
+  fi
   local rollback_attempts="$HEALTH_CHECK_ATTEMPTS"
   local previous_hub_mode="${PREVIOUS_TEAM_HUB_MODE:-disabled}"
   local previous_hub_id="$EXPECTED_TEAM_HUB_ID"
@@ -5714,7 +6101,9 @@ ensure_committed_candidate_service() {
   if wait_for_release_health; then
     return 0
   fi
-  if [[ "$OS_NAME" == "Linux" ]]; then
+  if [[ "${EXECUTION_MODE:-legacy}" == "split" ]]; then
+    execution_activation_command start "$CANDIDATE_RUNTIME_ROOT" || return 1
+  elif [[ "$OS_NAME" == "Linux" ]]; then
     systemctl --user daemon-reload || return 1
     systemctl --user enable "$SERVICE_NAME.service" >/dev/null || return 1
     systemctl --user start --no-block "$SERVICE_NAME.service" || return 1
@@ -5822,6 +6211,8 @@ load_pending_activation_transaction() {
     || [[ "${fields[2]}" != "$RELEASES_ROOT/${fields[1]}" ]] \
     || [[ "${fields[3]}" != "prepared" \
       && "${fields[3]}" != "guarded" \
+      && "${fields[3]}" != "quiescing" \
+      && "${fields[3]}" != "quiesced" \
       && "${fields[3]}" != "linking" \
       && "${fields[3]}" != "linked" \
       && "${fields[3]}" != "stopping" \
@@ -6031,6 +6422,10 @@ if [[ "$ACTIVATION_TRANSACTION_RESUMED" == "true" ]]; then
     echo "The pending activation transaction could not be verified for recovery." >&2
     exit 1
   fi
+  if [[ "${EXECUTION_MODE:-legacy}" == "split" ]]; then
+    execution_recovery_arm "$CANDIDATE_RUNTIME_ROOT" || exit 1
+    execution_recovery_command observe-lock || exit 1
+  fi
   if recover_pending_activation_transaction; then
     exit 0
   else
@@ -6094,6 +6489,15 @@ if [[ -z "$EXPECTED_SERVER_IDENTITY" \
   fi
 fi
 
+if [[ "${EXECUTION_MODE:-legacy}" == "split" ]]; then
+  candidate_api_contract="$(execution_activation_command candidate-api-contract "$STAGE_DIR" --candidate-source "$STAGE_DIR")" || exit 1
+  if [[ -n "$EXPECTED_API_CONTRACT" && "$EXPECTED_API_CONTRACT" != "$candidate_api_contract" ]]; then
+    echo "The staged candidate API contract differs from the required update pin." >&2
+    exit 1
+  fi
+  EXPECTED_API_CONTRACT="$candidate_api_contract"
+  execution_stop_services "$STAGE_DIR" preflight || exit 1
+fi
 backup_runtime_configuration
 if [[ -n "$EXPECTED_SERVER_IDENTITY" \
   && "$PREVIOUS_TEAM_HUB_MODE" == "disabled" \
@@ -6142,6 +6546,23 @@ if [[ "$TEAM_HUB_REACTIVATION_REQUESTED" == "true" \
       echo "The activation transaction could not persist the Team Hub guard." >&2
       exit 1
     fi
+  fi
+fi
+
+# Split activation owns a durable native-service stop before exposing candidate
+# links or configuration. Legacy runners can report a failed installer, so an
+# unfinished journal must never leave their old, unfenced API accepting work.
+if [[ "${EXECUTION_MODE:-legacy}" == "split" ]]; then
+  if ! execution_activation_command durability "$STAGE_DIR" \
+    || ! execution_recovery_arm "$STAGE_DIR" \
+    || ! record_activation_phase quiescing "$STAGE_DIR" \
+    || ! execution_stop_services "$STAGE_DIR" preflight \
+    || ! execution_activation_command suppress "$STAGE_DIR" \
+    || ! execution_stop_services "$STAGE_DIR" stop \
+    || ! record_activation_phase quiesced "$STAGE_DIR"; then
+    [[ "$COLD_TEAM_HUB_HANDOFF" != "true" ]] || resume_install_signals
+    echo "The admitted execution service could not be durably stopped before takeover." >&2
+    exit 1
   fi
 fi
 

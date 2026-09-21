@@ -63,6 +63,14 @@ class ExecutionInstallTests(unittest.TestCase):
         install.commit(self.root, self.receipt(layout))
         install.finish(self.root)
 
+    def test_split_logs_do_not_take_over_existing_legacy_log_directory(self):
+        logs = self.layout.state_root / "logs"
+        logs.mkdir(mode=0o755)
+        before = logs.stat().st_mode, logs.stat().st_ino
+        install.prepare_runtime(self.layout)
+        self.assertEqual((logs.stat().st_mode, logs.stat().st_ino), before)
+        self.assertEqual((self.layout.runtime_dir / "logs").stat().st_mode & 0o777, 0o700)
+
     def test_linux_jobs_pin_worker_and_keep_gateway_independent(self) -> None:
         worker = install.render_service(self.layout, "worker").decode()
         gateway = install.render_service(self.layout, "gateway").decode()

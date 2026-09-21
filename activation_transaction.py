@@ -25,11 +25,14 @@ from typing import Any
 
 
 FORMAT = 2
+EXECUTION_FORMAT = 3
 MAX_CONTROL_BYTES = 256 * 1024
 MAX_CONFIG_BYTES = 16 * 1024 * 1024
 PHASES = {
     "prepared",
     "guarded",
+    "quiescing",
+    "quiesced",
     "linking",
     "linked",
     "stopping",
@@ -47,8 +50,10 @@ PHASES = {
     "rollback-healthy",
 }
 TRANSITIONS = {
-    "prepared": {"guarded", "linking", "rolling-back"},
-    "guarded": {"linking", "rolling-back"},
+    "prepared": {"guarded", "quiescing", "linking", "rolling-back"},
+    "guarded": {"quiescing", "linking", "rolling-back"},
+    "quiescing": {"quiesced", "rolling-back"},
+    "quiesced": {"linking", "rolling-back"},
     "linking": {"linked", "rolling-back"},
     "linked": {"stopping", "candidate-starting", "rolling-back"},
     "stopping": {"stopped", "rolling-back"},
@@ -68,6 +73,136 @@ TRANSITIONS = {
 MANIFEST_TEMP_RE = re.compile(r"^\.manifest\.json\.[0-9a-f]{24}\.tmp$")
 GC_DIRECTORY_RE = re.compile(r"^\.activation-transaction-gc-activation-[0-9a-f]{24}$")
 BEGIN_DIRECTORY_RE = re.compile(r"^\.activation-transaction\.[0-9a-f]{24}\.tmp$")
+
+
+def _config_kinds(value: dict[str, Any]) -> tuple[str, ...]:
+    return (("env", "service", "gateway", "execution_layout")
+            if value.get("format") == EXECUTION_FORMAT else ("env", "service"))
+
+
+def _config_modes(kind: str, *, publication: bool = False) -> set[int]:
+    if kind in {"env", "execution_layout"}:
+        return {0o600}
+    return {0o600, 0o644} if publication else {0o600, 0o640, 0o644}
+
+
+def _execution_gateway_path(service: Path) -> Path:
+    names = {"agents-server.service": "agents-server-gateway.service",
+             "com.agentsdock.server.plist": "com.agentsdock.gateway.plist"}
+    if service.name not in names:
+        raise RuntimeError("execution activation requires the managed worker service")
+    return service.with_name(names[service.name])
+
+
+def _begin_execution(args: argparse.Namespace, value: dict[str, Any], directory: Path, root: Path) -> None:
+    runtime = _absolute(args.execution_runtime_dir)
+    if str(runtime) != args.execution_runtime_dir or runtime.name != "execution":
+        raise RuntimeError("execution runtime path is invalid")
+    _volume_anchor(runtime.parent)
+    gateway = _execution_gateway_path(_absolute(args.service))
+    if str(gateway) != args.gateway_service:
+        raise RuntimeError("execution gateway service path is invalid")
+    operation = str(uuid.uuid5(uuid.NAMESPACE_URL, "agentsdock-activation:" + value["transaction_id"]))
+    handoff = None
+    if args.execution_handoff_file:
+        handoff = json.loads(_read_private(_absolute(args.execution_handoff_file)))
+        if not isinstance(handoff, dict) or set(handoff) != {
+            "schema", "operation_id", "worker_instance_id", "lease_id", "expected_server_identity",
+        } or type(handoff.get("schema")) is not int or handoff.get("schema") != 1:
+            raise RuntimeError("execution handoff is invalid")
+        operation = handoff["operation_id"]
+    prior_layout = root / "execution-layout.json"
+    old_worker = dict(value["old_release"])
+    if prior_layout.exists() or prior_layout.is_symlink():
+        from execution_install import active_worker_release
+        previous_worker = active_worker_release(root)
+        if previous_worker is None:
+            raise RuntimeError("previous execution worker cannot be identified")
+        old_worker = (dict(value["old_release"])
+                      if value["old_release"] and _release_matches(previous_worker, value["old_release"])
+                      else _release_identity(previous_worker, previous_worker))
+    value["format"] = EXECUTION_FORMAT
+    value["execution"] = {"runtime_dir": str(runtime), "operation_id": operation,
+                          "gateway_state": args.gateway_state,
+                          "gateway_enabled": args.gateway_enabled == "true",
+                          "old_worker_release": old_worker, "handoff": handoff,
+                          "api_contract": args.execution_api_contract}
+    for kind, path in (("gateway", gateway), ("execution_layout", prior_layout)):
+        value[f"{kind}_path"] = str(path)
+        value[kind] = _configuration(path, directory / f"{kind}.backup", allowed_modes=_config_modes(kind))
+        value[f"desired_{kind}"] = None
+        value[f"observed_{kind}_sha256"] = [value[kind]["sha256"]]
+    if args.gateway_state != "absent" and not value["gateway"]["existed"]:
+        raise RuntimeError("loaded gateway has no restorable service configuration")
+    if old_worker:
+        _capture_volume(value, _absolute(old_worker["source"]))
+    _capture_volume(value, runtime.parent)
+
+
+def _validate_execution_metadata(root: Path, value: dict[str, Any], valid_release: Any) -> None:
+    if value["format"] != EXECUTION_FORMAT:
+        return
+    execution = value["execution"]
+    if not isinstance(execution, dict) or set(execution) != {
+        "runtime_dir", "operation_id", "gateway_state", "gateway_enabled", "old_worker_release", "handoff", "api_contract",
+    }:
+        raise RuntimeError("activation execution metadata is invalid")
+    runtime = _absolute(_safe_text(execution["runtime_dir"], "execution runtime"))
+    if (str(runtime) != execution["runtime_dir"] or runtime.name != "execution"
+            or root == runtime.parent or root in runtime.parents
+            or execution["gateway_state"] not in {"absent", "stopped", "running"}
+            or type(execution["gateway_enabled"]) is not bool
+            or type(execution["api_contract"]) is not int or execution["api_contract"] < 0
+            or value["gateway_path"] != str(_execution_gateway_path(_absolute(value["service_path"])))
+            or value["execution_layout_path"] != str(root / "execution-layout.json")):
+        raise RuntimeError("activation execution layout is invalid")
+    try:
+        if str(uuid.UUID(execution["operation_id"])) != execution["operation_id"]:
+            raise ValueError("noncanonical UUID")
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise RuntimeError("activation execution operation is invalid") from exc
+    old = execution["old_worker_release"]
+    if old and (not valid_release(old) or _absolute(old["target"]).parent != root / "releases"):
+        raise RuntimeError("activation prior worker release is invalid")
+    if not old and old != {}:
+        raise RuntimeError("activation prior worker release is invalid")
+    handoff = execution["handoff"]
+    if handoff is not None:
+        if (not isinstance(handoff, dict) or set(handoff) != {
+            "schema", "operation_id", "worker_instance_id", "lease_id", "expected_server_identity",
+        } or type(handoff["schema"]) is not int or handoff["schema"] != 1
+                or handoff["operation_id"] != execution["operation_id"]):
+            raise RuntimeError("activation execution handoff is invalid")
+        try:
+            if str(uuid.UUID(handoff["lease_id"])) != handoff["lease_id"]:
+                raise ValueError("noncanonical lease UUID")
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise RuntimeError("activation execution handoff lease is invalid") from exc
+        for field in ("worker_instance_id", "lease_id", "expected_server_identity"):
+            _safe_text(handoff[field], "execution " + field, maximum=240)
+
+
+def execution_context(root: Path) -> dict[str, Any] | None:
+    """Read owned outer-transaction execution metadata with all file proofs."""
+    root = _absolute(root)
+    _directory, value = _read_manifest(root, cleanup=False)
+    if value["format"] != EXECUTION_FORMAT:
+        return None
+    args = argparse.Namespace(root=str(root), current=str(root / "current"), previous=str(root / "previous"),
+                              env=value["env_path"], service=value["service_path"])
+    _validate_invocation(args, value, allow_missing_candidate=True)
+    return value
+
+
+def pending_execution_worker_operation(root: Path, runtime_root: Path) -> str | None:
+    value = execution_context(root)
+    if value is None:
+        return None
+    runtime_root = _absolute(runtime_root)
+    retained = [value["candidate_release"], value["execution"]["old_worker_release"]]
+    if not any(release and _release_matches(runtime_root, release) for release in retained):
+        raise RuntimeError("worker runtime is not retained by the pending activation")
+    return value["execution"]["operation_id"]
 
 
 def _absolute(path: str | Path) -> Path:
@@ -195,9 +330,12 @@ def _rebase_volume_bindings(value: dict[str, Any]) -> None:
         )
     coordinates = [
         (value[name], "device")
-        for name in ("candidate_release", "old_release", "previous_release", "desired_env", "desired_service", "guard")
+        for name in ("candidate_release", "old_release", "previous_release", "guard",
+                     *(f"desired_{kind}" for kind in _config_kinds(value)))
         if value[name]
     ]
+    if value.get("execution", {}).get("old_worker_release"):
+        coordinates.append((value["execution"]["old_worker_release"], "device"))
     if value["hub"]:
         coordinates.append((value["hub"], "fence_device"))
     # Map once from each original value: volumes may exchange device numbers.
@@ -641,7 +779,7 @@ def _remove_private_transaction_directory(directory: Path) -> None:
             continue
         if (
             child.name
-            not in {"manifest.json", "env.backup", "service.backup"}
+            not in {"manifest.json", "env.backup", "service.backup", "gateway.backup", "execution_layout.backup"}
             and MANIFEST_TEMP_RE.fullmatch(child.name) is None
         ) or (
             not stat.S_ISREG(child_info.st_mode)
@@ -677,6 +815,7 @@ def _read_manifest(
     root: Path,
     *,
     directory: Path | None = None,
+    cleanup: bool = True,
 ) -> tuple[Path, dict[str, Any]]:
     _validate_root(root)
     releases = _validate_releases_root(root)
@@ -688,7 +827,8 @@ def _read_manifest(
         or stat.S_IMODE(info.st_mode) != 0o700
     ):
         raise PermissionError("activation transaction directory is unsafe")
-    _cleanup_manifest_temps(directory)
+    if cleanup:
+        _cleanup_manifest_temps(directory)
     try:
         value = json.loads(_read_private(directory / "manifest.json"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -726,9 +866,13 @@ def _read_manifest(
         "observed_env_sha256",
         "observed_service_sha256",
     }
-    if isinstance(value, dict) and value.get("format") == FORMAT:
+    if isinstance(value, dict) and value.get("format") in {FORMAT, EXECUTION_FORMAT}:
         expected.add("volume_bindings")
-    if not isinstance(value, dict) or set(value) != expected or value.get("format") not in {1, FORMAT}:
+    if isinstance(value, dict) and value.get("format") == EXECUTION_FORMAT:
+        expected.add("execution")
+        for kind in ("gateway", "execution_layout"):
+            expected.update({kind, f"{kind}_path", f"desired_{kind}", f"observed_{kind}_sha256"})
+    if not isinstance(value, dict) or set(value) != expected or value.get("format") not in {1, FORMAT, EXECUTION_FORMAT}:
         raise RuntimeError("activation transaction manifest is invalid")
     if value.get("phase") not in PHASES:
         raise RuntimeError("activation transaction phase is invalid")
@@ -753,7 +897,7 @@ def _read_manifest(
     if re.fullmatch(r"activation-[0-9a-f]{24}", transaction_id) is None:
         raise RuntimeError("activation transaction id is invalid")
     _safe_text(value.get("release_version"), "version", maximum=128)
-    for field in ("release_dir", "env_path", "service_path"):
+    for field in ("release_dir", *(f"{kind}_path" for kind in _config_kinds(value))):
         _safe_text(value.get(field), field)
     if not isinstance(value.get("old_target"), str) or any(
         character in value["old_target"] for character in "\x00\r\n"
@@ -796,13 +940,13 @@ def _read_manifest(
             or (field == "previous" and item["kind"] == "directory")
         ):
             raise RuntimeError("activation transaction link state is invalid")
-    for field in ("env", "service"):
+    for field in _config_kinds(value):
         item = value.get(field)
         if (
             not isinstance(item, dict)
             or set(item) != {"existed", "backup", "sha256", "mode"}
             or not isinstance(item.get("existed"), bool)
-            or item.get("backup") not in {"env.backup", "service.backup"}
+            or item.get("backup") != f"{field}.backup"
             or (
                 item["existed"]
                 and (
@@ -863,11 +1007,11 @@ def _read_manifest(
         or any(character in client_binding for character in "\x00\r\n")
     ):
         raise RuntimeError("activation transaction client binding is invalid")
-    for field in ("desired_env", "desired_service"):
+    for field in (f"desired_{kind}" for kind in _config_kinds(value)):
         item = value.get(field)
         kind = field.removeprefix("desired_")
         destination = _absolute(
-            value["env_path" if kind == "env" else "service_path"]
+            value[f"{kind}_path"]
         )
         expected_source, _expected_secured = _config_staging_paths(
             destination,
@@ -881,7 +1025,7 @@ def _read_manifest(
             or re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) is None
             or not isinstance(item.get("mode"), int)
             or item["mode"] not in (
-                {0o600} if field == "desired_env" else {0o600, 0o644}
+                _config_modes(kind, publication=True)
             )
             or item.get("source") != str(expected_source)
             or isinstance(item.get("device"), bool)
@@ -894,7 +1038,7 @@ def _read_manifest(
             raise RuntimeError("activation desired configuration is invalid")
     if not isinstance(value.get("authority_pending"), bool):
         raise RuntimeError("activation transaction authority state is invalid")
-    for field in ("observed_env_sha256", "observed_service_sha256"):
+    for field in (f"observed_{kind}_sha256" for kind in _config_kinds(value)):
         items = value.get(field)
         if not isinstance(items, list) or any(
             item is not None
@@ -947,6 +1091,7 @@ def _read_manifest(
             or previous_target.parent != releases
         ):
             raise RuntimeError("activation transaction previous release path is invalid")
+    _validate_execution_metadata(root, value, valid_release)
     hub = value.get("hub")
     _validate_hub_metadata(hub, intent=value["intent"])
     guard = value.get("guard")
@@ -1154,10 +1299,10 @@ def _cleanup_config_staging(
 ) -> None:
     """Remove only schema-closed staging inodes owned by this transaction."""
 
-    for kind in ("env", "service"):
+    for kind in _config_kinds(value):
         desired = value[f"desired_{kind}"]
         destination = _absolute(
-            value["env_path" if kind == "env" else "service_path"]
+            value[f"{kind}_path"]
         )
         source, secured = _config_staging_paths(
             destination,
@@ -1346,9 +1491,13 @@ def begin(args: argparse.Namespace) -> None:
             "observed_env_sha256": [env["sha256"]],
             "observed_service_sha256": [service["sha256"]],
         }
+        if args.execution_runtime_dir:
+            _begin_execution(args, value, temporary, root)
+        elif args.gateway_service or args.execution_handoff_file:
+            raise RuntimeError("execution metadata requires an execution runtime directory")
         for anchor in (root, releases):
             _capture_volume(value, anchor)
-        for anchor in (env_path.parent, service_path.parent):
+        for anchor in (_absolute(value[f"{kind}_path"]).parent for kind in _config_kinds(value)):
             _capture_volume(value, anchor, allow_missing=True)
         _write_new_private(temporary / "manifest.json", _canonical(value))
         _fsync_directory(temporary)
@@ -1410,6 +1559,9 @@ def _validate_invocation(
             if value["format"] == 1 else ""
         )
         raise RuntimeError("activation rollback release identity changed" + suffix)
+    old_worker = value.get("execution", {}).get("old_worker_release")
+    if old_worker and _locate_release(old_worker) is None:
+        raise RuntimeError("activation pinned worker release identity changed")
     candidate_location = _locate_release(
         value["candidate_release"],
         extras=(candidate_retired, candidate_parked),
@@ -1472,7 +1624,7 @@ def _validate_invocation(
         and candidate_link_target_missing
     )
     current_missing = current_state == {"kind": "missing", "target": ""}
-    if phase in {"prepared", "guarded"}:
+    if phase in {"prepared", "guarded", "quiescing", "quiesced"}:
         if not original_current_valid:
             raise RuntimeError("current release changed before link takeover")
     elif phase in {"linking", "rolling-back"}:
@@ -1519,7 +1671,7 @@ def _validate_invocation(
         and _release_matches(_absolute(old_release["source"]), old_release)
     )
     previous_missing = previous_state == {"kind": "missing", "target": ""}
-    if phase in {"prepared", "guarded"}:
+    if phase in {"prepared", "guarded", "quiescing", "quiesced"}:
         if not original_previous_valid:
             raise RuntimeError("previous release changed before link takeover")
     elif phase in {"linking", "rolling-back"}:
@@ -1536,61 +1688,24 @@ def _validate_invocation(
     elif not candidate_previous_valid:
         raise RuntimeError("previous release does not resolve to the rollback release")
 
-    env_metadata = _current_config_metadata(_absolute(args.env))
-    service_metadata = _current_config_metadata(_absolute(args.service))
-
-    def original_configuration(field: str) -> dict[str, Any] | None:
-        item = value[field]
-        if not item["existed"]:
-            return None
-        return {"sha256": item["sha256"], "mode": item["mode"]}
-
-    def authorized_configuration(
-        metadata: dict[str, Any] | None,
-        history_field: str,
-        *,
-        modes: set[int],
-    ) -> bool:
-        if metadata is None:
-            return None in value[history_field]
-        return (
-            metadata["sha256"] in value[history_field]
-            and metadata["mode"] in modes
-        )
-
-    original_env = original_configuration("env")
-    original_service = original_configuration("service")
-    desired_env = value["desired_env"]
-    desired_service = value["desired_service"]
-    if phase in {"prepared", "guarded", "linking", "stopping", "stopped", "fencing"}:
-        configs_valid = (
-            env_metadata == original_env and service_metadata == original_service
-        )
-    elif phase in {"linked", "fenced", "authorizing", "authority", "rolling-back"}:
-        configs_valid = authorized_configuration(
-            env_metadata,
-            "observed_env_sha256",
-            modes={0o600},
-        ) and authorized_configuration(
-            service_metadata,
-            "observed_service_sha256",
-            modes={0o600, 0o640, 0o644},
-        )
-    elif phase in {"rolled-back", "rollback-healthy"}:
-        configs_valid = (
-            env_metadata == original_env and service_metadata == original_service
-        )
-    else:
-        configs_valid = (
-            desired_env is not None
-            and desired_service is not None
-            and _config_path_matches_desired(_absolute(args.env), desired_env)
-            and _config_path_matches_desired(
-                _absolute(args.service), desired_service
-            )
-        )
-    if not configs_valid:
-        raise RuntimeError("activation configuration does not match its phase")
+    for kind in _config_kinds(value):
+        destination = _absolute(value[f"{kind}_path"])
+        metadata = _current_config_metadata(destination)
+        original = value[kind]
+        original_metadata = ({"sha256": original["sha256"], "mode": original["mode"]}
+                             if original["existed"] else None)
+        desired = value[f"desired_{kind}"]
+        if phase in {"prepared", "guarded", "quiescing", "quiesced", "linking", "stopping", "stopped", "fencing",
+                     "rolled-back", "rollback-healthy"}:
+            valid = metadata == original_metadata
+        elif phase in {"linked", "fenced", "authorizing", "authority", "rolling-back"}:
+            history = value[f"observed_{kind}_sha256"]
+            valid = (None in history if metadata is None else
+                     metadata["sha256"] in history and metadata["mode"] in _config_modes(kind))
+        else:
+            valid = desired is not None and _config_path_matches_desired(destination, desired)
+        if not valid:
+            raise RuntimeError("activation configuration does not match its phase")
 
 
 def load(args: argparse.Namespace) -> None:
@@ -1691,6 +1806,8 @@ def record(args: argparse.Namespace) -> None:
     original_value = json.loads(json.dumps(value))
     previous_phase = value["phase"]
     if args.phase != value["phase"]:
+        if args.phase in {"quiescing", "quiesced"} and value.get("format") != EXECUTION_FORMAT:
+            raise RuntimeError("execution quiescence requires a split transaction")
         if args.phase not in TRANSITIONS[value["phase"]]:
             raise RuntimeError("activation transaction phase transition is invalid")
         value["phase"] = args.phase
@@ -1785,7 +1902,7 @@ def record(args: argparse.Namespace) -> None:
         except ValueError as exc:
             raise RuntimeError("activation transaction guard coordinates are invalid") from exc
         _validate_guard_metadata(guard)
-        if sys.platform == "darwin" and value["format"] == FORMAT:
+        if sys.platform == "darwin" and value["format"] in {FORMAT, EXECUTION_FORMAT}:
             if args.guard_path and not value["guard"]:
                 guard_path = _absolute(args.guard_path)
                 guard_info = guard_path.lstat()
@@ -1845,12 +1962,10 @@ def replace_config(args: argparse.Namespace) -> None:
     }:
         raise RuntimeError("activation configuration cannot change in this phase")
     source = _absolute(args.source)
-    field = "env_path" if args.kind == "env" else "service_path"
-    history_field = (
-        "observed_env_sha256"
-        if args.kind == "env"
-        else "observed_service_sha256"
-    )
+    if args.kind not in _config_kinds(value):
+        raise RuntimeError("activation configuration kind is not owned by this transaction")
+    field = f"{args.kind}_path"
+    history_field = f"observed_{args.kind}_sha256"
     destination = _absolute(value[field])
     expected_source, secured = _config_staging_paths(
         destination,
@@ -1860,10 +1975,10 @@ def replace_config(args: argparse.Namespace) -> None:
     if source != expected_source:
         raise RuntimeError("activation configuration staging path is invalid")
     mode = int(args.mode, 8)
-    expected_modes = {0o600} if args.kind == "env" else {0o600, 0o644}
+    expected_modes = _config_modes(args.kind, publication=True)
     if mode not in expected_modes:
         raise RuntimeError("activation configuration mode is invalid")
-    desired_field = "desired_env" if args.kind == "env" else "desired_service"
+    desired_field = f"desired_{args.kind}"
     journaled_desired = value[desired_field]
     try:
         source.lstat()
@@ -2136,16 +2251,8 @@ def restore_files(args: argparse.Namespace) -> None:
             _fsync_directory(previous.parent)
 
     _cleanup_config_staging(directory, value)
-    _restore_configuration(
-        _absolute(value["env_path"]),
-        directory,
-        value["env"],
-    )
-    _restore_configuration(
-        _absolute(value["service_path"]),
-        directory,
-        value["service"],
-    )
+    for kind in _config_kinds(value):
+        _restore_configuration(_absolute(value[f"{kind}_path"]), directory, value[kind])
 
 
 def finish(args: argparse.Namespace) -> None:
@@ -2209,10 +2316,9 @@ def finish(args: argparse.Namespace) -> None:
                 raise RuntimeError("activation candidate retirement path exists")
     _cleanup_config_staging(directory, value)
     allowed = {"manifest.json"}
-    if value["env"]["existed"]:
-        allowed.add("env.backup")
-    if value["service"]["existed"]:
-        allowed.add("service.backup")
+    for kind in _config_kinds(value):
+        if value[kind]["existed"]:
+            allowed.add(f"{kind}.backup")
     if value["phase"] == "rollback-healthy" and (directory / "candidate.retired").exists():
         allowed.add("candidate.retired")
     if {entry.name for entry in directory.iterdir()} != allowed:
@@ -2286,6 +2392,12 @@ def parser() -> argparse.ArgumentParser:
         required=True,
     )
     begin_parser.add_argument("--client-binding", default="")
+    begin_parser.add_argument("--execution-runtime-dir", default="")
+    begin_parser.add_argument("--execution-api-contract", type=int, default=0)
+    begin_parser.add_argument("--gateway-service", default="")
+    begin_parser.add_argument("--gateway-state", choices=("absent", "stopped", "running"), default="absent")
+    begin_parser.add_argument("--gateway-enabled", choices=("true", "false"), default="false")
+    begin_parser.add_argument("--execution-handoff-file", default="")
 
     load_parser = subparsers.add_parser("load")
     layout(load_parser)
@@ -2313,7 +2425,7 @@ def parser() -> argparse.ArgumentParser:
 
     replace_parser = subparsers.add_parser("replace-config")
     owned(replace_parser)
-    replace_parser.add_argument("--kind", choices=("env", "service"), required=True)
+    replace_parser.add_argument("--kind", choices=("env", "service", "gateway", "execution_layout"), required=True)
     replace_parser.add_argument("--source", required=True)
     replace_parser.add_argument("--mode", required=True)
 

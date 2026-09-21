@@ -24,12 +24,11 @@ import subprocess
 import sys
 import time
 from typing import Any, Callable
-import urllib.error
 import urllib.parse
-import urllib.request
 
 import execution_install as files
 from execution_transport import _read_secret
+from execution_http import request_json
 
 
 class InstallationLock:
@@ -260,31 +259,38 @@ class NativeServices:
             self.set_enabled(role, prior["enabled"])
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
-        raise RuntimeError("execution health/control redirects are refused")
-
-
 class WorkerControl:
-    def __init__(self, *, request_timeout: float = 5.0) -> None:
+    def __init__(self, *, request_timeout: float = 5.0, services: NativeServices | None = None) -> None:
         self.timeout = request_timeout
-        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+        self.services = services
 
-    def _json(self, url: str, token: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
-        request = urllib.request.Request(url, data=None if body is None else files._json_bytes(body),
-                                         headers={"Authorization": "Bearer " + token,
-                                                  **({"Content-Type": "application/json"} if body is not None else {})})
-        try:
-            with self.opener.open(request, timeout=self.timeout) as response:
-                data = response.read(files.MAX_CONFIG_BYTES + 1)
-        except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"execution control/health refused the request (HTTP {exc.code})") from None
-        if len(data) > files.MAX_CONFIG_BYTES:
-            raise RuntimeError("execution control/health response exceeds limit")
-        result = json.loads(data)
-        if not isinstance(result, dict):
-            raise RuntimeError("execution control/health returned an invalid object")
-        return result
+    def _native(self, layout: files.ExecutionLayout) -> dict[str, Any]:
+        return (self.services or NativeServices(layout)).snapshot()
+
+    @staticmethod
+    def _running_pid(native: dict, role: str) -> int:
+        value = native[role]
+        if value.get("state") != "running" or type(value.get("pid")) is not int or value["pid"] <= 1:
+            raise RuntimeError("credential endpoint has no running native owner")
+        return value["pid"]
+
+    def _json(self, url: str, token: str, body: dict[str, Any] | None = None, *,
+              expected_pid: int, platform: str, verify_owner: Callable[[], None]) -> dict[str, Any]:
+        return request_json(url, token, body=body, expected_pid=expected_pid, platform=platform,
+                            verify_owner=verify_owner, timeout=self.timeout, maximum_body=files.MAX_CONFIG_BYTES)
+
+    def _callback_request(self, layout: files.ExecutionLayout, record: dict, path: str,
+                          token: str, body: dict | None = None) -> dict:
+        def verify_owner():
+            if (self._running_pid(self._native(layout), "worker") != record["pid"]
+                    or self.worker_record(layout) != record):
+                raise RuntimeError("native worker or callback receipt changed before credentials were sent")
+        verify_owner()
+        return self._json(record["callback_origin"] + path, token, body,
+                          expected_pid=record["pid"], platform=layout.platform, verify_owner=verify_owner)
+
+    def callback_health(self, layout: files.ExecutionLayout, record: dict) -> dict:
+        return self._callback_request(layout, record, "/api/health", self._agent_token(layout))
 
     def worker_record(self, layout: files.ExecutionLayout) -> dict[str, Any]:
         files._owned_directory(layout.runtime_dir, private=True)
@@ -306,8 +312,8 @@ class WorkerControl:
 
     def status(self, layout: files.ExecutionLayout) -> tuple[dict[str, Any], dict[str, Any]]:
         record = self.worker_record(layout)
-        result = self._json(record["callback_origin"] + "/api/admin/execution/status",
-                            _read_secret(layout.runtime_dir / "control.token"))
+        result = self._callback_request(layout, record, "/api/admin/execution/status",
+                                        _read_secret(layout.runtime_dir / "control.token"))
         if result.get("worker_instance_id") != record["instance_id"] or type(result.get("idle")) is not bool:
             raise RuntimeError("private worker status does not match its process receipt")
         return record, result
@@ -318,8 +324,8 @@ class WorkerControl:
                    "operation_id": operation}
         if lease_id is not None:
             payload["lease_id"] = lease_id
-        result = self._json(record["callback_origin"] + "/api/admin/execution/maintenance",
-                            _read_secret(layout.runtime_dir / "control.token"), payload)
+        result = self._callback_request(layout, record, "/api/admin/execution/maintenance",
+                                        _read_secret(layout.runtime_dir / "control.token"), payload)
         if result.get("worker_instance_id") != record["instance_id"]:
             raise RuntimeError("worker changed during maintenance admission")
         return result
@@ -383,10 +389,21 @@ class WorkerControl:
         raise RuntimeError("authenticated activation health requires the preserved server token")
 
     def health(self, layout: files.ExecutionLayout) -> dict[str, Any]:
-        host = "127.0.0.1" if layout.bind == "0.0.0.0" else "::1" if layout.bind == "::" else layout.bind
+        host = ("127.0.0.1" if layout.bind in {"0.0.0.0", "localhost"} else
+                "::1" if layout.bind in {"::", "[::]", "::1", "[::1]"} else layout.bind)
         if ":" in host:
             host = f"[{host}]"
-        return self._json(f"http://{host}:{layout.port}/api/health", self._agent_token(layout))
+        native = self._native(layout)
+        role = "gateway" if native["gateway"]["state"] == "running" else "worker"
+        if role == "worker" and (native["gateway"]["state"] != "absent"
+                or layout.manifest_path.exists() or layout.manifest_path.is_symlink()):
+            raise RuntimeError("public credentials require the installed native gateway")
+        pid = self._running_pid(native, role)
+        def verify_owner():
+            if self._running_pid(self._native(layout), role) != pid:
+                raise RuntimeError("native health endpoint changed before credentials were sent")
+        return self._json(f"http://{host}:{layout.port}/api/health", self._agent_token(layout),
+                          expected_pid=pid, platform=layout.platform, verify_owner=verify_owner)
 
     def receipt(self, layout: files.ExecutionLayout, services: NativeServices) -> dict[str, Any]:
         health = self.health(layout)
@@ -405,7 +422,8 @@ class WorkerControl:
         return {"gateway_version": gateway.get("version"), "worker_version": worker.get("version"),
                 "worker_release": record["release_root"], "protocol_version": files.PROTOCOL_VERSION,
                 "server_identity": health.get("server_identity"), "gateway_pid": gateway.get("pid"),
-                "worker_pid": worker.get("pid"), "worker_instance_id": worker.get("instance_id")}
+                "worker_pid": worker.get("pid"), "worker_instance_id": worker.get("instance_id"),
+                "maintenance_held": worker.get("maintenance_held")}
 
 
 class ActivationController:

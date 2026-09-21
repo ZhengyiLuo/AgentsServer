@@ -14,6 +14,17 @@ from pathlib import Path
 
 
 FILES = (
+    "execution_durability.py",
+    "execution_http.py",
+    "execution_recovery_status.py",
+    "execution_recovery.py",
+    "execution_uninstall.py",
+    "update_recovery.py",
+    "execution_activation.py",
+    "execution_preparation.py",
+    "execution_update_status.py",
+    "update_handoff.py",
+    "update_preparation.py",
     "activation_transaction.py",
     "execution_control.py",
     "execution_install.py",

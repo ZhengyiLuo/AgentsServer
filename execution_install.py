@@ -294,8 +294,8 @@ def render_service(layout: ExecutionLayout, role: str) -> bytes:
             # controller reports a bounded failure while keeping the journal.
             "ExitTimeOut": 0 if role == "worker" else 10,
             "Umask": 0o077,
-            "StandardOutPath": str(layout.state_root / "logs" / f"{role}.stdout.log"),
-            "StandardErrorPath": str(layout.state_root / "logs" / f"{role}.stderr.log"),
+            "StandardOutPath": str(layout.runtime_dir / "logs" / f"{role}.stdout.log"),
+            "StandardErrorPath": str(layout.runtime_dir / "logs" / f"{role}.stderr.log"),
         }, sort_keys=True)
     lines = ["[Unit]", f"Description=AgentsDock {role}", "After=network-online.target"]
     if role == "gateway":
@@ -335,7 +335,7 @@ def prepare_runtime(layout: ExecutionLayout) -> None:
 
     layout.validate()
     _ensure_directory(layout.runtime_dir, private=True)
-    _ensure_directory(layout.state_root / "logs", private=True)
+    _ensure_directory(layout.runtime_dir / "logs", private=True)
     ensure_execution_secret(layout.runtime_dir / "control.token")
     _fsync_directory(layout.runtime_dir)
 
@@ -636,6 +636,15 @@ def retained_releases(root: Path) -> list[str]:
     root = _path(root)
     _owned_directory(root)
     retained: set[str] = set()
+    outer = root / ".activation-transaction"
+    if outer.exists() or outer.is_symlink():
+        from activation_transaction import execution_context
+        pending = execution_context(root)
+        if pending is not None:
+            for release in (pending["candidate_release"], pending["old_release"],
+                            pending["execution"]["old_worker_release"]):
+                if release:
+                    retained.update((release["source"], release["target"]))
     try:
         data, _mode = _read_file(root / LAYOUT_NAME, private=True)
     except FileNotFoundError:
@@ -663,6 +672,18 @@ def pending_worker_operation(root: Path, runtime_root: Path) -> str | None:
     root, runtime_root = _path(root), _path(runtime_root)
     _owned_directory(root)
     journal = root / TRANSACTION_NAME
+    outer = root / ".activation-transaction"
+    uninstall = root / ".execution-uninstall.json"
+    if uninstall.exists() or uninstall.is_symlink():
+        if outer.exists() or outer.is_symlink() or journal.exists() or journal.is_symlink():
+            raise RuntimeError("activation and uninstall both claim execution ownership")
+        from execution_uninstall import pending_uninstall_operation
+        return pending_uninstall_operation(root, runtime_root)
+    if outer.exists() or outer.is_symlink():
+        if journal.exists() or journal.is_symlink():
+            raise RuntimeError("two activation journals claim execution ownership")
+        from activation_transaction import pending_execution_worker_operation
+        return pending_execution_worker_operation(root, runtime_root)
     if not journal.exists() and not journal.is_symlink():
         return None
     value, layout = _load(root)

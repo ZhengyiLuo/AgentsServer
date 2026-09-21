@@ -14,8 +14,9 @@ from pathlib import Path
 import re
 import tempfile
 import unittest
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 from typing import Any, Literal
+from types import SimpleNamespace
 import uuid
 
 from cryptography.hazmat.primitives import serialization
@@ -62,6 +63,7 @@ class ServerUpdateEnsureTests(unittest.IsolatedAsyncioTestCase):
         self.ns = {
             "Any": Any, "Literal": Literal, "BaseModel": BaseModel, "Field": Field,
             "asyncio": asyncio, "HTTPException": HTTPException, "uuid": uuid, "re": re,
+            "os": SimpleNamespace(environ={}), "Path": Path,
             "SERVER_UPDATE_OPERATION_LOCK": asyncio.Lock(), "ACTIVE_LOCK": asyncio.Lock(),
             "QUEUE_LOCK": asyncio.Lock(), "UNSAFE_HTTP_MUTATION_ADMISSION_LOCK": asyncio.Lock(),
             "SERVER_INSTANCE_ID": "instance-current", "server_identity": lambda: "server-current",
@@ -134,6 +136,39 @@ class ServerUpdateEnsureTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("_npm_release", result)
         self.assertEqual(result["server_identity"], "server-current")
 
+    async def test_retry_settles_exact_failed_handoff_before_preparing_again(self):
+        self.status.update(phase="failed", update_id="a" * 32,
+            error_code="server_update_handoff_release_failed", retryable=True, _execution_handoff={"owned": True})
+        original = dict(self.status)
+        self.ns["os"].environ["AGENTS_SERVER_INSTALL_DIR"] = str(self.root)
+        def settle(**changes):
+            self.assertTrue(self.ns["SERVER_UPDATE_OPERATION_LOCK"].locked())
+            self.status.update(changes)
+            return dict(self.status)
+        self.ns["_write_server_update_status_unlocked"] = Mock(side_effect=settle)
+        self.ns["SERVER_ROOT"] = Path(__file__).parent
+        async def prepare(status, **unused):
+            self.assertIsNone(status.get("_execution_handoff"))
+            self.assertIsNone(status.get("error_code"))
+            return {"phase": "pending", "target_version": "1.0.4-beta.12"}, None
+        self.ns["prepare_scheduled_server_update"] = prepare
+        with patch("update_handoff.retry_failed_handoff", return_value={"released": True}) as cleanup:
+            result = await self.ns["ensure_server_update"](self.request())
+        cleanup.assert_called_once_with(self.root.resolve(), self.ns["SERVER_UPDATE_STATUS_FILE"], original)
+        self.assertEqual(result["phase"], "pending")
+        self.assertNotIn("_execution_handoff", result)
+
+    async def test_failed_handoff_retry_does_not_create_another_update(self):
+        self.status.update(phase="failed", update_id="a" * 32,
+            error_code="server_update_handoff_release_failed", retryable=True)
+        self.ns["os"].environ["AGENTS_SERVER_INSTALL_DIR"] = str(self.root)
+        with patch("update_handoff.retry_failed_handoff", side_effect=RuntimeError("foreign lease")):
+            with self.assertRaises(HTTPException) as error:
+                await self.ns["ensure_server_update"](self.request())
+        self.assertEqual(error.exception.status_code, 503)
+        self.assertEqual(error.exception.detail["code"], "server_update_handoff_release_failed")
+        self.write.assert_not_called()
+
     async def test_parallel_requests_join_one_durable_reservation(self):
         results = await asyncio.gather(*(self.ns["ensure_server_update"](self.request()) for _ in range(2)))
         self.write.assert_called_once()
@@ -144,6 +179,37 @@ class ServerUpdateEnsureTests(unittest.IsolatedAsyncioTestCase):
         result = await self.ns["ensure_server_update"](self.request("1.0.4-beta.10"))
         self.assertEqual(result["reconciliation"], "current")
         self.assertEqual(self.status, before)
+        self.write.assert_not_called()
+
+    async def test_same_version_split_update_joins_its_unfinished_activation(self):
+        self.ns["SERVER_VERSION"] = "1.0.4-beta.12"
+        self.ns["EXECUTION_MAINTENANCE"] = SimpleNamespace(worker_instance_id="owned-worker")
+        self.ns["os"].environ["AGENTS_SERVER_INSTALL_DIR"] = str(self.root)
+        for phase in ("pending", "installing"):
+            self.status.update(phase=phase, track="beta", target_version="1.0.4-beta.12", update_id="owned-update")
+            with patch("execution_update_status.current_components", return_value=False):
+                result = await self.ns["ensure_server_update"](self.request())
+            self.assertEqual(result["phase"], phase)
+            self.assertEqual(result["update_id"], "owned-update")
+            self.assertNotEqual(result["reconciliation"], "current")
+        self.write.assert_not_called()
+
+    async def test_same_version_split_update_requires_actual_component_proof(self):
+        self.ns["SERVER_VERSION"] = "1.0.4-beta.12"
+        self.ns["EXECUTION_MAINTENANCE"] = SimpleNamespace(worker_instance_id="owned-worker")
+        self.ns["os"].environ["AGENTS_SERVER_INSTALL_DIR"] = str(self.root)
+        with patch("execution_update_status.current_components", return_value=False):
+            with self.assertRaises(HTTPException) as rejected:
+                await self.ns["ensure_server_update"](self.request())
+        self.assertEqual(rejected.exception.detail["code"], "server_update_recovery_required")
+        with patch("execution_update_status.current_components", side_effect=RuntimeError("native ownership unavailable")):
+            with self.assertRaises(HTTPException) as rejected:
+                await self.ns["ensure_server_update"](self.request())
+        self.assertEqual(rejected.exception.detail["code"], "server_update_recovery_required")
+        with patch("execution_update_status.current_components", return_value=True) as proof:
+            result = await self.ns["ensure_server_update"](self.request())
+        self.assertEqual(result["reconciliation"], "current")
+        self.assertEqual(proof.call_args.kwargs["expected_worker_instance"], "owned-worker")
         self.write.assert_not_called()
 
     async def test_newer_compatible_other_channel_is_satisfied_without_mutation(self):

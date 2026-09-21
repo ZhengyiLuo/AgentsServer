@@ -109,10 +109,11 @@ class ProcessLease:
 class ComponentHealth:
     """Add component identity without relabeling an old engine as upgraded."""
 
-    def __init__(self, app: Any, field: str, identity: dict[str, Any]) -> None:
+    def __init__(self, app: Any, field: str, identity: dict[str, Any], live_identity: Any = None) -> None:
         self.app = app
         self.field = field
         self.identity = dict(identity)
+        self.live_identity = live_identity
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope["type"] != "http" or scope.get("path") != "/api/health":
@@ -155,7 +156,8 @@ class ComponentHealth:
             try:
                 document = json.loads(body)
                 if isinstance(document, dict):
-                    document[self.field] = self.identity
+                    document[self.field] = {**self.identity,
+                        **(self.live_identity() if self.live_identity is not None else {})}
                     body = json.dumps(document, separators=(",", ":")).encode()
             except (ValueError, UnicodeError):
                 pass
@@ -289,7 +291,8 @@ async def serve_worker(args: argparse.Namespace, lease: ProcessLease) -> None:
         "worker_upgrade_policy": "when_idle",
         "rolling_worker_upgrade": False,
     }
-    health_app = ComponentHealth(app, "execution_service", identity)
+    health_app = ComponentHealth(app, "execution_service", identity,
+        (lambda: {"maintenance_held": maintenance.is_held()}) if maintenance is not None else None)
     transport = ExecutionTransportServer(
         health_app,
         socket_path=args.runtime_dir / "worker.socket",

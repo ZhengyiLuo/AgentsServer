@@ -104,16 +104,32 @@ class UpdateOwnershipLostError(RuntimeError):
     """Raised when a detached updater no longer owns the durable status row."""
 
 
+class InstallerRolledBack(RuntimeError):
+    """The recovery-only installer verified and restored the prior installation."""
+
+
 def utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 def atomic_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, path)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            json.dump(value, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 @contextmanager
@@ -298,6 +314,7 @@ def run_installer(
     timeout_seconds: float = INSTALLER_TIMEOUT_SECONDS,
     heartbeat_seconds: float = INSTALLER_HEARTBEAT_SECONDS,
     on_started: Callable[[], None] | None = None,
+    accepted_returncodes: tuple[int, ...] = (0,),
 ) -> None:
     """Run the installer with live logging and a durable status heartbeat."""
     if expected_update_id is not None:
@@ -382,6 +399,8 @@ def run_installer(
 
     tail = installer_log_tail(log_path, start_offset=attempt_start) if returncode else ""
     trim_installer_log(log_path)
+    if returncode == 75 and returncode in accepted_returncodes:
+        raise InstallerRolledBack("interrupted activation was rolled back")
     if returncode != 0:
         raise RuntimeError(
             f"installer failed ({returncode}): {tail or 'no output; inspect server-update.log'}"
@@ -525,6 +544,13 @@ def assert_post_update_identity(
         raise RuntimeError("updated AgentsServer stable identity does not match")
     if expected_server_version is not None and health.get("server_version") != expected_server_version:
         raise RuntimeError("updated AgentsServer version does not match the signed release")
+    if expected_server_version is not None and ("gateway" in health or "execution_service" in health):
+        for component in ("gateway", "execution_service"):
+            identity = health.get(component)
+            if not isinstance(identity, dict) or identity.get("version") != expected_server_version:
+                raise RuntimeError("updated AgentsServer gateway and execution versions have not converged")
+        if health["execution_service"].get("maintenance_held") is not False:
+            raise RuntimeError("updated AgentsServer activation has not released admission")
     if expected_api_contract_version is not None and (
         type(health.get("api_contract_version")) is not int
         or health["api_contract_version"] != expected_api_contract_version
@@ -1393,7 +1419,24 @@ def run_update(args: argparse.Namespace) -> None:
         and bool(current_version)
         and version_is_prerelease(current_version)
     )
-    if getattr(args, "npm_descriptor", False):
+    prepared_update = None
+    prepared_receipt = getattr(args, "prepared_receipt", None)
+    if prepared_receipt:
+        from update_preparation import verify_prepared_status
+        with server_update_status_lock(status_path):
+            admitted = _read_status_unlocked(status_path)
+        if admitted.get("update_id") != update_id or admitted.get("phase") not in RUNNER_OWNED_ACTIVE_PHASES:
+            raise RuntimeError("Prepared release is not owned by this update")
+        if admitted.get("_prepared_update", {}).get("receipt_sha256") != getattr(args, "prepared_receipt_sha256", None):
+            raise RuntimeError("Prepared release receipt digest changed")
+        prepared_update = verify_prepared_status(admitted,
+            root=Path(os.environ["AGENTS_SERVER_INSTALL_DIR"]).expanduser().resolve(), public_key=public_key)
+        if prepared_update["receipt"] != prepared_receipt:
+            raise RuntimeError("Prepared release receipt path changed")
+        manifest = prepared_update["manifest"]
+        if manifest["track"] != track:
+            raise RuntimeError("Prepared release track changed")
+    elif getattr(args, "npm_descriptor", False):
         with server_update_status_lock(status_path):
             admitted = _read_status_unlocked(status_path)
         if admitted.get("update_id") != update_id or admitted.get("phase") not in RUNNER_OWNED_ACTIVE_PHASES:
@@ -1421,32 +1464,38 @@ def run_update(args: argparse.Namespace) -> None:
 
     with tempfile.TemporaryDirectory(prefix="agents-server-update-") as temporary:
         root = Path(temporary)
-        archive_path = root / str(manifest["archive"]["name"])
-        update_status(
-            status_path,
-            expected_update_id=update_id,
-            phase="downloading",
-            track=track,
-            target_version=version,
-            message=f"Downloading AgentsServer {version}.",
-        )
-        archive_bytes = (download_npm_archive(manifest) if manifest.get("schema") == 2 else
-                         download_bytes(str(manifest["archive"]["url"]), MAX_ARCHIVE_BYTES, timeout=120.0))
-        digest = hashlib.sha256(archive_bytes).hexdigest()
-        if digest != manifest["archive"]["sha256"]:
-            raise RuntimeError("release archive checksum does not match the signed manifest")
-        archive_path.write_bytes(archive_bytes)
+        if prepared_update is not None:
+            source = Path(prepared_update["candidate"])
+            update_status(status_path, expected_update_id=update_id, phase="verifying",
+                target_version=version, message="Prepared runtime and signed release verified.")
+        else:
+            archive_path = root / str(manifest["archive"]["name"])
+            update_status(
+                status_path,
+                expected_update_id=update_id,
+                phase="downloading",
+                track=track,
+                target_version=version,
+                message=f"Downloading AgentsServer {version}.",
+            )
+            archive_bytes = (download_npm_archive(manifest) if manifest.get("schema") == 2 else
+                             download_bytes(str(manifest["archive"]["url"]), MAX_ARCHIVE_BYTES, timeout=120.0))
+            digest = hashlib.sha256(archive_bytes).hexdigest()
+            if digest != manifest["archive"]["sha256"]:
+                raise RuntimeError("release archive checksum does not match the signed manifest")
+            archive_path.write_bytes(archive_bytes)
 
-        update_status(
-            status_path,
-            expected_update_id=update_id,
-            phase="verifying",
-            message="Signature and archive checksum verified.",
-        )
-        source = (safe_extract(archive_path, root / "extracted", npm_manifest=manifest)
-                  if manifest.get("schema") == 2 else safe_extract(archive_path, root / "extracted"))
+            update_status(
+                status_path,
+                expected_update_id=update_id,
+                phase="verifying",
+                message="Signature and archive checksum verified.",
+            )
+            source = (safe_extract(archive_path, root / "extracted", npm_manifest=manifest)
+                      if manifest.get("schema") == 2 else safe_extract(archive_path, root / "extracted"))
         install = source / "install.sh"
-        install.chmod(0o755)
+        if prepared_update is None:
+            install.chmod(0o755)
         command = [
             str(install),
             "--non-interactive",
@@ -1455,7 +1504,14 @@ def run_update(args: argparse.Namespace) -> None:
             "--bind", args.bind,
             "--expected-server-identity", expected_server_identity,
         ]
-        if manifest.get("schema") == 2:
+        if prepared_update is not None:
+            command.extend(["--activate-prepared", prepared_update["receipt"],
+                            "--prepared-archive-sha256", manifest["archive"]["sha256"],
+                            "--execution-mode", "split"])
+        handoff_file = getattr(args, "execution_handoff_file", None)
+        if handoff_file:
+            command.extend(["--execution-handoff-file", handoff_file])
+        if manifest.get("schema") == 2 or prepared_update is not None:
             command.extend(["--expected-api-contract", str(manifest["api_contract_version"])])
         if expected_team_hub_id is not None:
             command.extend(
@@ -1510,6 +1566,13 @@ def run_update(args: argparse.Namespace) -> None:
             phase="installing",
             message=f"Installing AgentsServer {version} with rollback protection.",
         )
+        if prepared_update is not None:
+            from update_recovery import activation_intent
+            update_status(status_path, expected_update_id=update_id,
+                _activation_recovery=activation_intent(
+                    root=Path(os.environ["AGENTS_SERVER_INSTALL_DIR"]), candidate=source,
+                    version=version, api_contract=manifest["api_contract_version"],
+                    update_id=update_id, server_identity=expected_server_identity))
         log_path = status_path.with_name("server-update.log")
         run_installer(
             command,
@@ -1593,6 +1656,11 @@ def main() -> int:
     parser.add_argument("--current-version")
     parser.add_argument("--track", choices=sorted(RELEASE_TRACKS), default="stable")
     parser.add_argument("--npm-descriptor", action="store_true")
+    parser.add_argument("--prepared-receipt")
+    parser.add_argument("--prepared-receipt-sha256")
+    parser.add_argument("--execution-handoff-file")
+    parser.add_argument("--recover-only", action="store_true")
+    parser.add_argument("--recovery-transaction")
     parser.add_argument("--auth-token-file")
     parser.add_argument("--expected-server-identity", required=True)
     parser.add_argument("--update-id", required=True)
@@ -1606,12 +1674,30 @@ def main() -> int:
     parser.add_argument("--repair-failed-team-hub-host", action="store_true")
     args = parser.parse_args()
     try:
-        run_update(args)
+        if args.recover_only:
+            from update_recovery import run_recovery
+            run_recovery(args)
+        else:
+            run_update(args)
         return 0
     except Exception as exc:
         status_path = Path(args.status_file).expanduser().resolve()
         update_id = str(getattr(args, "update_id", "") or "").strip()
+        if args.recover_only:
+            # Only install.sh may release an interrupted transaction's fences.
+            # Keep the journal/hold intact and expose a retryable recovery error.
+            try:
+                update_status(status_path, expected_update_id=update_id,
+                    phase="installing", runner_pid=None, heartbeat_at=None, retryable=True,
+                    error_code="server_update_recovery_failed",
+                    error_action="Retry recovery from the application update settings.",
+                    message="The interrupted server update could not finish recovery. See server-update.log.",
+                    finished_at=utc_now())
+            except UpdateOwnershipLostError:
+                pass
+            return 1
         try:
+            release_handoff = False
             with server_update_status_lock(status_path):
                 current = _read_status_unlocked(status_path)
                 if (
@@ -1621,6 +1707,14 @@ def main() -> int:
                 ):
                     return 1
                 phase = str(current.get("phase") or "")
+                if phase in {"installing", "restarting"} and current.get("_activation_recovery"):
+                    from update_recovery import journal_present
+                    if journal_present(Path(os.environ["AGENTS_SERVER_INSTALL_DIR"]).expanduser().resolve()):
+                        _update_status_unlocked(status_path, current, runner_pid=None,
+                            heartbeat_at=None, retryable=True,
+                            error_code="server_update_recovery_pending",
+                            message="The installer was interrupted. Its retained activation will be recovered.")
+                        return 1
                 if phase in {
                     "starting",
                     "checking",
@@ -1631,12 +1725,19 @@ def main() -> int:
                     # Hub fence is cleared. A clear failure therefore remains
                     # fail-closed instead of publishing a false terminal row.
                     clear_team_hub_maintenance(args)
+                    release_handoff = bool(getattr(args, "execution_handoff_file", None))
                 elif phase in {"installing", "restarting"} and \
                         team_hub_maintenance_fence_present(args):
                     # Once install.sh starts, only its verified rollback or
                     # successful candidate handoff may clear the fence. Keep
                     # the active row if recovery was not proven complete.
                     return 1
+                # Installer preflight can fail after the public phase changed
+                # to installing but before it creates a transaction. The same
+                # exact old hold then needs cleanup; the helper refuses any
+                # journal, takeover or changed native worker before releasing.
+                release_handoff = release_handoff or bool(
+                    current.get("_execution_handoff") and getattr(args, "execution_handoff_file", None))
                 _update_status_unlocked(
                     status_path,
                     current,
@@ -1644,9 +1745,36 @@ def main() -> int:
                     message=str(exc),
                     heartbeat_at=None,
                     runner_pid=None,
+                    **({"error_code": "server_update_handoff_release_failed", "retryable": True,
+                        "error_action": "Retry the update to finish releasing its execution hold."}
+                       if release_handoff else {}),
                     finished_at=utc_now(),
                 )
-        except (UpdateOwnershipLostError, RuntimeError, OSError):
+            # The sealed lease still owns admission after the failed status
+            # is durable. Release outside the status flock: the authenticated
+            # worker callback reads this same status while proving it is idle.
+            if release_handoff:
+                from update_handoff import release_existing_handoff
+                try:
+                    release_existing_handoff(
+                        Path(os.environ["AGENTS_SERVER_INSTALL_DIR"]).expanduser().resolve(),
+                        Path(args.execution_handoff_file),
+                    )
+                    with server_update_status_lock(status_path):
+                        current = _read_status_unlocked(status_path)
+                        if current.get("update_id") == update_id and current.get("phase") == "failed":
+                            _update_status_unlocked(status_path, current, _execution_handoff=None,
+                                error_code=None, error_action=None, retryable=True)
+                except Exception:
+                    with server_update_status_lock(status_path):
+                        current = _read_status_unlocked(status_path)
+                        if current.get("update_id") == update_id and current.get("phase") == "failed":
+                            _update_status_unlocked(status_path, current, retryable=True,
+                                error_code="server_update_handoff_release_failed",
+                                error_action="Retry the update to finish releasing its execution hold.",
+                                message="The update failed and its execution hold could not be released safely.")
+                    raise
+        except (UpdateOwnershipLostError, RuntimeError, OSError, ValueError):
             pass
         return 1
 

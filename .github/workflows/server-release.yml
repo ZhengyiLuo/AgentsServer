@@ -15,12 +15,47 @@ on:
         required: false
         default: false
         type: boolean
+      npm_source_sha:
+        description: Optional reviewed canonical SHA to also prepare a signed npm candidate; requires prepare_only
+        required: false
+        type: string
+      npm_source_ref:
+        description: Canonical main or release/* branch containing npm_source_sha; supply all three npm inputs together
+        required: false
+        type: string
+      npm_version:
+        description: Exact npm and app version, matching tag without v; supply all three npm inputs together
+        required: false
+        type: string
 
 permissions:
   contents: write
 
 jobs:
+  validate-inputs:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Require prepare-only mode for coordinated signing
+        env:
+          PREPARE_ONLY: ${{ inputs.prepare_only }}
+          NPM_SOURCE_SHA: ${{ inputs.npm_source_sha }}
+          NPM_SOURCE_REF: ${{ inputs.npm_source_ref }}
+          NPM_VERSION: ${{ inputs.npm_version }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          if [[ -n "$NPM_SOURCE_SHA" || -n "$NPM_SOURCE_REF" || -n "$NPM_VERSION" ]]; then
+            test "$PREPARE_ONLY" = true
+            [[ "$NPM_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+            [[ "$NPM_SOURCE_REF" == main || "$NPM_SOURCE_REF" =~ ^release/[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || exit 1
+            git check-ref-format "refs/heads/$NPM_SOURCE_REF"
+            [[ "$NPM_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-beta\.[1-9][0-9]*)?$ ]] || exit 1
+            test "$RELEASE_TAG" = "v$NPM_VERSION"
+          fi
   test:
+    needs: validate-inputs
     name: Tests (${{ matrix.shard }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -42,6 +77,18 @@ jobs:
           uv lock --check
           ulimit -s 65536
           PYTHONFAULTHANDLER=1 uv run --python 3.13 python -X faulthandler scripts/run_test_shard.py --index ${{ matrix.shard }} --count 8
+  npm-candidate:
+    needs: test
+    if: inputs.prepare_only && inputs.npm_source_sha != ''
+    permissions:
+      contents: read
+    uses: ./.github/workflows/server-npm-candidate.yml
+    with:
+      source_sha: ${{ inputs.npm_source_sha }}
+      source_ref: ${{ inputs.npm_source_ref }}
+      version: ${{ inputs.npm_version }}
+    secrets:
+      AGENTS_SERVER_RELEASE_PRIVATE_KEY_B64: ${{ secrets.AGENTS_SERVER_RELEASE_PRIVATE_KEY_B64 }}
   release:
     needs: test
     runs-on: ubuntu-latest

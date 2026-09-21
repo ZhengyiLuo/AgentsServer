@@ -42,6 +42,19 @@ def copy_regular(source: Path, target: Path, *, executable: bool = False) -> Non
     target.chmod(0o755 if executable else 0o644)
 
 
+def legal_document_root(root: Path) -> Path:
+    # Both supported layouts keep legal documents at the checkout boundary:
+    # AgentsDock/server is nested; the standalone compatibility export is not.
+    # Never fall back to unrelated parent files or mix documents across layouts.
+    checkout = Path(subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"], cwd=root,
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()).resolve()
+    if root.resolve() not in (checkout, checkout / "server"):
+        raise ValueError("server source must be the checkout root or its server directory")
+    return checkout
+
+
 def stage_package(root: Path, destination: Path) -> tuple[str, set[str]]:
     version = (root / "VERSION").read_text().strip()
     if not VERSION_PATTERN.fullmatch(version):
@@ -54,13 +67,14 @@ def stage_package(root: Path, destination: Path) -> tuple[str, set[str]]:
         raise ValueError("source package must have the expected name and remain private")
     if metadata.get("scripts") or metadata.get("dependencies") or metadata.get("optionalDependencies"):
         raise ValueError("server wrapper must not run lifecycle scripts or install npm dependencies")
+    legal_root = legal_document_root(root)
     metadata["version"] = version
     metadata.pop("private")
     destination.mkdir(parents=True, exist_ok=False)
     (destination / "package.json").write_text(json.dumps(metadata, indent=2) + "\n")
     copy_regular(root / "npm" / "README.md", destination / "README.md")
-    copy_regular(root.parent / "LICENSE", destination / "LICENSE")
-    copy_regular(root.parent / "NOTICE", destination / "NOTICE")
+    copy_regular(legal_root / "LICENSE", destination / "LICENSE")
+    copy_regular(legal_root / "NOTICE", destination / "NOTICE")
     copy_regular(root / "npm" / "cli.cjs", destination / "npm" / "cli.cjs", executable=True)
     for name in runtime_files():
         copy_regular(root / name, destination / "server" / name, executable=name in EXECUTABLE_FILES)

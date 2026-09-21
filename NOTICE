@@ -1,0 +1,19 @@
+AgentsDock
+Copyright 2026 Zhengyi Luo and contributors
+
+AgentsDock's original code is licensed under the Apache License, Version 2.0,
+except where a component explicitly states another license. See LICENSE.
+
+Third-party and separately licensed components retain their own copyrights,
+licenses, and attribution notices. In particular:
+
+- mobile-react/LICENSE preserves the Expo template's MIT license and
+  copyright notice for 650 Industries, Inc. (Expo).
+- The agentsdock-native-video, agentsdock-native-terminal, and
+  agentsdock-android-updater modules retain the MIT license declared in
+  their package metadata.
+- SwiftTerm retains its MIT license in
+  mobile-react/modules/agentsdock-native-terminal/ios/Vendor/SwiftTerm/LICENSE.
+
+Dependencies and other bundled third-party materials remain subject to their
+respective license terms. This notice does not replace those licenses.

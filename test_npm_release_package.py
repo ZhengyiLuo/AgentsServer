@@ -32,14 +32,22 @@ class NpmReleasePackageTests(unittest.TestCase):
             shutil.copyfile(ROOT / "npm" / name, self.root / "npm" / name)
         shutil.copyfile(ROOT / "package.json", self.root / "package.json")
         for name in ("LICENSE", "NOTICE"):
-            shutil.copyfile(ROOT.parent / name, self.root.parent / name)
+            (self.root.parent / name).write_text(f"canonical fixture {name}\n")
         subprocess.run(["git", "init", "--quiet"], cwd=self.root.parent, check=True)
         subprocess.run(["git", "add", "."], cwd=self.root.parent, check=True)
         subprocess.run(["git", "-c", "user.name=Package Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "fixture"], cwd=self.root.parent, check=True)
 
+    def test_standalone_export_legal_documents_match_canonical_checkout(self):
+        checkout = package.legal_document_root(ROOT)
+        for name in ("LICENSE", "NOTICE"):
+            self.assertFalse((ROOT / name).is_symlink())
+            self.assertEqual((ROOT / name).read_bytes(), (checkout / name).read_bytes())
+
     def test_exact_payload_no_tests_secrets_or_lifecycle_scripts(self):
         (self.root / ".env").write_text("must not ship")
         (self.root / "test_private.py").write_text("must not ship")
+        for name in ("LICENSE", "NOTICE"):
+            (self.root / name).write_text(f"nested decoy {name}\n")
         staged = Path(self.temporary.name) / "package"
         version, expected = package.stage_package(self.root, staged)
         metadata = json.loads((staged / "package.json").read_text())
@@ -51,6 +59,33 @@ class NpmReleasePackageTests(unittest.TestCase):
         self.assertFalse((staged / "server/.env").exists())
         self.assertEqual((staged / "server/install.sh").stat().st_mode & 0o777, 0o755)
         self.assertTrue(json.loads((self.root / "package.json").read_text())["private"])
+        for name in ("LICENSE", "NOTICE"):
+            self.assertEqual((staged / name).read_bytes(), (self.root.parent / name).read_bytes())
+
+    def standalone_fixture(self):
+        # Its folder is deliberately also called server: layout must follow the
+        # checkout boundary, not a directory name or an arbitrary parent file.
+        standalone = Path(self.temporary.name) / "server"
+        shutil.copytree(self.root, standalone)
+        for name in ("LICENSE", "NOTICE"):
+            (standalone / name).write_text(f"standalone fixture {name}\n")
+            (standalone.parent / name).write_text(f"unrelated parent {name}\n")
+        subprocess.run(["git", "init", "--quiet"], cwd=standalone, check=True)
+        subprocess.run(["git", "add", "."], cwd=standalone, check=True)
+        subprocess.run(["git", "-c", "user.name=Package Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "standalone fixture"], cwd=standalone, check=True)
+        return standalone
+
+    def test_missing_standalone_notice_does_not_borrow_parent_notice(self):
+        standalone = self.standalone_fixture()
+        (standalone / "NOTICE").unlink()
+        with self.assertRaisesRegex(ValueError, "regular file"):
+            package.stage_package(standalone, Path(self.temporary.name) / "bad")
+
+    def test_noncanonical_nested_source_is_rejected(self):
+        nested = self.root.with_name("backend")
+        self.root.rename(nested)
+        with self.assertRaisesRegex(ValueError, "checkout root or its server directory"):
+            package.stage_package(nested, Path(self.temporary.name) / "bad")
 
     def test_rejects_linked_payload_and_unlisted_hub_members(self):
         target = self.root / "agent_server.py"
@@ -77,6 +112,19 @@ class NpmReleasePackageTests(unittest.TestCase):
                 package.prepare(self.root, Path(self.temporary.name) / "bad", require_clean_source=True)
             subprocess.run(["git", "add", "."], cwd=self.root.parent, check=True)
             subprocess.run(["git", "-c", "user.name=Package Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "fixture change"], cwd=self.root.parent, check=True)
+
+    @unittest.skipUnless(shutil.which("npm"), "npm required for actual offline pack proof")
+    def test_real_standalone_npm_pack_keeps_its_own_license_notice_and_source_commit(self):
+        standalone = self.standalone_fixture()
+        output = Path(self.temporary.name) / "standalone-output"
+        manifest = package.prepare(standalone, output, require_clean_source=True)
+        expected_commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=standalone, capture_output=True, text=True, check=True).stdout.strip()
+        self.assertEqual(manifest["commit"], expected_commit)
+        with tarfile.open(output / manifest["archive"]["name"]) as tar:
+            for name in ("LICENSE", "NOTICE"):
+                self.assertEqual(tar.extractfile(f"package/{name}").read(), (standalone / name).read_bytes())
+            for name in package.runtime_files():
+                self.assertEqual(tar.extractfile(f"package/server/{name}").read(), (standalone / name).read_bytes())
 
     @unittest.skipUnless(shutil.which("npm"), "npm required for actual offline pack proof")
     def test_real_offline_npm_pack_exact_bytes_hashes_and_version(self):

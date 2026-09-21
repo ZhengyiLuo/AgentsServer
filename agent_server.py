@@ -10257,9 +10257,13 @@ class SessionStore:
         resume_placeholder = f"Resumed {backend.title()} {str(active_provider_id)[:8]}"
         # Older clients explicitly send this generated resume label. Recognize
         # it only at creation; PATCH renames (even identical wording) stay manual.
-        automatic_title = not req.title or req.title == "New chat" or (
-            bool(active_provider_id) and req.title == resume_placeholder
-        )
+        # A staged import already chose a native title or preview. Preserve it
+        # even if its literal text happens to match an AgentsDock placeholder.
+        automatic_title = not req.title or (not initializing_import and (
+            req.title == "New chat" or (
+                bool(active_provider_id) and req.title == resume_placeholder
+            )
+        ))
         provider_title = None
         if active_provider_id and automatic_title and not (
             parent_id or initializing_fork or initializing_import
@@ -46195,7 +46199,7 @@ def parse_claude_history(
     )
 
 
-def strip_agentsdock_provider_context(text: str) -> str:
+def strip_agentsdock_provider_context(text: str, *, allow_jobless_legacy: bool = False) -> str:
     """Remove launch-only context from a Codex transcript user message."""
     if not text.startswith("[AgentsDock context]"):
         return text
@@ -46218,11 +46222,19 @@ def strip_agentsdock_provider_context(text: str) -> str:
         max(scheduled_start, 0),
     )
     if scheduled_start < 0 or snapshot_start < 0:
-        return text
-    scheduled_end = remainder.find("\n\n", snapshot_start)
-    if scheduled_end < 0:
-        return text
-    remainder = remainder[scheduled_end + 2:]
+        # Early codex-exec prompts predate the jobs snapshot. Enable this
+        # only for display previews, not reconciliation/durable history keys.
+        # A bare bracket label or an ordinary human quotation is insufficient.
+        if not (allow_jobless_legacy and base_index <= 64 * 1024 and text.startswith((
+            "[AgentsDock context]\nYou are responding through AgentsDock, backed by AgentsServer.\n",
+            "[AgentsDock context]\nYou are operating through AgentsDock, backed by AgentsServer.\n",
+        ))):
+            return text
+    else:
+        scheduled_end = remainder.find("\n\n", snapshot_start)
+        if scheduled_end < 0:
+            return text
+        remainder = remainder[scheduled_end + 2:]
     if remainder.startswith("\n[Per-chat system instructions]\n"):
         remainder = remainder[1:]
     if remainder.startswith("[Per-chat system instructions]\n"):
@@ -47056,8 +47068,7 @@ def cursor_native_session_title(provider_id: str, cwd: Any) -> str | None:
             return None
         if metadata.get("subagentInfo") is not None:
             return None
-        title = native_session_title(metadata.get("name"))
-        return title if title and title.casefold() != "new agent" else None
+        return cursor_history.native_title(metadata.get("name"))
     except (OSError, ValueError, RecursionError, sqlite3.Error):
         return None
 
@@ -47258,7 +47269,13 @@ def schedule_generated_session_title(session_id: str, event: dict) -> None:
 
 
 def local_session_label(value: Any, fallback: str) -> str:
-    clean = compact_import_text(str(value or "")).strip()
+    # A preview is user text, not a provider title: words like "New chat" are
+    # valid messages. Keep display sanitization without placeholder filtering.
+    clean = " ".join("".join(
+        character for character in compact_import_text(str(value or ""))
+        if character.isspace()
+        or unicodedata.category(character) not in {"Cc", "Cf", "Cs"}
+    ).split())
     return (clean or fallback)[:MAX_LOCAL_SESSION_LABEL_CHARS]
 
 
@@ -47302,12 +47319,11 @@ def local_claude_session_candidates(known_provider_ids: set[str]) -> list[dict[s
                 newest_paths[provider_id] = (mtime, path)
     for provider_id, (mtime, path) in newest_paths.items():
         cwd = normalized_local_session_cwd(claude_transcript_cwd(path))
-        folder_display = Path(cwd).name if cwd else path.parent.name
-        fallback = folder_display or f"Claude chat {provider_id[:8]}"
+        fallback = f"Claude chat {provider_id[:8]}"
         title = claude_transcript_title(path, provider_id)
         preview = None if title else claude_transcript_preview(path)
         label = local_session_label(
-            title or (f"{folder_display}: {preview}" if preview else fallback),
+            title or preview,
             fallback,
         )
         candidates.append({
@@ -47367,7 +47383,15 @@ def codex_transcript_preview(path: Path) -> str | None:
                 break
             item = codex_history_event_item(event)
             if item is not None and item.get("kind") == "user" and item.get("provider_runtime_context") not in ("subagent_notification", "turn_aborted", "provider_notice"):
-                return item["text"][:160]
+                preview = item["text"]
+                record = codex_history_user_record(event)
+                if record is not None and not codex_user_item_has_human_provenance(record[0]):
+                    original = record[1].lstrip()
+                    unwrapped = strip_agentsdock_provider_context(original, allow_jobless_legacy=True)
+                    if unwrapped != original:
+                        preview = strip_agentsdock_generated_user_text(unwrapped, provider_history=True)
+                if preview.strip():
+                    return preview[:160]
     return None
 
 
@@ -47428,10 +47452,7 @@ def local_codex_session_candidates(known_provider_ids: set[str]) -> list[dict[st
     for provider_id, (mtime, path, cwd) in newest_paths.items():
         label = thread_names.get(provider_id)
         if not label:
-            preview = codex_transcript_preview(path)
-            folder_display = Path(cwd).name if cwd else path.stem
-            fallback = folder_display or f"Codex chat {provider_id[:8]}"
-            label = f"{folder_display}: {preview}" if preview else fallback
+            label = codex_transcript_preview(path)
         candidates.append({
             "provider_session_id": provider_id,
             "backend": BACKEND_CODEX,
@@ -47442,7 +47463,66 @@ def local_codex_session_candidates(known_provider_ids: set[str]) -> list[dict[st
     return candidates
 
 
-def cursor_history_event_item(event: dict[str, Any]) -> dict[str, Any] | None:
+CURSOR_IMPORT_TOOL_BINDING_RE = re.compile(
+    r"\n\n\[AgentsDock tool binding\]\n"
+    r"For this turn only, use MCP server `(?P<server>plugin-agentsdock-[0-9a-f]{24}-native)`, tool `run` "
+    r"\(Cursor tool `(?P=server)-run`\) for AgentsDock helpers\. "
+    r"This supersedes older helper commands and earlier tool bindings\. "
+    r"No shell fallback, credential lookup, or full-access permission is needed\. "
+    r"Only this top-level agent may call it\.\n\[End AgentsDock tool binding\]\Z"
+)
+
+
+def cursor_import_user_preview(text: str) -> str:
+    """Unwrap a recognized server launch envelope for a display label only.
+
+    Do not use a generic bracket-removal regex. A standalone current-prompt
+    marker needs a validated generated authority/tool-binding suffix. Preserve
+    incomplete envelopes, ordinary quotations and markers inside the real prompt.
+    This does not rewrite provider transcripts or persisted/imported history.
+    """
+    original = text
+    normalized = text.strip()
+    candidate = strip_all_legacy_agentsdock_provider_authority_suffixes(
+        normalized, allow_portable_authority_root=True,
+    )
+    generated = candidate != normalized
+    binding = CURSOR_IMPORT_TOOL_BINDING_RE.search(candidate)
+    if binding is not None:
+        candidate = candidate[:binding.start()]
+        generated = True
+    header = (
+        "[AgentsDock provider instructions]\n"
+        "You are operating through AgentsDock, backed by AgentsServer.\n"
+    )
+    footer = "\n[End AgentsDock provider instructions]\n\n"
+    if candidate.startswith(header):
+        boundary = candidate.find(footer, len(header), 64 * 1024)
+        if boundary < 0:
+            return original
+        policy = candidate[len(header):boundary]
+        if "- Keep the final answer concise;" not in policy:
+            return original
+        candidate = candidate[boundary + len(footer):]
+        generated = True
+    if not generated:
+        return original
+    memory = re.match(r"\[Fork memory context; chars=(\d{1,8})\]\n", candidate)
+    if memory is not None:
+        memory_end = memory.end() + int(memory.group(1))
+        memory_footer = "\n[End Fork memory context]\n\n"
+        if not candidate.startswith(memory_footer, memory_end):
+            return original
+        candidate = candidate[memory_end + len(memory_footer):]
+    marker = "[Current user prompt]\n"
+    if candidate == marker.rstrip():
+        return ""
+    if candidate.startswith(marker):
+        return candidate[len(marker):]
+    return original
+
+
+def cursor_history_event_item(event: dict[str, Any], *, for_preview: bool = False) -> dict[str, Any] | None:
     """Project only Cursor CLI's public text export, never internal blobs/tools."""
     role = event.get("role")
     if role not in {"user", "assistant"}:
@@ -47465,7 +47545,8 @@ def cursor_history_event_item(event: dict[str, Any]) -> dict[str, Any] | None:
             )
             if match is None:
                 continue
-            text = strip_agentsdock_generated_user_text(match[1], provider_history=True)
+            text = cursor_import_user_preview(match[1]) if for_preview else match[1]
+            text = strip_agentsdock_generated_user_text(text, provider_history=True)
         parts.append(text)
     return normalized_history_item(role, "\n".join(parts), allow_user_boilerplate=True)
 
@@ -47494,22 +47575,19 @@ def local_cursor_session_candidates(known_provider_ids: set[str]) -> list[dict[s
         provider_id = session.provider_id
         if provider_id in known_provider_ids or provider_id in ambiguous:
             continue
-        title = native_session_title(session.title)
-        if title and title.casefold() == "new agent":
-            title = None
+        title = cursor_history.native_title(session.title)
         preview = None
         try:
             for index, event in enumerate(bounded_jsonl_events(session.transcript)):
                 if index >= 200:
                     break
-                item = cursor_history_event_item(event)
+                item = cursor_history_event_item(event, for_preview=True)
                 if item is not None and item["kind"] == "user":
-                    preview = item["text"][:160]
+                    preview = " ".join(item["text"].split())[:160]
                     break
         except (OSError, ValueError, RecursionError):
             continue
-        folder = Path(session.cwd).name
-        label = title or (f"{folder}: {preview}" if preview else f"{folder}: Cursor chat {provider_id[:8]}")
+        label = local_session_label(title or preview, f"Cursor chat {provider_id[:8]}")
         # Do not choose arbitrarily if a copied ID exists in multiple workspaces.
         if provider_id in candidates:
             candidates.pop(provider_id)
@@ -47517,7 +47595,7 @@ def local_cursor_session_candidates(known_provider_ids: set[str]) -> list[dict[s
             continue
         candidates[provider_id] = {
             "provider_session_id": provider_id, "backend": BACKEND_CURSOR,
-            "label": native_session_title(label) or f"Cursor chat {provider_id[:8]}",
+            "label": label,
             "updated_at": iso_from_timestamp(session.updated_at), "cwd": session.cwd,
         }
     return list(candidates.values())

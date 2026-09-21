@@ -14,11 +14,28 @@ from pathlib import Path
 import re
 import sqlite3
 import stat
+import unicodedata
 from typing import Iterator
 
 MAX_METADATA_BYTES = 64 * 1024
 MAX_SCAN_ENTRIES = 10_000
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}")
+
+
+def native_title(value: object) -> str | None:
+    """Bound display metadata before choosing between native naming sources.
+
+    Cursor's default is New Agent. Other names (including a user's literal
+    'New chat' or 'Untitled') are not generic AgentsDock placeholders here.
+    """
+    if not isinstance(value, str) or len(value) > 4096:
+        return None
+    clean = " ".join("".join(
+        character for character in value
+        if character.isspace()
+        or unicodedata.category(character) not in {"Cc", "Cf", "Cs"}
+    ).split())[:120]
+    return clean if clean and clean.casefold() != "new agent" else None
 
 
 def config_root(cwd: str | None = None) -> Path:
@@ -156,10 +173,8 @@ def read_session(directory: Path, root: Path, *, expected_cwd: str | None = None
         return None
     updated = sidecar.get("updatedAtMs")
     timestamp = updated / 1000 if type(updated) is int and 0 < updated < 253402300800000 else info.st_mtime
-    title = metadata["title"]
-    if not isinstance(title, str) or not title.strip() or title.strip().casefold() == "new agent":
-        title = sidecar.get("title")
-    return LocalSession(provider_id, cwd, title if isinstance(title, str) else None, timestamp, transcript)
+    title = native_title(metadata["title"]) or native_title(sidecar.get("title"))
+    return LocalSession(provider_id, cwd, title, timestamp, transcript)
 
 
 def find_session(provider_id: str, cwd: str) -> LocalSession | None:

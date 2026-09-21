@@ -13,10 +13,22 @@ explicitly named imports, forks, and child agents are not retroactively renamed.
 ## Resume and import labels
 
 - Claude import candidates prefer the last exact-session `custom-title`, then
-  the last `ai-title`, then the existing project/first-message fallback. Metadata
+  the last `ai-title`, then the first-user-message fallback. Metadata
   from another session or a sidechain is never used as the parent title.
 - Codex import candidates prefer a valid `session_index.jsonl` `thread_name`;
-  missing, malformed, oversized, or placeholder names keep the existing fallback.
+  missing, malformed, oversized, or placeholder names use the first user message.
+- Preview labels for Claude, Codex and Cursor do not repeat the project name;
+  workspace information stays in `cwd`. If no title or user text is readable,
+  use a provider/short-ID label. Listing never generates a new title with a model.
+  Preview-only follow-up: 201 focused tests passed, including first-message
+  selection, display sanitization, separate workspace metadata and distinct
+  sessions with identical previews. The updated test server's authenticated list
+  was checked against native titles and first messages after restart.
+- Legacy AgentsDock-wrapped inputs are not display titles: preview extraction
+  handles old Codex context without a jobs snapshot and Cursor's complete
+  instruction/current-prompt/tool-binding envelopes. Known human quotations and
+  incomplete wrappers remain intact. This is display-only; existing transcripts,
+  imported timeline events and reconciliation fingerprints are unchanged.
 - Resume by session ID reads existing titles for Claude, Codex, and Cursor before
   returning the new chat. Explicit custom names win. For compatibility with
   existing clients, the exact generated `Resumed <Provider> <first 8 ID chars>`
@@ -63,7 +75,7 @@ Discovery still has its existing scan/response limits; this is not pagination
 or a fixed 50-chat cap. Distinct main sessions with identical labels remain
 distinct. Deleting an AgentsDock entry does not delete its native transcript or
 create a permanent import-hide tombstone. A missing native title still falls
-back to the project/first message; discovery does not generate names with a model.
+back to the first user message; discovery does not generate names with a model.
 
 Verification: 104 focused tests passed, including a real HTTP picker fixture
 with 510 children, native titles, archives and cross-instance ownership together,

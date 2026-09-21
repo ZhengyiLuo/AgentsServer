@@ -12,6 +12,18 @@
   Cursor `--resume` runner, not a fresh session primed with imported text.
 - Prefer native metadata titles, then a human-message preview. `New Agent` is
   a placeholder. Discovery does not call a model to manufacture missing titles.
+  Display a valid native name unchanged apart from bounded display sanitization;
+  otherwise use the first user message (not the latest message or tool output).
+  Do not prefix the project: the unchanged `cwd` field carries that information.
+  If neither title nor user text is available, use `Cursor chat <short ID>`.
+  Sanitize the database name before trying the native sidecar fallback.
+  Import keeps the chosen label, including native names such as `New chat` or
+  `Untitled`; it does not schedule automatic renaming or change Cursor's data.
+  Preview extraction recognizes complete AgentsDock instruction/current-prompt
+  envelopes, length-delimited fork memory and validated authority/tool-binding
+  suffixes. A bare bracket heading or an incomplete/lookalike envelope is not
+  stripped. This display-only cleanup does not rewrite imported history or
+  change history reconciliation keys.
 - Apply current/cross-instance ownership filters before the list limit and
   recheck during import. Do not expose subagents, empty sessions, ambiguous IDs,
   missing workspaces or unreadable/mismatched native stores.
@@ -68,6 +80,20 @@ after import and app reopen, a contextual follow-up returned its earlier code
 word using the same native ID/workspace (exit 0). No private blobs were read by
 AgentsServer. Native execution also verified independent `CURSOR_DATA_DIR` and
 `CURSOR_CONFIG_DIR` handling. Mobile and packaged-app acceptance are not claimed.
+
+Title-preservation follow-up (2026-09-21): 376 focused import, naming, ownership,
+Cursor runtime, history-sync and packaging checks passed. Regressions cover
+native-over-sidecar precedence, sanitization before fallback, first-human-message
+selection and preserving the picker label after durable import without generation.
+An authenticated test-instance restart and read-only native-metadata/list check
+passed; no additional desktop/mobile UI acceptance is claimed for this follow-up.
+
+Preview-envelope follow-up (2026-09-21): 280 focused import, naming, ownership,
+history-sync and packaging tests passed. After restarting the test instance,
+authenticated list labels were checked directly against the affected native
+user messages. Internal instruction prefixes were absent, and source files,
+existing chat identities/titles and the separate production service were unchanged.
+This follow-up checks the live API, not additional GUI or packaged-app acceptance.
 
 Official CLI references: [parameters](https://cursor.com/docs/cli/reference/parameters),
 [using sessions](https://cursor.com/docs/cli/using),

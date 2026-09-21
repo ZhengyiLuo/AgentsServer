@@ -17,6 +17,25 @@ def text_event(role, text):
     return {"role": role, "message": {"content": [{"type": "text", "text": text}]}}
 
 
+def cursor_provider_envelope(prompt, *, memory=None):
+    session = {"backend": "cursor", "cwd": "/tmp", "memory_seed": memory or ""}
+    return server.build_cursor_provider_prompt(
+        "sess_preview_fixture", session, prompt, Path("/tmp/preview-fixture-manifest.json"),
+    )[0]
+
+
+def native_tool_binding():
+    name = "plugin-agentsdock-" + "a" * 24 + "-native"
+    return (
+        "\n\n[AgentsDock tool binding]\n"
+        f"For this turn only, use MCP server `{name}`, tool `run` "
+        f"(Cursor tool `{name}-run`) for AgentsDock helpers. "
+        "This supersedes older helper commands and earlier tool bindings. "
+        "No shell fallback, credential lookup, or full-access permission is needed. "
+        "Only this top-level agent may call it.\n[End AgentsDock tool binding]"
+    )
+
+
 class CursorFixture:
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="cursor-import-")
@@ -70,7 +89,116 @@ class CursorDiscoveryTests(CursorFixture, unittest.TestCase):
         self.fixture(title=" New Agent ", sidecar={"title": "Sidecar title"})
         self.assertEqual(server.local_cursor_session_candidates(set())[0]["label"], "Sidecar title")
         self.fixture(title="New Agent")
-        self.assertEqual(server.local_cursor_session_candidates(set())[0]["label"], "workspace: Original question")
+        self.assertEqual(server.local_cursor_session_candidates(set())[0]["label"], "Original question")
+
+    def test_native_title_wins_over_sidecar_and_prompt(self):
+        self.fixture(title="Original Cursor name", sidecar={"title": "Stale sidecar name"})
+        self.assertEqual(server.local_cursor_session_candidates(set())[0]["label"], "Original Cursor name")
+
+    def test_sanitize_before_falling_back_to_sidecar(self):
+        for title in (None, 42, "\x00\u200b", "New\u200b Agent", "x" * 4097):
+            with self.subTest(title_type=type(title).__name__):
+                self.fixture(title=title, sidecar={"title": "Native\x00 sidecar\n title"})
+                self.assertEqual(server.local_cursor_session_candidates(set())[0]["label"],
+                                 "Native sidecar title")
+
+    def test_cursor_names_are_not_agentsdock_placeholders(self):
+        for title in ("New chat", "Untitled", "New session - 2026-09-21"):
+            with self.subTest(title=title):
+                self.fixture(title=title)
+                self.assertEqual(server.local_cursor_session_candidates(set())[0]["label"], title)
+                self.assertEqual(server.cursor_native_session_title("native-cursor", str(self.cwd)), title)
+
+    def test_fallback_uses_first_human_message_not_internal_or_latest_text(self):
+        self.fixture(title="New Agent", events=[
+            text_event("user", "Internal context, not a human message"),
+            {"role": "user", "message": {"content": [{"type": "tool_result", "content": "Tool result"}]}},
+            text_event("assistant", "Earlier assistant content"),
+            text_event("user", "<user_query>" + "\n " * 100 + "First request\n continued</user_query>"),
+            text_event("assistant", "An answer"),
+            text_event("user", "<user_query>Latest request</user_query>"),
+        ])
+        self.assertEqual(server.local_cursor_session_candidates(set())[0]["label"],
+                         "First request continued")
+
+    def test_preview_is_message_text_not_a_placeholder_title(self):
+        for message, expected in (("New chat", "New chat"), ("New Agent", "New Agent"),
+                                  ("Fix\x00 the\n issue\u202e", "Fix the issue")):
+            with self.subTest(message=message):
+                self.fixture(title="New Agent", events=[text_event("user", f"<user_query>{message}</user_query>")])
+                candidate = server.local_cursor_session_candidates(set())[0]
+                self.assertEqual(candidate["label"], expected)
+                self.assertEqual(candidate["cwd"], str(self.cwd))
+
+    def test_no_native_title_or_user_text_uses_identity_not_project(self):
+        self.fixture(title="New Agent", events=[text_event("assistant", "Assistant-only export")])
+        self.assertEqual(server.local_cursor_session_candidates(set())[0]["label"], "Cursor chat native-c")
+
+    def test_identical_previews_in_different_projects_stay_distinct(self):
+        other = self.root / "another-project"
+        other.mkdir()
+        self.fixture("first", title="New Agent")
+        self.fixture("second", title="New Agent", cwd=other)
+        rows = server.local_cursor_session_candidates(set())
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({row["label"] for row in rows}, {"Original question"})
+        self.assertEqual({row["cwd"] for row in rows}, {str(self.cwd), str(other)})
+
+    def test_actual_server_envelope_is_not_the_first_message_preview(self):
+        wrapped = cursor_provider_envelope("Fix the real issue")
+        event = text_event("user", f"<user_query>\n{wrapped}\n</user_query>")
+        directory, transcript = self.fixture(title="New Agent", events=[event])
+        paths = [directory / "store.db", directory / "meta.json", transcript]
+        before = [path.read_bytes() for path in paths]
+        self.assertEqual(server.local_cursor_session_candidates(set())[0]["label"], "Fix the real issue")
+        self.assertEqual(server.cursor_history_event_item(event, for_preview=True)["text"], "Fix the real issue")
+        # This change is display-only; do not silently alter history projection.
+        self.assertTrue(server.cursor_history_event_item(event)["text"].startswith("[AgentsDock provider instructions]"))
+        self.assertEqual(before, [path.read_bytes() for path in paths])
+
+    def test_preview_uses_real_prompt_after_length_delimited_memory(self):
+        prompt = "[Current user prompt]\nThis marker is part of my example"
+        wrapped = cursor_provider_envelope(prompt, memory="Context with [Current user prompt] inside it")
+        self.assertEqual(server.cursor_import_user_preview(wrapped), prompt)
+
+    def test_resumed_current_prompt_requires_exact_tool_binding(self):
+        wrapped = "[Current user prompt]\nActual request" + native_tool_binding()
+        self.assertEqual(server.cursor_import_user_preview(wrapped), "Actual request")
+        for malformed in (wrapped.replace("plugin-agentsdock-", "plugin-other-", 1),
+                          wrapped.removesuffix("[End AgentsDock tool binding]")):
+            self.assertEqual(server.cursor_import_user_preview(malformed), malformed)
+
+    def test_current_prompt_with_generated_authority_suffix(self):
+        authority = server.cross_chat_provider_authority_block(
+            [], server.cross_chat_authority_path("run_preview_fixture", "a" * 32),
+            "sess_preview_fixture", {"publish"}, "blocked", compact=True,
+        )
+        wrapped = "[Current user prompt]\nActual request" + authority
+        self.assertEqual(server.cursor_import_user_preview(wrapped), "Actual request")
+
+    def test_quoted_and_incomplete_envelopes_are_preserved(self):
+        valid = cursor_provider_envelope("Actual request")
+        for text in (
+            "[Current user prompt]\nA native CLI user quotation",
+            "Please explain this:\n" + valid,
+            "```text\n" + valid + "\n```",
+            valid.replace("[End AgentsDock provider instructions]", "[Other footer]"),
+            valid.replace("You are operating through AgentsDock, backed by AgentsServer.", "Quoted instructions"),
+            cursor_provider_envelope("Actual request", memory="abc").replace("chars=3", "chars=99"),
+        ):
+            with self.subTest(prefix=text[:35]):
+                self.assertEqual(server.cursor_import_user_preview(text), text)
+
+    def test_native_title_wins_even_when_first_message_has_policy(self):
+        self.fixture(title="Original name", events=[text_event("user", "<user_query>" + cursor_provider_envelope("Actual request") + "</user_query>")])
+        self.assertEqual(server.local_cursor_session_candidates(set())[0]["label"], "Original name")
+
+    def test_empty_generated_prompt_does_not_hide_the_first_real_message(self):
+        self.fixture(title="New Agent", events=[
+            text_event("user", "<user_query>" + cursor_provider_envelope("") + "</user_query>"),
+            text_event("user", "<user_query>First real request</user_query>"),
+        ])
+        self.assertEqual(server.local_cursor_session_candidates(set())[0]["label"], "First real request")
 
     def test_invalid_entries_do_not_hide_a_valid_main_session(self):
         self.fixture("valid")
@@ -227,6 +355,45 @@ class CursorImportTests(CursorFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await server.import_session_history(session))["imported"], 2)
         self.assertEqual(session["title"], "My name")
         self.assertEqual((await server.import_session_history(session, force=True))["imported"], 0)
+
+    async def test_bulk_import_keeps_unwrapped_picker_title(self):
+        self.fixture(title="New Agent", events=[
+            text_event("user", "<user_query>" + cursor_provider_envelope("The first actual question") + "</user_query>"),
+            text_event("assistant", "An answer"),
+        ])
+        picker = await server.get_local_sessions(limit=100, include_cursor=True)
+        self.assertEqual(picker["sessions"][0]["label"], "The first actual question")
+        result = (await server.bulk_import_sessions_guarded(self.request(), set()))["results"][0]
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.store.sessions[result["session_id"]]["title"], "The first actual question")
+
+    async def test_picker_name_is_preserved_on_import_without_generation(self):
+        cases = [
+            ("Original Cursor name", "Original Cursor name"),
+            ("New Agent", "Original question"),
+            ("New chat", "New chat"),
+            ("Untitled", "Untitled"),
+        ]
+        with patch.object(server, "generate_session_title", new_callable=AsyncMock) as generate:
+            for index, (native_title, expected) in enumerate(cases):
+                with self.subTest(title=native_title):
+                    provider_id = f"named-cursor-{index}"
+                    self.fixture(provider_id, title=native_title)
+                    picker = await server.get_local_sessions(limit=100, include_cursor=True)
+                    candidate = next(row for row in picker["sessions"] if row["provider_session_id"] == provider_id)
+                    self.assertEqual(candidate["label"], expected)
+                    request = server.BulkImportSessionsRequest(items=[{
+                        "provider_session_id": provider_id, "backend": "cursor", "cwd": str(self.cwd),
+                    }])
+                    result = (await server.bulk_import_sessions_guarded(request, set()))["results"][0]
+                    self.assertTrue(result["ok"], result)
+                    session = self.store.sessions[result["session_id"]]
+                    self.assertEqual(session["title"], expected)
+                    self.assertEqual(session["_title_source"], "manual")
+                    self.assertFalse(server.generated_title_eligible(session))
+                    persisted = json.loads(server.SESSIONS_FILE.read_text())
+                    self.assertEqual(persisted[session["id"]]["title"], expected)
+            generate.assert_not_called()
 
     async def test_foreign_claim_and_changed_workspace_do_not_create_sessions(self):
         result = (await server.bulk_import_sessions_guarded(self.request(), {("cursor", "native-cursor")}))["results"][0]

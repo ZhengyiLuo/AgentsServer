@@ -65,7 +65,7 @@ class ImportTitleLabels(unittest.TestCase):
             {"type": "summary", "summary": "Not a title"},
             {"type": "ai-title", "aiTitle": "New chat"},
             {"type": "custom-title", "customTitle": {"bad": "shape"}},
-        ]), "project: Long original prompt")
+        ]), "Long original prompt")
 
     def test_claude_tail_title_after_large_middle(self):
         with self.transcript.open("a") as stream:
@@ -78,7 +78,22 @@ class ImportTitleLabels(unittest.TestCase):
     def test_claude_malformed_metadata_does_not_break_list(self):
         with self.transcript.open("ab") as stream:
             stream.write(b'not json\n{"bad utf8":"\xff"}\n')
-        self.assertEqual(self.claude_label([]), "project: Long original prompt")
+        self.assertEqual(self.claude_label([]), "Long original prompt")
+
+    def test_claude_preview_keeps_first_message_and_separate_workspace(self):
+        self.assertEqual(self.claude_label([
+            {"type": "user", "message": {"role": "user", "content": "Latest request"}},
+        ]), "Long original prompt")
+        self.assertEqual(server.local_claude_session_candidates(set())[0]["cwd"], "/work/project")
+
+    def test_preview_sanitization_does_not_filter_user_words(self):
+        for text, expected in (("New chat", "New chat"), ("New Agent", "New Agent"),
+                               ("  Fix\x00\n issue\u202e  ", "Fix issue"),
+                               ("\x00\u200b", "Fallback")):
+            with self.subTest(text=text):
+                self.assertEqual(server.local_session_label(text, "Fallback"), expected)
+        self.assertEqual(len(server.local_session_label("x" * 500, "Fallback")),
+                         server.MAX_LOCAL_SESSION_LABEL_CHARS)
 
     def test_deeply_nested_claude_and_codex_metadata_is_skipped(self):
         nested = "[" * 2000 + "0" + "]" * 2000
@@ -132,7 +147,71 @@ class ImportTitleLabels(unittest.TestCase):
                 with self.subTest(value=str(value)[:30]):
                     index.write_text(json.dumps({"id": "native-chat", "thread_name": value}) + "\n")
                     self.assertEqual(server.local_codex_session_candidates(set())[0]["label"],
-                                     "project: Original Codex prompt")
+                                     "Original Codex prompt")
+
+    def test_codex_preview_keeps_first_message_and_separate_workspace(self):
+        transcripts = self.root / "codex"
+        transcript = transcripts / "rollout.jsonl"
+        write_codex_transcript(transcript, session_id="native-chat", cwd="/work/project",
+                               first_user_text="Original Codex prompt")
+        with transcript.open("a") as stream:
+            stream.write(json.dumps({"type": "response_item", "payload": {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "Latest request"}],
+            }}) + "\n")
+        with patch.object(server, "CODEX_SESSIONS_ROOT", transcripts), patch.object(
+            server, "CODEX_SESSION_INDEX_PATH", self.root / "missing-index.jsonl",
+        ):
+            candidate = server.local_codex_session_candidates(set())[0]
+        self.assertEqual(candidate["label"], "Original Codex prompt")
+        self.assertEqual(candidate["cwd"], "/work/project")
+
+
+class LegacyCodexPreviewTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "rollout.jsonl"
+
+    def wrapper(self, prompt):
+        return ("[AgentsDock context]\n"
+                "You are responding through AgentsDock, backed by AgentsServer.\n"
+                "- Keep the final answer concise.\nUser prompt follows.\n]\n\n" + prompt)
+
+    def event(self, text, **payload):
+        return {"type": "event_msg", "payload": {"type": "user_message", "message": text, **payload}}
+
+    def preview(self, *events):
+        self.path.write_text("".join(json.dumps(event) + "\n" for event in events))
+        before = self.path.read_bytes()
+        preview = server.codex_transcript_preview(self.path)
+        self.assertEqual(self.path.read_bytes(), before)
+        return preview
+
+    def test_legacy_context_without_jobs_is_not_a_user_title(self):
+        original = self.wrapper("Original question")
+        self.assertEqual(self.preview(self.event(original)), "Original question")
+        self.assertEqual(server.codex_history_event_item(self.event(original))["text"], original)
+
+    def test_legacy_context_with_jobs_and_per_chat_instructions(self):
+        original = self.wrapper(
+            "Scheduled jobs:\nCurrent jobs for this chat (turn-start snapshot; prompts omitted):\n(none)\n\n"
+            "[Per-chat system instructions]\nTest policy\n[End per-chat system instructions]\n\nReal question"
+        )
+        self.assertEqual(self.preview(self.event(original)), "Real question")
+
+    def test_empty_generated_context_skips_to_first_real_user_message(self):
+        self.assertEqual(self.preview(self.event(self.wrapper("")), self.event("First real question")),
+                         "First real question")
+
+    def test_human_quotation_and_incomplete_context_are_preserved(self):
+        original = self.wrapper("Quoted text")
+        self.assertEqual(self.preview(self.event(original, provider_user_authored=True)), original[:160])
+        for text in ("Please explain:\n" + original,
+                     original.replace("User prompt follows.\n]\n\n", "Missing boundary\n"),
+                     original.replace("You are responding through AgentsDock, backed by AgentsServer.", "A user's example")):
+            with self.subTest(prefix=text[:35]):
+                self.assertEqual(self.preview(self.event(text)), text[:160])
 
 
 class CursorNativeMetadata(unittest.TestCase):

@@ -85,6 +85,12 @@ Describe differences and extra provider usage for server-provided equivalents.
   versus generated titles, placeholder/missing titles, duplicate labels, manual
   AgentsDock names and malicious/control-character metadata. Listing/renaming
   must not spend model usage or mutate native stores.
+  Verify the picker and imported chat retain the same native name; when absent,
+  use the first human message, never the latest message/tool output. Keep the
+  project in `cwd`, not as a duplicated prefix in the preview label.
+  Include actual server-generated prompt envelopes in preview tests (policy,
+  current-prompt, memory and tool-binding wrappers); role=user alone does not
+  establish that the first text is the user's request. Preserve quoted markers.
 - [ ] Exclude child/subagent, confirmed archived, empty and unavailable native
   sessions as supported by each provider's metadata. Do not hide stopped main
   chats or ordinary user forks. Define what "deleted" means: deleting an

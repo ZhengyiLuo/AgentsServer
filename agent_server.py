@@ -74,6 +74,7 @@ import chat_mailbox
 import workspace_git
 import codex_auth
 import codex_provider
+import local_session_ownership
 
 from codex_app_server import (
     CodexAppServerDisconnected,
@@ -45283,10 +45284,16 @@ def contained_jsonl_path(path: Path, root: Path) -> Path | None:
         return None
 
 
-def bounded_jsonl_paths(root: Path) -> Iterator[Path]:
+def bounded_jsonl_paths(
+    root: Path,
+    *,
+    excluded_directory_names: frozenset[str] = frozenset(),
+) -> Iterator[Path]:
     try:
         resolved_root = root.expanduser().resolve(strict=True)
     except (OSError, RuntimeError):
+        return
+    if resolved_root.name in excluded_directory_names:
         return
     scanned = 0
     pending = [resolved_root]
@@ -45308,7 +45315,8 @@ def bounded_jsonl_paths(root: Path) -> Iterator[Path]:
                     return
                 try:
                     if entry.is_dir(follow_symlinks=False):
-                        pending.append(Path(entry.path))
+                        if entry.name not in excluded_directory_names:
+                            pending.append(Path(entry.path))
                     elif (
                         entry.name.endswith(".jsonl")
                         and entry.is_file(follow_symlinks=False)
@@ -47253,14 +47261,38 @@ def local_session_label(value: Any, fallback: str) -> str:
     return (clean or fallback)[:MAX_LOCAL_SESSION_LABEL_CHARS]
 
 
+def claude_transcript_is_subagent(path: Path) -> bool:
+    # Older Claude versions also stored sidechains beside main transcripts.
+    # Inspect conversation records, not copied title/summary metadata or text.
+    for region in bounded_claude_transcript_regions(path):
+        for raw_line in region.splitlines():
+            if not raw_line or len(raw_line) > CLAUDE_TRANSCRIPT_CWD_LINE_BYTES:
+                continue
+            try:
+                event = json.loads(raw_line)
+            except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+                continue
+            if not isinstance(event, dict) or event.get("type") not in {"user", "assistant"}:
+                continue
+            if event.get("sessionId") not in (None, path.stem):
+                continue
+            if event.get("isSidechain") is True:
+                return True
+    return False
+
+
 def local_claude_session_candidates(known_provider_ids: set[str]) -> list[dict[str, Any]]:
     if not CLAUDE_PROJECTS_ROOT.exists():
         return []
     candidates: list[dict[str, Any]] = []
     newest_paths: dict[str, tuple[float, Path]] = {}
-    for path in bounded_jsonl_paths(CLAUDE_PROJECTS_ROOT):
+    for path in bounded_jsonl_paths(
+        CLAUDE_PROJECTS_ROOT, excluded_directory_names=frozenset({"subagents"}),
+    ):
         provider_id = provider_session_identifier(path.stem)
         if not provider_id or provider_id in known_provider_ids:
+            continue
+        if claude_transcript_is_subagent(path):
             continue
         with suppress(OSError):
             mtime = path.stat().st_mtime
@@ -47290,7 +47322,24 @@ def local_claude_session_candidates(known_provider_ids: set[str]) -> list[dict[s
 CODEX_TRANSCRIPT_SCAN_LINES = 200
 
 
-def codex_transcript_meta(path: Path) -> tuple[str | None, str | None]:
+def codex_session_meta_is_subagent(payload: dict[str, Any]) -> bool:
+    # Parent identity denotes a child, whereas forked_from_id alone can be an
+    # ordinary user-created fork and must remain resumable in the picker.
+    if any(isinstance(payload.get(key), str) and payload[key].strip()
+           for key in ("parent_thread_id", "parentThreadId")):
+        return True
+    for key in ("source", "thread_source", "threadSource"):
+        source = payload.get(key)
+        if isinstance(source, dict) and any(name in source for name in ("subagent", "subAgent")):
+            return True
+        if isinstance(source, str) and source.replace("_", "").lower().startswith("subagent"):
+            return True
+    return False
+
+
+def codex_transcript_meta(
+    path: Path, *, exclude_subagents: bool = False,
+) -> tuple[str | None, str | None]:
     """Return (session_id, cwd) from a Codex transcript's session_meta record."""
     with suppress(OSError, ValueError):
         for index, event in enumerate(bounded_jsonl_events(path)):
@@ -47299,6 +47348,8 @@ def codex_transcript_meta(path: Path) -> tuple[str | None, str | None]:
             if event.get("type") != "session_meta":
                 continue
             payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            if exclude_subagents and codex_session_meta_is_subagent(payload):
+                return None, None
             session_id = provider_session_identifier(
                 payload.get("id") or payload.get("session_id")
             )
@@ -47360,8 +47411,12 @@ def local_codex_session_candidates(known_provider_ids: set[str]) -> list[dict[st
     thread_names = codex_session_index_thread_names()
     candidates: list[dict[str, Any]] = []
     newest_paths: dict[str, tuple[float, Path, str | None]] = {}
-    for path in bounded_jsonl_paths(CODEX_SESSIONS_ROOT):
-        provider_id, cwd = codex_transcript_meta(path)
+    # Native archive moves rollouts out of sessions/ into archived_sessions/.
+    # Also prune that directory if an operator configured a broader scan root.
+    for path in bounded_jsonl_paths(
+        CODEX_SESSIONS_ROOT, excluded_directory_names=frozenset({"archived_sessions"}),
+    ):
+        provider_id, cwd = codex_transcript_meta(path, exclude_subagents=True)
         if not provider_id or provider_id in known_provider_ids:
             continue
         with suppress(OSError):
@@ -47390,17 +47445,15 @@ def local_session_candidates(
     limit: int,
     known_provider_keys: set[tuple[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Enumerate local Claude/Codex sessions not already imported into AgentsDock."""
+    """Enumerate sessions not already used by this or another local instance."""
 
     if known_provider_keys is None:
         known_provider_keys = {
-            (
-                str(sess.get("backend") or DEFAULT_BACKEND).strip().lower(),
-                str(pid),
-            )
+            key
             for sess in STORE.sessions.values()
-            if (pid := session_provider_id(sess))
+            for key in local_session_ownership.provider_session_keys(sess, DEFAULT_BACKEND)
         }
+    known_provider_keys = known_provider_keys | other_local_instance_provider_keys()
     claude_known = {
         provider_id
         for backend, provider_id in known_provider_keys
@@ -47417,6 +47470,33 @@ def local_session_candidates(
     ]
     candidates.sort(key=lambda c: c["updated_at"], reverse=True)
     return candidates[:max(1, min(limit, MAX_LOCAL_SESSION_LIST_ITEMS))]
+
+
+def other_local_instance_provider_keys() -> set[tuple[str, str]]:
+    try:
+        return local_session_ownership.other_instance_provider_keys(STATE_DIR)
+    except (OSError, ValueError) as exc:
+        logger.warning("local import ownership check failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Cannot verify chats already used by other local server instances. Check their configuration/session indexes and retry.",
+        ) from exc
+
+
+@contextmanager
+def local_history_import_guard():
+    guard = local_session_ownership.history_import_lock()
+    try:
+        guard.__enter__()
+    except (OSError, ValueError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Local history import is busy or unavailable. Retry when the other import has finished.",
+        ) from exc
+    try:
+        yield
+    finally:
+        guard.__exit__(None, None, None)
 
 
 def standalone_provider_session(sess: dict[str, Any]) -> dict[str, Any]:
@@ -81653,6 +81733,20 @@ async def complete_working_directory(
 
 @app.post("/api/sessions")
 async def create_session(req: CreateSessionRequest) -> dict[str, Any]:
+    provider_keys = local_session_ownership.provider_session_keys(req.model_dump(), DEFAULT_BACKEND)
+    if provider_keys:
+        with local_history_import_guard():
+            foreign_keys = await asyncio.to_thread(other_local_instance_provider_keys)
+            if provider_keys & foreign_keys:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This provider conversation is already used by another local AgentsServer instance. Open it there instead.",
+                )
+            return await create_session_with_history(req)
+    return await create_session_with_history(req)
+
+
+async def create_session_with_history(req: CreateSessionRequest) -> dict[str, Any]:
     sess = await STORE.create(req)
     provider_id = session_provider_id(sess)
     should_import = bool(provider_id) if req.import_history is None else req.import_history
@@ -81665,16 +81759,13 @@ async def create_session(req: CreateSessionRequest) -> dict[str, Any]:
 async def get_local_sessions(
     limit: int = Query(default=200, ge=1, le=MAX_LOCAL_SESSION_LIST_ITEMS),
 ) -> dict[str, Any]:
-    """List local Claude/Codex chat history not yet imported into AgentsDock."""
+    """List main conversations unused by any installed same-user local instance."""
 
     async with STORE._lock:
         known_provider_keys = {
-            (
-                str(session.get("backend") or DEFAULT_BACKEND).strip().lower(),
-                str(provider_id),
-            )
+            key
             for session in STORE.sessions.values()
-            if (provider_id := session_provider_id(session))
+            for key in local_session_ownership.provider_session_keys(session, DEFAULT_BACKEND)
         }
     sessions = await asyncio.to_thread(
         local_session_candidates,
@@ -81733,15 +81824,20 @@ async def bulk_import_sessions(req: BulkImportSessionsRequest) -> dict[str, Any]
             status_code=400,
             detail=f"at most {MAX_BULK_IMPORT_ITEMS} items are allowed per bulk import",
         )
+    with local_history_import_guard():
+        foreign_keys = await asyncio.to_thread(other_local_instance_provider_keys)
+        return await bulk_import_sessions_guarded(req, foreign_keys)
+
+
+async def bulk_import_sessions_guarded(
+    req: BulkImportSessionsRequest, foreign_keys: set[tuple[str, str]],
+) -> dict[str, Any]:
     async with LOCAL_SESSION_IMPORT_LOCK:
         async with STORE._lock:
             known_provider_keys = {
-                (
-                    str(session.get("backend") or DEFAULT_BACKEND).strip().lower(),
-                    str(provider_id),
-                )
+                key
                 for session in STORE.sessions.values()
-                if (provider_id := session_provider_id(session))
+                for key in local_session_ownership.provider_session_keys(session, DEFAULT_BACKEND)
             }
         available = await asyncio.to_thread(
             local_session_candidates,
@@ -81765,12 +81861,13 @@ async def bulk_import_sessions(req: BulkImportSessionsRequest) -> dict[str, Any]
                 ))
                 continue
             requested_keys.add(key)
-            if key in known_provider_keys:
+            if key in known_provider_keys or key in foreign_keys:
                 results.append(bulk_import_result(
                     item,
                     ok=False,
                     code="already_imported",
-                    error="This local session is already present in AgentsDock.",
+                    error=("This local session is already used by another local AgentsServer instance."
+                           if key in foreign_keys else "This local session is already present in AgentsDock."),
                 ))
                 continue
             candidate = candidate_by_key.get(key)

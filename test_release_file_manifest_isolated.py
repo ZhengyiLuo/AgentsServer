@@ -12,6 +12,7 @@ import unittest
 
 ROOT = Path(__file__).parent
 NEW_MODULES = {
+    "local_session_ownership.py",
     "workspace_git.py",
     "codex_auth.py",
     "codex_provider.py",

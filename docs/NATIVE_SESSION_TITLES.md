@@ -30,6 +30,47 @@ Cursor's existing path is **resume by ID**, not bulk history import. The import
 candidate API and bulk importer still support Claude/Codex only; this change does
 not advertise Cursor transcript import to clients that cannot handle it.
 
+### Import discovery safeguards on the 1.0 release line
+
+The title branch is based on `release/1.0` (`c2caa7f`), which does not contain
+main's earlier #108/#112 import safeguards. Those safeguards are now explicitly
+backported alongside naming rather than inferred from the release version:
+
+- Prune Claude `subagents/` directories and confirmed legacy sidechain message
+  records. Copied child title metadata or a different session's records do not
+  hide a main conversation.
+- Exclude Codex child-source/parent metadata and `archived_sessions/`, including
+  broad/custom scan roots. Ordinary user forks and stopped main chats remain.
+- Exclude provider identities used by the current or other installed same-user
+  local instances **before** applying the response limit. Parked provider IDs,
+  stopped instances and archived AgentsDock chats still count as owned.
+- Recheck cross-instance ownership for bulk import and manual resume, including
+  `import_history: false`. A shared nonblocking lock serializes cooperating
+  imports; unreadable/unsafe ownership indexes fail closed with a retryable error.
+  Fresh chats without an existing provider ID do not need that scan or lock.
+
+`local_session_ownership.py` contains the compatible registry/index reader and
+import lock extracted from main's `server_instances.py`, without backporting
+service-install/remove commands. It is included in all runtime packaging lists.
+No service, registry or other instance's history is modified during discovery.
+Older servers do not participate in the import lock until upgraded; this is not
+a global provider lock or a cross-machine ownership service.
+
+Discovery still has its existing scan/response limits; this is not pagination
+or a fixed 50-chat cap. Distinct main sessions with identical labels remain
+distinct. Deleting an AgentsDock entry does not delete its native transcript or
+create a permanent import-hide tombstone. A missing native title still falls
+back to the project/first message; discovery does not generate names with a model.
+
+Verification: 104 focused tests passed, including a real HTTP picker fixture
+with 510 children, native titles, archives and cross-instance ownership together,
+stale-picker/manual-resume rejection, read-only checks, cancellation, corrupt
+indexes, and packaging. The wider 427-test run passed 426 tests; the existing
+Cursor hung-process test exceeded its two-second wall-clock assertion. That
+same failure reproduced on the unchanged `7d44880` title-branch baseline (2.49s),
+so it is recorded separately, not hidden by relaxing the assertion. Syntax and
+diff checks passed. No full-suite or client UI success is claimed.
+
 ### Cursor metadata compatibility
 
 The CLI 2026.09.18 local format was verified read-only: configuration directory

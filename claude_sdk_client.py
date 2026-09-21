@@ -3085,6 +3085,7 @@ class ClaudeSDKSupervisorManager:
         *,
         options: Any,
         configuration_key: str,
+        reuse_connected: bool = False,
     ) -> ClaudeSDKSupervisor:
         """Return and pin the exact supervisor used by one MCP HTTP request."""
 
@@ -3095,11 +3096,15 @@ class ClaudeSDKSupervisorManager:
             raise ValueError("chat_id is required")
         await self._wait_for_eviction(clean_chat_id)
         async with self._lock:
-            supervisor, old_to_close = await self._get_locked(
-                clean_chat_id,
-                options=options,
-                configuration_key=str(configuration_key),
-            )
+            supervisor = self._supervisors.get(clean_chat_id)
+            old_to_close = None
+            if not (reuse_connected and supervisor is not None
+                    and supervisor.connected and not supervisor.closed):
+                supervisor, old_to_close = await self._get_locked(
+                    clean_chat_id,
+                    options=options,
+                    configuration_key=str(configuration_key),
+                )
             self._pins[clean_chat_id] = self._pins.get(clean_chat_id, 0) + 1
         if old_to_close is not None:
             try:
@@ -3190,6 +3195,10 @@ class ClaudeSDKSupervisorManager:
             clean_chat_id,
             options=options,
             configuration_key=configuration_key,
+            # /btw reads the live parent's context and settings. Saved settings
+            # may already describe the next main turn; applying them here can
+            # reject an active parent or replace an idle native conversation.
+            reuse_connected=True,
         )
         side_task: asyncio.Task[dict[str, Any]] | None = None
         retired_task: asyncio.Task[bool] | None = None

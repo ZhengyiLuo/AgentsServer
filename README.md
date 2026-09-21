@@ -805,14 +805,13 @@ background configuration refresh is added.
 
 ## Side Questions
 
-Native clients can ask Codex or Claude a temporary side question about recent
-visible conversation text without changing the main turn, queue, goals or chat
-history. Capability-gated POST/DELETE endpoints provide independent answers,
-bounded follow-up side-conversation history, and cancellation. The response
-describes the bounded text snapshot; tool results, attachments and hidden
-provider context are not included. See
-[Side questions](docs/SIDE_QUESTIONS.md) for the API, provider isolation and
-context limitations.
+Native clients can ask Codex or Claude a temporary side question using the
+provider's conversation context, including completed tool results, without
+changing the main turn, queue, goals or chat history. Codex uses an ephemeral
+fork; Claude uses its native side-question control on the existing connection.
+Saved settings for a later Claude turn do not reconfigure that connection when
+asking a side question. See [Native side conversations](docs/NATIVE_SIDE_CHAT.md)
+for follow-ups, cancellation and context behavior.
 
 ## Context Digests
 

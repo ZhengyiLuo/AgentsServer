@@ -1,5 +1,17 @@
 # Development and release log
 
+## 2026-09-21 — Retain failed scheduled-run status — source acceptance
+
+- Classify terminal scheduled-run events with nonzero exit codes as failed.
+  A later `turn_finished` event can no longer overwrite a preceding stream error
+  with a successful-looking completed status. Preserve successful, legacy, and
+  explicitly stopped runs; refresh cached history with projection version 7.
+- Pass 33 job-history and timeline checks, including the observed error followed
+  by `turn_finished` with exit code 1. Both job history and timeline summary keep
+  the failure and its error output after rebuilding an old cached projection.
+- Availability: tested source correction for the coordinated release; existing
+  production event logs remain unchanged.
+
 ## 2026-09-21 — Restore native custom-endpoint retries — source acceptance
 
 - Stop applying connection-test retry limits to ordinary custom-endpoint chats.

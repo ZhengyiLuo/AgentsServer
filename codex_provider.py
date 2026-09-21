@@ -29,6 +29,7 @@ PROVIDER_ID = "agentsdock_custom"
 ENV_KEY = "AGENTSDOCK_CODEX_PROVIDER_API_KEY"
 MAX_BODY_BYTES = 16 * 1024
 MAX_SUMMARY_CAPABILITIES_BYTES = 192 * 1024
+MAX_MODEL_CATALOG_BYTES = 384 * 1024
 TEST_TIMEOUT_SECONDS = 45
 TEST_TOOL = "agentsdock_compatibility_ping"
 TEST_INSTRUCTIONS = (
@@ -58,6 +59,7 @@ def model_capability(value: dict | None = None) -> dict:
     supported = supported if isinstance(supported, bool) else None
     efforts = value.get("reasoning_efforts")
     allowed = {option["value"] for option in EFFORT_OPTIONS}
+    efforts = [effort.get("effort") if isinstance(effort, dict) else effort for effort in efforts] if isinstance(efforts, list) else []
     efforts = list(dict.fromkeys(effort for effort in efforts if isinstance(effort, str) and effort in allowed)) if isinstance(efforts, list) else []
     if supported is False:
         efforts = []
@@ -89,7 +91,7 @@ def turn_overrides(model: str, effort: str = "", *, summary: str = "none") -> di
         **({"effort": effort} if effort else {})}
 
 
-def discovered_model_capability(entry: dict, model: str) -> dict | None:
+def discovered_model_capability(entry: dict, model: str, native_models: dict | None = None) -> dict | None:
     """Exclude affirmative non-chat evidence; unfamiliar IDs remain usable."""
     non_chat = {"embedding", "embeddings", "rerank", "reranking", "moderation", "image-generation",
         "text-to-image", "image", "text-to-speech", "speech-to-text", "transcription", "tts", "video-generation"}
@@ -110,8 +112,24 @@ def discovered_model_capability(entry: dict, model: str) -> dict | None:
         return None
     reasoning = entry.get("reasoning") if isinstance(entry.get("reasoning"), dict) else {}
     supported = entry.get("reasoning_supported", entry.get("supports_reasoning", capabilities.get("reasoning", reasoning.get("supported"))))
-    efforts = entry.get("supported_reasoning_efforts", entry.get("reasoning_efforts",
-        capabilities.get("reasoning_efforts", reasoning.get("efforts", []))))
+    effort_fields = [(source, key) for source, keys in (
+        (entry, ("supported_reasoning_efforts", "reasoning_efforts", "supported_reasoning_levels")),
+        (capabilities, ("supported_reasoning_efforts", "reasoning_efforts", "supported_reasoning_levels")),
+        (reasoning, ("efforts", "supported_reasoning_levels")),
+    ) for key in keys]
+    efforts = next((source[key] for source, key in effort_fields if key in source), [])
+    explicit_reasoning = (any(key in source for source, key in effort_fields)
+        or any(key in entry for key in ("reasoning_supported", "supports_reasoning"))
+        or "reasoning" in capabilities or "supported" in reasoning)
+    if not explicit_reasoning and entry.get("owned_by") == "openai" and entry.get("mode") == "responses":
+        # An explicitly OpenAI Responses model may use its installed native
+        # model's effort choices. This does not verify gateway compatibility.
+        native_entries = native_models.get("models") if isinstance(native_models, dict) else None
+        native_name = model.rsplit("/", 1)[-1]
+        native_model = next((item for item in native_entries
+            if isinstance(item, dict) and item.get("slug") == native_name), None) if isinstance(native_entries, list) else None
+        if native_model:
+            efforts = native_model.get("supported_reasoning_levels", [])
     summary_supported = entry.get("reasoning_summary_supported", entry.get("supports_reasoning_summary_parameter",
         capabilities.get("reasoning_summary", reasoning.get("summary_supported"))))
     return model_capability({"kind": "chat" if declared & chat else "unknown",
@@ -181,6 +199,7 @@ class ProviderStore:
         self.root = root
         self.lock = threading.RLock()
         self._catalogs: dict[str, dict] = {}
+        self._saved_catalogs: dict[str, dict] = {}
         self._model_capabilities: dict[str, dict[str, dict]] = {}
         self._summary_capabilities: dict[str, dict[str, bool]] = {}
         self._public_selections: dict[str, dict] = {}
@@ -333,7 +352,9 @@ class ProviderStore:
             if selected and "api_key" not in selected and identifier not in self._revision_catalog_keys:
                 selected = self.selection(include_key=True, revision=selected.get("credential_id"))
             key = (catalog_key(selected) if "api_key" in selected else self._revision_catalog_keys.get(identifier)) if selected else None
-            cached = self._catalogs.get(key, {})
+            cached = self._catalogs.get(key)
+            if cached is None:
+                cached = self._saved_model_catalog(selected)
             capabilities = {model["value"]: model_capability(cached.get("model_capabilities", {}).get(model["value"]))
                 for model in cached.get("models", [])}
             for model, evidence in self._model_capabilities.get(key, {}).items():
@@ -355,12 +376,76 @@ class ProviderStore:
             self._catalogs[catalog_key(selected)] = {"models": models,
                 "model_capabilities": {model["value"]: model_capability(catalog.get("model_capabilities", {}).get(model["value"])) for model in models},
                 "default_model": catalog.get("default_model", "")}
+            self._save_model_catalog(selected, self._catalogs[catalog_key(selected)])
             # Apply fresh explicit denials when discovery completes, rather
             # than letting old metadata veto a later successful model check.
             denials = {model["value"]: False for model in models
                 if catalog.get("model_capabilities", {}).get(model["value"], {}).get("reasoning_summary_supported") is False}
             if denials:
                 self._cache_summary_capabilities(selected, denials)
+
+    def _save_model_catalog(self, selected: dict, catalog: dict) -> None:
+        identifier = selected.get("credential_id")
+        if not isinstance(identifier, str) or not re.fullmatch(r"[0-9a-f]{32}", identifier):
+            return
+        saved = self.selection(include_key=True, revision=identifier)
+        if not saved or catalog_key(saved) != catalog_key(selected):
+            raise HTTPException(409, "The saved endpoint changed. Refresh before discovering models.")
+        # Basic-check status and summary observations keep their independent
+        # lifetimes. Only the discovered model list and effort choices reload.
+        metadata = {**catalog, "model_capabilities": {model: {
+            name: value for name, value in capability.items()
+            if name not in {"compatibility", "reasoning_summary_supported"}}
+            for model, capability in catalog["model_capabilities"].items()}}
+        record = {"version": 1, "credential_id": identifier, "binding": binding(saved),
+            "catalog_key": catalog_key(saved), "catalog": metadata}
+        if len(json.dumps(record, separators=(",", ":")).encode()) > MAX_MODEL_CATALOG_BYTES:
+            return
+        try:
+            self._atomic("model-catalog-" + identifier + ".json", record)
+        except (OSError, HTTPException):
+            pass
+        self._saved_catalogs[identifier] = metadata
+
+    def _saved_model_catalog(self, selected: dict | None) -> dict:
+        identifier = (selected or {}).get("credential_id")
+        if not isinstance(identifier, str) or not re.fullmatch(r"[0-9a-f]{32}", identifier):
+            return {}
+        if identifier in self._saved_catalogs:
+            return self._saved_catalogs[identifier]
+        try:
+            if identifier not in self._revision_catalog_keys:
+                self.selection(revision=identifier)
+            expected_key = self._revision_catalog_keys.get(identifier)
+            if "api_key" in selected and catalog_key(selected) != expected_key:
+                return {}
+            record = self._read("model-catalog-" + identifier + ".json", max_bytes=MAX_MODEL_CATALOG_BYTES)
+            if record is None:
+                self._saved_catalogs[identifier] = {}
+                return {}
+            catalog = record.get("catalog")
+            if (record.get("version") != 1 or record.get("credential_id") != identifier
+                    or record.get("binding") != binding(selected)
+                    or record.get("catalog_key") != expected_key
+                    or not isinstance(catalog, dict) or not isinstance(catalog.get("models"), list)
+                    or len(catalog["models"]) > 512 or not isinstance(catalog.get("model_capabilities"), dict)):
+                raise ValueError("Invalid saved model catalog")
+            models = [{"value": validate_model(model.get("value")), "label": validate_model(model.get("value"))}
+                for model in catalog["models"]]
+            if len({model["value"] for model in models}) != len(models):
+                raise ValueError("Duplicate saved model identities")
+            capabilities = {model["value"]: model_capability({
+                **catalog["model_capabilities"].get(model["value"], {}),
+                "compatibility": "unverified", "reasoning_summary_supported": None}) for model in models}
+            default_model = catalog.get("default_model") or ""
+            if default_model and default_model not in capabilities:
+                raise ValueError("Invalid saved default model")
+            result = {"models": models, "model_capabilities": capabilities, "default_model": default_model}
+            self._saved_catalogs[identifier] = result
+            return result
+        except Exception:
+            # Optional catalog metadata never blocks opening a custom chat.
+            return {}
 
     def cache_model_capability(self, selected: dict, capability: dict):
         """Retain only probe evidence for this exact endpoint/key/model tuple."""
@@ -632,7 +717,7 @@ class _NoModelRedirects(HTTPRedirectHandler):
         return None
 
 
-def discover_models(selected: dict) -> dict:
+def discover_models(selected: dict, native_models: dict | None = None) -> dict:
     """One bounded operator-requested listing; never forward a key on redirect."""
     request = URLRequest(selected["base_url"] + "/models", headers={
         "Authorization": "Bearer " + selected["api_key"], "Accept": "application/json"})
@@ -655,7 +740,7 @@ def discover_models(selected: dict) -> dict:
                 value = validate_model(entry.get("id"))
             except HTTPException:
                 continue
-            capability = discovered_model_capability(entry, value)
+            capability = discovered_model_capability(entry, value, native_models)
             if capability is None:
                 continue
             if value not in seen:
@@ -894,7 +979,7 @@ async def test_connection(selected: dict, *, executable: str, environment: dict,
                 raise asyncio.CancelledError
 
 
-def create_router(*, authorize, store: ProviderStore, mutate, probe, available, discover=discover_models, session_lookup=None) -> APIRouter:
+def create_router(*, authorize, store: ProviderStore, mutate, probe, available, discover=discover_models, session_lookup=None, native_models=None) -> APIRouter:
     router = APIRouter()
 
     async def body(request, *, saved=False):
@@ -939,7 +1024,16 @@ def create_router(*, authorize, store: ProviderStore, mutate, probe, available, 
             raise HTTPException(503, "Custom providers require native Codex app-server transport.")
 
     async def catalog(selected):
-        result = await asyncio.to_thread(discover, selected)
+        # Native metadata is local and credential-free; endpoint discovery stays
+        # explicit and supplies the identity/ownership fence for any fallback.
+        if native_models is not None:
+            try:
+                native = await native_models()
+            except (HTTPException, OSError, ValueError):
+                native = None
+            result = await asyncio.to_thread(discover, selected, native_models=native)
+        else:
+            result = await asyncio.to_thread(discover, selected)
         if result.get("ok") is True:
             store.cache_catalog(selected, result)
             return {**result, **store.cached_catalog(selected)}

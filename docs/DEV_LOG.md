@@ -1,5 +1,25 @@
 # Development and release log
 
+## 2026-09-20 — Custom OpenAI model effort choices — source acceptance
+
+- Accept native structured effort metadata from endpoint discovery. For an
+  explicitly OpenAI-owned Responses model with no reasoning metadata, derive
+  choices only from its exact matching installed Codex model. Explicit endpoint
+  restrictions take precedence; discovery does not certify gateway compatibility.
+- Persist discovered model IDs and effort choices privately for their exact
+  credential revision. Keep compatibility and summary evidence independent;
+  a different endpoint revision cannot inherit old choices. After updating an
+  existing server, use the model picker's Refresh models action once.
+- Pass 65 focused provider/session/readiness checks and Python compilation.
+  In native offscreen Electron connected to an isolated production server,
+  click Refresh models, select Low, reopen the picker and send a real Codex
+  turn. Confirm the native Responses request carries the selected model and
+  `reasoning.effort: "low"`; the endpoint returns a completed response. Model
+  choices include the levels reported by the installed native catalog.
+- The UI bootstrap uses an isolated seeded profile. Production preload, IPC,
+  HTTP authorization, native Codex and the real endpoint are exercised.
+  Availability: committed source correction, not deployed or published.
+
 ## 2026-09-20 — Claude side chat after settings changes — source acceptance
 
 - Keep side questions on the connected parent Claude conversation when saved

@@ -100,6 +100,30 @@ class StoreTests(unittest.TestCase):
         self.store.save({**SELECTION, "api_key": "replacement-synthetic"})
         self.assertEqual(provider.runtime_summary(SELECTION, self.store.cached_catalog()), "none")
 
+    def test_discovered_efforts_reload_for_the_exact_saved_revision(self):
+        self.store.save(SELECTION)
+        selected = self.store.registration(include_key=True)
+        self.store.cache_catalog(selected, {"models": [{"value": selected["model"]}],
+            "default_model": selected["model"], "model_capabilities": {selected["model"]: {
+                "reasoning_efforts": ["low", "high"], "compatibility": "verified",
+                "reasoning_summary_supported": True}}})
+        record = self.store.root / ("model-catalog-" + selected["credential_id"] + ".json")
+        self.assertEqual(record.stat().st_mode & 0o777, 0o600)
+        self.assertNotIn(KEY, record.read_text())
+        self.store.save(SELECTION)
+        replacement = self.store.registration(include_key=True)
+        reloaded = provider.ProviderStore(self.store.root)
+        current = reloaded.cached_catalog(replacement)
+        self.assertEqual(provider.runtime_effort(replacement, current, "high"), "")
+        retained = reloaded.cached_catalog(selected)
+        self.assertEqual(provider.runtime_effort(selected, retained, "high"), "high")
+        self.assertEqual(retained["models"], [{"value": selected["model"], "label": selected["model"]}])
+        self.assertEqual(retained["model_capabilities"][selected["model"]]["compatibility"], "unverified")
+        self.assertEqual(provider.runtime_summary(selected, retained), "none")
+        record.write_text("invalid optional catalog")
+        unavailable = provider.ProviderStore(self.store.root).cached_catalog(selected)
+        self.assertEqual(provider.runtime_effort(selected, unavailable, "high"), "")
+
     def test_summary_evidence_reloads_privately_without_persisting_basic_compatibility(self):
         self.store.save(SELECTION)
         selected = self.store.registration(include_key=True)
@@ -472,6 +496,36 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DiscoveryTests(unittest.TestCase):
+    def test_native_effort_choices_require_declared_openai_responses_and_exact_model(self):
+        model = "openai/openai/gpt-6-astra"
+        native_models = {"models": [{"slug": "gpt-6-astra",
+            "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}, {"effort": "ultra"}]}]}
+        metadata = {"owned_by": "openai", "mode": "responses"}
+        capability = provider.discovered_model_capability(metadata, model, native_models)
+        self.assertEqual(capability["reasoning_efforts"], ["low", "high", "ultra"])
+        self.assertEqual(capability["compatibility"], "unverified")
+        self.assertIsNone(capability["reasoning_summary_supported"])
+        catalog = {"model_capabilities": {model: capability}}
+        self.assertEqual(provider.runtime_effort({"model": model}, catalog, "ultra"), "ultra")
+        for changes, model_id in (({}, "openai/gpt-6-astra-preview"),
+                ({"owned_by": "other"}, model), ({"mode": "chat"}, model),
+                ({"owned_by": None}, model), ({"mode": None}, model),
+                ({"reasoning_supported": False}, model), ({"reasoning_supported": True}, model),
+                ({"supports_reasoning": False}, model), ({"reasoning_efforts": []}, model),
+                ({"supported_reasoning_efforts": None}, model),
+                ({"capabilities": {"reasoning": False}}, model),
+                ({"reasoning": {"efforts": []}}, model)):
+            with self.subTest(changes=changes, model=model_id):
+                result = provider.discovered_model_capability({**metadata, **changes}, model_id, native_models)
+                self.assertEqual(result["reasoning_efforts"], [])
+        explicit = provider.discovered_model_capability({**metadata,
+            "supported_reasoning_levels": [{"effort": "medium"}, {"effort": "high"},
+                {"effort": "high"}, {"effort": "invalid"}]}, model, native_models)
+        self.assertEqual(explicit["reasoning_efforts"], ["medium", "high"])
+        denied = provider.discovered_model_capability({**metadata, "reasoning_supported": False,
+            "supported_reasoning_levels": [{"effort": "high"}]}, model, native_models)
+        self.assertEqual(denied["reasoning_efforts"], [])
+
     def test_summary_capability_is_independent_and_requires_explicit_boolean_evidence(self):
         for model in ("gpt-6-astra", "unknown/provider-model"):
             for metadata, expected in (({}, None), ({"reasoning_efforts": ["high"]}, None),

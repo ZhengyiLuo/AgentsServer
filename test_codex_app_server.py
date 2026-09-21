@@ -126,6 +126,45 @@ async def wait_until(predicate: Callable[[], bool], timeout: float = 1.0) -> Non
 
 
 class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_native_thread_names_are_cached_without_extra_requests(self) -> None:
+        factory = FakeProcessFactory()
+        client = self.make_client(factory)
+        self.addAsyncCleanup(client.close)
+        self.assertIsNone(client.cached_thread_name("thread"))
+        self.assertEqual(factory.calls, [])
+        factory.process.responders.update({
+            "thread/start": lambda _: {"thread": {"id": "thread", "name": "Started name"}},
+            "thread/resume": lambda _: {"thread": {"id": "thread", "name": "Resumed name"}},
+            "thread/read": lambda _: {"thread": {"id": "thread", "name": "Read name"}},
+        })
+        await client.start_thread({})
+        self.assertEqual(client.cached_thread_name("thread"), "Started name")
+        await client.resume_thread("thread")
+        self.assertEqual(client.cached_thread_name("thread"), "Resumed name")
+        await client.read_thread("thread")
+        self.assertEqual(client.cached_thread_name("thread"), "Read name")
+        requests = len(factory.process.messages)
+        client._route_notification({"method": "thread/name/updated", "params": {
+            "threadId": "thread", "threadName": "Updated name",
+        }})
+        self.assertEqual(client.cached_thread_name("thread"), "Updated name")
+        self.assertEqual(len(factory.process.messages), requests)
+        client._route_notification({"method": "thread/name/updated", "params": {
+            "threadId": "thread", "threadName": None,
+        }})
+        self.assertIsNone(client.cached_thread_name("thread"))
+
+    async def test_thread_title_cache_is_bounded_and_ignores_bad_values(self) -> None:
+        client = self.make_client(FakeProcessFactory())
+        for index in range(1100):
+            client._cache_thread_name({"id": f"thread-{index}", "name": "Name"})
+        self.assertEqual(len(client._thread_names), 1024)
+        self.assertIsNone(client.cached_thread_name("thread-0"))
+        self.assertEqual(client.cached_thread_name("thread-1099"), "Name")
+        for value in (None, {}, "", "x" * 4097):
+            client._cache_thread_name({"id": "bad", "name": value})
+            self.assertIsNone(client.cached_thread_name("bad"))
+
     def make_client(
         self,
         factory: FakeProcessFactory,

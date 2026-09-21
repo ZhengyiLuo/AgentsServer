@@ -337,11 +337,12 @@ class TerminalWebSocketRejectionTests(unittest.IsolatedAsyncioTestCase):
         registry = agent_server.TerminalAttachmentRegistry()
         websocket = HeldTerminalWebSocket()
         process = MagicMock()
-        spawn_entered = threading.Event()
+        loop = asyncio.get_running_loop()
+        spawn_entered = asyncio.Event()
         release_spawn = threading.Event()
 
         def slow_spawn(*_args):
-            spawn_entered.set()
+            loop.call_soon_threadsafe(spawn_entered.set)
             self.assertTrue(release_spawn.wait(timeout=2))
             return process, 92, "zd_terminal-cross-device-race"
 
@@ -351,6 +352,16 @@ class TerminalWebSocketRejectionTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(agent_server, "TERMINAL_ATTACHMENTS", registry), \
              patch.object(agent_server, "websocket_authorized", return_value=True), \
+             patch.object(
+                 agent_server,
+                 "managed_server_update_blocks_work",
+                 return_value=False,
+             ), \
+             patch.object(
+                 agent_server,
+                 "managed_server_restart_blocks_work",
+                 return_value=False,
+             ), \
              patch.dict(
                  agent_server.STORE.sessions,
                  {session_id: {"id": session_id, "archived": False, "cwd": "/workspace"}},
@@ -362,9 +373,7 @@ class TerminalWebSocketRejectionTests(unittest.IsolatedAsyncioTestCase):
             owner = asyncio.create_task(
                 agent_server.session_terminal(session_id, websocket)  # type: ignore[arg-type]
             )
-            self.assertTrue(
-                await asyncio.to_thread(spawn_entered.wait, 1),
-            )
+            await asyncio.wait_for(spawn_entered.wait(), timeout=1)
             drain = asyncio.create_task(registry.close_admission_and_all())
             async def cleanup_task_is_owned() -> bool:
                 async with registry._lock:

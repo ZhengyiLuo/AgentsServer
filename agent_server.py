@@ -165,6 +165,7 @@ from claude_background_reconciliation import (
 from public_chat_share_routes import create_public_chat_share_router, redact_public_share_path
 from interactive_chat_share_routes import create_interactive_chat_share_router
 import side_questions
+import title_generation
 from shared_chat_videos import (SharedVideoUnavailable, shared_chat_video_descriptor,
                                open_shared_chat_video)
 from interactive_chat_projection import IncrementalChatTranscript
@@ -6092,6 +6093,7 @@ def canonical_port_tunnel_port(value: Any) -> int:
 
 class CreateSessionRequest(BaseModel):
     title: str | None = None
+    auto_title_enabled: bool | None = None
     folder: str | None = None
     cwd: str | None = None
     backend: str | None = None
@@ -6160,6 +6162,7 @@ class BulkImportSessionsRequest(BaseModel):
 
 class UpdateSessionRequest(BaseModel):
     title: str | None = None
+    auto_title_enabled: bool | None = None
     folder: str | None = None
     cwd: str | None = None
     backend: str | None = None
@@ -10268,6 +10271,15 @@ class SessionStore:
         sess = {
             "id": sid,
             "title": title,
+            "auto_title_enabled": req.auto_title_enabled is not False,
+            # Clients send "New chat" explicitly for an unnamed creation.
+            # Older persisted titles without provenance are left alone.
+            "_title_source": (
+                "placeholder" if not req.title or req.title == "New chat" else "manual"
+            ),
+            "_title_auto_value": (
+                title if not req.title or req.title == "New chat" else None
+            ),
             "folder": req.folder or "General",
             "cwd": req.cwd or DEFAULT_CWD,
             "backend": backend,
@@ -10447,6 +10459,16 @@ class SessionStore:
             for key in ("title", "folder", "cwd"):
                 if key in patch and patch[key] is not None:
                     sess[key] = patch[key]
+                    if key == "title":
+                        # Even renaming to the existing text is a manual choice.
+                        sess["_title_source"] = "manual"
+                        sess.pop("_title_auto_value", None)
+                        sess.pop("_title_seed", None)
+            if patch.get("auto_title_enabled") is not None:
+                sess["auto_title_enabled"] = bool(patch["auto_title_enabled"])
+            if (any(key in patch for key in ("title", "model", "backend", "codex_provider"))
+                    or patch.get("auto_title_enabled") is False or patch.get("archived") is True):
+                cancel_generated_session_title(sid)
             for key, default, allowed in (
                 (
                     "claude_permission_mode",
@@ -10568,6 +10590,74 @@ class SessionStore:
                 raise
             HISTORY_SEARCH_DIRTY.add(sid)
             return sess
+
+    async def adopt_auto_title(
+        self,
+        sid: str,
+        title: str,
+        *,
+        source: str,
+        backend: str | None = None,
+        provider_id: str | None = None,
+        expected_title: str | None = None,
+        expected_runtime: tuple | None = None,
+        prompt_seed: str | None = None,
+    ) -> bool:
+        """Compare and persist under the same lock as a manual rename."""
+        if source not in {"prompt", "provider", "generated"} or not title:
+            return False
+        if source == "prompt" and title == "New chat":
+            # An attachment-only first turn still needs a useful fallback
+            # when the user later sends text.
+            return False
+        async with self._lock:
+            sess = self.sessions.get(sid)
+            if not sess or not session_accepts_auto_title(sess):
+                return False
+            if sid in DELETING_SESSIONS or sid in DELETED_SESSION_TOMBSTONES:
+                return False
+            if source == "prompt" and sess.get("_title_source") != "placeholder":
+                return False
+            if source in {"provider", "generated"} and (
+                not provider_id
+                or (sess.get("backend") or DEFAULT_BACKEND) != backend
+                or session_provider_id(sess) != provider_id
+            ):
+                return False
+            if expected_title is not None and sess.get("title") != expected_title:
+                return False
+            if source == "generated" and (not generated_title_eligible(sess, allow_attempted=True)
+                    or title_runtime_key(sess) != expected_runtime):
+                return False
+            if sess.get("title") == title and sess.get("_title_source") == source:
+                return False
+            missing = object()
+            previous = {
+                key: sess.get(key, missing)
+                for key in ("title", "_title_source", "_title_auto_value", "_title_seed", "updated_at")
+            }
+            sess.update(title=title, _title_source=source, _title_auto_value=title)
+            if source == "prompt" and isinstance(prompt_seed, str):
+                sess["_title_seed"] = prompt_seed[:1600]
+            elif source in {"provider", "generated"}:
+                sess.pop("_title_seed", None)
+            sess["updated_at"] = now_iso()
+            try:
+                await self.save()
+            except asyncio.CancelledError:
+                # Awaited SessionStore.save commits before surfacing caller
+                # cancellation. Retain that exact committed state in memory.
+                HISTORY_SEARCH_DIRTY.add(sid)
+                raise
+            except BaseException:
+                for key, value in previous.items():
+                    if value is missing:
+                        sess.pop(key, None)
+                    else:
+                        sess[key] = value
+                raise
+            HISTORY_SEARCH_DIRTY.add(sid)
+            return True
 
     async def reorder(
         self,
@@ -44888,8 +44978,21 @@ async def finalize_cross_chat_terminal(event: dict[str, Any]) -> None:
 
 
 async def append_turn_finished_event(session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    # Persist before the terminal notification. Existing session-list refresh /
+    # polling paths pick up the title without a new protocol or synthetic turn.
     try:
+        if (
+            not payload.get("imported")
+            and not str(payload.get("run_id") or "").startswith("import_")
+        ):
+            await refresh_native_session_title(session_id)
         event = await append_event(session_id, "turn_finished", payload)
+        # Optional metadata work cannot delay/fail the terminal event or add a
+        # hidden user turn. Its own task owns and reaps independent providers.
+        try:
+            schedule_generated_session_title(session_id, event)
+        except Exception as exc:
+            logger.debug("title scheduling skipped error=%s", type(exc).__name__)
     except BaseException as write_error:
         # Execution has ended even when its terminal record cannot be written
         # (for example ENOSPC). Do not invent a persisted event or forward a
@@ -46832,6 +46935,244 @@ def normalized_local_session_cwd(value: Any) -> str | None:
     return os.path.normpath(str(candidate))
 
 
+def session_accepts_auto_title(sess: dict[str, Any]) -> bool:
+    # Never infer ownership from a title's wording: a user can intentionally
+    # name a chat "New chat" or the exact first line of their prompt.
+    return (
+        sess.get("_title_source") in {"placeholder", "prompt", "provider", "generated"}
+        and sess.get("_title_auto_value") == sess.get("title")
+        and not sess.get("_fork_initializing")
+        and not sess.get("_history_import_initializing")
+    )
+
+
+def native_session_title(value: Any) -> str | None:
+    """Treat provider titles only as bounded, single-line display metadata."""
+    if not isinstance(value, str) or len(value) > 4096:
+        return None
+    display_text = "".join(
+        character for character in value
+        if character.isspace()
+        or unicodedata.category(character) not in {"Cc", "Cf", "Cs"}
+    )
+    clean = " ".join(display_text.split())[:120]
+    if not clean or clean.lower() in {"new chat", "new session", "untitled"}:
+        return None
+    if re.match(r"^(?:New|Child) session - \d{4}-\d{2}-\d{2}", clean):
+        return None
+    return clean
+
+
+def read_native_session_title(sess: dict[str, Any]) -> str | None:
+    """Read existing native metadata only; never launch a CLI or model request.
+
+    Missing/changed provider formats intentionally leave the prompt fallback.
+    Cursor stream-json has no title event; its private serialized store is not
+    decoded here. Claude and Codex use the same roots as history discovery.
+    """
+    backend = str(sess.get("backend") or DEFAULT_BACKEND)
+    provider_id = provider_session_identifier(session_provider_id(sess))
+    if not provider_id:
+        return None
+    if backend == BACKEND_CLAUDE:
+        candidates = claude_history_candidates(provider_id)
+        if len(candidates) != 1:
+            return None
+        custom_title = ai_title = None
+        for region in bounded_claude_transcript_regions(candidates[0]):
+            for line in region.splitlines():
+                if len(line) > CLAUDE_TRANSCRIPT_CWD_LINE_BYTES:
+                    continue
+                try:
+                    event = json.loads(line)
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                if not isinstance(event, dict) or event.get("sessionId") != provider_id:
+                    continue
+                if event.get("isSidechain") is True:
+                    continue
+                if event.get("type") == "custom-title":
+                    custom_title = native_session_title(event.get("customTitle"))
+                elif event.get("type") == "ai-title":
+                    ai_title = native_session_title(event.get("aiTitle"))
+        return custom_title or ai_title
+    if backend == BACKEND_CODEX:
+        return native_session_title(codex_session_index_thread_names().get(provider_id))
+    if backend == "opencode":
+        # Current native storage. A schema change, missing store, or busy DB
+        # fails closed. mode=ro must never create or migrate a provider DB.
+        data_root = Path(
+            os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share"
+        )
+        database = data_root / "opencode" / "opencode.db"
+        if not database.is_file() or database.is_symlink():
+            return None
+        connection = sqlite3.connect(
+            database.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.1,
+        )
+        try:
+            connection.set_progress_handler(lambda: 1, 10000)
+            row = connection.execute(
+                "SELECT substr(title, 1, 4097) FROM session "
+                "WHERE id = ? AND parent_id IS NULL AND typeof(title) = 'text'",
+                (provider_id,),
+            ).fetchone()
+            return native_session_title(row[0]) if row else None
+        finally:
+            connection.close()
+    return None
+
+
+async def refresh_native_session_title(session_id: str) -> None:
+    """Best-effort read outside the store lock; recheck ownership before save."""
+    sess = STORE.sessions.get(session_id)
+    if not sess or not session_accepts_auto_title(sess) or not session_provider_id(sess):
+        return
+    snapshot = dict(sess)
+    try:
+        title = None
+        if snapshot.get("backend") == BACKEND_CODEX:
+            # This release isolates custom-provider transports per chat.
+            # Never read a different provider's cached naming metadata.
+            manager = existing_codex_app_server_manager(snapshot)
+            cached_name = getattr(manager, "cached_thread_name", None)
+            if cached_name is not None:
+                title = native_session_title(cached_name(session_provider_id(snapshot)))
+        if not title:
+            title = await asyncio.wait_for(
+                asyncio.to_thread(read_native_session_title, snapshot), timeout=1.0,
+            )
+        if title:
+            await STORE.adopt_auto_title(
+                session_id, title, source="provider",
+                backend=str(snapshot.get("backend") or DEFAULT_BACKEND),
+                provider_id=session_provider_id(snapshot),
+                expected_title=snapshot.get("title"),
+            )
+    except Exception as exc:
+        # Do not leak titles, transcripts, or paths to logs; metadata failure
+        # must not fail a turn or opening a chat. Cancellation still propagates.
+        logger.debug(
+            "native title lookup skipped session=%s error=%s",
+            session_id, type(exc).__name__,
+        )
+
+
+GENERATED_TITLE_TASKS: dict[str, asyncio.Task] = {}
+GENERATED_TITLE_SLOTS = asyncio.Semaphore(2)
+
+
+def title_runtime_key(sess: dict[str, Any]) -> tuple:
+    return (sess.get("backend") or DEFAULT_BACKEND, session_provider_id(sess),
+            sess.get("model"), sess.get("codex_provider"), sess.get("codex_provider_revision"))
+
+
+def generated_title_eligible(sess: dict[str, Any], *, allow_attempted: bool = False) -> bool:
+    return bool(
+        os.environ.get("AGENTSDOCK_AUTO_TITLES", "1").strip().lower() not in {"0", "false", "off"}
+        and not SERVER_SHUTTING_DOWN
+        and sess.get("backend") in {BACKEND_CODEX, BACKEND_CURSOR}
+        and sess.get("auto_title_enabled", True) is not False
+        and not sess.get("archived") and not sess.get("parent_id") and not sess.get("fork_from")
+        and sess.get("id") not in DELETING_SESSIONS
+        and sess.get("id") not in DELETED_SESSION_TOMBSTONES
+        and session_accepts_auto_title(sess)
+        and sess.get("_title_source") in {"placeholder", "prompt"}
+        and (allow_attempted or not sess.get("_title_generation_attempted"))
+    )
+
+
+def cancel_generated_session_title(session_id: str) -> None:
+    task = GENERATED_TITLE_TASKS.get(session_id)
+    if task is not None and not task.done():
+        task.cancel()
+
+
+async def close_generated_session_titles() -> None:
+    tasks = tuple(GENERATED_TITLE_TASKS.values())
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def generate_session_title(session_id: str, snapshot: dict, reply: str) -> None:
+    async with GENERATED_TITLE_SLOTS:
+        # Persist the claim before spending any provider usage. A restart does
+        # not retry an ambiguous request. This is one optional attempt per chat.
+        async with STORE._lock:
+            current = STORE.sessions.get(session_id)
+            if (not current or not generated_title_eligible(current)
+                    or title_runtime_key(current) != title_runtime_key(snapshot)
+                    or current.get("title") != snapshot.get("title")):
+                return
+            current["_title_generation_attempted"] = True
+            try:
+                await STORE.save()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                current.pop("_title_generation_attempted", None)
+                raise
+        options = {"model": snapshot.get("model"), "env": runner_env()}
+        if snapshot["backend"] == BACKEND_CODEX:
+            options["model"] = codex_runtime_settings(snapshot)[0]
+            options["executable"] = CODEX_BIN
+            options["provider_selection"] = CODEX_PROVIDER_STORE.for_session(snapshot, include_key=True)
+        else:
+            options["executable"] = resolve_cursor_executable()
+            if not options["executable"]:
+                return
+        result = await title_generation.generate_title(
+            snapshot["backend"], snapshot["_title_seed"], reply, **options,
+        )
+        if result:
+            changed = await STORE.adopt_auto_title(
+                session_id, result, source="generated", backend=snapshot["backend"],
+                provider_id=session_provider_id(snapshot), expected_title=snapshot.get("title"),
+                expected_runtime=title_runtime_key(snapshot),
+            )
+            if changed:
+                # Existing desktop/mobile list polling reads the saved title.
+                # Web shares have their own metadata-only invalidation signal.
+                live_shares = globals().get("INTERACTIVE_CHAT_LIVE")
+                if live_shares is not None:
+                    live_shares.notify(session_id, {"type": "session_updated"})
+
+
+def schedule_generated_session_title(session_id: str, event: dict) -> None:
+    sess = STORE.sessions.get(session_id)
+    if (not sess or not generated_title_eligible(sess)
+            or session_id in GENERATED_TITLE_TASKS or len(GENERATED_TITLE_TASKS) >= 16
+            or event.get("purpose") or event.get("job_id") or event.get("imported")
+            or event.get("stopped") or event.get("exit_code") != 0
+            or str(event.get("run_id") or "").startswith("import_")
+            or not isinstance(sess.get("_title_seed"), str) or not sess["_title_seed"].strip()
+            or not session_provider_id(sess)):
+        return
+    reply = event.get("result_text")
+    if not isinstance(reply, str) or not reply.strip():
+        return
+
+    async def work():
+        try:
+            await generate_session_title(session_id, snapshot, reply[:800])
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.info("automatic title skipped session=%s error=%s", session_id, type(exc).__name__)
+
+    snapshot = dict(sess)
+    task = asyncio.create_task(work(), name=f"session-title:{session_id}")
+    GENERATED_TITLE_TASKS[session_id] = task
+
+    def finished(done):
+        if GENERATED_TITLE_TASKS.get(session_id) is done:
+            GENERATED_TITLE_TASKS.pop(session_id, None)
+
+    task.add_done_callback(finished)
+
+
 def local_session_label(value: Any, fallback: str) -> str:
     clean = compact_import_text(str(value or "")).strip()
     return (clean or fallback)[:MAX_LOCAL_SESSION_LABEL_CHARS]
@@ -48506,6 +48847,7 @@ async def run_provider_history_sync(session_id: str) -> None:
                     )
                 ):
                     return
+            await refresh_native_session_title(session_id)
             result = await sync_provider_history(dict(sess))
         if result.get("imported"):
             logger.info(
@@ -49849,6 +50191,7 @@ def validate_session_subagent_limit(sess: dict[str, Any], value: Any) -> None:
 
 def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, Any]:
     detail_fields = () if summary else (
+        "auto_title_enabled",
         "system_prompt", "session_id", "claude_session_id", "codex_thread_id",
         "cursor_session_id",
         "claude_permission_mode", "cursor_permission_mode",
@@ -52966,6 +53309,14 @@ async def project_codex_notification(notification: dict[str, Any]) -> None:
         and thread_id != root_thread_id
         and indexed_child_session_id == session_id
     )
+    if method == "thread/name/updated" and not is_child_thread:
+        title = native_session_title(params.get("threadName"))
+        if session_id and not is_child_thread and thread_id == root_thread_id and title:
+            await STORE.adopt_auto_title(
+                session_id, title, source="provider", backend=BACKEND_CODEX,
+                provider_id=thread_id,
+            )
+        return
     if method == "turn/started" and thread_id and not is_child_thread:
         # Stop may win while an ordinary parent is between native turns. A
         # child result can then start B while A's already-completed supervisor
@@ -69515,11 +69866,12 @@ async def _start_turn_locked(
         register_session_task(SESSION_TURN_TASKS, session_id, turn_task)
         provider_task_committed = True
         try:
-            current_title = str(sess.get("title") or "").strip()
-            if not current_title or current_title == "New chat":
-                first_line = (req.prompt.strip().splitlines() or ["New chat"])[0]
-                await STORE.update(session_id, {"title": first_line[:72] or "New chat"})
-            else:
+            first_line = (req.prompt.strip().splitlines() or ["New chat"])[0]
+            title_changed = await STORE.adopt_auto_title(
+                session_id, first_line[:72] or "New chat", source="prompt",
+                prompt_seed=req.prompt if req.purpose is None else None,
+            )
+            if not title_changed:
                 await STORE.update(session_id, {})
         except Exception:
             # Provider ownership is already committed. Title persistence is a
@@ -73621,7 +73973,9 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         SERVER_SHUTTING_DOWN = True
-        await bounded_shutdown_phase("side-questions", SIDE_QUESTIONS.close())
+        await bounded_shutdown_phase("side-questions", asyncio.gather(
+            SIDE_QUESTIONS.close(), close_generated_session_titles(),
+        ))
         # Every phase below is bounded by SERVER_SHUTDOWN_PHASE_TIMEOUT_SECONDS
         # (see bounded_shutdown_phase) so one stuck join cannot starve the
         # provider teardown that follows it. The order is load-bearing.
@@ -78694,6 +79048,17 @@ async def interactive_chat_native_snapshot(session_id: str) -> dict[str, Any]:
     goal = await get_codex_goal(session_id)
     codex_available = backend == BACKEND_CODEX and CODEX_TRANSPORT != CODEX_TRANSPORT_EXEC
     claude_available = backend == BACKEND_CLAUDE and CLAUDE_TRANSPORT != CLAUDE_TRANSPORT_PRINT
+    runtime_available = True
+    if backend == BACKEND_CURSOR:
+        # Contract support is independent of CLI readiness. Read only the
+        # cached readiness bit; never expose raw diagnostics or probe on a
+        # guest refresh. Actual turn admission still rechecks the runtime.
+        with RUNTIME_DIAGNOSTICS_LOCK:
+            diagnostic = RUNTIME_DIAGNOSTICS.get(BACKEND_CURSOR) or {}
+            runtime_available = (
+                diagnostic.get("status") == "ready"
+                and diagnostic.get("available") is True
+            )
     status = {"type": "active" if active else "idle", "activeFlags": []}
     codex_runtime = {
         "available": codex_available, "transport": CODEX_TRANSPORT,
@@ -78739,6 +79104,11 @@ async def interactive_chat_native_snapshot(session_id: str) -> dict[str, Any]:
             "codex_controls": {"available": codex_available},
             "claude_controls": {"available": claude_available,
                                 "interactive_client_capability": CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY},
+            "cursor_backend": {
+                "available": True, "required": False, "version": 2,
+                "permission_modes": list(CURSOR_PERMISSION_MODES),
+                "default_permission_mode": CURSOR_DEFAULT_PERMISSION_MODE,
+            },
             "provider_jobs_access_control_v1": {
                 "available": bool(AGENT_TOKEN), "version": 1,
                 "modes": list(PROVIDER_JOBS_ACCESS_MODES),
@@ -78747,7 +79117,7 @@ async def interactive_chat_native_snapshot(session_id: str) -> dict[str, Any]:
             "workspace_files": {"available": False},
         }},
         "runtime_catalog": {"backends": {backend: {
-            "available": True, "models": [{"value": model, "label": model or "Server default"}],
+            "available": runtime_available, "models": [{"value": model, "label": model or "Server default"}],
             "efforts": [{"value": effort, "label": effort or "Server default"}],
         }}},
     })
@@ -84595,6 +84965,7 @@ async def delete_session(session_id: str) -> dict[str, Any]:
                 ),
             )
         DELETING_SESSIONS.add(session_id)
+        cancel_generated_session_title(session_id)
         deleted = False
         try:
             if (

@@ -47,6 +47,7 @@ def make_namespace(root: Path):
     """Reusable native UI fixture: real routes/store methods, synthetic helpers."""
     locks = {}
     ns = {"Any": Any, "Literal": Literal, "BaseModel": BaseModel, "Field": Field,
+        "cancel_generated_session_title": Mock(),
         "Path": Path, "asyncio": asyncio, "suppress": suppress, "uuid": uuid, "json": json, "re": re,
         "RUNTIME_DIAGNOSTICS": {"claude": {"version": "2.1.277"}},
         "RUNTIME_DIAGNOSTICS_LOCK": threading.RLock(),

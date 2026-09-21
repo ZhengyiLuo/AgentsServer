@@ -174,6 +174,17 @@ public ingress configuration.
 Creating a real invitation, configuring ingress, and deployment are separate
 explicit actions.
 
+### Cursor availability
+
+The restricted snapshot includes the safe `health.capabilities.cursor_backend`
+contract (version and permission modes), separately from runtime readiness.
+For a Cursor chat, its baseline catalog is available only when the cached runtime
+diagnostic is ready. Missing, signed-out, failed or unchecked runtimes are not
+reported ready. Reading state does not probe the CLI or copy full health,
+credentials, executable paths or raw diagnostic messages into the share.
+Explicit model discovery uses the existing `runtime.catalog` read action;
+ordinary server-side turn admission still validates the runtime.
+
 ## Renderer artifact
 
 `interactive_chat_share_web.py` is generated from the AgentsDock shared-chat

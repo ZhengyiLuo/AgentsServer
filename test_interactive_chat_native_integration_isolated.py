@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import re
 import tempfile
+import threading
 import time
 from types import MethodType, SimpleNamespace
 import unittest
@@ -60,7 +61,14 @@ class InteractiveChatNativeGlueTests(unittest.IsolatedAsyncioTestCase):
             "BUSY_SESSIONS": {"chat-one"}, "ACTIVE": {},
             "read_semantic_timeline_page": Mock(return_value={"events": [self.row, {"id": "file-one", "session_id": "chat-one", "type": "file_uploaded", "seq": 2}], "semantic_total": 2, "semantic_omitted_before": 1, "next_semantic_before": 1}),
             "public_session": lambda value: dict(value), "DEFAULT_BACKEND": "codex",
-            "BACKEND_CODEX": "codex", "BACKEND_CLAUDE": "claude",
+            "BACKEND_CODEX": "codex", "BACKEND_CLAUDE": "claude", "BACKEND_CURSOR": "cursor",
+            "CURSOR_PERMISSION_MODES": ("default", "full_access", "plan"),
+            "CURSOR_DEFAULT_PERMISSION_MODE": "default",
+            "RUNTIME_DIAGNOSTICS": {}, "RUNTIME_DIAGNOSTICS_LOCK": threading.RLock(),
+            "health": AsyncMock(side_effect=AssertionError("shared snapshot must not read full health")),
+            "probe_runtime": Mock(side_effect=AssertionError("shared snapshot must not probe")),
+            "runtime_diagnostic": Mock(side_effect=AssertionError("shared snapshot must not probe")),
+            "refresh_runtime_diagnostics": Mock(side_effect=AssertionError("shared snapshot must not probe")),
             "CODEX_TRANSPORT": "app-server", "CODEX_TRANSPORT_EXEC": "exec",
             "CLAUDE_TRANSPORT": "sdk", "CLAUDE_TRANSPORT_PRINT": "print",
             "CODEX_INTERACTIVE_CLIENT_CAPABILITY": "codex-test", "CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY": "claude-test",
@@ -125,6 +133,71 @@ class InteractiveChatNativeGlueTests(unittest.IsolatedAsyncioTestCase):
         capability = result["health"]["capabilities"]["provider_jobs_access_control_v1"]
         self.assertFalse(capability["available"])
         self.assertEqual(capability["default"], "blocked")
+        self.native["runtime_catalog"].assert_not_awaited()
+
+    async def test_cursor_snapshot_exposes_safe_contract_and_cached_readiness(self):
+        self.native["STORE"].sessions["chat-one"].update(backend="cursor", model="auto")
+        self.native["RUNTIME_DIAGNOSTICS"].update({
+            "cursor": {
+                "status": "ready", "available": True,
+                "_executable": "/private/owner/cursor-agent", "version": "private-build",
+                "email": "private-owner@example.invalid", "access_token": "private-runtime-token",
+                "message": "private-runtime-message", "last_error": "private-runtime-error",
+                "action": "private-runtime-action", "future_field": "private-future-field",
+            },
+            "claude": {"status": "ready", "available": True, "message": "private-other-provider"},
+        })
+        result = await self.native["interactive_chat_native_snapshot"]("chat-one")
+        capability = result["health"]["capabilities"]["cursor_backend"]
+        self.assertEqual(capability, {
+            "available": True, "required": False, "version": 2,
+            "permission_modes": ["default", "full_access", "plan"],
+            "default_permission_mode": "default",
+        })
+        self.assertEqual(set(result["health"]), {"capabilities"})
+        self.assertEqual(set(result["health"]["capabilities"]), {
+            "codex_controls", "claude_controls", "cursor_backend",
+            "provider_jobs_access_control_v1", "workspace_files",
+        })
+        self.assertEqual(result["runtime_catalog"], {"backends": {"cursor": {
+            "available": True, "models": [{"value": "auto", "label": "auto"}],
+            "efforts": [{"value": "", "label": "Server default"}],
+        }}})
+        self.assertFalse(result["health"]["capabilities"]["workspace_files"]["available"])
+        encoded = json.dumps(result)
+        for private in ("/private/owner", "private-build", "private-owner@example.invalid",
+                        "private-runtime-", "private-future-field", "private-other-provider",
+                        "synthetic-native-admin", "private-file"):
+            self.assertNotIn(private, encoded)
+        self.native["health"].assert_not_awaited()
+        self.native["runtime_catalog"].assert_not_awaited()
+        for name in ("probe_runtime", "runtime_diagnostic", "refresh_runtime_diagnostics"):
+            self.native[name].assert_not_called()
+
+    async def test_cursor_support_does_not_claim_an_unready_runtime_is_available(self):
+        self.native["STORE"].sessions["chat-one"]["backend"] = "cursor"
+        for diagnostic in ({}, {"status": "missing", "available": False},
+                {"status": "unauthenticated", "available": False},
+                {"status": "error", "available": False}, {"status": "unknown", "available": False},
+                {"status": "ready", "available": False}, {"status": "ready", "available": "true"},
+                {"status": "error", "available": True}, {"status": "ready", "available": True}):
+            with self.subTest(diagnostic=diagnostic):
+                self.native["RUNTIME_DIAGNOSTICS"]["cursor"] = diagnostic
+                result = await self.native["interactive_chat_native_snapshot"]("chat-one")
+                self.assertTrue(result["health"]["capabilities"]["cursor_backend"]["available"])
+                self.assertEqual(result["runtime_catalog"]["backends"]["cursor"]["available"],
+                    diagnostic.get("status") == "ready" and diagnostic.get("available") is True)
+        self.native["runtime_catalog"].assert_not_awaited()
+
+    async def test_non_cursor_snapshot_retains_existing_backend_availability(self):
+        for backend in ("codex", "claude"):
+            with self.subTest(backend=backend):
+                self.native["STORE"].sessions["chat-one"]["backend"] = backend
+                result = await self.native["interactive_chat_native_snapshot"]("chat-one")
+                self.assertEqual(set(result["runtime_catalog"]["backends"]), {backend})
+                self.assertTrue(result["runtime_catalog"]["backends"][backend]["available"])
+                self.assertEqual(result["codex_runtime"]["available"], backend == "codex")
+                self.assertEqual(result["claude_runtime"]["available"], backend == "claude")
         self.native["runtime_catalog"].assert_not_awaited()
 
     async def test_native_page_issues_real_media_and_discards_event_supplied_handles(self):

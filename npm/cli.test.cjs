@@ -6,6 +6,7 @@ const os = require('node:os')
 const path = require('node:path')
 const http = require('node:http')
 const crypto = require('node:crypto')
+const { spawnSync } = require('node:child_process')
 const { parse, run, validateOrigin } = require('./cli.cjs')
 
 function fixture(t) {
@@ -55,6 +56,70 @@ test('fresh guard refuses an existing install or state without spawning anything
   fs.mkdirSync(path.join(f.home, '.agentsdock'))
   await assert.rejects(run(['install'], { ...f.context, uid: 501 }), /existing server installation or state/)
   assert.equal(f.calls.length, 0)
+})
+
+test('fresh install retries after a real installer subprocess fails leaving only empty scaffolding', async t => {
+  const f = fixture(t)
+  const attempt = path.join(f.root, 'attempt')
+  const completed = path.join(f.root, 'completed')
+  fs.writeFileSync(path.join(f.packageRoot, 'server/install.sh'), `#!/bin/bash
+set -eu
+mkdir -p "$QA_FRESH_HOME/.local/share/agents-server/releases"
+if [[ ! -e "$QA_INSTALL_ATTEMPT" ]]; then
+  touch "$QA_INSTALL_ATTEMPT"
+  exit 73
+fi
+touch "$QA_INSTALL_COMPLETED"
+`)
+  let installs = 0
+  const context = {
+    ...f.context,
+    env: { ...process.env, QA_FRESH_HOME: f.home, QA_INSTALL_ATTEMPT: attempt, QA_INSTALL_COMPLETED: completed },
+    spawn: (command, args, options) => {
+      if (command !== '/bin/bash') return { status: 0, stdout: 'not-found\n' }
+      installs++
+      return spawnSync(command, args, options)
+    },
+  }
+  for (const key of ['AGENTS_SERVER_INSTALL_DIR', 'AGENTS_SERVER_CONFIG_DIR', 'AGENTS_SERVER_STATE_DIR', 'AGENTSDOCK_STATE_DIR', 'ZENITHBOT_AGENT_DIR', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME']) delete context.env[key]
+  assert.equal(await run(['install', '--non-interactive'], context), 73)
+  const installRoot = path.join(f.home, '.local/share/agents-server')
+  assert.deepEqual(fs.readdirSync(installRoot), ['releases'])
+  assert.deepEqual(fs.readdirSync(path.join(installRoot, 'releases')), [])
+  assert.equal(fs.existsSync(path.join(f.home, '.agentsdock')), false)
+  assert.equal(fs.existsSync(path.join(f.home, '.config/agents-server')), false)
+  assert.equal(await run(['install', '--non-interactive'], context), 0)
+  assert.equal(installs, 2)
+  assert.equal(fs.existsSync(completed), true)
+  fs.mkdirSync(path.join(installRoot, '.install-lock'))
+  await assert.rejects(run(['install'], context), /existing server installation or state/)
+  assert.equal(installs, 2)
+})
+
+test('empty scaffolding admission still refuses files, links, releases, unsafe ownership and state', async t => {
+  const cases = [
+    (root) => fs.writeFileSync(root, 'existing'),
+    (root, f) => fs.symlinkSync(f.home, root),
+    (root) => { fs.mkdirSync(root); fs.writeFileSync(path.join(root, 'releases'), 'existing') },
+    (root, f) => { fs.mkdirSync(root); fs.symlinkSync(f.home, path.join(root, 'releases')) },
+    (root) => fs.mkdirSync(path.join(root, 'releases/older-version'), { recursive: true }),
+    (root) => fs.mkdirSync(path.join(root, 'releases/.stage-other'), { recursive: true }),
+    (root) => { fs.mkdirSync(root); fs.writeFileSync(path.join(root, '.hidden'), 'existing') },
+    (root) => { fs.mkdirSync(root); fs.chmodSync(root, 0o777) },
+    (root) => { fs.mkdirSync(path.join(root, 'releases'), { recursive: true }); fs.chmodSync(path.join(root, 'releases'), 0o777) },
+    (root, f) => { fs.mkdirSync(root); f.context.uid++ },
+    (root, f) => { fs.mkdirSync(root); fs.mkdirSync(path.join(f.home, '.agentsdock')) },
+    (root, f) => { fs.mkdirSync(root); fs.mkdirSync(path.join(f.home, '.config/agents-server'), { recursive: true }) },
+  ]
+  for (const setup of cases) {
+    const f = fixture(t)
+    const root = path.join(f.home, '.local/share/agents-server')
+    fs.mkdirSync(path.dirname(root), { recursive: true })
+    setup(root, f)
+    await assert.rejects(run(['install'], f.context), /existing server installation or state/)
+    assert.equal(f.calls.length, 0)
+    assert.equal(fs.lstatSync(root).isSymbolicLink() || fs.existsSync(root), true)
+  }
 })
 
 test('fresh guard refuses custom roots, root user, loaded service and inspection failure', async t => {

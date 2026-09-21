@@ -64,15 +64,32 @@ function ensureFreshInstall(context) {
   if (context.uid === 0) throw new Error('Run as the user who will own the server, without sudo.')
   if (!['darwin', 'linux'].includes(context.platform)) throw new Error('Server installation requires Linux or Apple silicon macOS.')
   for (const name of ROOT_SELECTORS) if (context.env[name]) throw new Error(`Custom installation selector ${name} is unsupported by the fresh-install CLI. Use the existing server's managed updater.`)
+  const existingInstall = () => new Error('An existing server installation or state was found. Use AgentsDock or agentsdock-server update; no installer was started.')
+  const installRoot = path.join(context.home, '.local/share/agents-server')
+  let rootInfo
+  try { rootInfo = fs.lstatSync(installRoot) } catch (error) { if (error.code !== 'ENOENT') throw error }
+  if (rootInfo) {
+    // A failed dependency/bootstrap stage can leave only these empty directories.
+    // Do not remove them or relax admission for state, locks, links, or releases.
+    // install.sh repeats its layout and fresh-state checks under the install lock.
+    const safeDirectory = info => info.isDirectory() && !info.isSymbolicLink() && info.uid === context.uid && (info.mode & 0o022) === 0
+    if (!safeDirectory(rootInfo)) throw existingInstall()
+    const entries = fs.readdirSync(installRoot)
+    if (entries.length > 1 || (entries.length === 1 && entries[0] !== 'releases')) throw existingInstall()
+    if (entries.length === 1) {
+      const releases = path.join(installRoot, 'releases')
+      if (!safeDirectory(fs.lstatSync(releases)) || fs.readdirSync(releases).length !== 0) throw existingInstall()
+    }
+  }
   const targets = [
-    '.local/share/agents-server', '.config/agents-server', '.agentsdock', '.zenithbot-agent',
+    '.config/agents-server', '.agentsdock', '.zenithbot-agent',
     '.config/systemd/user/agents-server.service', '.config/systemd/user/zenithbot-agent.service',
     'Library/LaunchAgents/com.agentsdock.server.plist',
   ]
   for (const relative of targets) {
     try {
       fs.lstatSync(path.join(context.home, relative))
-      throw new Error('An existing server installation or state was found. Use AgentsDock or agentsdock-server update; no installer was started.')
+      throw existingInstall()
     } catch (error) { if (error.code !== 'ENOENT') throw error }
   }
   if (context.platform === 'darwin') {

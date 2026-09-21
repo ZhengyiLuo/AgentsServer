@@ -12,6 +12,8 @@ import is created by a side question.
   waiting for a side answer never occupies the main-turn actor. Cancellation
   addresses only its control request. Cold connections must resume the exact
   parent identity; an empty conversation is not an acceptable fallback.
+  A connected parent keeps its current settings for side questions, even if
+  saved model or effort settings have changed for the next main turn.
 
 The desktop requires `side_questions.version: 2` and `native_context: true`.
 Each request supplies `request_id`, `side_chat_id`, `question`, and, for a

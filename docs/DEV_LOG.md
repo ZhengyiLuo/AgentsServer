@@ -1,5 +1,21 @@
 # Development and release log
 
+## 2026-09-20 — Claude side chat after settings changes — source acceptance
+
+- Keep side questions on the connected parent Claude conversation when saved
+  model or effort settings have changed for a later main turn. Avoid a false
+  configuration conflict without replacing or interrupting the active parent.
+  Preserve cold-resume identity checks and strict configuration checks for MCP.
+- Pass 73 focused side-question checks. Verify the production HTTP API and
+  native Claude with a running parent: change saved effort, ask about a fact
+  available only in a completed tool result, ask a follow-up, and cancel a side
+  request. The main run remains active and its transcript stays unchanged.
+- Exercise the desktop popup through production preload, IPC and native HTTP
+  into the same isolated server and provider. The parent subsequently completes
+  normally; the test server is cleaned up.
+- Availability: accepted source correction. No published release or running
+  production server is changed by this acceptance.
+
 ## 2026-09-19 — Completed Codex plaintext preservation — source only
 
 - Read native completed reasoning `content` arrays of strings, while retaining

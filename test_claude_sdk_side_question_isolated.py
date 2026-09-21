@@ -122,6 +122,37 @@ class ClaudeSDKSideQuestionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.manager._supervisors["chat"].active_run_id, "main")
         self.assertEqual(self.manager._pins, {})
 
+    async def test_saved_effort_change_uses_live_parent_without_reconfiguration(self) -> None:
+        self.options["effort"] = "ultracode"
+        main = await self.start_main()
+        client = self.factory.clients[0]
+        supervisor = self.manager._supervisors["chat"]
+        original_calls = list(client.calls)
+        saved_options = {**self.options, "effort": "max"}
+
+        with patch("claude_side_question.ask_native_side_question",
+                   return_value={"answer": "Live context"}) as native:
+            answer = await self.manager.ask_side_question(
+                "chat", "Status?", options=saved_options,
+                configuration_key="saved-max-profile",
+                expected_provider_id="existing-provider-session",
+            )
+            self.assertEqual(answer, {"answer": "Live context"})
+            self.assertIs(native.call_args.args[0], client)
+
+        self.assertFalse(main.done)
+        self.assertEqual(client.calls, original_calls)
+        self.assertEqual(len(self.factory.clients), 1)
+        self.assertIs(self.manager._supervisors["chat"], supervisor)
+        self.assertEqual(supervisor.configuration_key, "profile")
+        self.assertEqual(client.options["effort"], "ultracode")
+        self.assertEqual(self.manager._pins, {})
+        with self.assertRaises(ClaudeSDKConfigurationConflict):
+            await self.manager.get_mcp_status(
+                "chat", options=saved_options,
+                configuration_key="saved-max-profile",
+            )
+
     async def test_lease_blocks_idle_eviction_and_configuration_replacement(self) -> None:
         started = asyncio.Event()
         release = asyncio.Event()

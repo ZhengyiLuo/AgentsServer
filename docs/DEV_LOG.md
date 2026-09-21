@@ -1,5 +1,26 @@
 # Development and release log
 
+## 2026-09-21 — Preserve user authorization in chat mail — source acceptance
+
+- Preserve the originating user's exact instruction through permanent-route
+  messages, durable storage, and authenticated provider inbox reads. Recipients
+  can execute delegated work within that scope without requiring a second user
+  approval. Agent-authored message text cannot grant or expand authorization.
+- Keep generated wake prompts separate from user instructions, preserve public
+  inbox projections, and include provenance in bounded pagination and retries.
+  Reject unreadable messages before acceptance. Oversized legacy handoffs retain
+  their original queue recovery path instead of blocking startup.
+- Pass focused mailbox, route, helper, lifecycle, migration, and legacy handoff
+  checks, plus Python compilation. In an isolated production server with actual
+  native Codex and a real Responses endpoint, a user-authorized source message
+  wakes an idle recipient, which creates and verifies the requested artifact
+  without any user turn in the recipient chat.
+- Forged-source rejection passes deterministic boundary checks. The live
+  informational-mail follow-up is inconclusive because the custom endpoint
+  stream ends before provider completion; it is not counted as a behavior pass.
+- Availability: source correction prepared for the coordinated desktop/server
+  release. This acceptance does not restart or update production servers.
+
 ## 2026-09-20 — Custom OpenAI model effort choices — source acceptance
 
 - Accept native structured effort metadata from endpoint discovery. For an

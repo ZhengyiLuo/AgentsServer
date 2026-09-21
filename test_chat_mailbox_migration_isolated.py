@@ -107,6 +107,20 @@ class ChatMailboxMigrationTests(unittest.IsolatedAsyncioTestCase):
         self.ns["append_cross_chat_terminal_lifecycle"].assert_not_awaited()
         self.ns["schedule_next_queued_turn"].assert_not_called()
 
+    async def test_oversized_legacy_provenance_keeps_original_queue_recoverable(self):
+        source = "用户授权" * 20_000
+        record = await self.envelope(source_user_instruction=source)
+        self.events([self.queue_event(record)])
+        proof = {record["id"]: {"target_session_id": "recipient"}}
+        recovered = self.ns["scan_queued_turns_from_events"]([("recipient", {})], mailbox_evidence=proof)
+        self.assertEqual(await self.ns["migrate_unstarted_chat_mailbox_backlog"]([record], proof, recovered), 0)
+        after = await self.ledger.get(record["id"])
+        self.assertEqual((after["status"], after["delivery_mode"], after["queued_id"]),
+                         (record["status"], record["delivery_mode"], record["queued_id"]))
+        self.assertEqual(after["source_user_instruction"], source)
+        self.assertEqual(recovered["recipient"][0]["queued_id"], record["queued_id"])
+        self.assertEqual((await self.ledger.mailbox_call("list_messages", "recipient", None, [PAIR]))["messages"], [])
+
     async def test_started_without_queue_id_fenced_legacy_and_secure_owners_are_unchanged(self):
         started = await self.envelope("started")
         fenced = await self.envelope("fenced")

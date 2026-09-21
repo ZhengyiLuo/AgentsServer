@@ -102,7 +102,8 @@ _VALID = """m.excluded_at IS NULL AND e.status='stored' AND e.delivery_mode='mai
     AND e.kind='instruction' AND e.authorization_kind='configured_route'
     AND e.source_session_id=m.source_session_id AND e.target_session_id=m.target_session_id
     AND e.authorization_pair_id=m.pair_id"""
-_COLUMNS = """m.*, e.body AS original_body, e.target_body, e.message_revision, e.created_at"""
+_COLUMNS = """m.*, e.body AS original_body, e.target_body, e.message_revision, e.created_at,
+    e.source_user_instruction"""
 
 
 def _message(row: sqlite3.Row) -> dict:
@@ -112,6 +113,7 @@ def _message(row: sqlite3.Row) -> dict:
         "source_session_id": row["source_session_id"], "target_session_id": row["target_session_id"],
         "conversation_id": row["pair_id"],
         "body": row["target_body"] if edited else row["original_body"],
+        "source_user_instruction": row["source_user_instruction"] or "",
         "created_at": row["created_at"], "stored_at": row["stored_at"],
         "in_reply_to_message_id": row["in_reply_to_message_id"],
         "read_id": row["read_id"], "read_at": row["read_at"],
@@ -155,7 +157,13 @@ def store_message(connection: sqlite3.Connection, message_id: str, *, now: str,
             or row["pair_id"] != record["authorization_pair_id"]
             or row["in_reply_to_message_id"] != parent):
         raise MailboxConflict("Stored mailbox identity changed")
-    return _message(row)
+    message = _message(row)
+    # Reject before the caller commits, rather than accepting mail that no
+    # bounded read can deliver. Include the metadata added on its first read.
+    readable = {**message, "read_id": "mailread_" + "0" * 32, "read_at": now}
+    if 8192 + len(json.dumps(readable, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > MAX_PAGE_BYTES:
+        raise MailboxConflict("Message and source user instruction exceed the bounded mailbox response")
+    return message
 
 
 def _scope(target: str, source: str | None, pairs: Iterable[str]) -> tuple[str, list]:
@@ -278,8 +286,10 @@ def read_sender(connection: sqlite3.Connection, *, target_session_id: str, sourc
         page = connection.execute("SELECT * FROM chat_mailbox_read_pages WHERE read_id=? AND after_seq=?",
                                   (batch["id"], after_seq)).fetchone()
     ids = json.loads(page["message_ids_json"])
-    messages, _ = _page(connection, clause + " AND m.message_id IN (SELECT value FROM json_each(?))",
-                         [*args, json.dumps(ids)], limit) if ids else ([], False)
+    messages, overflow = _page(connection, clause + " AND m.message_id IN (SELECT value FROM json_each(?))",
+                              [*args, json.dumps(ids)], limit) if ids else ([], False)
+    if overflow:
+        raise MailboxConflict("Stored mailbox read page exceeds the bounded response; retry was not truncated")
     return {"read_id": batch["id"], "snapshot_seq": batch["snapshot_seq"], "messages": messages,
             "next_after_seq": page["end_seq"] if page["has_more"] else None,
             "has_more": bool(page["has_more"]), "unavailable_count": len(ids) - len(messages), "replayed": replayed}

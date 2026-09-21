@@ -1,5 +1,18 @@
 # Development and release log
 
+## 2026-09-21 — Avoid redundant history scans on chat switches — source acceptance
+
+- Return unchanged timeline deltas before looking up fork provenance. For new
+  events and WebSocket catch-up, read fork metadata only when a forked event
+  actually needs it. Preserve internal fork filtering, sequence rollback
+  detection, and all visible reasoning and tool events.
+- Pass 66 focused timeline paging and WebSocket catch-up checks. In a read-only
+  comparison on an existing 497 MB history, unchanged deltas fall from 2,246 ms
+  to 0.23 ms and a one-event delta from 1,851 ms to 4.64 ms. These measure the
+  server reader, excluding network and client rendering time.
+- Availability: tested source optimization for the coordinated release; no
+  running production server or transcript changed by acceptance.
+
 ## 2026-09-21 — Retain failed scheduled-run status — source acceptance
 
 - Classify terminal scheduled-run events with nonzero exit codes as failed.

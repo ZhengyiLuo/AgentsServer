@@ -395,6 +395,29 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([event["seq"] for event in after_page[0]], [12, 14, 16])
         self.assertEqual(after_page[1:], (22, 6, 0, 3))
 
+    def test_empty_delta_skips_fork_scan_and_preserves_rollback_sequence(self) -> None:
+        with patch.object(agent_server, "fork_internal_run_ids") as fork_scan:
+            for after in (22, 30):
+                with self.subTest(after=after):
+                    self.assertEqual(
+                        agent_server.read_visible_events_after_page(self.session_id, after=after),
+                        ([], 22, 0, 0, 0),
+                    )
+            fork_scan.assert_not_called()
+
+    def test_ordinary_delta_and_visible_catchup_skip_fork_scan(self) -> None:
+        with patch.object(agent_server, "fork_internal_run_ids") as fork_scan:
+            delta = agent_server.read_visible_events_after_page(self.session_id, after=18)
+            catchup, continuation, exhausted = agent_server.read_event_catchup_batch(
+                self.session_id, after=18, through=22, visible=True,
+            )
+            fork_scan.assert_not_called()
+        self.assertEqual([event["seq"] for event in delta[0]], [19, 20, 21, 22])
+        self.assertEqual(delta[1:], (22, 4, 0, 0))
+        self.assertEqual([event["seq"] for event in catchup], [19, 20, 21, 22])
+        self.assertEqual(continuation[4], 22)
+        self.assertTrue(exhausted)
+
     def test_legacy_fork_digest_runs_do_not_count_as_visible_page_events(self) -> None:
         path = agent_server.events_path(self.session_id)
         events = [
@@ -408,13 +431,19 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
         agent_server.FORK_INTERNAL_RUN_CACHE.clear()
 
         page = agent_server.read_visible_events_page(self.session_id, limit=100, tail=False)
-        after_page = agent_server.read_visible_events_after_page(self.session_id, after=0, limit=100)
+        after_page = agent_server.read_visible_events_after_page(self.session_id, after=1, limit=100)
+        catchup, continuation, exhausted = agent_server.read_event_catchup_batch(
+            self.session_id, after=1, through=5, visible=True,
+        )
         generic = agent_server.read_events(self.session_id, limit=100, visible=True)
 
         self.assertEqual([event["seq"] for event in page[0]], [4, 5])
         self.assertEqual(page[1:], (5, 2, 0, 0))
         self.assertEqual([event["seq"] for event in after_page[0]], [4, 5])
         self.assertEqual(after_page[1:], (5, 2, 0, 0))
+        self.assertEqual([event["seq"] for event in catchup], [4, 5])
+        self.assertEqual(continuation[4], 5)
+        self.assertTrue(exhausted)
         self.assertEqual([event["seq"] for event in generic], [4, 5])
 
     def test_semantic_page_counts_a_recurring_job_once_and_bounds_its_history(self) -> None:

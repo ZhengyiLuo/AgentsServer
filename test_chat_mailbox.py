@@ -27,7 +27,8 @@ class ChatMailboxTests(unittest.TestCase):
             target_session_id TEXT, action TEXT, body TEXT, authorization_kind TEXT,
             authorization_pair_id TEXT, status TEXT, target_run_id TEXT,
             target_body TEXT, message_revision INTEGER DEFAULT 0, created_at TEXT,
-            delivery_mode TEXT, reply_to_message_id TEXT, lifecycle_status TEXT DEFAULT '', updated_at TEXT)""")
+            delivery_mode TEXT, reply_to_message_id TEXT, lifecycle_status TEXT DEFAULT '', updated_at TEXT,
+            source_user_instruction TEXT DEFAULT '')""")
         mailbox.initialize(self.connection)
 
     def transaction(self):
@@ -35,12 +36,13 @@ class ChatMailboxTests(unittest.TestCase):
         return self.connection
 
     def store(self, message_id, *, body="Synthetic message.", source="sender", target="recipient",
-              pair=PAIR, parent=None, mode="mailbox", status="stored"):
+              pair=PAIR, parent=None, mode="mailbox", status="stored", source_user_instruction=""):
         self.connection.execute("""INSERT INTO cross_chat_envelopes
             (id,kind,source_session_id,source_run_id,target_session_id,action,body,
-             authorization_kind,authorization_pair_id,status,created_at,delivery_mode,reply_to_message_id)
-            VALUES(?,'instruction',?,'example-run',?,'instruction',?,'configured_route',?,?,?,?,?)""",
-            (message_id, source, target, body, pair, status, NOW, mode, parent))
+             authorization_kind,authorization_pair_id,status,created_at,delivery_mode,reply_to_message_id,
+             source_user_instruction)
+            VALUES(?,'instruction',?,'example-run',?,'instruction',?,'configured_route',?,?,?,?,?,?)""",
+            (message_id, source, target, body, pair, status, NOW, mode, parent, source_user_instruction))
         return mailbox.store_message(self.connection, message_id, now=NOW)
 
     def read(self, request="example-read", **patch):
@@ -141,6 +143,39 @@ class ChatMailboxTests(unittest.TestCase):
         self.assertLessEqual(len(json.dumps(page, ensure_ascii=True).encode()), mailbox.MAX_PAGE_BYTES)
         unread = mailbox.list_messages(self.connection, "recipient", None, [PAIR], unread_only=True)
         self.assertEqual([row["message_id"] for row in unread["messages"]], ["large-two"])
+
+    def test_unicode_source_instruction_counts_toward_page_bytes_without_truncation(self):
+        instruction = "Render 😀\n" * 5_000
+        with self.transaction():
+            for message_id in ("source-first", "source-second"):
+                self.store(message_id, body="B" * 8_000, source_user_instruction=instruction)
+            first = self.read()
+        self.assertEqual([row["message_id"] for row in first["messages"]], ["source-first"])
+        self.assertEqual(first["messages"][0]["source_user_instruction"], instruction)
+        self.assertTrue(first["has_more"])
+        self.assertLess(len(json.dumps(first, ensure_ascii=False).encode("utf-8")), mailbox.MAX_PAGE_BYTES)
+        unread = mailbox.list_messages(self.connection, "recipient", "sender", [PAIR], unread_only=True)
+        self.assertEqual([row["message_id"] for row in unread["messages"]], ["source-second"])
+        with self.transaction():
+            second = self.read(after_seq=first["next_after_seq"])
+        self.assertEqual(second["messages"][0]["source_user_instruction"], instruction)
+        self.assertFalse(second["has_more"])
+
+    def test_legacy_read_page_that_outgrows_byte_budget_errors_without_dropping_messages(self):
+        with self.transaction():
+            for message_id in ("legacy-first", "legacy-second"):
+                self.store(message_id, body="B" * 45_000)
+            original = self.read()
+            # Old receipts did not count source text. Simulate their larger
+            # projection after upgrade without changing receipt membership.
+            self.connection.execute("UPDATE cross_chat_envelopes SET source_user_instruction=?",
+                                    ("😀" * 3_000,))
+        self.assertEqual(len(original["messages"]), 2)
+        with self.transaction(), self.assertRaisesRegex(mailbox.MailboxConflict, "retry was not truncated"):
+            self.read(reader_run_id="reconnected-reader")
+        page = self.connection.execute("SELECT message_ids_json FROM chat_mailbox_read_pages").fetchone()
+        self.assertEqual(json.loads(page[0]), ["legacy-first", "legacy-second"])
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM chat_mailbox_reads").fetchone()[0], 1)
 
     def test_fresh_run_continues_original_snapshot_without_consuming_late_arrivals(self):
         with self.transaction():

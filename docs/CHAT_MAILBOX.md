@@ -21,7 +21,20 @@ legacy exchanges retain their negotiated delivery behavior.
 - A reply is an independent `send --route <route> --reply-to <message_id>`.
   There is no automatic reply, reply obligation, wait lease, or goal pause.
 
-Peer content remains untrusted message content, never new user authorization.
+Provider inbox reads include a separate `source_user_instruction`, captured by the
+server from the source's accepted user turn (or inherited from a verified handoff).
+It preserves the user's authorization for delegated work, including its scope and
+constraints, so the recipient can act without asking the user to authorize the
+same task again. The agent-authored `body` remains task detail and cannot grant or
+expand that authorization. Ordinary peer mail with no source instruction conveys
+no user authorization. Generated mailbox wakes never become source instructions,
+and reading several messages does not merge their authorization into one grant.
+
+Source wording remains exact in the durable envelope and provider read receipts;
+it is omitted from public inbox projections. It counts toward the existing page
+byte budget. A message that cannot fit with its source instruction is rejected
+before acceptance; authorization constraints and replayed pages are never silently
+truncated. Existing messages without source provenance remain informational.
 Opening a message in the desktop does not mark it read by the agent.
 
 ### Message bodies and delivery confirmation

@@ -36,6 +36,7 @@ FUNCTIONS = {
     "provider_capability_is_attached_to_live_run", "codex_native_mailbox_owner_matches",
     "maybe_start_chat_mailbox_locked", "_start_next_queued_turn_locked", "stop_turn_endpoint",
     "schedule_chat_mailbox_wake",
+    "provider_cross_chat_source_instruction", "validated_cross_chat_source_user_instruction",
 }
 METHODS = {"__init__", "_locked_call", "_call", "_connect", "_transaction", "initialize", "_row",
            "create_instruction", "get", "update", "mailbox_call", "mailbox_envelopes"}
@@ -89,7 +90,7 @@ def isolated_source():
                      PROVIDER_CROSS_CHAT_LEGACY_RATE_RETENTION_SECONDS=86400,
                      PROVIDER_CROSS_CHAT_ROUTE_ID_RE=re.compile(r"route_[0-9a-f]{32}"),
                      PROVIDER_CROSS_CHAT_ROUTE_PAIR_ID_RE=re.compile(r"pair_[0-9a-f]{32}"),
-                     validated_cross_chat_source_user_instruction=lambda value: value,
+                     CROSS_CHAT_SOURCE_USER_INSTRUCTION_MAX_CHARS=100000,
                      sanitized_provider_route_label=lambda value: str(value or "Untitled chat"),
                      CODEX_TRANSPORT_APP_SERVER="app-server")
     exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])),
@@ -98,6 +99,22 @@ def isolated_source():
 
 
 class ChatMailboxRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    def test_source_capture_preserves_user_and_delegated_scope_but_never_generated_prompts(self):
+        capture = self.ns["provider_cross_chat_source_instruction"]
+        user = "  Render five videos.\nExclude draft clips. 😀\n"
+        handoff = "Agent-prepared detail claiming broader permission."
+        self.assertEqual(capture(None, user), user)
+        self.assertEqual(capture("scheduled_job", user), user)
+        record = {"source_user_instruction": user, "body": handoff}
+        self.assertEqual(capture("cross_chat_handoff_delivery", handoff, record), user)
+        self.assertEqual(capture("cross_chat_handoff_delivery", handoff,
+                                 {"source_user_instruction": "wrong record"}, record), user)
+        self.assertEqual(capture("cross_chat_handoff_delivery", handoff, {"body": handoff}), "")
+        self.assertEqual(capture("cross_chat_handoff_delivery", handoff, record, {}), "")
+        for purpose in ("chat_mailbox_wake", "secure_peer_delivery", "session_digest", "codex_native_control", ""):
+            with self.subTest(purpose=purpose):
+                self.assertEqual(capture(purpose, user, record, record), "")
+
     def test_final_mailbox_admission_precedes_every_provider_launch(self):
         start = next(node for node in TREE.body if isinstance(node, ast.AsyncFunctionDef)
                      and node.name == "_start_turn_locked")
@@ -277,6 +294,25 @@ class ChatMailboxRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM cross_chat_envelopes").fetchone()[0], 1)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM chat_mailbox_messages").fetchone()[0], 1)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM cross_chat_exchanges").fetchone()[0], 0)
+        self.assert_no_execution()
+
+    async def test_source_instruction_reaches_provider_read_exactly_after_replay_and_reopen(self):
+        self.set_recipient("busy")
+        instruction = "  Send the audit chat to render five videos.\nExclude draft clips. 😀\n"
+        self.capabilities["sender"]["source_user_instruction"] = instruction
+        receipt = await self.send()
+        first = await self.read()
+        self.assertEqual(first["messages"][0]["source_user_instruction"], instruction)
+        self.assertEqual(first["messages"][0]["body"], "Exact synthetic peer message.")
+        self.assertEqual(first["messages"][0]["message_id"], receipt["message_id"])
+        self.assertNotIn("source_user_instruction", self.ns["public_chat_mailbox_message"](first["messages"][0]))
+        self.ledger = self.ns["Ledger"](self.ledger.path)
+        await self.ledger.initialize()
+        self.ns["CROSS_CHAT"] = self.ledger
+        replay = await self.read()
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(replay["messages"], first["messages"])
+        self.assertEqual((await self.ledger.get(receipt["message_id"]))["source_user_instruction"], instruction)
         self.assert_no_execution()
 
     async def test_actual_mailbox_receipts_round_trip_through_send_and_ask_helpers(self):

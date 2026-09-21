@@ -78846,6 +78846,13 @@ async def replace_codex_provider_settings(selected: dict | None):
             await asyncio.to_thread(CODEX_PROVIDER_STORE.save, selected)
 
 
+async def custom_codex_discovery_native_models() -> dict:
+    path = await codex_provider.prepare_native_catalog(
+        CODEX_BIN, codex_app_server_env(), CODEX_PROVIDER_STORE.root / "discovery-native-models.json",
+    )
+    return await asyncio.to_thread(lambda: json.loads(Path(path).read_text(encoding="utf-8")))
+
+
 app.include_router(codex_provider.create_router(
     authorize=require_native_admin_control,
     store=CODEX_PROVIDER_STORE,
@@ -78853,6 +78860,7 @@ app.include_router(codex_provider.create_router(
     probe=probe_codex_provider,
     available=lambda: CODEX_TRANSPORT != CODEX_TRANSPORT_EXEC,
     session_lookup=lambda session_id: STORE.sessions.get(session_id),
+    native_models=custom_codex_discovery_native_models,
 ))
 
 

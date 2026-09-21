@@ -122,6 +122,19 @@ while (($#)); do
   esac
 done
 
+refuse_execution_layout() {
+  local marker=""
+  for marker in "$INSTALL_ROOT/execution-layout.json" "$INSTALL_ROOT/.execution-transaction"; do
+    if [[ -e "$marker" || -L "$marker" ]]; then
+      echo "This uninstaller does not support the separate gateway/execution layout or its pending transaction." >&2
+      echo "Use the execution-aware managed lifecycle; the pinned worker has not been changed." >&2
+      return 1
+    fi
+  done
+}
+
+refuse_execution_layout || exit 1
+
 INSTALL_LOCK_DIR="$INSTALL_ROOT/.install-lock"
 UNINSTALL_LOCK_HELD="false"
 INSTALL_ROOT_CREATED_FOR_LOCK="false"
@@ -168,6 +181,7 @@ acquire_operation_lock() {
 acquire_operation_lock || exit 1
 trap release_operation_lock EXIT
 trap 'exit 130' HUP INT TERM
+refuse_execution_layout || exit 1
 
 confirm() {
   local prompt="$1"

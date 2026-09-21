@@ -11,6 +11,10 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parent
+EXECUTION_MODULES = {
+    "execution_control.py", "execution_install.py", "execution_maintenance.py",
+    "execution_manage.py", "execution_ownership.py", "execution_service.py", "execution_transport.py",
+}
 sys.path.insert(0, str(ROOT / "scripts"))
 import package_npm_release as package
 
@@ -114,11 +118,16 @@ class NpmReleasePackageTests(unittest.TestCase):
             subprocess.run(["git", "-c", "user.name=Package Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "fixture change"], cwd=self.root.parent, check=True)
 
     @unittest.skipUnless(shutil.which("npm"), "npm required for actual offline pack proof")
-    def test_actual_npm_and_legacy_archives_preserve_license_and_notice_in_runtime(self):
+    def test_actual_npm_and_legacy_archives_preserve_legal_and_execution_runtime(self):
         # Exercise both real packagers; checking only their arrays would not
         # prove the documents survive the different distribution layouts.
         for name in ("LICENSE", "NOTICE"):
             shutil.copyfile(self.root.parent / name, self.root / name)
+        # Copy real execution sources so this checks actual runtime bytes in
+        # both layouts, including modules whose entry points run with python -m.
+        self.assertTrue(EXECUTION_MODULES <= set(package.runtime_files()))
+        for name in EXECUTION_MODULES:
+            shutil.copyfile(ROOT / name, self.root / name)
         scripts = self.root / "scripts"
         scripts.mkdir()
         shutil.copyfile(ROOT / "scripts/package_release.py", scripts / "package_release.py")
@@ -135,6 +144,13 @@ class NpmReleasePackageTests(unittest.TestCase):
                         member = archive.getmember(member_name)
                         self.assertTrue(member.isfile())
                         self.assertEqual(member.mode & 0o111, 0)
+                        self.assertEqual(archive.extractfile(member).read(), expected)
+            for name in sorted(EXECUTION_MODULES):
+                expected = (ROOT / name).read_bytes()
+                for archive, member_name in [(npm, f"package/server/{name}"), (legacy, f"agents-server-{version}/{name}")]:
+                    with self.subTest(member=member_name):
+                        member = archive.getmember(member_name)
+                        self.assertTrue(member.isfile())
                         self.assertEqual(archive.extractfile(member).read(), expected)
 
     @unittest.skipUnless(shutil.which("npm"), "npm required for actual offline pack proof")

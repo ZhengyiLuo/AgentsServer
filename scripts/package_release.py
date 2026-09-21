@@ -15,6 +15,13 @@ from pathlib import Path
 
 FILES = (
     "activation_transaction.py",
+    "execution_control.py",
+    "execution_install.py",
+    "execution_maintenance.py",
+    "execution_manage.py",
+    "execution_ownership.py",
+    "execution_service.py",
+    "execution_transport.py",
     "agent_server.py",
     "workspace_git.py",
     "team_hub_host.py",

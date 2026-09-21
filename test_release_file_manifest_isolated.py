@@ -11,6 +11,10 @@ import unittest
 
 
 ROOT = Path(__file__).parent
+EXECUTION_MODULES = {
+    "execution_control.py", "execution_install.py", "execution_maintenance.py",
+    "execution_manage.py", "execution_ownership.py", "execution_service.py", "execution_transport.py",
+}
 NEW_MODULES = {
     "workspace_git.py",
     "codex_auth.py",
@@ -73,6 +77,7 @@ class ReleaseFileManifestTests(unittest.TestCase):
         self.assertEqual(shell_array(self.installer, "RELEASE_FILES"), package)
         self.assertEqual(len(package), len(set(package)))
         self.assertTrue(NEW_MODULES <= set(package))
+        self.assertTrue(EXECUTION_MODULES <= set(package))
         self.manifest["validate_release_files"](ROOT)
 
     def test_license_and_notice_are_required_for_packaging_installation_and_deployment(self):
@@ -119,7 +124,7 @@ class ReleaseFileManifestTests(unittest.TestCase):
             root = Path(temporary)
             for name in self.manifest["FILES"]:
                 (root / name).write_text("synthetic release member\n")
-            for name in sorted(NEW_MODULES):
+            for name in sorted(NEW_MODULES | EXECUTION_MODULES):
                 selected = root / name
                 selected.unlink()
                 with self.subTest(name=name), self.assertRaisesRegex(SystemExit, re.escape(name)):
@@ -128,8 +133,8 @@ class ReleaseFileManifestTests(unittest.TestCase):
 
     def test_staged_and_direct_deploy_compile_lists_cover_new_modules(self):
         runtime = {name.removeprefix("$SCRIPT_DIR/") for name in shell_array(self.deployer, "RUNTIME_FILES")}
-        self.assertTrue(NEW_MODULES <= runtime)
-        for name in NEW_MODULES:
+        self.assertTrue(NEW_MODULES | EXECUTION_MODULES <= runtime)
+        for name in NEW_MODULES | EXECUTION_MODULES:
             with self.subTest(name=name):
                 self.assertIn(f'"$STAGE_DIR/{name}"', self.installer)
                 self.assertIn(f"'$REMOTE_SERVER_DIR/{name}'", self.deployer)

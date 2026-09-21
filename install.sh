@@ -460,6 +460,17 @@ paths_overlap() {
     || "$second" == "$first/"* ]]
 }
 
+refuse_execution_layout() {
+  local marker=""
+  for marker in "$INSTALL_ROOT/execution-layout.json" "$INSTALL_ROOT/.execution-transaction"; do
+    if [[ -e "$marker" || -L "$marker" ]]; then
+      echo "This installer does not support the separate gateway/execution layout or its pending transaction." >&2
+      echo "Use the execution-aware managed lifecycle; the pinned worker has not been changed." >&2
+      return 1
+    fi
+  done
+}
+
 INSTALL_ROOT="$(normalize_managed_path AGENTS_SERVER_INSTALL_DIR "$INSTALL_ROOT")" \
   || exit 2
 CONFIG_ROOT="$(normalize_managed_path AGENTS_SERVER_CONFIG_DIR "$CONFIG_ROOT")" \
@@ -486,6 +497,7 @@ if paths_overlap "$INSTALL_ROOT" "$CONFIG_ROOT" \
   echo "Refusing overlapping install, configuration, and state roots; each must be a separate directory." >&2
   exit 2
 fi
+refuse_execution_layout || exit 1
 if [[ "$STATE_ROOT" == "$DEFAULT_STATE_GUARD" \
   && ( -e "$LEGACY_STATE_ROOT" || -L "$LEGACY_STATE_ROOT" ) \
   && ! -L "$LEGACY_STATE_ROOT" \
@@ -1623,7 +1635,7 @@ if [[ "$TEAM_HUB_MODE" == "host" && "$TEAM_HUB_OPERATION_PENDING" != "true" ]]; 
   fi
 fi
 
-RELEASE_FILES=(activation_transaction.py agent_server.py workspace_git.py team_hub_host.py secure_peer_runtime.py team_mail_runtime.py team_mail_websocket.py team_mail_grants.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py chat_mailbox.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py provider_commands.py claude_sdk_client.py claude_background_reconciliation.py codex_app_server.py codex_auth.py codex_provider.py side_questions.py title_generation.py codex_side_question.py claude_side_question.py cursor_agent_client.py cursor_process_guard.py claude_history_repair.py claude_history_provenance.py codex_history_repair.py public_chat_shares.py public_chat_transcript.py public_chat_share_routes.py interactive_chat_shares.py interactive_chat_share_routes.py interactive_chat_share_web.py interactive_chat_projection.py interactive_chat_runtime.py interactive_chat_native.py shared_chat_videos.py shared_chat_video_stream.py interactive_chat_controls.py install.sh uninstall.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem LICENSE NOTICE)
+RELEASE_FILES=(activation_transaction.py execution_control.py execution_install.py execution_maintenance.py execution_manage.py execution_ownership.py execution_service.py execution_transport.py agent_server.py workspace_git.py team_hub_host.py secure_peer_runtime.py team_mail_runtime.py team_mail_websocket.py team_mail_grants.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py chat_mailbox.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py provider_commands.py claude_sdk_client.py claude_background_reconciliation.py codex_app_server.py codex_auth.py codex_provider.py side_questions.py title_generation.py codex_side_question.py claude_side_question.py cursor_agent_client.py cursor_process_guard.py claude_history_repair.py claude_history_provenance.py codex_history_repair.py public_chat_shares.py public_chat_transcript.py public_chat_share_routes.py interactive_chat_shares.py interactive_chat_share_routes.py interactive_chat_share_web.py interactive_chat_projection.py interactive_chat_runtime.py interactive_chat_native.py shared_chat_videos.py shared_chat_video_stream.py interactive_chat_controls.py install.sh uninstall.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem LICENSE NOTICE)
 RELEASE_DIRECTORIES=(agentsdock_team_hub)
 TEAM_HUB_RELEASE_FILES=(
   __init__.py
@@ -3049,6 +3061,7 @@ acquire_install_lock() {
 }
 
 validate_exclusive_install_state() {
+  refuse_execution_layout || return 1
   validate_fresh_install_state || return 1
   if [[ -d "$ACTIVATION_TRANSACTION_DIR" \
     && ! -L "$ACTIVATION_TRANSACTION_DIR" ]]; then
@@ -3148,6 +3161,13 @@ validate_staged_release_runtime() (
   "$STAGE_DIR/.venv/bin/python" -c 'import croniter, dateutil; from zoneinfo import ZoneInfo; ZoneInfo("America/Los_Angeles")' >/dev/null
   "$STAGE_DIR/.venv/bin/python" -m py_compile \
     "$STAGE_DIR/activation_transaction.py" \
+    "$STAGE_DIR/execution_control.py" \
+    "$STAGE_DIR/execution_install.py" \
+    "$STAGE_DIR/execution_maintenance.py" \
+    "$STAGE_DIR/execution_manage.py" \
+    "$STAGE_DIR/execution_ownership.py" \
+    "$STAGE_DIR/execution_service.py" \
+    "$STAGE_DIR/execution_transport.py" \
     "$STAGE_DIR/agent_server.py" \
     "$STAGE_DIR/team_hub_host.py" \
     "$STAGE_DIR/secure_peer_runtime.py" \
@@ -3192,7 +3212,7 @@ validate_staged_release_runtime() (
     "$STAGE_DIR/interactive_chat_controls.py" \
     "$STAGE_DIR/update_runner.py"
   "$STAGE_DIR/.venv/bin/python" -m compileall -q "$STAGE_DIR/agentsdock_team_hub"
-  PYTHONPATH="$STAGE_DIR" "$STAGE_DIR/.venv/bin/python" -c 'import workspace_git; import codex_auth, codex_provider, side_questions, title_generation, codex_side_question, claude_side_question, agentsdock_team_hub, cursor_agent_client, cursor_process_guard, secure_peer_delivery, secure_peer_runtime, team_mail_runtime, team_mail_websocket, team_mail_grants, team_hub_host, agentsdock_mail, agentsdock_team, claude_history_repair, claude_history_provenance, claude_background_reconciliation, codex_history_repair, public_chat_shares, public_chat_transcript, public_chat_share_routes, interactive_chat_shares, interactive_chat_share_routes, interactive_chat_share_web, interactive_chat_projection, interactive_chat_runtime, interactive_chat_native, shared_chat_videos, shared_chat_video_stream, interactive_chat_controls, chat_mailbox, provider_commands; from agentsdock_team_hub import secure_peer, secure_peer_hub' >/dev/null
+  PYTHONPATH="$STAGE_DIR" "$STAGE_DIR/.venv/bin/python" -c 'import execution_control, execution_install, execution_maintenance, execution_manage, execution_ownership, execution_service, execution_transport; import workspace_git; import codex_auth, codex_provider, side_questions, title_generation, codex_side_question, claude_side_question, agentsdock_team_hub, cursor_agent_client, cursor_process_guard, secure_peer_delivery, secure_peer_runtime, team_mail_runtime, team_mail_websocket, team_mail_grants, team_hub_host, agentsdock_mail, agentsdock_team, claude_history_repair, claude_history_provenance, claude_background_reconciliation, codex_history_repair, public_chat_shares, public_chat_transcript, public_chat_share_routes, interactive_chat_shares, interactive_chat_share_routes, interactive_chat_share_web, interactive_chat_projection, interactive_chat_runtime, interactive_chat_native, shared_chat_videos, shared_chat_video_stream, interactive_chat_controls, chat_mailbox, provider_commands; from agentsdock_team_hub import secure_peer, secure_peer_hub' >/dev/null
 )
 
 abort_unclaimed_team_hub_reactivation() {

@@ -5915,9 +5915,16 @@ def request_client_is_codex_provider_mcp_local(request: Request) -> bool:
     return request_client_is_provider_helper_local(request)
 
 
+# Set only by the independently managed execution entrypoint, before startup.
+# Public bind/port remain unchanged for Team Hub and native client discovery.
+PROVIDER_CALLBACK_ORIGIN: str | None = None
+
+
 def provider_helper_server_origin() -> str:
     """Return the exact same-host origin used by provider helper transports."""
 
+    if PROVIDER_CALLBACK_ORIGIN is not None:
+        return PROVIDER_CALLBACK_ORIGIN
     host = codex_provider_mcp_connection_host()
     url_host = (
         f"[{host}]"
@@ -70208,6 +70215,7 @@ MANAGED_SERVER_UPDATE_PENDING_DETAIL = (
 MANAGED_SERVER_UPDATE_ACTIVE_DETAIL = "AgentsServer is preparing a managed update"
 MANAGED_SERVER_RESTART_ACTIVE_DETAIL = "AgentsServer is restarting"
 MANAGED_SERVER_SERVICE_KIND_CACHE: str | None = None
+EXECUTION_MAINTENANCE: Any = None
 SERVER_RESTART_SIGNAL_LOCK = threading.Lock()
 TEAM_HUB_HOST_CONTROL_LOCK = asyncio.Lock()
 
@@ -70288,7 +70296,45 @@ def managed_server_update_blocks_work(
     return (
         str(current.get("phase") or "") in SERVER_UPDATE_ACTIVE_PHASES
         or managed_update_provider_quiesce_in_progress()
+        or (EXECUTION_MAINTENANCE is not None and EXECUTION_MAINTENANCE.is_held())
     )
+
+
+async def execution_maintenance_control(
+    action: str | None = None,
+    operation_id: str | None = None,
+    lease_id: str | None = None,
+    lifetime_seconds: int = 120,
+) -> dict[str, Any]:
+    """Hold actual turn/mutation admission before authorizing worker retirement."""
+
+    if EXECUTION_MAINTENANCE is None:
+        raise RuntimeError("This process is not an independent execution worker")
+    provider_snapshot = await prepare_provider_background_work_snapshot(timeout_seconds=5.0)
+    async with ACTIVE_LOCK:
+        async with QUEUE_LOCK:
+            async with UNSAFE_HTTP_MUTATION_ADMISSION_LOCK:
+                blockers = server_update_blocker_counts(
+                    server_update_active_session_ids_locked(),
+                    update_blocking_queued_turn_count_locked(),
+                    provider_background_work_labels_from_snapshot(provider_snapshot),
+                    unsafe_http_mutation_count_locked(),
+                )
+                blockers.update({
+                    "session_deletions": len(DELETING_SESSIONS),
+                    "goals_reconfiguration": int(CODEX_GOALS_RECONFIGURING),
+                    "managed_restart": int(managed_server_restart_blocks_work()),
+                    "managed_update": int(
+                        str(read_server_update_status().get("phase") or "")
+                        in SERVER_UPDATE_ACTIVE_PHASES
+                        or managed_update_provider_quiesce_in_progress()
+                    ),
+                })
+                if action is None:
+                    return EXECUTION_MAINTENANCE.status(blockers)
+                return EXECUTION_MAINTENANCE.apply(
+                    action, operation_id, lease_id, lifetime_seconds, blockers,
+                )
 
 
 def managed_server_update_is_pending(
@@ -70526,14 +70572,24 @@ def managed_server_restart_is_planned() -> bool:
 
 
 def official_server_release_tree() -> bool:
-    """Return whether this process is running from the installer's current link."""
+    """Prove an installed runtime, including a worker retained across API updates."""
 
     configured = str(os.environ.get("AGENTS_SERVER_INSTALL_DIR") or "").strip()
     if not configured:
         return False
+    install_root = Path(configured).expanduser()
     try:
-        current = (Path(configured).expanduser() / "current").resolve(strict=True)
-    except (OSError, RuntimeError):
+        current = (install_root / "current").resolve(strict=True)
+        if EXECUTION_MAINTENANCE is not None:
+            from execution_install import active_worker_release
+
+            # Only the owned installation manifest can authorize the older
+            # execution runtime once the public gateway advances. Service
+            # ownership must still be proven separately below.
+            retained = active_worker_release(install_root)
+            if retained is not None:
+                return retained == SERVER_ROOT
+    except (OSError, RuntimeError, ValueError):
         return False
     return current == SERVER_ROOT
 
@@ -73746,6 +73802,12 @@ async def bounded_shutdown_phase(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from execution_ownership import acquire_state_ownership
+
+    # Both the maintained legacy entrypoint and the split worker pass here.
+    # Retain the descriptor until process exit: bounded shutdown can leave
+    # finalizers alive after this lifespan returns.
+    acquire_state_ownership(STATE_DIR)
     global SERVER_SHUTTING_DOWN, QUEUE_RECOVERY_TASK
     SERVER_SHUTTING_DOWN = False
     await STORE.load()

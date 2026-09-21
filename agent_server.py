@@ -29829,7 +29829,7 @@ def read_event_catchup_batch(
     if not path.exists():
         return [], (0, 0, 0, 0, max(0, int(after))), False
     limit = max(1, min(int(limit or 500), MAX_EVENT_RESPONSE_LIMIT))
-    internal_run_ids = fork_internal_run_ids(session_id) if visible else set()
+    internal_run_ids: set[str] | None = None
     out: list[dict[str, Any]] = []
     highest_scanned_seq = max(0, int(after))
     with path.open("rb") as source:
@@ -29883,6 +29883,8 @@ def read_event_catchup_batch(
             if not is_client_visible_event(event):
                 continue
             event = client_safe_event(event)
+            if visible and event.get("forked") is True and internal_run_ids is None:
+                internal_run_ids = fork_internal_run_ids(session_id)
             if visible and not is_visible_timeline_event(
                 event,
                 fork_internal_run_ids=internal_run_ids,
@@ -30075,11 +30077,13 @@ def read_visible_events_after_page(
     path = events_path(session_id)
     if not path.exists() or path.stat().st_size <= 0:
         return [], 0, 0, 0, 0
+    latest_seq = last_event_seq_from_file(path)
+    if latest_seq <= after:
+        return [], latest_seq, 0, 0, 0
     limit = max(1, min(int(limit or 500), MAX_EVENT_RESPONSE_LIMIT))
     selected: deque[dict[str, Any]] = deque(maxlen=limit)
-    internal_run_ids = fork_internal_run_ids(session_id)
+    internal_run_ids: set[str] | None = None
     visible_count = 0
-    latest_seq = last_event_seq_from_file(path)
 
     try:
         with path.open("rb") as source, mmap.mmap(source.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
@@ -30104,6 +30108,8 @@ def read_visible_events_after_page(
                 if not is_client_visible_event(event):
                     continue
                 event = client_safe_event(event)
+                if event.get("forked") is True and internal_run_ids is None:
+                    internal_run_ids = fork_internal_run_ids(session_id)
                 if not is_visible_timeline_event(
                     event,
                     compact=compact,

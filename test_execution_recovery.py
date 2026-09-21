@@ -94,6 +94,7 @@ class RecoveryOwnerTests(unittest.TestCase):
         self.assertEqual(lock["pid"], os.getpid())
         self.assertTrue(lock["boot_id"])
         self.assertTrue(lock["process_start"])
+        self.assertEqual(set(lock["incarnation"]), {"directory_ctime_ns", "pid_inode", "pid_ctime_ns"})
 
     def test_arm_requires_existing_installer_authority_before_writing_owner(self):
         with self.assertRaises(FileNotFoundError):
@@ -360,6 +361,36 @@ class RecoveryOwnerTests(unittest.TestCase):
             with mock.patch.object(recovery, "_boot_id", return_value="different-boot"):
                 self.assertFalse(recovery._reap_observed_lock(self.item.root, self.directory, self.transaction))
             self.assertEqual((self.item.root / ".install-lock").stat().st_ino, before)
+
+    def test_identical_pid_replacement_is_not_the_recorded_lock_incarnation(self):
+        self.arm()
+        with InstallationLock(self.item.root):
+            recovery.observe_lock(self.item.root, self.transaction)
+            path = self.item.root / ".install-lock"
+            saved = json.loads((self.directory / "lock.json").read_text())
+            data = (path / "pid").read_bytes()
+            recovery.files._atomic_write(path / "pid", data)
+            self.assertEqual(path.stat().st_ino, saved["binding"]["inode"])
+            self.assertNotEqual((path / "pid").stat().st_ino, saved["incarnation"]["pid_inode"])
+            self.assertFalse(recovery._observed_installer_is_live(self.item.root, self.directory, self.transaction))
+            with mock.patch.object(recovery, "_boot_id", return_value="different-boot"), \
+                    mock.patch.object(recovery.os, "kill", side_effect=AssertionError("never signal a replacement owner")):
+                self.assertFalse(recovery._reap_observed_lock(self.item.root, self.directory, self.transaction))
+            self.assertEqual((path / "pid").read_bytes(), data)
+
+    def test_receipt_without_lock_incarnation_cannot_reap_or_claim_live_ownership(self):
+        self.arm()
+        with InstallationLock(self.item.root):
+            recovery.observe_lock(self.item.root, self.transaction)
+            path = self.item.root / ".install-lock"
+            saved = json.loads((self.directory / "lock.json").read_text())
+            saved.pop("incarnation")
+            recovery._write(self.directory / "lock.json", saved)
+            before = (path / "pid").read_bytes(), path.stat().st_ino
+            for inspect in (recovery._reap_observed_lock, recovery._observed_installer_is_live):
+                with self.assertRaisesRegex(ValueError, "provenance"):
+                    inspect(self.item.root, self.directory, self.transaction)
+            self.assertEqual(((path / "pid").read_bytes(), path.stat().st_ino), before)
 
     def test_finalization_requires_terminal_journal_and_proven_retirement(self):
         self.arm()

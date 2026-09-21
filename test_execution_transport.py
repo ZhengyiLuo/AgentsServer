@@ -463,6 +463,43 @@ class ExecutionTransportTests(unittest.IsolatedAsyncioTestCase):
         writer.close()
         await writer.wait_closed()
 
+    async def test_worker_shutdown_skips_transport_closed_during_request_drain(self):
+        accepted = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def app(scope, receive, send):
+            accepted.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        server, _ = await self.start(app)
+        reader, writer = await self.raw_open()
+        self.assertEqual((await _read_frame(reader))["kind"], "ready")
+        await accepted.wait()
+        owned_writer = next(iter(server._writers))
+        # The request remains owned after its real Unix connection closes.
+        # CPython releases the transport's event loop at this boundary.
+        owned_writer.close()
+        await owned_writer.wait_closed()
+        self.assertEqual(owned_writer.get_extra_info("socket").fileno(), -1)
+        self.assertEqual(server.active_connections, 1)
+        try:
+            with mock.patch.object(owned_writer.transport, "write", wraps=owned_writer.transport.write) as write:
+                with self.assertRaises(ConnectionError):
+                    await _write_frame(owned_writer, {"kind": "error"})
+                write.assert_not_called()
+            with mock.patch.object(owned_writer.transport, "abort", wraps=owned_writer.transport.abort) as abort:
+                await asyncio.wait_for(server.close(timeout=0.01), 1)
+                abort.assert_not_called()
+            self.assertTrue(cancelled.is_set())
+            self.assertFalse(self.socket_path.exists())
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
     async def test_secret_permissions_links_and_existing_socket_paths_fail_closed(self):
         self.assertEqual(ensure_execution_secret(self.secret_path), self.secret)
         self.assertEqual(self.secret_path.stat().st_mode & 0o777, 0o600)

@@ -131,6 +131,35 @@ class ExecutionManageTests(unittest.TestCase):
     def controller(self, layout):
         return manage.ActivationController(layout, services=self.services, control=self.control, health_timeout=0)
 
+    def test_launchd_enablement_accepts_both_native_spellings_for_exact_label(self):
+        native = manage.NativeServices(replace(self.layout, platform="Darwin"), run=mock.Mock())
+        for spelling, enabled in (("true", False), ("false", True), ("disabled", False), ("enabled", True), (None, True)):
+            with self.subTest(spelling=spelling):
+                output = '\n "com.agentsdock.server-other" => disabled\n "comXagentsdockXserver" => disabled\n'
+                if spelling is not None:
+                    output += f' "com.agentsdock.server" => {spelling}\n'
+                def command(args, **kwargs):
+                    return subprocess.CompletedProcess(args, 0, output if args[1] == "print-disabled" else " pid = 123\n", "")
+                with mock.patch.object(files, "_snapshot", return_value={"exists": True}), mock.patch.object(native, "_command", side_effect=command):
+                    self.assertEqual(native._observe("worker"), {"state": "running", "enabled": enabled, "pid": 123})
+        for output in ('"com.agentsdock.server" => unknown\n', '"com.agentsdock.server" => true\n"com.agentsdock.server" => enabled\n'):
+            with mock.patch.object(files, "_snapshot", return_value={"exists": True}), mock.patch.object(native, "_command", return_value=subprocess.CompletedProcess([], 0, output, "")):
+                with self.assertRaisesRegex(RuntimeError, "ambiguous enablement"):
+                    native._observe("worker")
+
+    def test_installer_preserves_both_launchd_disabled_spellings(self):
+        source = (Path(__file__).parent / "install.sh").read_text()
+        start = source.index('    if printf \'%s\\n\' "$disabled_services"')
+        end = source.index('\n    fi', start) + len('\n    fi')
+        script = 'set -eu\nLABEL=com.agentsdock.server\n' + source[start:end] + '\nprintf "%s" "$PRIOR_SERVICE_ENABLED"\n'
+        for spelling, expected in (("true", "false"), ("disabled", "false"), ("false", "true"), ("enabled", "true"), (None, "true")):
+            with self.subTest(spelling=spelling):
+                output = ' "comXagentsdockXserver" => disabled\n "com.agentsdock.server-other" => true\n'
+                if spelling is not None:
+                    output += f' "com.agentsdock.server" => {spelling}\n'
+                result = subprocess.run(["/bin/bash", "-c", script], env={**os.environ, "disabled_services": output}, capture_output=True, text=True, check=True)
+                self.assertEqual(result.stdout, expected)
+
     def test_busy_gateway_update_never_mutates_or_stops_worker(self):
         self.control.busy = True
         worker_file = self.layout.service_path("worker")

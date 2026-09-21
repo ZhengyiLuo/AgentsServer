@@ -190,15 +190,52 @@ def _ancestor(pid: int) -> bool:
 def _lock_observation(root: Path, transaction: str) -> dict:
     path = root / ".install-lock"
     files._owned_directory(path, private=True)
+    incarnation = _lock_incarnation(path)
     data, _mode = files._read_file(path / "pid", private=True)
     if re.fullmatch(rb"[0-9]{1,20}\n?", data) is None or not _ancestor(int(data)):
         raise RuntimeError("recovery caller does not own the installer lock")
     start = _process_start(int(data))
     if not start:
         raise RuntimeError("installer process incarnation is unavailable")
+    binding = _binding(path)
+    if _lock_incarnation(path) != incarnation:
+        raise RuntimeError("installer lock changed while observing its incarnation")
     return {"format": 1, "transaction_id": transaction,
-        "binding": _binding(path), "pid": int(data), "pid_sha256": hashlib.sha256(data).hexdigest(),
+        "binding": binding, "incarnation": incarnation,
+        "pid": int(data), "pid_sha256": hashlib.sha256(data).hexdigest(),
         "boot_id": _boot_id(), "process_start": start}
+
+
+def _lock_incarnation(path: Path) -> dict:
+    """Distinguish a later lock even when ext4 immediately reuses its inode.
+
+    Neither pathname nor inode is a creation identity. Directory and PID-file
+    change times survive reboot and cannot be restored with utime; the PID-file
+    inode also binds replacement of an identical PID inside the same directory.
+    Device identity remains covered by the existing volume-aware binding.
+    """
+    directory, owner = path.lstat(), (path / "pid").lstat()
+    if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.getuid()
+            or stat.S_IMODE(directory.st_mode) != 0o700
+            or not stat.S_ISREG(owner.st_mode) or owner.st_uid != os.getuid()
+            or owner.st_nlink != 1 or stat.S_IMODE(owner.st_mode) != 0o600
+            or owner.st_dev != directory.st_dev):
+        raise PermissionError("installer lock incarnation is unsafe")
+    return {"directory_ctime_ns": directory.st_ctime_ns,
+            "pid_inode": owner.st_ino, "pid_ctime_ns": owner.st_ctime_ns}
+
+
+def _saved_lock(directory: Path, transaction: str) -> dict:
+    saved = _json(directory / "lock.json")
+    if (set(saved) != {"format", "transaction_id", "binding", "incarnation", "pid", "pid_sha256", "boot_id", "process_start"}
+            or saved["format"] != 1 or saved["transaction_id"] != transaction):
+        raise ValueError("recovery lock provenance is invalid")
+    incarnation = saved["incarnation"]
+    if (not isinstance(incarnation, dict)
+            or set(incarnation) != {"directory_ctime_ns", "pid_inode", "pid_ctime_ns"}
+            or any(type(value) is not int or value <= 0 for value in incarnation.values())):
+        raise ValueError("recovery lock incarnation is invalid")
+    return saved
 
 
 def observe_lock(root: Path, transaction: str) -> None:
@@ -211,13 +248,11 @@ def _reap_observed_lock(root: Path, directory: Path, transaction: str) -> bool:
     path = root / ".install-lock"
     if not path.exists() and not path.is_symlink():
         return False
-    saved = _json(directory / "lock.json")
-    if set(saved) != {"format", "transaction_id", "binding", "pid", "pid_sha256", "boot_id", "process_start"}:
-        raise ValueError("recovery lock provenance is invalid")
-    if saved["format"] != 1 or saved["transaction_id"] != transaction:
-        raise ValueError("recovery lock belongs to another transaction")
+    saved = _saved_lock(directory, transaction)
     try:
         _check_binding(path, saved["binding"])
+        if _lock_incarnation(path) != saved["incarnation"]:
+            return False
     except (RuntimeError, ValueError):
         return False  # another installer owns a different lock directory
     data, _mode = files._read_file(path / "pid", private=True)
@@ -228,14 +263,21 @@ def _reap_observed_lock(root: Path, directory: Path, transaction: str) -> bool:
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         info = os.fstat(descriptor)
-        if (info.st_dev, info.st_ino) != (path.stat().st_dev, path.stat().st_ino):
+        linked = path.lstat()
+        if ((info.st_dev, info.st_ino, info.st_ctime_ns) != (linked.st_dev, linked.st_ino, linked.st_ctime_ns)
+                or info.st_ctime_ns != saved["incarnation"]["directory_ctime_ns"]):
             raise RuntimeError("recovery lock changed during inspection")
         if set(os.listdir(descriptor)) != {"pid"}:
             raise RuntimeError("recovery lock contains unknown evidence")
         _check_binding(path, saved["binding"])
+        if _lock_incarnation(path) != saved["incarnation"]:
+            raise RuntimeError("recovery lock incarnation changed during inspection")
         latest, _mode = files._read_file(path / "pid", private=True)
         if latest != data:
             raise RuntimeError("recovery lock owner changed")
+        owner = os.stat("pid", dir_fd=descriptor, follow_symlinks=False)
+        if (owner.st_ino, owner.st_ctime_ns) != (saved["incarnation"]["pid_inode"], saved["incarnation"]["pid_ctime_ns"]):
+            raise RuntimeError("recovery lock owner incarnation changed")
         os.unlink("pid", dir_fd=descriptor)
         os.fsync(descriptor)
         path.rmdir()
@@ -633,12 +675,11 @@ def inspect_owner(root: Path, transaction: str) -> dict | None:
 def _observed_installer_is_live(root: Path, directory: Path, transaction: str) -> bool:
     """A busy API retry may join only the exact installer recorded at arm."""
     path = root / ".install-lock"
-    saved = _json(directory / "lock.json")
-    if (set(saved) != {"format", "transaction_id", "binding", "pid", "pid_sha256", "boot_id", "process_start"}
-            or saved["format"] != 1 or saved["transaction_id"] != transaction):
-        raise RuntimeError("recovery lock provenance is invalid")
+    saved = _saved_lock(directory, transaction)
     try:
         _check_binding(path, saved["binding"])
+        if _lock_incarnation(path) != saved["incarnation"]:
+            return False
         data, _mode = files._read_file(path / "pid", private=True)
     except (FileNotFoundError, RuntimeError, ValueError):
         return False

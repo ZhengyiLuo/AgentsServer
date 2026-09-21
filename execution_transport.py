@@ -142,6 +142,8 @@ async def _read_frame(reader: asyncio.StreamReader) -> dict[str, Any]:
 
 
 async def _write_frame(writer: asyncio.StreamWriter, message: dict[str, Any]) -> None:
+    if writer.is_closing():
+        raise ConnectionError("Execution connection is closing")
     encoded = json.dumps({"v": PROTOCOL_VERSION, **message}, ensure_ascii=True,
                          allow_nan=False, separators=(",", ":")).encode("ascii")
     if len(encoded) > MAX_FRAME_BYTES:
@@ -402,7 +404,13 @@ class ExecutionTransportServer:
         # buffered response indefinitely. Only explicit worker shutdown aborts
         # those remaining transports after the drain window.
         for writer in writers:
-            writer.transport.abort()
+            connection = writer.get_extra_info("socket")
+            # is_closing() also covers live sockets flushing buffered data.
+            # A completed close instead retires the actual descriptor and,
+            # on CPython, can clear the transport's loop before abort().
+            # There is no await between this check and the remaining abort.
+            if connection is not None and connection.fileno() >= 0:
+                writer.transport.abort()
         if pending:
             await asyncio.wait(pending, timeout=1.0)
         if server is not None:

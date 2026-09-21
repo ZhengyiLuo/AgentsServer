@@ -2398,7 +2398,7 @@ backup_runtime_configuration() {
     disabled_services="$(launchctl print-disabled "gui/$(id -u)" 2>/dev/null)" \
       || return 1
     if printf '%s\n' "$disabled_services" \
-      | grep -Eq "\"$LABEL\"[[:space:]]*=>[[:space:]]*true"; then
+      | awk -v label="$LABEL" '$1 == "\"" label "\"" && $2 == "=>" && ($3 == "true" || $3 == "disabled") { found = 1 } END { exit !found }'; then
       PRIOR_SERVICE_ENABLED="false"
     else
       PRIOR_SERVICE_ENABLED="true"

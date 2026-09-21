@@ -7,6 +7,7 @@ Every mutating operation requires its owned outer transaction and install lock.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import ast
 import json
 import os
@@ -191,6 +192,95 @@ def admitted_update_id(args: argparse.Namespace, status: dict[str, Any]) -> str:
     raise RuntimeError("legacy installer is not descended from the admitted updater")
 
 
+def require_retired_legacy_intent(layout: files.ExecutionLayout, previous: Any, intent: dict) -> None:
+    """Permit an old updater's carried-over intent only after proven retirement.
+
+    This reads historical evidence without loading or executing its bootstrap.
+    A retired owner's payload may predate additional bootstrap modules.
+    """
+    import execution_recovery as recovery
+    from execution_preparation import _check_binding
+    from execution_recovery_status import INTENT_KEYS
+
+    root = layout.install_root
+    def no_journal():
+        for name in (".activation-transaction", ".execution-transaction", ".execution-uninstall.json"):
+            if (root / name).exists() or (root / name).is_symlink():
+                raise RuntimeError("a lifecycle journal still owns the previous recovery intent")
+    no_journal()
+    if (not isinstance(previous, dict) or set(previous) != INTENT_KEYS
+            or type(previous["format"]) is not int or previous["format"] != 1
+            or previous["root"] != str(root) or previous["server_identity"] != intent["server_identity"]
+            or not isinstance(previous["version"], str) or not previous["version"]
+            or type(previous["api_contract"]) is not int or previous["api_contract"] < 1
+            or re.fullmatch(r"[0-9a-f]{32}", str(previous["update_id"])) is None
+            or previous["update_id"] == intent["update_id"]):
+        raise RuntimeError("previous recovery intent is not a different admitted update")
+    _check_binding(root, previous["root_binding"])
+    parent = root / recovery.DIRECTORY
+    files._path(parent)
+    if not parent.exists() and not parent.is_symlink():
+        no_journal()
+        return  # Pre-arm failure: no recovery owner was ever published.
+    files._owned_directory(parent, private=True)
+    directories = list(parent.iterdir())
+    if len(directories) > 4096:
+        raise RuntimeError("too many historical recovery owners")
+    digest = hashlib.sha256(files._json_bytes(previous)).hexdigest()
+    binding = {"format": 1, "path": str(layout.state_root / "admin/server-update.json"),
+               "update_id": previous["update_id"], "target_version": previous["version"],
+               "intent_sha256": digest}
+    matched = 0
+    for entry in directories:
+        directory = recovery._directory(root, entry.name)
+        owner = recovery._json(directory / "owner.json")
+        if (set(owner) != recovery.OWNER_KEYS or type(owner["format"]) is not int or owner["format"] != 1
+                or owner["root"] != str(root) or owner["transaction_id"] != entry.name
+                or owner["expected_server_identity"] != previous["server_identity"]
+                or owner["home"] != str(layout.home) or owner["platform"] != layout.platform
+                or owner["state_root"] != str(layout.state_root) or owner["config_root"] != str(layout.config_root)):
+            raise RuntimeError("historical recovery owner belongs to another installation")
+        _check_binding(root, owner["root_binding"])
+        previous_owner = (owner["managed_update_id"] == previous["update_id"]
+            or (isinstance(owner["status_binding"], dict)
+                and owner["status_binding"].get("update_id") == previous["update_id"]))
+        if previous_owner and (owner["status_binding"] != binding
+                or owner["root_binding"] != previous["root_binding"]
+                or owner["source_binding"] != previous["candidate_binding"]
+                or owner["managed_update_id"] != previous["update_id"]
+                or owner["version"] != previous["version"] or owner["api_contract"] != previous["api_contract"]):
+            raise RuntimeError("retired recovery owner differs from its admitted intent")
+        payload = owner["payload"]
+        required = set(recovery.PAYLOAD) - {"execution_http.py"}
+        if not isinstance(payload, dict) or not required <= set(payload) <= set(recovery.PAYLOAD):
+            raise RuntimeError("historical recovery bootstrap inventory is invalid")
+        for name, expected in payload.items():
+            if recovery._digest(directory / name) != expected:
+                raise RuntimeError("historical recovery bootstrap changed")
+        terminal = recovery._json(directory / "terminal.json")
+        snapshot = terminal.get("snapshot")
+        health = snapshot.get("health") if isinstance(snapshot, dict) else None
+        final = {"format": 1, "transaction_id": entry.name,
+                 "terminal_sha256": recovery._digest(directory / "terminal.json")}
+        if (recovery._json(directory / "finalized.json") != final
+                or recovery._json(directory / "retired.json") != final
+                or set(terminal) != {"format", "transaction_id", "phase", "snapshot"}
+                or type(terminal["format"]) is not int or terminal["format"] != 1
+                or terminal["transaction_id"] != entry.name or terminal["phase"] != "rollback-healthy"
+                or not isinstance(health, dict) or health.get("server_identity") != previous["server_identity"]):
+            raise RuntimeError("previous recovery intent lacks finalized rollback proof")
+        service = recovery._service_path(owner)
+        if service.exists() or service.is_symlink() or recovery.RecoveryService(owner).running(service):
+            raise RuntimeError("previous recovery owner is still registered or running")
+        matched += int(previous_owner)
+    if matched > 1:
+        raise RuntimeError("previous recovery intent has no unique retired owner")
+    # No matching owner is an interrupted pre-arm attempt. Every historical
+    # owner above must nevertheless be terminal and absent from native jobs;
+    # partial directories, unretired owners and any journal fail closed.
+    no_journal()
+
+
 def seed_legacy_recovery(args: argparse.Namespace, services: NativeServices) -> None:
     layout = command_layout(args)
     if services.snapshot()["worker"]["state"] != "running" or (layout.runtime_dir / "worker.json").exists():
@@ -211,7 +301,7 @@ def seed_legacy_recovery(args: argparse.Namespace, services: NativeServices) -> 
             server_identity=args.expected_server_identity)
         previous = status.get("_activation_recovery")
         if previous is not None and previous != intent:
-            raise RuntimeError("admitted update already owns a different recovery candidate")
+            require_retired_legacy_intent(layout, previous, intent)
         updates._update_status_unlocked(status_path, status, _activation_recovery=intent)
 
 

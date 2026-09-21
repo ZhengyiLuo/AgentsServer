@@ -194,10 +194,10 @@ class NativeServices:
             return {"state": "transitioning", "enabled": enabled}
         disabled = self._command(["/bin/launchctl", "print-disabled", f"gui/{os.getuid()}"])
         label = self._target(role).rsplit("/", 1)[1]
-        entries = re.findall(r'"' + re.escape(label) + r'"\s*=>\s*(true|false)', disabled.stdout)
-        if len(entries) > 1:
+        entries = re.findall(r'(?m)^\s*"' + re.escape(label) + r'"\s*=>\s*(\S+)\s*$', disabled.stdout)
+        if len(entries) > 1 or (entries and entries[0] not in {"true", "false", "enabled", "disabled"}):
             raise RuntimeError("launchd returned ambiguous enablement")
-        enabled = entries != ["true"]
+        enabled = not entries or entries[0] in {"false", "enabled"}
         result = self._command(["/bin/launchctl", "print", self._target(role)], allow_failure=True)
         if result.returncode:
             if "Could not find service" not in result.stderr:

@@ -54,7 +54,7 @@ class CodexSubagentsAdminTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(temporary.cleanup)
         self.settings = Path(temporary.name) / "admin" / "codex-settings.json"
         self.ns = {
-            "Any": object, "Path": Path, "json": json, "os": os, "asyncio": asyncio,
+            "Any": object, "Path": Path, "json": json, "os": os, "tempfile": tempfile, "asyncio": asyncio,
             "hmac": hmac, "re": re, "logger": Mock(), "BaseModel": BaseModel,
             "Field": Field, "Request": Request, "HTTPException": HTTPException,
             "JSONResponse": JSONResponse, "CODEX_SETTINGS_FILE": self.settings,

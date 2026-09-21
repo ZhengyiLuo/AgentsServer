@@ -727,6 +727,73 @@ class JobRunHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["output"], "Useful diagnostic output")
         self.assertEqual(summary["job_status"], "failed")
 
+    def test_failed_native_turn_reprojects_legacy_completed_job_status(self) -> None:
+        common = {
+            "run_id": "stream-failed-run",
+            "purpose": "scheduled_job",
+            "job_id": "job-1",
+            "backend": "codex",
+        }
+        message = "stream disconnected before completion: stream closed before response.completed"
+        self.write_events([
+            self.event(1, "turn_started", **common),
+            self.event(2, "job_ran", **common),
+            self.event(3, "error", message=message, transport="app-server", **common),
+            self.event(
+                4,
+                "turn_finished",
+                exit_code=1,
+                stopped=False,
+                result_text=message,
+                transport="app-server",
+                **common,
+            ),
+        ])
+
+        classify = agent_server.scheduled_job_run_status
+        with (
+            patch.object(
+                agent_server,
+                "TIMELINE_INDEX_PROJECTION_VERSION",
+                agent_server.TIMELINE_INDEX_PROJECTION_VERSION - 1,
+            ),
+            patch.object(
+                agent_server,
+                "scheduled_job_run_status",
+                side_effect=lambda event: (
+                    "completed" if event["type"] == "turn_finished" else classify(event)
+                ),
+            ),
+        ):
+            legacy = agent_server.read_scheduled_job_runs(self.session_id, "job-1")
+            self.assertEqual(legacy["runs"][0]["job_status"], "completed")
+
+        history = agent_server.read_scheduled_job_runs(self.session_id, "job-1")
+        semantic = agent_server.read_semantic_timeline_page(
+            self.session_id, limit=1, tail=True,
+        )
+        summary = next(event for event in semantic["events"] if event["type"] == "job_summary")
+        for event in (history["runs"][0], summary):
+            self.assertEqual(event["job_status"], "failed")
+            self.assertEqual(event["result_text"], message)
+            self.assertEqual(event["exit_code"], 1)
+            self.assertTrue(event["is_error"])
+
+    def test_terminal_job_exit_codes_preserve_success_and_stop_status(self) -> None:
+        for event_type in ("turn_finished", "job_finished"):
+            for fields, expected in (
+                ({}, "completed"),
+                ({"exit_code": None}, "completed"),
+                ({"exit_code": 0}, "completed"),
+                ({"exit_code": 1}, "failed"),
+                ({"exit_code": -1, "stopped": True}, "stopped"),
+            ):
+                with self.subTest(event_type=event_type, fields=fields):
+                    self.assertEqual(
+                        agent_server.scheduled_job_run_status({"type": event_type, **fields}),
+                        expected,
+                    )
+
     def test_history_reuses_the_primary_index_without_a_second_file_scan(self) -> None:
         agent_server.build_timeline_index(self.session_id)
 

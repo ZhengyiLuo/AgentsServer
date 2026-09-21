@@ -5157,7 +5157,7 @@ ARTIFACT_PUBLICATION_LOCK_STRIPES = tuple(asyncio.Lock() for _ in range(64))
 TIMELINE_PIN_LOCK_STRIPES = tuple(asyncio.Lock() for _ in range(64))
 TIMELINE_INDEX_CACHE_MAX = int(agentsdock_setting("TIMELINE_INDEX_CACHE_MAX", "24"))
 TIMELINE_INDEX_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
-TIMELINE_INDEX_PROJECTION_VERSION = 6
+TIMELINE_INDEX_PROJECTION_VERSION = 7
 # Retained as a compatibility/testing surface; synchronization uses the fixed
 # stripe pool below so deleted-session churn cannot leak one lock per chat.
 TIMELINE_INDEX_LOCKS: dict[str, threading.Lock] = {}
@@ -32234,6 +32234,8 @@ def scheduled_job_run_status(event: dict[str, Any]) -> str | None:
     if event_type == "job_deferred":
         return "deferred"
     if event_type in {"turn_finished", "job_finished"}:
+        if event.get("exit_code") not in (None, 0):
+            return "failed"
         return "completed"
     if event_type in {"turn_started", "job_started", "job_ran"}:
         return "running"

@@ -1,0 +1,154 @@
+name: Prepare signed npm server candidate
+
+# Active only after server/ is exported to AgentsServer. During the transition,
+# reuse that repository's existing signing secret; do not copy the private key
+# to the canonical or private desktop repository. This workflow only prepares
+# an Actions artifact. Native/migration acceptance and explicit publication of
+# the exact three files happen later; no release or registry is changed here.
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        required: true
+        type: string
+      source_ref:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+    secrets:
+      AGENTS_SERVER_RELEASE_PRIVATE_KEY_B64:
+        required: true
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full reviewed canonical AgentsDock commit SHA
+        required: true
+        type: string
+      source_ref:
+        description: Reviewed canonical branch containing that commit (main or release/*)
+        required: true
+        default: release/1.0
+        type: string
+      version:
+        description: Exact reviewed server and app version (for example 1.0.4-beta.12)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agentsdock-npm-candidate-signing
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository == 'ZhengyiLuo/AgentsServer' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      SOURCE_REF: ${{ inputs.source_ref }}
+      RELEASE_VERSION: ${{ inputs.version }}
+    steps:
+      - name: Require controlled workflow branch and reviewed source inputs
+        env:
+          WORKFLOW_REF: ${{ github.ref }}
+        shell: bash
+        run: |
+          [[ "$WORKFLOW_REF" == refs/heads/main || "$WORKFLOW_REF" =~ ^refs/heads/release/[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || exit 1
+          git check-ref-format "$WORKFLOW_REF"
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ "$SOURCE_REF" == main || "$SOURCE_REF" =~ ^release/[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || exit 1
+          git check-ref-format "refs/heads/$SOURCE_REF"
+          [[ "$RELEASE_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-beta\.[1-9][0-9]*)?$ ]] || exit 1
+      - name: Check out the controlled standalone trust root
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Check out the exact reviewed canonical source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: ZhengyiLuo/AgentsDock
+          ref: ${{ inputs.source_sha }}
+          path: release-source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify canonical ancestry, version and established signing key
+        working-directory: release-source
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git fetch --no-tags origin "refs/heads/$SOURCE_REF:refs/remotes/origin/npm-reviewed"
+          git merge-base --is-ancestor "$SOURCE_SHA" refs/remotes/origin/npm-reviewed
+          test "$(cat server/VERSION)" = "$RELEASE_VERSION"
+          # The native pipeline stamps its staged app version from this same
+          # signed descriptor; electron/package.json is a development placeholder.
+          cmp "$GITHUB_WORKSPACE/release-public-key.pem" server/release-public-key.pem
+          test -z "$(git status --porcelain --untracked-files=normal)"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Verify CLI, staging guards and offline npm packaging
+        working-directory: release-source
+        shell: bash
+        run: |
+          node --test server/npm/cli.test.cjs scripts/tests/stage_coordinated_release.test.mjs scripts/tests/verify_npm_publication.test.mjs
+          python3 -m unittest discover -s server -p test_npm_release_package.py
+      - name: Prepare the exact clean candidate once
+        working-directory: release-source
+        run: python3 server/scripts/package_npm_release.py --output "$RUNNER_TEMP/npm-candidate" --require-clean-source
+      - name: Sign and verify the exact prepared descriptor
+        env:
+          RELEASE_KEY_B64: ${{ secrets.AGENTS_SERVER_RELEASE_PRIVATE_KEY_B64 }}
+        shell: bash
+        run: |
+          test -n "$RELEASE_KEY_B64"
+          umask 077
+          key_file="$(mktemp "$RUNNER_TEMP/agents-server-signing.XXXXXX")"
+          trap 'rm -f "$key_file"' EXIT
+          printf '%s' "$RELEASE_KEY_B64" | base64 --decode > "$key_file"
+          openssl pkeyutl -sign -rawin -inkey "$key_file" \
+            -in "$RUNNER_TEMP/npm-candidate/agents-server-npm-manifest.json" \
+            -out "$RUNNER_TEMP/npm-candidate/agents-server-npm-manifest.sig"
+          openssl pkeyutl -verify -rawin -pubin -inkey release-public-key.pem \
+            -in "$RUNNER_TEMP/npm-candidate/agents-server-npm-manifest.json" \
+            -sigfile "$RUNNER_TEMP/npm-candidate/agents-server-npm-manifest.sig"
+      - name: Inspect the signed bundle without publication or acceptance
+        working-directory: release-source
+        shell: bash
+        run: |
+          # The helper also validates the later draft's shape. This local fixture
+          # represents that shape only; no GitHub draft is created or accepted.
+          node --input-type=module <<'NODE'
+          import { createHash } from 'node:crypto'
+          import { readFileSync, readdirSync, writeFileSync, appendFileSync } from 'node:fs'
+          import { join } from 'node:path'
+          const version = process.env.RELEASE_VERSION
+          const names = ['agents-server-npm-manifest.json', 'agents-server-npm-manifest.sig', `server-${version}.tgz`].sort()
+          const directory = join(process.env.RUNNER_TEMP, 'npm-candidate')
+          if (JSON.stringify(readdirSync(directory).sort()) !== JSON.stringify(names)) throw Error('Expected exactly three candidate files')
+          const digest = createHash('sha256').update(readFileSync(join(directory, names[0]))).digest('hex')
+          writeFileSync(join(process.env.RUNNER_TEMP, 'npm-candidate-inspection.json'), JSON.stringify({ tagName: `npm-candidate-v${version}`, isDraft: true, assets: names.map(name => ({ name })) }))
+          appendFileSync(process.env.GITHUB_ENV, `CANDIDATE_MANIFEST_SHA256=${digest}\n`)
+          writeFileSync(join(process.env.RUNNER_TEMP, 'npm-candidate-manifest-sha256'), digest)
+          NODE
+          node scripts/verify_npm_publication.mjs inspect "$RUNNER_TEMP/npm-candidate" "$SOURCE_SHA" "$(cat "$RUNNER_TEMP/npm-candidate-manifest-sha256")" "$RUNNER_TEMP/npm-candidate-inspection.json"
+      - name: Preserve only the signed candidate bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signed-npm-server-${{ inputs.version }}-${{ inputs.source_sha }}
+          path: |
+            ${{ runner.temp }}/npm-candidate/agents-server-npm-manifest.json
+            ${{ runner.temp }}/npm-candidate/agents-server-npm-manifest.sig
+            ${{ runner.temp }}/npm-candidate/server-${{ inputs.version }}.tgz
+          if-no-files-found: error
+          retention-days: 14
+      - name: Record preparation status
+        shell: bash
+        run: |
+          printf 'Prepared signed npm candidate **%s** from canonical commit `%s`.\n\nCandidate manifest SHA-256: `%s`.\n\nThis is signing preparation only. Native app and migration acceptance remain required before this hash can be used as an accepted publication pin. No npm package, GitHub release, or native app was published.\n' "$RELEASE_VERSION" "$SOURCE_SHA" "$CANDIDATE_MANIFEST_SHA256" >> "$GITHUB_STEP_SUMMARY"

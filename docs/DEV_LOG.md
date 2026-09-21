@@ -1,5 +1,23 @@
 # Development and release log
 
+## 2026-09-21 — Restore native custom-endpoint retries — source acceptance
+
+- Stop applying connection-test retry limits to ordinary custom-endpoint chats.
+  Production requests now use the installed Codex runtime's bounded retry
+  behavior; explicit connection checks and offline catalog inspection retain
+  zero retries. No whole-turn replay or synthetic completion is introduced.
+- Pass 40 focused provider checks. Verify with actual Codex 0.155.0 and a
+  controlled local Responses stream: a first-attempt disconnect reconnects and
+  completes on request two; the old zero-retry configuration fails after one
+  request; persistent disconnects fail after five retries; the actual connection
+  probe makes exactly one request and remains unverified.
+- A separate real-endpoint check completes three streams with their completion
+  events intact. Historical missing-completion errors do not establish the
+  upstream cause; restoring retries improves recovery from transient failures
+  and does not certify endpoint reliability.
+- Availability: tested source correction for the coordinated release; no
+  production credentials, chats, or running servers changed by acceptance.
+
 ## 2026-09-21 — Preserve user authorization in chat mail — source acceptance
 
 - Preserve the originating user's exact instruction through permanent-route

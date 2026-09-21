@@ -75,6 +75,23 @@ class ReleaseFileManifestTests(unittest.TestCase):
         self.assertTrue(NEW_MODULES <= set(package))
         self.manifest["validate_release_files"](ROOT)
 
+    def test_license_and_notice_are_required_for_packaging_installation_and_deployment(self):
+        legal_files = {"LICENSE", "NOTICE"}
+        self.assertTrue(legal_files <= set(self.manifest["FILES"]))
+        self.assertTrue(legal_files <= set(shell_array(self.installer, "RELEASE_FILES")))
+        deployed = {name.removeprefix("$SCRIPT_DIR/") for name in shell_array(self.deployer, "RUNTIME_FILES")}
+        self.assertTrue(legal_files <= deployed)
+        with tempfile.TemporaryDirectory(prefix="release-legal-manifest-") as temporary:
+            root = Path(temporary)
+            for name in self.manifest["FILES"]:
+                (root / name).write_text("synthetic release member\n")
+            for name in sorted(legal_files):
+                selected = root / name
+                selected.unlink()
+                with self.subTest(name=name), self.assertRaisesRegex(SystemExit, name):
+                    self.manifest["validate_release_files"](root)
+                selected.write_text("synthetic release member\n")
+
     def test_package_and_installer_require_migration_20_and_exact_hub_members(self):
         package = self.manifest["DIRECTORY_FILES"]["agentsdock_team_hub"]
         self.assertEqual(shell_array(self.installer, "TEAM_HUB_RELEASE_FILES"), package)

@@ -9,6 +9,7 @@ that exact transaction before it may choose a new rollback baseline.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import ipaddress
 import json
@@ -19,10 +20,11 @@ import secrets
 import shutil
 import stat
 import sys
+import uuid
 from typing import Any
 
 
-FORMAT = 1
+FORMAT = 2
 MAX_CONTROL_BYTES = 256 * 1024
 MAX_CONFIG_BYTES = 16 * 1024 * 1024
 PHASES = {
@@ -70,6 +72,131 @@ BEGIN_DIRECTORY_RE = re.compile(r"^\.activation-transaction\.[0-9a-f]{24}\.tmp$"
 
 def _absolute(path: str | Path) -> Path:
     return Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
+
+
+def _volume_uuid(path: Path, identity: os.stat_result) -> str:
+    """Read Darwin's persistent volume UUID from the exact inspected inode."""
+    class Attributes(ctypes.Structure):
+        _fields_ = [
+            ("count", ctypes.c_uint16), ("reserved", ctypes.c_uint16),
+            ("common", ctypes.c_uint32), ("volume", ctypes.c_uint32),
+            ("directory", ctypes.c_uint32), ("file", ctypes.c_uint32),
+            ("fork", ctypes.c_uint32),
+        ]
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (identity.st_dev, identity.st_ino):
+            raise RuntimeError("activation volume anchor changed")
+        library = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+        function = library.fgetattrlist
+        function.argtypes = [
+            ctypes.c_int, ctypes.POINTER(Attributes), ctypes.c_void_p,
+            ctypes.c_size_t, ctypes.c_ulong,
+        ]
+        function.restype = ctypes.c_int
+        # ATTR_BIT_MAP_COUNT, ATTR_VOL_INFO | ATTR_VOL_UUID, from sys/attr.h.
+        attributes = Attributes(5, 0, 0, 0x80040000, 0, 0, 0)
+        result = ctypes.create_string_buffer(20)
+        if function(descriptor, ctypes.byref(attributes), result, 20, 0) != 0:
+            raise OSError(ctypes.get_errno(), "cannot read activation volume UUID")
+        if int.from_bytes(result.raw[:4], sys.byteorder) != 20:
+            raise RuntimeError("activation volume UUID response is invalid")
+        identifier = uuid.UUID(bytes=result.raw[4:20])
+        if identifier.int == 0:
+            raise RuntimeError("activation filesystem has no persistent volume UUID")
+        linked = path.lstat()
+        if (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino):
+            raise RuntimeError("activation volume anchor changed")
+        return str(identifier)
+    finally:
+        os.close(descriptor)
+
+
+def _volume_anchor(path: Path) -> os.stat_result:
+    identity = path.lstat()
+    if (
+        not stat.S_ISDIR(identity.st_mode)
+        or identity.st_uid != os.getuid()
+        or stat.S_IMODE(identity.st_mode) & 0o022
+    ):
+        raise PermissionError("activation volume anchor is unsafe")
+    return identity
+
+
+def _capture_volume(value: dict[str, Any], path: Path) -> None:
+    if sys.platform != "darwin" or value["format"] == 1:
+        return
+    identity = _volume_anchor(path)
+    identifier = _volume_uuid(path, identity)
+    key = str(identity.st_dev)
+    bindings = value["volume_bindings"]
+    if key in bindings:
+        if bindings[key]["uuid"] != identifier:
+            raise RuntimeError("activation filesystem identity changed")
+        return
+    bindings[key] = {"anchor": str(path), "uuid": identifier}
+
+
+def _rebase_volume_bindings(value: dict[str, Any]) -> None:
+    """Translate journal coordinates after remount; never relax inode checks."""
+    if value["format"] == 1:
+        return
+    bindings = value["volume_bindings"]
+    if not isinstance(bindings, dict) or len(bindings) > 8:
+        raise RuntimeError("activation volume bindings are invalid")
+    if sys.platform == "darwin" and not bindings:
+        raise RuntimeError("activation volume bindings are missing")
+    mapping: dict[int, int] = {}
+    rebound: dict[str, dict[str, str]] = {}
+    for device, binding in bindings.items():
+        if (
+            not isinstance(device, str)
+            or re.fullmatch(r"[1-9][0-9]*", device) is None
+            or not isinstance(binding, dict)
+            or set(binding) != {"anchor", "uuid"}
+            or not isinstance(binding.get("anchor"), str)
+            or not isinstance(binding.get("uuid"), str)
+            or re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", binding["uuid"]) is None
+        ):
+            raise RuntimeError("activation volume binding is invalid")
+        path = _absolute(_safe_text(binding["anchor"], "volume anchor"))
+        if str(path) != binding["anchor"] or sys.platform != "darwin":
+            raise RuntimeError("activation volume binding is unsupported")
+        identity = _volume_anchor(path)
+        if _volume_uuid(path, identity) != binding["uuid"]:
+            raise RuntimeError("activation filesystem identity changed")
+        current_device = str(identity.st_dev)
+        if current_device in rebound:
+            raise RuntimeError("activation filesystems no longer have distinct identities")
+        mapping[int(device)] = identity.st_dev
+        rebound[current_device] = binding
+    if not mapping:
+        return
+    if any(old != new for old, new in mapping.items()) and value["intent"] in {
+        "host-reactivation", "failed-host-repair",
+    }:
+        raise RuntimeError(
+            "interrupted Team Hub reactivation crossed a filesystem remount; "
+            "its separate recovery journal requires support-assisted recovery"
+        )
+    coordinates = [
+        (value[name], "device")
+        for name in ("candidate_release", "old_release", "previous_release", "desired_env", "desired_service", "guard")
+        if value[name]
+    ]
+    if value["hub"]:
+        coordinates.append((value["hub"], "fence_device"))
+    # Map once from each original value: volumes may exchange device numbers.
+    for item, field in coordinates:
+        if item[field] not in mapping:
+            raise RuntimeError("activation filesystem coordinate lacks a volume binding")
+    for item, field in coordinates:
+        item[field] = mapping[item[field]]
+    value["volume_bindings"] = rebound
 
 
 def _fsync_directory(path: Path) -> None:
@@ -589,7 +716,9 @@ def _read_manifest(
         "observed_env_sha256",
         "observed_service_sha256",
     }
-    if not isinstance(value, dict) or set(value) != expected or value.get("format") != FORMAT:
+    if isinstance(value, dict) and value.get("format") == FORMAT:
+        expected.add("volume_bindings")
+    if not isinstance(value, dict) or set(value) != expected or value.get("format") not in {1, FORMAT}:
         raise RuntimeError("activation transaction manifest is invalid")
     if value.get("phase") not in PHASES:
         raise RuntimeError("activation transaction phase is invalid")
@@ -812,6 +941,7 @@ def _read_manifest(
     _validate_hub_metadata(hub, intent=value["intent"])
     guard = value.get("guard")
     _validate_guard_metadata(guard)
+    _rebase_volume_bindings(value)
     return directory, value
 
 
@@ -1174,6 +1304,7 @@ def begin(args: argparse.Namespace) -> None:
             raise RuntimeError("activation candidate release version changed")
         value: dict[str, Any] = {
             "format": FORMAT,
+            "volume_bindings": {},
             "transaction_id": f"activation-{secrets.token_hex(12)}",
             "release_version": release_version,
             "release_dir": str(release_dir),
@@ -1205,6 +1336,8 @@ def begin(args: argparse.Namespace) -> None:
             "observed_env_sha256": [env["sha256"]],
             "observed_service_sha256": [service["sha256"]],
         }
+        for anchor in (root, releases, env_path.parent, service_path.parent):
+            _capture_volume(value, anchor)
         _write_new_private(temporary / "manifest.json", _canonical(value))
         _fsync_directory(temporary)
         _verified_directory, verified_value = _read_manifest(
@@ -1259,7 +1392,12 @@ def _validate_invocation(
     ) / "candidate.retired"
     old_release = value["old_release"]
     if old_release and _locate_release(old_release) is None:
-        raise RuntimeError("activation rollback release identity changed")
+        suffix = (
+            "; this legacy journal has no persistent volume proof, so a "
+            "filesystem remount requires support-assisted recovery"
+            if value["format"] == 1 else ""
+        )
+        raise RuntimeError("activation rollback release identity changed" + suffix)
     candidate_location = _locate_release(
         value["candidate_release"],
         extras=(candidate_retired, candidate_parked),
@@ -1593,6 +1731,7 @@ def record(args: argparse.Namespace) -> None:
             raise RuntimeError("activation Team Hub fence ownership changed")
         hub["fence_device"] = fence_device
         hub["fence_inode"] = fence_inode
+        _capture_volume(value, data_dir)
         _validate_hub_metadata(hub, intent=value["intent"])
         if value["hub"] and value["hub"] != hub:
             existing_without_inode = {
@@ -1634,10 +1773,31 @@ def record(args: argparse.Namespace) -> None:
         except ValueError as exc:
             raise RuntimeError("activation transaction guard coordinates are invalid") from exc
         _validate_guard_metadata(guard)
+        if sys.platform == "darwin" and value["format"] == FORMAT:
+            if args.guard_path and not value["guard"]:
+                guard_path = _absolute(args.guard_path)
+                guard_info = guard_path.lstat()
+                if (
+                    str(guard_path) != args.guard_path
+                    or guard_path.name != ".managed-startup-guard.json"
+                    or not stat.S_ISREG(guard_info.st_mode)
+                    or guard_info.st_uid != os.getuid()
+                    or guard_info.st_nlink != 1
+                    or stat.S_IMODE(guard_info.st_mode) != 0o600
+                    or (guard_info.st_dev, guard_info.st_ino)
+                    != (guard["device"], guard["inode"])
+                ):
+                    raise RuntimeError("activation Team Hub guard path changed")
+                guard_payload = json.loads(_read_private(guard_path))
+                if not isinstance(guard_payload, dict) or guard_payload.get("guard_id") != guard["id"]:
+                    raise RuntimeError("activation Team Hub guard identity changed")
+                _capture_volume(value, guard_path.parent)
+            if str(guard["device"]) not in value["volume_bindings"]:
+                raise RuntimeError("activation Team Hub guard lacks a volume binding")
         if value["guard"] and value["guard"] != guard:
             raise RuntimeError("activation Team Hub guard ownership changed")
         value["guard"] = guard
-    elif args.guard_device or args.guard_inode:
+    elif args.guard_device or args.guard_inode or args.guard_path:
         raise RuntimeError("activation transaction guard coordinates have no id")
     if args.authority_pending != "unchanged":
         value["authority_pending"] = args.authority_pending == "true"
@@ -1729,6 +1889,7 @@ def replace_config(args: argparse.Namespace) -> None:
         )
         return
 
+    _capture_volume(value, source.parent)
     descriptor, source_identity, payload = _open_config_staging_source(source)
     digest = hashlib.sha256(payload).hexdigest()
     desired = {
@@ -2131,6 +2292,7 @@ def parser() -> argparse.ArgumentParser:
     record_parser.add_argument("--guard-id", default="")
     record_parser.add_argument("--guard-device", default="")
     record_parser.add_argument("--guard-inode", default="")
+    record_parser.add_argument("--guard-path", default="")
     record_parser.add_argument(
         "--authority-pending",
         choices=("true", "false", "unchanged"),

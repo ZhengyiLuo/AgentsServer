@@ -1594,7 +1594,7 @@ if [[ "$TEAM_HUB_MODE" == "host" && "$TEAM_HUB_OPERATION_PENDING" != "true" ]]; 
   fi
 fi
 
-RELEASE_FILES=(activation_transaction.py agent_server.py workspace_git.py team_hub_host.py secure_peer_runtime.py team_mail_runtime.py team_mail_websocket.py team_mail_grants.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py chat_mailbox.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py provider_commands.py claude_sdk_client.py claude_background_reconciliation.py codex_app_server.py codex_auth.py codex_provider.py side_questions.py title_generation.py codex_side_question.py claude_side_question.py cursor_agent_client.py cursor_process_guard.py claude_history_repair.py claude_history_provenance.py codex_history_repair.py public_chat_shares.py public_chat_transcript.py public_chat_share_routes.py interactive_chat_shares.py interactive_chat_share_routes.py interactive_chat_share_web.py interactive_chat_projection.py interactive_chat_runtime.py interactive_chat_native.py shared_chat_videos.py shared_chat_video_stream.py interactive_chat_controls.py install.sh uninstall.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem)
+RELEASE_FILES=(activation_transaction.py agent_server.py workspace_git.py team_hub_host.py secure_peer_runtime.py team_mail_runtime.py team_mail_websocket.py team_mail_grants.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py chat_mailbox.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py provider_commands.py claude_sdk_client.py claude_background_reconciliation.py codex_app_server.py codex_auth.py codex_provider.py side_questions.py title_generation.py codex_side_question.py claude_side_question.py cursor_agent_client.py cursor_process_guard.py claude_history_repair.py claude_history_provenance.py codex_history_repair.py public_chat_shares.py public_chat_transcript.py public_chat_share_routes.py interactive_chat_shares.py interactive_chat_share_routes.py interactive_chat_share_web.py interactive_chat_projection.py interactive_chat_runtime.py interactive_chat_native.py shared_chat_videos.py shared_chat_video_stream.py interactive_chat_controls.py install.sh uninstall.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem LICENSE NOTICE)
 RELEASE_DIRECTORIES=(agentsdock_team_hub)
 TEAM_HUB_RELEASE_FILES=(
   __init__.py
@@ -2363,6 +2363,13 @@ record_activation_phase() {
       --guard-device "$TEAM_HUB_COLD_GUARD_DEVICE"
       --guard-inode "$TEAM_HUB_COLD_GUARD_INODE"
     )
+    # Recovery may use an older transaction's retained helper. Preserve its
+    # argument contract while providing volume proof to helpers that support it.
+    local record_help=""
+    if record_help="$(activation_transaction_command "$runtime_root" record --help 2>/dev/null)" \
+      && [[ "$record_help" == *"--guard-path"* ]]; then
+      arguments+=(--guard-path "$TEAM_HUB_CANONICAL_DATA_DIR/.managed-startup-guard.json")
+    fi
   fi
   result="$(activation_transaction_command "$runtime_root" "${arguments[@]}")" \
     || return 1

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -86,6 +88,75 @@ class InstallerActivationRecoveryTests(unittest.TestCase):
             'if [[ "$PORT_EXPLICIT" != "true" ]]; then',
             'EXISTING_ENV_TEAM_HUB_MODE_SET="false"',
         )
+        cls.record_activation_functions = _between(
+            source,
+            "activation_service_config_path() {",
+            "replace_activation_config() {",
+        )
+
+    def test_guard_path_is_negotiated_with_the_selected_recovery_helper(self) -> None:
+        for selected, supports_path, broken_help in (
+            ("retired", False, False),
+            ("preferred", False, False),
+            ("preferred", True, False),
+            ("preferred", True, True),
+        ):
+            with self.subTest(selected=selected, supports_path=supports_path, broken_help=broken_help), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                retired = root / ".activation-transaction/candidate.retired"
+                preferred = root / "preferred"
+                target = retired if selected == "retired" else preferred
+                for runtime in {target, preferred}:
+                    executable = runtime / ".venv/bin/python"
+                    executable.parent.mkdir(parents=True)
+                    executable.symlink_to(sys.executable)
+                    (runtime / "activation_transaction.py").write_text("raise AssertionError('wrong recovery helper selected')\n")
+                output = root / "arguments.json"
+                # A real argparse boundary represents the older public command
+                # contract; unknown options must fail, rather than being ignored.
+                fixture = f"""
+import argparse, json, pathlib, sys
+if {broken_help!r} and '--help' in sys.argv:
+    sys.exit(9)
+parser = argparse.ArgumentParser()
+record = parser.add_subparsers(dest='command', required=True).add_parser('record')
+for name in ('root', 'current', 'previous', 'env', 'service', 'release-dir', 'release-version', 'transaction-id', 'phase', 'authority-pending', 'guard-id', 'guard-device', 'guard-inode'):
+    record.add_argument('--' + name, required=True)
+if {supports_path!r}:
+    record.add_argument('--guard-path', required=True)
+args = record.parse_args(sys.argv[2:])
+pathlib.Path({str(output)!r}).write_text(json.dumps(vars(args)))
+"""
+                (target / "activation_transaction.py").write_text(fixture)
+                values = {
+                    "OS_NAME": "Darwin", "PLIST": str(root / "service.plist"),
+                    "ACTIVATION_TRANSACTION_DIR": str(retired.parent),
+                    "CANDIDATE_RUNTIME_ROOT": str(preferred),
+                    "STAGE_DIR": str(preferred), "RELEASE_DIR": str(root / "release"),
+                    "SOURCE_DIR": str(preferred), "INSTALL_ROOT": str(root),
+                    "CURRENT_LINK": str(root / "current"), "PREVIOUS_LINK": str(root / "previous"),
+                    "ENV_FILE": str(root / "env"), "RELEASE_VERSION": "2.0.0",
+                    "ACTIVATION_TRANSACTION_ID": "activation-" + "a" * 24,
+                    "ACTIVATION_TRANSACTION_PHASE": "prepared", "ACTIVATION_ROLLBACK_FROM": "",
+                    "TEAM_HUB_REACTIVATION_FENCE_PENDING": "false", "TEAM_HUB_OPERATION_PENDING": "false",
+                    "TEAM_HUB_STARTUP_AUTHORITY_PENDING": "false", "TEAM_HUB_COLD_GUARD_PENDING": "true",
+                    "TEAM_HUB_COLD_GUARD_ID": "guard-test", "TEAM_HUB_COLD_GUARD_DEVICE": "123",
+                    "TEAM_HUB_COLD_GUARD_INODE": "456", "TEAM_HUB_CANONICAL_DATA_DIR": str(root / "hub"),
+                }
+                script = "set -eu\n" + "\n".join(f"{name}={shlex.quote(value)}" for name, value in values.items())
+                script += '\nrun_without_server_secrets() { "$@"; }\n' + self.record_activation_functions
+                script += '\nrecord_activation_phase linked\n'
+                result = subprocess.run(["/bin/bash", "-c", script], cwd=root, capture_output=True, text=True)
+                if broken_help:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(output.exists(), "a failed capability probe must not bypass helper validation")
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    received = json.loads(output.read_text())
+                    if supports_path:
+                        self.assertEqual(received["guard_path"], str(root / "hub/.managed-startup-guard.json"))
+                    else:
+                        self.assertNotIn("guard_path", received)
 
     def _lock_prefix(self, root: Path) -> str:
         runtime = root / "runtime"

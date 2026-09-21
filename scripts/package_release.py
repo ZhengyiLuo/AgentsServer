@@ -64,6 +64,8 @@ FILES = (
     "uv.lock",
     "VERSION",
     "release-public-key.pem",
+    "LICENSE",
+    "NOTICE",
 )
 
 DIRECTORY_FILES = {

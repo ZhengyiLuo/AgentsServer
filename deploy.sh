@@ -56,6 +56,8 @@ RUNTIME_FILES=(
   "$SCRIPT_DIR/update_runner.py"
   "$SCRIPT_DIR/release-public-key.pem"
   "$SCRIPT_DIR/VERSION"
+  "$SCRIPT_DIR/LICENSE"
+  "$SCRIPT_DIR/NOTICE"
 )
 
 if [[ -z "$REMOTE_HOST" ]]; then

@@ -78,7 +78,7 @@ class NpmReleasePackageTests(unittest.TestCase):
     def test_missing_standalone_notice_does_not_borrow_parent_notice(self):
         standalone = self.standalone_fixture()
         (standalone / "NOTICE").unlink()
-        with self.assertRaisesRegex(ValueError, "regular file"):
+        with self.assertRaisesRegex(SystemExit, "missing release files: NOTICE"):
             package.stage_package(standalone, Path(self.temporary.name) / "bad")
 
     def test_noncanonical_nested_source_is_rejected(self):
@@ -112,6 +112,30 @@ class NpmReleasePackageTests(unittest.TestCase):
                 package.prepare(self.root, Path(self.temporary.name) / "bad", require_clean_source=True)
             subprocess.run(["git", "add", "."], cwd=self.root.parent, check=True)
             subprocess.run(["git", "-c", "user.name=Package Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "fixture change"], cwd=self.root.parent, check=True)
+
+    @unittest.skipUnless(shutil.which("npm"), "npm required for actual offline pack proof")
+    def test_actual_npm_and_legacy_archives_preserve_license_and_notice_in_runtime(self):
+        # Exercise both real packagers; checking only their arrays would not
+        # prove the documents survive the different distribution layouts.
+        for name in ("LICENSE", "NOTICE"):
+            shutil.copyfile(self.root.parent / name, self.root / name)
+        scripts = self.root / "scripts"
+        scripts.mkdir()
+        shutil.copyfile(ROOT / "scripts/package_release.py", scripts / "package_release.py")
+        legacy_output = Path(self.temporary.name) / "legacy-output"
+        subprocess.run([sys.executable, str(scripts / "package_release.py"), "--output", str(legacy_output)], capture_output=True, text=True, check=True)
+        npm_output = Path(self.temporary.name) / "npm-output"
+        descriptor = package.prepare(self.root, npm_output)
+        version = descriptor["version"]
+        with tarfile.open(npm_output / descriptor["archive"]["name"]) as npm, tarfile.open(legacy_output / f"agents-server-{version}.tar.gz") as legacy:
+            for name in ("LICENSE", "NOTICE"):
+                expected = (self.root / name).read_bytes()
+                for archive, member_name in [(npm, f"package/{name}"), (npm, f"package/server/{name}"), (legacy, f"agents-server-{version}/{name}")]:
+                    with self.subTest(member=member_name):
+                        member = archive.getmember(member_name)
+                        self.assertTrue(member.isfile())
+                        self.assertEqual(member.mode & 0o111, 0)
+                        self.assertEqual(archive.extractfile(member).read(), expected)
 
     @unittest.skipUnless(shutil.which("npm"), "npm required for actual offline pack proof")
     def test_real_standalone_npm_pack_keeps_its_own_license_notice_and_source_commit(self):

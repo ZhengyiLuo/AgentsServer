@@ -1,11 +1,19 @@
 """Server metadata ownership/scheduling with synthetic sessions and providers."""
 import asyncio
+import json
 import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 import agent_server as server
+
+REAL_GENERATE_TITLE = server.title_generation.generate_title
+REAL_AUTONOMOUS_ADMISSION = server.managed_server_update_scheduled_job_blocker
 
 
 class GeneratedTitleLifecycleTests(unittest.IsolatedAsyncioTestCase):
@@ -34,6 +42,8 @@ class GeneratedTitleLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.enterContext(patch.object(server.title_generation, 'generate_title', self.generator))
         self.enterContext(patch.object(server, 'runner_env', return_value={'PATH': '/synthetic'}))
         self.enterContext(patch.object(server, 'resolve_cursor_executable', return_value='cursor'))
+        self.admission = self.enterContext(patch.object(
+            server, 'managed_server_update_scheduled_job_blocker', return_value=None))
         self.runtime_settings = self.enterContext(patch.object(
             server, 'codex_runtime_settings', return_value=('selected-model', 'medium', '')))
         self.append = self.enterContext(patch.object(server, 'append_event', new_callable=AsyncMock))
@@ -226,6 +236,149 @@ class GeneratedTitleLifecycleTests(unittest.IsolatedAsyncioTestCase):
             server.GENERATED_TITLE_SLOTS.release()
             await self.drain()
         self.generator.assert_not_awaited()
+
+    async def test_pending_update_or_restart_does_not_admit_optional_titles(self):
+        for reason in ('update pending', 'update starting', 'server restarting'):
+            self.admission.return_value = reason
+            self.schedule()
+            self.assertFalse(self.tasks)
+            self.assertNotIn('_title_generation_attempted', self.sess)
+        self.generator.assert_not_awaited()
+
+    async def test_queued_title_skips_pending_update_without_claiming_attempt(self):
+        with patch.object(server, 'GENERATED_TITLE_SLOTS', asyncio.Semaphore(0)):
+            self.schedule()
+            await asyncio.sleep(0)
+            self.admission.return_value = 'update pending'
+            server.GENERATED_TITLE_SLOTS.release()
+            await self.drain()
+        self.generator.assert_not_awaited()
+        self.assertNotIn('_title_generation_attempted', self.sess)
+        self.assertFalse(self.tasks)
+        # A later eligible user turn can retry if the optional request never ran.
+        self.admission.return_value = None
+        self.schedule()
+        await self.drain()
+        self.generator.assert_awaited_once()
+
+    async def test_restart_during_saved_claim_cannot_start_provider(self):
+        async def saved_claim():
+            self.admission.return_value = 'server restarting'
+        self.store.save.side_effect = saved_claim
+        self.schedule()
+        await self.drain()
+        self.generator.assert_not_awaited()
+        self.assertFalse(self.tasks)
+
+    def real_title_process(self):
+        """Exercise the actual adapter/process owner with no provider or account."""
+        temporary = tempfile.TemporaryDirectory(prefix='title-lifecycle-process-')
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        executable = root / 'synthetic-cursor'
+        executable.write_text(f'''#!{sys.executable}
+import json, os, pathlib, signal, subprocess, sys, time
+if '--version' in sys.argv:
+    print('2026.09.18-synthetic')
+    raise SystemExit(0)
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+child = subprocess.Popen([sys.executable, '-c', 'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'])
+root = pathlib.Path({str(root)!r})
+(root / 'process.json').write_text(json.dumps({{'pid': os.getpid(), 'child': child.pid, 'home': os.environ['HOME']}}))
+while not (root / 'release').exists():
+    time.sleep(0.01)
+child.kill()
+child.wait()
+print(json.dumps({{'type': 'result', 'subtype': 'success', 'result': 'Song About Two Cats'}}), flush=True)
+''')
+        executable.chmod(0o700)
+        self.enterContext(patch.object(server.title_generation, 'generate_title', REAL_GENERATE_TITLE))
+        self.enterContext(patch.object(server, 'resolve_cursor_executable', return_value=str(executable)))
+        self.enterContext(patch.object(server, 'runner_env', return_value={
+            'HOME': str(root / 'unused-home'), 'CURSOR_API_KEY': 'synthetic-not-a-credential',
+        }))
+        return root
+
+    async def await_process(self, root):
+        async def ready():
+            while True:
+                try:
+                    return json.loads((root / 'process.json').read_text())
+                except (FileNotFoundError, json.JSONDecodeError):
+                    await asyncio.sleep(0.01)
+        return await asyncio.wait_for(ready(), 5)
+
+    @staticmethod
+    def process_running(pid):
+        result = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True)
+        return result.returncode == 0 and bool(result.stdout.strip()) and not result.stdout.strip().startswith('Z')
+
+    @unittest.skipUnless(os.name == 'posix', 'owned process groups require POSIX')
+    async def test_actual_title_process_defers_update_and_restart_until_completion(self):
+        root = self.real_title_process()
+        for target, value in (
+            ('SERVER_VERSION', '1.0.0'), ('SERVER_UPDATE_STATUS_FILE', root / 'status.json'),
+            ('SERVER_RESTART_STATUS_FILE', root / 'restart.json'),
+            ('SERVER_UPDATE_RUNNER', Path(server.__file__).with_name('update_runner.py')),
+            ('SERVER_UPDATE_PUBLIC_KEY', Path(server.__file__).with_name('release-public-key.pem')),
+            ('AGENT_TOKEN', ''),
+            ('BUSY_SESSIONS', set()), ('SERVER_MAINTENANCE_SESSIONS', set()),
+            ('QUEUED_TURNS', {}), ('RUN_NOW_TURNS', {}), ('CLAUDE_SDK_MANAGER', None),
+            ('CODEX_APP_SERVER_MANAGER', None), ('CODEX_CUSTOM_APP_SERVER_MANAGERS', {}),
+        ):
+            self.enterContext(patch.object(server, target, value))
+        self.enterContext(patch.object(server, 'managed_server_update_scheduled_job_blocker', REAL_AUTONOMOUS_ADMISSION))
+        self.enterContext(patch.object(server, 'server_update_is_active', return_value=False))
+        self.enterContext(patch.object(server, 'working_tmux_bin', return_value='/synthetic/tmux'))
+        self.enterContext(patch.object(server, 'ensure_managed_update_tmux_isolated', return_value=None))
+        launcher = self.enterContext(patch.object(server, 'run_tmux'))
+        quiesce = self.enterContext(patch.object(server, 'quiesce_managed_update_service_cgroup', new_callable=AsyncMock))
+        self.schedule()
+        process = await self.await_process(root)
+        title_task = self.tasks['title-chat']
+        self.assertTrue(self.process_running(process['pid']))
+        snapshot = await server.prepare_provider_background_work_snapshot()
+        for labels in (server.active_provider_background_work_labels(), server.provider_background_work_labels_from_snapshot(snapshot)):
+            self.assertIn('Automatic title for title-chat', labels)
+        restart = server.server_restart_blocker_snapshot_locked(tmux_cgroup_state={})
+        self.assertEqual(restart['provider_background_count'], 1)
+        self.assertTrue(restart['has_forceable_blockers'])
+        pending = await server.start_server_update(server.ServerUpdateRequest(version='1.1.0', when_idle=True))
+        self.assertEqual(pending['phase'], 'pending')
+        self.assertEqual(pending['blocker_counts']['provider_background_tasks'], 1)
+        self.assertEqual(pending['blocker_counts']['active_runs'], 0)
+        launcher.assert_not_called()
+        quiesce.assert_not_awaited()
+        self.assertFalse(title_task.done())
+        (root / 'release').touch()
+        await asyncio.wait_for(title_task, 5)
+        await asyncio.sleep(0)
+        self.assertEqual(self.sess['title'], 'Song About Two Cats')
+        self.assertFalse(server.active_generated_title_work_labels())
+        self.assertFalse(server.server_restart_blocker_snapshot_locked(tmux_cgroup_state={})['has_forceable_blockers'])
+        self.assertFalse(self.process_running(process['pid']))
+        self.assertFalse(self.process_running(process['child']))
+        self.assertFalse(Path(process['home']).exists())
+        started = await server.advance_pending_server_update_once()
+        self.assertEqual(started['phase'], 'starting')
+        self.assertEqual(started['schedule_id'], pending['schedule_id'])
+        launcher.assert_called_once()
+
+    @unittest.skipUnless(os.name == 'posix', 'owned process groups require POSIX')
+    async def test_actual_title_shutdown_reaps_term_ignoring_process_group(self):
+        root = self.real_title_process()
+        self.schedule()
+        process = await self.await_process(root)
+        task = self.tasks['title-chat']
+        self.assertTrue(self.process_running(process['pid']))
+        completed = await server.bounded_shutdown_phase(
+            'title-test', server.close_generated_session_titles(), timeout=5)
+        self.assertTrue(completed)
+        self.assertTrue(task.cancelled())
+        self.assertFalse(self.tasks)
+        self.assertFalse(self.process_running(process['pid']))
+        self.assertFalse(self.process_running(process['child']))
+        self.assertFalse(Path(process['home']).exists())
 
     async def test_reply_is_bounded_before_background_work(self):
         self.schedule(result_text='r' * 10000)

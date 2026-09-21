@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock
 
 NAMES = {
     "normalize_subagent_status", "codex_child_status_from_turn",
-    "codex_subagent_has_live_owner", "active_codex_work_labels",
+    "codex_subagent_has_live_owner", "active_codex_work_labels", "active_generated_title_work_labels",
     "codex_subagent_native_turn_candidates", "codex_subagent_native_turn_scopes",
     "cached_codex_subagent_native_statuses", "cache_codex_subagent_native_statuses",
     "prepare_codex_subagent_terminal_snapshot", "provider_background_work_labels_from_snapshot",
@@ -51,7 +51,7 @@ class ProviderBackgroundTests(unittest.IsolatedAsyncioTestCase):
             "SERVER_MAINTENANCE_SESSIONS": set(), "CODEX_NATIVE_ACTION_TASKS": {},
             "CODEX_PENDING_INTERACTIONS": {}, "SERVER_UPDATE_CODEX_SUBAGENT_SCAN_LIMIT": 2,
             "SERVER_UPDATE_CODEX_SUBAGENT_SCAN_TIMEOUT_SECONDS": 1,
-            "SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT": 32,
+            "SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT": 32, "GENERATED_TITLE_TASKS": {},
             "durable_event_seq": lambda state: state.get("seq"),
             "loaded_claude_background_session_state": lambda manager: ((), ()),
             "claude_event_file_fingerprints": lambda sessions: (),

@@ -47062,6 +47062,15 @@ GENERATED_TITLE_TASKS: dict[str, asyncio.Task] = {}
 GENERATED_TITLE_SLOTS = asyncio.Semaphore(2)
 
 
+def active_generated_title_work_labels() -> list[str]:
+    """Include owned title requests until their provider cleanup has finished."""
+    return sorted(
+        f"Automatic title for {session_id}"
+        for session_id, task in GENERATED_TITLE_TASKS.items()
+        if not task.done()
+    )
+
+
 def title_runtime_key(sess: dict[str, Any]) -> tuple:
     return (sess.get("backend") or DEFAULT_BACKEND, session_provider_id(sess),
             sess.get("model"), sess.get("codex_provider"), sess.get("codex_provider_revision"))
@@ -47103,6 +47112,7 @@ async def generate_session_title(session_id: str, snapshot: dict, reply: str) ->
         async with STORE._lock:
             current = STORE.sessions.get(session_id)
             if (not current or not generated_title_eligible(current)
+                    or managed_server_update_scheduled_job_blocker()
                     or title_runtime_key(current) != title_runtime_key(snapshot)
                     or current.get("title") != snapshot.get("title")):
                 return
@@ -47114,6 +47124,10 @@ async def generate_session_title(session_id: str, snapshot: dict, reply: str) ->
             except Exception:
                 current.pop("_title_generation_attempted", None)
                 raise
+        # A forced restart may close admission during the awaited save. These
+        # optional requests must not start a new provider after that fence.
+        if SERVER_SHUTTING_DOWN or managed_server_update_scheduled_job_blocker():
+            return
         options = {"model": snapshot.get("model"), "env": runner_env()}
         if snapshot["backend"] == BACKEND_CODEX:
             options["model"] = codex_runtime_settings(snapshot)[0]
@@ -47143,6 +47157,7 @@ async def generate_session_title(session_id: str, snapshot: dict, reply: str) ->
 def schedule_generated_session_title(session_id: str, event: dict) -> None:
     sess = STORE.sessions.get(session_id)
     if (not sess or not generated_title_eligible(sess)
+            or managed_server_update_scheduled_job_blocker()
             or session_id in GENERATED_TITLE_TASKS or len(GENERATED_TITLE_TASKS) >= 16
             or event.get("purpose") or event.get("job_id") or event.get("imported")
             or event.get("stopped") or event.get("exit_code") != 0
@@ -78256,7 +78271,9 @@ def active_provider_background_work_labels() -> list[str]:
     provider process has been evicted or the server has restarted.
     """
 
-    labels = active_codex_work_labels()[:SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT]
+    labels = sorted(set(
+        active_codex_work_labels() + active_generated_title_work_labels()
+    ))[:SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT]
     remaining = SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT - len(labels)
     manager = CLAUDE_SDK_MANAGER
     if remaining <= 0 or manager is None:
@@ -78430,7 +78447,9 @@ def provider_background_work_labels_from_snapshot(
                 for thread_id in codex_snapshot.get("terminal_thread_ids") or ()
             }
             labels = [label for label in labels if label not in terminal_labels]
-    labels = sorted(set(labels))[:SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT]
+    labels = sorted(set(
+        labels + active_generated_title_work_labels()
+    ))[:SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT]
     remaining = SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT - len(labels)
     if remaining <= 0:
         return labels

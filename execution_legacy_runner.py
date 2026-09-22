@@ -242,6 +242,23 @@ def _tmux(session: str) -> tuple:
     return _tmux_at(session, socket, Path(binary).resolve(strict=True))
 
 
+def _launch_arguments(display: str) -> tuple[str, ...]:
+    """Decode tmux's display of one shell command, without evaluating it.
+
+    Older tmux exposes the command text directly. Newer tmux quotes the single
+    command argument passed to new-session, adding one serialization layer.
+    The caller still compares every decoded argument to the kernel snapshot.
+    """
+    if any(ord(character) < 32 or ord(character) == 127 for character in display):
+        raise RuntimeError("legacy tmux launch display contains control characters")
+    arguments = tuple(shlex.split(display))
+    if len(arguments) == 1:
+        arguments = tuple(shlex.split(arguments[0]))
+    if len(arguments) < 2:
+        raise RuntimeError("legacy tmux launch display is missing arguments or nested")
+    return arguments
+
+
 def _tmux_at(session: str, socket: Path, executable: Path) -> tuple:
     """Read one pane; production caller always supplies the default socket."""
     _directory(socket.parent, private=True)
@@ -275,7 +292,7 @@ def _tmux_at(session: str, socket: Path, executable: Path) -> tuple:
     binding = (socket_info.st_dev, socket_info.st_ino, socket_info.st_uid, socket_info.st_mode)
     if binding != (current.st_dev, current.st_ino, current.st_uid, current.st_mode):
         raise RuntimeError("legacy tmux socket changed")
-    return (*fields[:3], int(fields[3]), server, tuple(shlex.split(fields[6])), binding)
+    return (*fields[:3], int(fields[3]), server, _launch_arguments(fields[6]), binding)
 
 
 def verify_legacy_runner(args: Any, status: dict[str, Any]) -> str:

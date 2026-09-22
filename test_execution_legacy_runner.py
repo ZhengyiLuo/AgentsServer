@@ -142,6 +142,17 @@ class LegacyRunnerProofTests(unittest.TestCase):
         self.pane=(*self.pane[:5],('/bin/sh','-c',shlex.join(self.runner.argv)),self.pane[6])
         with self.assertRaisesRegex(RuntimeError,'launch command'):self.verify()
 
+    def test_serialized_tmux_launch_keeps_exact_kernel_argument_check(self):
+        command=shlex.join(self.runner.argv)
+        for display in (command,json.dumps(command)):
+            self.pane=(*self.pane[:5],legacy._launch_arguments(display),self.pane[6])
+            self.assertEqual(self.verify(),self.identifier)
+        for command in (shlex.join((*self.runner.argv,'--extra','value')),
+                        shlex.join(self.runner.argv)+'; /bin/true',
+                        shlex.join(self.runner.argv)+' && /bin/true'):
+            self.pane=(*self.pane[:5],legacy._launch_arguments(json.dumps(command)),self.pane[6])
+            with self.subTest(command=command),self.assertRaisesRegex(RuntimeError,'launch command'):self.verify()
+
     def test_pid_reuse_and_reparenting_are_detected(self):
         for changed in (replace(self.runner,started=(123457,222)),replace(self.runner,ppid=777)):
             self.ancestry.side_effect=[self.chain,(self.child,changed,self.pane_process,self.tmux_process)]
@@ -203,6 +214,14 @@ class KernelArgumentsTests(unittest.TestCase):
         argv=('/owned/python','/a path/runner.py','--url','','--value','single quote\' and "double"')
         self.assertEqual(legacy._arguments(self.raw(argv)),argv)
 
+    def test_tmux_single_shell_argument_has_only_one_serialization_layer(self):
+        argv=('/owned/python','/a path/runner.py','--url','','--value','single quote\' and "double"')
+        command=shlex.join(argv)
+        self.assertEqual(legacy._launch_arguments(command),argv)
+        self.assertEqual(legacy._launch_arguments(json.dumps(command)),argv)
+        for display in (json.dumps(json.dumps(command)),command+'\n/bin/true',command+'\x7f'):
+            with self.subTest(display=display),self.assertRaises(RuntimeError):legacy._launch_arguments(display)
+
     def test_malformed_kernel_data_is_rejected(self):
         for raw in (b'',struct.pack('=i',0)+b'/p\0',struct.pack('=i',99999)+b'/p\0',self.raw(('p','x'))[:-len(b'PRIVATE_ENV=not-an-argument\0')-1],self.raw(('p','bad\nvalue'))):
             with self.subTest(raw=raw[:20]),self.assertRaises((RuntimeError,UnicodeError)):legacy._arguments(raw)
@@ -247,8 +266,9 @@ class KernelArgumentsTests(unittest.TestCase):
             root=Path(tmp).resolve();root.chmod(0o700);socket=root/'tmux.sock';binary=Path(shutil.which('tmux')).resolve()
             ready=root/'ready'
             code='from pathlib import Path; import time; Path('+repr(str(ready))+').write_text("ready"); time.sleep(30)'
-            args=(legacy._process(os.getpid()).executable,'-c',code,'space value');session='agents_server_update_'+'a'*32
-            env={'PATH':'/usr/bin:/bin','HOME':str(root),'TERM':'xterm-256color'}
+            args=(legacy._process(os.getpid()).executable,'-c',code,'space value','',"a'b");session='agents_server_update_'+'a'*32
+            env={'PATH':'/usr/bin:/bin','TERM':'xterm-256color'}
+            if os.environ.get('TERMINFO'):env['TERMINFO']=os.environ['TERMINFO']
             started=subprocess.run([str(binary),'-S',str(socket),'-f','/dev/null','new-session','-d','-s',session,shlex.join(args)],capture_output=True,env=env,timeout=10)
             self.assertEqual(started.returncode,0,started.stderr.decode())
             try:

@@ -14,8 +14,13 @@ concurrency:
 
 jobs:
   test:
+    name: Tests (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     env:
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
@@ -23,12 +28,8 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.13"
-      - name: Lock and test
+      - name: Lock and test assigned cases
         run: |
           uv lock --check
           ulimit -s 65536
-          for source in tests/test_*.py; do
-            echo "Compiling $source"
-            PYTHONFAULTHANDLER=1 uv run --python 3.13 python -X faulthandler -m py_compile "$source"
-          done
-          PYTHONFAULTHANDLER=1 uv run --python 3.13 python -X faulthandler -m unittest discover -s tests -t . -v -p 'test_*.py'
+          PYTHONFAULTHANDLER=1 uv run --python 3.13 python -X faulthandler scripts/run_test_shard.py --index ${{ matrix.shard }} --count 8

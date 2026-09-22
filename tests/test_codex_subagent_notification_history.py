@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, Mock
 
 from tests.test_codex_goal_history_isolated import load_projection, source_user
 import tests.test_codex_native_history_repair as native_fixture
+from codex_history_repair import CodexNativeHistoryProofUnavailable
 
 
 KIND = "multi_agent.subagent_notification"
@@ -267,7 +268,12 @@ class CodexSubagentNotificationHistoryTests(unittest.IsolatedAsyncioTestCase):
                 ledger[0]["_history_sync_checkpoint"]["cursor"].update(
                     source_offset=len(body), source_digest=hashlib.sha256(body).hexdigest())
                 case.events.write_text("".join(json.dumps(row) + "\n" for row in ledger))
-                case.prepare()
+                if linked and first_owner == PROVIDER:
+                    case.prepare()
+                else:
+                    with self.assertRaises(CodexNativeHistoryProofUnavailable):
+                        case.prepare()
+                    self.assertFalse(case.cache.is_prepared("chat", PROVIDER))
                 corrected = case.cache.project_event("chat", case.imports[0])
                 self.assertEqual(corrected is not None, linked and first_owner == PROVIDER)
 

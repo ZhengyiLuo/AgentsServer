@@ -17,8 +17,9 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
+import agentsdock_chats
 import chat_mailbox
 
 
@@ -34,6 +35,9 @@ FUNCTIONS = {
     "maybe_notify_chat_mailbox_codex", "get_provider_chat_mailbox", "read_provider_chat_mailbox",
     "delete_chat_mailbox_message",
     "provider_capability_is_attached_to_live_run", "codex_native_mailbox_owner_matches",
+    "maybe_start_chat_mailbox_locked", "_start_next_queued_turn_locked", "stop_turn_endpoint",
+    "schedule_chat_mailbox_wake",
+    "provider_cross_chat_source_instruction", "validated_cross_chat_source_user_instruction",
 }
 METHODS = {"__init__", "_locked_call", "_call", "_connect", "_transaction", "initialize", "_row",
            "create_instruction", "get", "update", "mailbox_call", "mailbox_envelopes"}
@@ -106,6 +110,25 @@ def isolated_source():
             found.add(node.name)
     if found != FUNCTIONS:
         raise AssertionError("Required mailbox source changed")
+    # Run the exact final ledger admission block, not a hand-written substitute
+    # for the production claim/CAS. Everything before provider launch is inert.
+    start = next(node for node in TREE.body if isinstance(node, ast.AsyncFunctionDef)
+                 and node.name == "_start_turn_locked")
+    admission = [node for node in ast.walk(start) if isinstance(node, ast.If)
+                 and ast.unparse(node.test) == "mailbox_wake_claim is not None"
+                 and any(isinstance(call, ast.Call) and call.args
+                         and isinstance(call.args[0], ast.Constant) and call.args[0].value == "admit_wake"
+                         for call in ast.walk(node))]
+    if len(admission) != 1:
+        raise AssertionError("Exact mailbox admission boundary changed")
+    wrapper = ast.parse("async def admit_mailbox_wake(session_id, mailbox_wake_claim, run_id):\n    pass").body[0]
+    wrapper.body = [deepcopy(admission[0])]
+    nodes.append(wrapper)
+    for node in TREE.body:
+        if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name)
+                and target.id in {"CHAT_MAILBOX_WAKE_PURPOSE", "CHAT_MAILBOX_WAKE_PROMPT"}
+                for target in node.targets):
+            nodes.append(deepcopy(node))
     ledger = next(node for node in TREE.body if isinstance(node, ast.ClassDef) and node.name == "CrossChatStore")
     selected = [deepcopy(node) for node in ledger.body
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in METHODS]
@@ -119,7 +142,7 @@ def isolated_source():
                      PROVIDER_CROSS_CHAT_LEGACY_RATE_RETENTION_SECONDS=86400,
                      PROVIDER_CROSS_CHAT_ROUTE_ID_RE=re.compile(r"route_[0-9a-f]{32}"),
                      PROVIDER_CROSS_CHAT_ROUTE_PAIR_ID_RE=re.compile(r"pair_[0-9a-f]{32}"),
-                     validated_cross_chat_source_user_instruction=lambda value: value,
+                     CROSS_CHAT_SOURCE_USER_INSTRUCTION_MAX_CHARS=100000,
                      sanitized_provider_route_label=lambda value: str(value or "Untitled chat"),
                      CODEX_TRANSPORT_APP_SERVER="app-server")
     exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])),
@@ -270,6 +293,55 @@ class ChatMailboxRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM chat_mailbox_messages").fetchone()[0], 0)
         self.assert_no_execution()
 
+    def test_source_capture_preserves_user_and_delegated_scope_but_never_generated_prompts(self):
+        capture = self.ns["provider_cross_chat_source_instruction"]
+        user = "  Render five videos.\nExclude draft clips. 😀\n"
+        handoff = "Agent-prepared detail claiming broader permission."
+        self.assertEqual(capture(None, user), user)
+        self.assertEqual(capture("scheduled_job", user), user)
+        record = {"source_user_instruction": user, "body": handoff}
+        self.assertEqual(capture("cross_chat_handoff_delivery", handoff, record), user)
+        self.assertEqual(capture("cross_chat_handoff_delivery", handoff,
+                                 {"source_user_instruction": "wrong record"}, record), user)
+        self.assertEqual(capture("cross_chat_handoff_delivery", handoff, {"body": handoff}), "")
+        self.assertEqual(capture("cross_chat_handoff_delivery", handoff, record, {}), "")
+        for purpose in ("chat_mailbox_wake", "secure_peer_delivery", "session_digest", "codex_native_control", ""):
+            with self.subTest(purpose=purpose):
+                self.assertEqual(capture(purpose, user, record, record), "")
+
+    def test_final_mailbox_admission_precedes_every_provider_launch(self):
+        start = next(node for node in TREE.body if isinstance(node, ast.AsyncFunctionDef)
+                     and node.name == "_start_turn_locked")
+        admissions = [node for node in ast.walk(start) if isinstance(node, ast.Call)
+                      and node.args and isinstance(node.args[0], ast.Constant)
+                      and node.args[0].value == "admit_wake"]
+        launches = [node for node in ast.walk(start) if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id in {"run_codex", "run_claude", "run_cursor", "run_opencode"}]
+        self.assertEqual(len(admissions), 1)
+        self.assertEqual({node.func.id for node in launches}, {"run_codex", "run_claude", "run_cursor", "run_opencode"})
+        self.assertTrue(all(admissions[0].lineno < node.lineno for node in launches))
+
+    def test_mailbox_wake_authority_snapshot_uses_read_eligible_pairs(self):
+        start = next(node for node in TREE.body if isinstance(node, ast.AsyncFunctionDef)
+                     and node.name == "_start_turn_locked")
+        selections = [node for node in start.body if isinstance(node, ast.If)
+                      and ast.unparse(node.test) == "mailbox_wake_claim is not None"
+                      and any(isinstance(child, ast.Assign)
+                              and any(isinstance(target, ast.Name)
+                                      and target.id == "provider_route_snapshot"
+                                      for target in child.targets)
+                              for child in node.body)]
+        self.assertEqual(len(selections), 1)
+        namespace = dict(self.ns, session_id="recipient", mailbox_wake_claim={},
+                         sess=self.ns["STORE"].sessions["recipient"], provider_route_snapshot=[])
+        strict_live = Mock(side_effect=AssertionError("Wake reads must not require send eligibility"))
+        namespace["live_provider_cross_chat_route"] = strict_live
+        exec(compile(ast.fix_missing_locations(ast.Module(body=deepcopy(selections), type_ignores=[])),
+                     "<isolated-mailbox-wake-routes>", "exec"), namespace)
+        self.assertEqual(namespace["provider_route_snapshot"], [self.reverse])
+        strict_live.assert_not_called()
+
     def test_mailbox_routes_have_exact_bounded_provider_header_entry_points(self):
         names = {"agent_helper_route_body_limit", "is_agent_helper_route"}
         nodes = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
@@ -311,12 +383,13 @@ class ChatMailboxRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "ACTIVE": {"sender": {"run_id": "sender-run"}},
             "CURRENT_TURNS": {"sender": {"run_id": "sender-run"}},
             "BUSY_SESSIONS": {"sender"}, "STOPPED_RUNS": set(), "DELETING_SESSIONS": set(),
-            "QUEUED_TURNS": {}, "CHAT_MAILBOX_PENDING": set(),
+            "QUEUED_TURNS": {}, "CHAT_MAILBOX_PENDING": set(), "CHAT_MAILBOX_WAKE_BLOCKED": set(),
             "session_lifecycle_lock": self.lifecycle_lock,
             "provider_route_capability_source": AsyncMock(side_effect=lambda request: request.owner),
             "authorize_provider_action": AsyncMock(side_effect=lambda request, **kw: deepcopy(self.capabilities[request.owner])),
             "provider_cross_chat_routes": lambda row: self.routes["recipient" if row["title"] == "Synthetic recipient" else "sender"],
             "live_provider_cross_chat_route": lambda owner, issued: next((dict(route) for route in self.routes[owner] if route == issued), None),
+            "live_provider_chat_mailbox_route": lambda owner, issued: next((dict(route) for route in self.routes[owner] if route == issued), None),
             "provider_cross_chat_route_projection": lambda owner, route: dict(route),
             "provider_cross_chat_route_availability": lambda *_args: (True, None),
             "cross_chat_delivery_client_capabilities": lambda *_args: [],
@@ -324,6 +397,19 @@ class ChatMailboxRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "prime_cross_chat_event_cache": Mock(), "append_cross_chat_event_once": AsyncMock(),
             "generic_provider_route_delivery_error": lambda: HTTPException(409, "delivery failed"),
             "join_task_despite_caller_cancellation": lambda task: task,
+            "schedule_next_queued_turn": Mock(),
+            "SERVER_SHUTTING_DOWN": False, "AGENT_TOKEN": "synthetic-fixture-only",
+            "DEFAULT_BACKEND": "codex", "SERVER_MAINTENANCE_SESSIONS": set(),
+            "DELETED_SESSION_TOMBSTONES": set(), "STEERING_SESSIONS": set(),
+            "STOP_REQUESTS": set(), "RUN_NOW_TURNS": {}, "QUEUE_START_TASKS": {},
+            "QUEUE_LOCK": asyncio.Lock(), "EXPLICIT_STOP_OPERATIONS": {},
+            "stop_cleanup_in_progress": lambda _sid: False,
+            "detached_stop_in_progress": lambda _sid: False,
+            "managed_server_update_admission_blocker": lambda: None,
+            "managed_server_update_blocker": lambda: None,
+            "log_queue_promotion_fence": Mock(),
+            "concise_error_message": lambda error: type(error).__name__,
+            "TurnRequest": SimpleNamespace,
         })
         self.traps = {}
         for name in ("submit_cross_chat_delivery", "submit_cross_chat_exchange_leg", "reserve_provider_route_handoff",
@@ -365,30 +451,288 @@ class ChatMailboxRuntimeTests(unittest.IsolatedAsyncioTestCase):
         for trap in self.traps.values():
             trap.assert_not_awaited()
 
-    async def test_actual_send_is_passive_for_idle_busy_and_goal_recipients(self):
+    async def test_actual_send_acceptance_is_nonblocking_and_schedules_idle_check(self):
         for kind in ("idle", "busy", "goal"):
             with self.subTest(recipient=kind):
                 self.set_recipient(kind)
+                self.ns["schedule_next_queued_turn"].reset_mock()
                 before = self.work_snapshot()
                 receipt = await self.send("message-" + kind)
                 self.assertEqual((receipt["state"], receipt["delivery_mode"], receipt["execution_started"]), ("unread", "mailbox", False))
+                self.assertNotIn("wake_policy", receipt)  # Older helpers require this exact receipt shape.
                 record = await self.ledger.get(receipt["message_id"])
                 self.assertEqual((record["status"], record["queued_id"], record["target_run_id"]), ("stored", None, None))
                 self.assertEqual(self.work_snapshot(), before)
                 self.assertIn("recipient", self.ns["CHAT_MAILBOX_PENDING"])
+                if kind == "idle":
+                    self.ns["schedule_next_queued_turn"].assert_called_once_with("recipient")
+                else:
+                    self.ns["schedule_next_queued_turn"].assert_not_called()
         self.assert_no_execution()
 
     async def test_actual_duplicate_send_has_one_sqlite_effect(self):
-        self.set_recipient()
+        self.set_recipient("idle")
         first, repeated = await self.send(), await self.send()
         self.assertFalse(first["duplicate"])
         self.assertTrue(repeated["duplicate"])
         self.assertEqual(first["message_id"], repeated["message_id"])
+        # A retry repairs a lost wake edge too; durable admission, not receipt
+        # callback count, owns the exactly-once execution attempt.
+        self.assertEqual(self.ns["schedule_next_queued_turn"].call_count, 2)
+        self.enable_wake_admission()
+        await self.drain_idle_check()
+        self.set_recipient("idle")
+        await self.drain_idle_check()
+        self.assertEqual(len(self.launches), 1)
         with self.ledger._transaction() as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM cross_chat_envelopes").fetchone()[0], 1)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM chat_mailbox_messages").fetchone()[0], 1)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM cross_chat_exchanges").fetchone()[0], 0)
         self.assert_no_execution()
+
+    async def test_source_instruction_reaches_provider_read_exactly_after_replay_and_reopen(self):
+        self.set_recipient("busy")
+        instruction = "  Send the audit chat to render five videos.\nExclude draft clips. 😀\n"
+        self.delegate(instruction)
+        receipt = await self.send()
+        first = await self.read()
+        self.assertEqual(first["messages"][0]["user_delegation"]["source_user_instruction"], instruction)
+        self.assertEqual(first["messages"][0]["body"], "Exact synthetic peer message.")
+        self.assertEqual(first["messages"][0]["message_id"], receipt["message_id"])
+        self.assertNotIn("user_delegation", self.ns["public_chat_mailbox_message"](first["messages"][0]))
+        self.ledger = self.ns["Ledger"](self.ledger.path)
+        await self.ledger.initialize()
+        self.ns["CROSS_CHAT"] = self.ledger
+        replay = await self.read()
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(replay["messages"], first["messages"])
+        self.assertEqual((await self.ledger.get(receipt["message_id"]))["source_user_instruction"], instruction)
+        self.assert_no_execution()
+
+    async def test_actual_mailbox_receipts_round_trip_through_send_and_ask_helpers(self):
+        self.set_recipient("busy")
+        first, repeated = await self.send("wire-retry"), await self.send("wire-retry")
+        keys = []
+        for verb in ("send", "ask"):
+            args = agentsdock_chats.parser().parse_args([
+                verb, "--route", ROUTE, "--message", "Exact synthetic peer message.",
+                "--mode", "async_route_v1", "--idempotency-key", "wire-retry",
+            ])
+            with patch.object(agentsdock_chats, "authority", return_value="synthetic-capability"), \
+                    patch.object(agentsdock_chats, "get_json", return_value={"routes": [
+                        {"route_id": ROUTE, "available": True, "mode": "async_route_v1"}]}):
+                # Validate the REAL handler/SQLite receipt, not a separately
+                # maintained approximation of its response schema.
+                for receipt in (first, repeated):
+                    with patch.object(agentsdock_chats, "post_json", return_value=receipt) as post:
+                        self.assertEqual(args.handler(args), receipt)
+                        keys.append(post.call_args.args[1]["idempotency_key"])
+        self.assertEqual(keys, ["wire-retry"] * 4)
+        self.assertEqual(first["message_id"], repeated["message_id"])
+        self.assertFalse(first["duplicate"])
+        self.assertTrue(repeated["duplicate"])
+        with self.ledger._transaction() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM chat_mailbox_messages").fetchone()[0], 1)
+        self.assert_no_execution()
+
+    def enable_wake_admission(self, before_admit=None):
+        self.launches = []
+
+        async def start(session_id, req, **kwargs):
+            self.assertEqual(session_id, "recipient")
+            self.assertFalse(kwargs["queue_if_busy"])
+            self.assertEqual(kwargs["admission_backend"],
+                             self.ns["STORE"].sessions[session_id].get("backend", "codex"))
+            self.assertEqual(req.purpose, "chat_mailbox_wake")
+            self.assertEqual(req.display_prompt, "")
+            self.assertNotIn("Exact synthetic peer message", req.prompt)
+            self.assertNotIn("queued_id", kwargs)
+            claim = kwargs["mailbox_wake_claim"]
+            self.assertEqual(claim["target_session_id"], session_id)
+            if before_admit:
+                await before_admit(claim)
+            run_id = f"synthetic-mail-wake-{len(self.launches) + 1}"
+            await self.ns["admit_mailbox_wake"](session_id, claim, run_id)
+            self.launches.append({"run_id": run_id, "through_seq": claim["through_seq"]})
+            self.ns["ACTIVE"][session_id] = {"run_id": run_id}
+            self.ns["CURRENT_TURNS"][session_id] = {"run_id": run_id}
+            self.ns["BUSY_SESSIONS"].add(session_id)
+
+        self.ns["_start_turn_locked"] = AsyncMock(side_effect=start)
+
+    async def drain_idle_check(self):
+        await self.ns["_start_next_queued_turn_locked"]("recipient", admission_backend="codex")
+
+    def wake_state(self):
+        with self.ledger._transaction() as connection:
+            row = connection.execute("SELECT * FROM chat_mailbox_wakes WHERE target_session_id='recipient'").fetchone()
+            return dict(row) if row else None
+
+    async def test_idle_coalesces_real_ledger_batch_once_without_reading_or_goal_mutation(self):
+        self.set_recipient("idle")
+        goal = deepcopy(self.ns["STORE"].sessions["recipient"]["codex_goal"])
+        first, second = await self.send(), await self.send("message-two")
+        self.enable_wake_admission()
+        await asyncio.gather(self.drain_idle_check(), self.drain_idle_check())
+        self.assertEqual(len(self.launches), 1)
+        self.assertEqual(self.wake_state()["state"], "admitted")
+        self.assertEqual(self.launches[0]["through_seq"], 2)
+        for receipt in (first, second):
+            row = (await self.ledger.mailbox_envelopes(message_id=receipt["message_id"]))[0]
+            self.assertIsNone(row["read_at"])
+            self.assertIsNone(row["queued_id"])
+            self.assertIsNone(row["target_run_id"])
+        self.set_recipient("idle")
+        await self.drain_idle_check()
+        self.assertEqual(len(self.launches), 1, "Unread attempted mail must not create a wake loop")
+        self.assertEqual(self.ns["STORE"].sessions["recipient"]["codex_goal"], goal)
+        self.assert_no_execution()
+
+    async def test_idle_wake_uses_read_eligible_pairs_when_send_is_unavailable(self):
+        self.set_recipient("idle")
+        receipt = await self.send()
+        self.ns["live_provider_cross_chat_route"] = Mock(return_value=None)
+        self.enable_wake_admission()
+        await self.drain_idle_check()
+        self.assertEqual(len(self.launches), 1)
+        row = (await self.ledger.mailbox_envelopes(message_id=receipt["message_id"]))[0]
+        self.assertIsNone(row["read_at"])
+        self.assertEqual(self.wake_state()["state"], "admitted")
+        self.ns["live_provider_cross_chat_route"].assert_not_called()
+        self.assert_no_execution()
+
+    async def test_arrivals_during_existing_idle_check_schedule_one_done_recheck(self):
+        self.set_recipient("idle")
+        gate = asyncio.Event()
+        owner = asyncio.create_task(gate.wait())
+        self.ns["QUEUE_START_TASKS"]["recipient"] = owner
+        try:
+            await self.send()
+            await self.send("during-idle-check")
+            self.assertFalse(owner.done())
+            self.assertTrue(getattr(owner, "_chat_mailbox_recheck", False))
+            self.ns["schedule_next_queued_turn"].assert_not_called()
+        finally:
+            gate.set()
+            await owner
+        self.ns["schedule_next_queued_turn"].assert_called_once_with("recipient")
+        self.enable_wake_admission()
+        await self.drain_idle_check()
+        self.assertEqual([row["through_seq"] for row in self.launches], [2])
+        self.assert_no_execution()
+
+    async def test_busy_goal_never_interrupted_then_idle_transition_wakes(self):
+        self.set_recipient("goal")
+        await self.send()
+        before = self.work_snapshot()
+        self.enable_wake_admission()
+        await self.drain_idle_check()
+        self.assertEqual(self.work_snapshot(), before)
+        self.assertEqual(self.launches, [])
+        self.assertIsNone(self.wake_state())
+        self.ns["ACTIVE"].pop("recipient")
+        self.ns["CURRENT_TURNS"].pop("recipient")
+        self.ns["BUSY_SESSIONS"].discard("recipient")
+        await self.drain_idle_check()
+        self.assertEqual(len(self.launches), 1)
+        self.assertEqual(self.ns["STORE"].sessions["recipient"]["codex_goal"]["status"], "active")
+        self.assert_no_execution()
+
+    async def test_idle_wake_forwards_each_native_backend_without_changing_goal(self):
+        for backend in ("codex", "claude"):
+            with self.subTest(backend=backend):
+                self.set_recipient("idle")
+                self.ns["STORE"].sessions["recipient"]["backend"] = backend
+                goal = deepcopy(self.ns["STORE"].sessions["recipient"]["codex_goal"])
+                await self.send("backend-" + backend)
+                self.enable_wake_admission()
+                await self.drain_idle_check()
+                self.assertEqual(len(self.launches), 1)
+                self.assertEqual(self.ns["STORE"].sessions["recipient"]["codex_goal"], goal)
+        self.assert_no_execution()
+
+    async def test_new_arrival_after_claim_cutoff_waits_for_next_idle_wake(self):
+        self.set_recipient("idle")
+        await self.send()
+        async def arrive(_claim):
+            await self.send("after-cutoff")
+        self.enable_wake_admission(arrive)
+        await self.drain_idle_check()
+        self.assertEqual([row["through_seq"] for row in self.launches], [1])
+        await self.drain_idle_check()
+        self.assertEqual(len(self.launches), 1)
+        self.set_recipient("idle")
+        self.enable_wake_admission()
+        await self.drain_idle_check()
+        self.assertEqual([row["through_seq"] for row in self.launches], [2])
+        self.set_recipient("idle")
+        await self.drain_idle_check()
+        self.assertEqual(len(self.launches), 1)
+
+    async def test_read_delete_revoke_and_stop_between_claim_and_admission_do_not_launch(self):
+        for action in ("read", "delete", "revoke", "stop"):
+            with self.subTest(action=action):
+                self.set_recipient("idle")
+                self.routes["recipient"] = [self.reverse]
+                receipt = await self.send("before-admit-" + action)
+                async def invalidate(_claim):
+                    if action == "read":
+                        self.set_recipient("busy")
+                        await self.read("read-before-admit")
+                        self.set_recipient("idle")
+                    elif action == "delete":
+                        await self.ns["delete_chat_mailbox_message"]("recipient", receipt["message_id"])
+                    elif action == "revoke":
+                        self.routes["recipient"] = []
+                        await self.ledger.mailbox_call("exclude_pair", PAIR, now=NOW)
+                    else:
+                        await self.ledger.mailbox_call("suppress_wake", "recipient", now=NOW)
+                self.enable_wake_admission(invalidate)
+                await self.drain_idle_check()
+                self.assertEqual(self.launches, [])
+                self.assertNotEqual(self.wake_state()["state"], "admitted")
+        self.assert_no_execution()
+
+    async def test_explicit_stop_suppresses_existing_unread_until_a_new_arrival(self):
+        self.set_recipient("idle")
+        first = await self.send()
+        # SQL may commit before receipt publication updates the process cache.
+        self.ns["CHAT_MAILBOX_PENDING"].discard("recipient")
+        async def stop(_session_id, admission_ready):
+            admission_ready.set()
+            return {"stopped": True}
+        self.ns["run_explicit_stop_operation"] = AsyncMock(side_effect=stop)
+        self.assertEqual(await self.ns["stop_turn_endpoint"]("recipient"), {"stopped": True})
+        self.assertEqual(self.wake_state()["suppressed_seq"], 1)
+        await self.ns["publish_chat_mailbox_message"](await self.ledger.get(first["message_id"]))
+        self.enable_wake_admission()
+        await self.drain_idle_check()
+        self.assertEqual(self.launches, [])
+        self.assertIsNone((await self.ledger.mailbox_envelopes(message_id=first["message_id"]))[0]["read_at"])
+        await self.send("after-explicit-stop")
+        await self.drain_idle_check()
+        self.assertEqual([row["through_seq"] for row in self.launches], [2])
+        self.assert_no_execution()
+
+    async def test_stop_still_runs_when_mailbox_storage_is_full(self):
+        self.set_recipient("idle")
+        await self.send()
+        call = self.ledger.mailbox_call
+        async def full(name, *args, **kwargs):
+            if name == "suppress_wake":
+                raise sqlite3.OperationalError("database or disk is full")
+            return await call(name, *args, **kwargs)
+        async def stop(_session_id, admission_ready):
+            admission_ready.set()
+            return {"stopped": True}
+        self.ledger.mailbox_call = full
+        self.ns["run_explicit_stop_operation"] = AsyncMock(side_effect=stop)
+        with self.assertLogs("isolated-mailbox", level="WARNING"):
+            self.assertEqual(await self.ns["stop_turn_endpoint"]("recipient"), {"stopped": True})
+        self.assertIn("recipient", self.ns["CHAT_MAILBOX_WAKE_BLOCKED"])
+        self.enable_wake_admission()
+        await self.drain_idle_check()
+        self.assertEqual(self.launches, [])
 
     async def test_actual_read_preserves_goal_owner_and_replays_same_claim(self):
         self.set_recipient()
@@ -487,7 +831,7 @@ class ChatMailboxRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(items[0]["role"], "developer")
             self.assertNotIn("Exact synthetic peer message", items[0]["content"][0]["text"])
         manager.inject_items_guarded = AsyncMock(side_effect=inject)
-        self.ns["CODEX_APP_SERVER_MANAGER"] = manager
+        self.ns["existing_codex_app_server_manager"] = lambda session=None: manager
         await self.ns["maybe_notify_chat_mailbox_codex"]("recipient")
         manager.inject_items_guarded.assert_awaited_once()
         await self.ns["maybe_notify_chat_mailbox_codex"]("recipient")

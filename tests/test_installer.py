@@ -30,6 +30,19 @@ RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "server-release.yml"
 
 
 class InstallerContractTests(unittest.TestCase):
+    def assert_smoke_check_imports(self, source, expected_modules):
+        checks = []
+        for command in re.findall(r"-c '([^'\n]+)'", source):
+            checks.append({
+                module.strip()
+                for statement in re.findall(r"(?:^|;)\s*import\s+([\w., \t]+)", command)
+                for module in statement.split(",")
+            })
+        self.assertTrue(
+            any(set(expected_modules) <= modules for modules in checks),
+            f"No runtime smoke check imports all required modules: {sorted(expected_modules)}",
+        )
+
     def test_top_level_release_symlinks_are_rejected_by_packager_and_installer(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -113,9 +126,11 @@ class InstallerContractTests(unittest.TestCase):
         self.assertIn("-c 'import websockets'", INSTALLER.read_text())
         self.assertIn("import claude_agent_sdk", INSTALLER.read_text())
         self.assertIn("import croniter, dateutil", INSTALLER.read_text())
-        self.assertIn(
-            "import agentsdock_team_hub, cursor_agent_client, cursor_process_guard, secure_peer_delivery, secure_peer_runtime",
+        self.assert_smoke_check_imports(
             INSTALLER.read_text(),
+            {"codex_auth", "codex_provider", "side_questions", "codex_side_question",
+             "claude_side_question", "agentsdock_team_hub", "cursor_agent_client",
+             "cursor_process_guard", "secure_peer_delivery", "secure_peer_runtime"},
         )
         self.assertIn("from agentsdock_team_hub import secure_peer, secure_peer_hub", INSTALLER.read_text())
         self.assertIn('"state_available": True', INSTALLER.read_text())
@@ -750,7 +765,9 @@ exit 0
         self.assertIn('"$SCRIPT_DIR/opencode_agent_client.py"', source)
         self.assertIn('"$SCRIPT_DIR/team_hub_host.py"', source)
         self.assertIn('"$SCRIPT_DIR/agentsdock_team_hub/"', source)
-        self.assertIn("import claude_agent_sdk, croniter, cryptography, dateutil, tzdata", source)
+        self.assert_smoke_check_imports(
+            source, {"claude_agent_sdk", "croniter", "cryptography", "dateutil", "tzdata"},
+        )
         self.assertIn(r'version(\"claude-agent-sdk\")', source)
         self.assertIn(r'raise SystemExit(0 if sdk_version == \"0.2.130\"', source)
         self.assertIn("'claude-agent-sdk==0.2.130'", source)
@@ -766,9 +783,13 @@ exit 0
         self.assertIn("'$REMOTE_SERVER_DIR/agentsdock_team.py'", source)
         self.assertIn("'$REMOTE_SERVER_DIR/provider_commands.py'", source)
         self.assertIn("'$REMOTE_SERVER_DIR/agentsdock_team_hub'", source)
-        self.assertIn(
-            "import agentsdock_team_hub, claude_agent_sdk, cursor_agent_client, cursor_process_guard, secure_peer_delivery, secure_peer_runtime, team_hub_host, agentsdock_mail, agentsdock_team, provider_commands",
+        self.assert_smoke_check_imports(
             source,
+            {"codex_auth", "codex_provider", "side_questions", "codex_side_question",
+             "claude_side_question", "agentsdock_team_hub", "claude_agent_sdk",
+             "cursor_agent_client", "cursor_process_guard", "secure_peer_delivery",
+             "secure_peer_runtime", "team_hub_host", "agentsdock_mail", "agentsdock_team",
+             "provider_commands"},
         )
         self.assertIn("from agentsdock_team_hub import secure_peer, secure_peer_hub", source)
         self.assertIn('"state_available": True', source)
@@ -1414,15 +1435,14 @@ exit 0
         self.assertIn('"$STAGE_DIR/codex_app_server.py"', installer_source)
         self.assertIn('"$STAGE_DIR/cursor_agent_client.py"', installer_source)
         self.assertIn('"$STAGE_DIR/opencode_agent_client.py"', installer_source)
-        self.assertIn(
-            "import agentsdock_team_hub, cursor_agent_client, cursor_process_guard, secure_peer_delivery",
+        self.assert_smoke_check_imports(
             installer_source,
+            {"codex_auth", "codex_provider", "side_questions", "codex_side_question",
+             "claude_side_question", "agentsdock_team_hub", "cursor_agent_client",
+             "cursor_process_guard", "secure_peer_delivery", "agentsdock_team",
+             "claude_history_repair", "chat_mailbox", "provider_commands",
+             "opencode_agent_client", "server_instances"},
         )
-        self.assertIn(
-            "agentsdock_team, claude_history_repair",
-            installer_source,
-        )
-        self.assertIn("chat_mailbox, provider_commands, opencode_agent_client;", installer_source)
         self.assertIn('"$STAGE_DIR/secure_peer_runtime.py"', installer_source)
         self.assertIn('"$STAGE_DIR/secure_peer_delivery.py"', installer_source)
         self.assertIn('"$STAGE_DIR/uninstall.sh"', installer_source)
@@ -4197,6 +4217,43 @@ exit 0
             self.assertIn("--expected-operation-id", restore_event)
             self.assertIn(operation_id, restore_event)
             self.assertTrue(any(value.startswith("verify-snapshot:") for value in events))
+
+    def test_schema4_installer_fixture_restores_then_upgrades_without_future_objects(self):
+        # Exercise the installer's own historical snapshot helper without
+        # starting a process or relying on the service-manager test doubles.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            identity = "server_schema4_fixture_12345678"
+            operation = "update_schema4_fixture_12345678"
+            hub_data = root / "hub"
+            (root / "install" / "current").mkdir(parents=True)
+            store, snapshot = self.prepare_real_managed_hub_fixture(
+                root / "install", hub_data, operation_id=operation,
+                server_identity=identity, schema_version=4,
+            )
+            expected_database = (snapshot / "team-hub.sqlite3").read_bytes()
+            expected_key = store.signing_key_path.read_bytes()
+            expected_proof = store.bootstrap_proof_path.read_bytes()
+            for database in (store.database_path, snapshot / "team-hub.sqlite3"):
+                with sqlite3.connect(database) as connection:
+                    self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 4)
+                    self.assertIsNone(connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE name LIKE 'team_bulletin_%'"
+                    ).fetchone())
+            arguments = dict(expected_host_identity=identity,
+                expected_hub_id=store.hub_id, expected_operation_id=operation)
+            HubStore.verify_maintenance_snapshot(hub_data, snapshot, **arguments)
+            HubStore.restore_maintenance_snapshot(hub_data, snapshot, **arguments)
+            self.assertEqual(store.database_path.read_bytes(), expected_database)
+            HubStore.confirm_restored_maintenance_snapshot(hub_data, snapshot, **arguments)
+            HubStore.acknowledge_restored_maintenance_snapshot(hub_data, snapshot, **arguments)
+            migrated = HubStore(hub_data, managed_host_identity=identity)
+            self.assertEqual(migrated.hub_id, store.hub_id)
+            self.assertEqual(migrated.signing_key_path.read_bytes(), expected_key)
+            self.assertEqual(migrated.bootstrap_proof_path.read_bytes(), expected_proof)
+            with migrated.connect() as connection:
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], LATEST_SCHEMA_VERSION)
+                self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
 
     def test_beta2_schema4_managed_host_upgrades_with_exact_identity_and_secrets(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -7149,6 +7206,14 @@ exit 0
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_insert")
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_update")
             for trigger in (
+                "team_message_search_insert", "team_message_search_revision", "team_message_search_delete",
+                "team_message_sender_nodes_insert", "team_message_sender_nodes_update", "team_message_sender_nodes_delete",
+                "team_message_sender_principals_insert", "team_message_sender_principals_update", "team_message_sender_principals_delete",
+                "team_bulletin_created",
+                "team_bulletin_revised",
+                "team_bulletin_deleted",
+                "team_bulletin_changes_immutable",
+                "team_bulletin_changes_retained",
                 "team_mail_arrival_on_server_recipient",
                 "team_message_revisions_are_immutable",
                 "team_message_revisions_cannot_be_deleted",
@@ -7160,6 +7225,8 @@ exit 0
             ):
                 connection.execute(f"DROP TRIGGER {trigger}")
             for index in (
+                "team_messages_sender_node_order",
+                "team_bulletin_changes_by_team",
                 "team_mail_server_arrival_lookup",
                 "team_messages_parent_order",
                 "team_message_revisions_by_message",
@@ -7171,6 +7238,10 @@ exit 0
             ):
                 connection.execute(f"DROP INDEX {index}")
             for table in (
+                # Migration 0023 (current-content/name search projections).
+                "team_message_search", "team_message_sender_nodes", "team_message_sender_principals",
+                # Migration 0022 (metadata-only Bulletin change journal).
+                "team_bulletin_changes",
                 # Migration 0020 (durable Mail arrival watermark).
                 "team_mail_arrivals",
                 # Migration 0013 (immutable Team Message revision journal).
@@ -7204,6 +7275,9 @@ exit 0
             connection.execute("DROP TABLE bootstrap_delegations")
             connection.execute("DELETE FROM schema_migrations WHERE version > 4")
             connection.execute("PRAGMA user_version = 4")
+            assert connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE name LIKE 'team_bulletin_%'"
+            ).fetchone() is None, "legacy fixture must not retain migration-22 objects"
             connection.execute("COMMIT")
             connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         finally:

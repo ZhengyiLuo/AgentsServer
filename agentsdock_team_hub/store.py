@@ -58,6 +58,7 @@ from .auth import (
 )
 from .database import LATEST_SCHEMA_VERSION, MIGRATIONS, open_database
 from .mail_hints import MailArrival, MailHintBroker, MailHintSubscription
+from .notification_hints import BulletinChange, NotificationBroker, NotificationCursor
 from .security import (
     ACCESS_TOKEN_TTL_SECONDS,
     BOOTSTRAP_PROOF_TTL_SECONDS,
@@ -99,6 +100,8 @@ MAX_TEAM_MESSAGE_ATTACHMENTS = 16
 MAX_TEAM_MESSAGE_ATTACHMENT_BYTES = 2 * 1024 * 1024 * 1024
 MAX_TEAM_MESSAGE_TITLE_CHARS = 160
 MAX_TEAM_MESSAGE_PREVIEW_CHARS = 280
+MAX_TEAM_MESSAGE_SEARCH_CHARS = 200
+MAX_TEAM_MESSAGE_SEARCH_SECONDS = 1.0
 MAX_TEAM_MESSAGE_REVISIONS = 200
 MAX_TEAM_MAIL_THREAD_PAGE_ITEMS = 25
 MAX_TEAM_MAIL_THREAD_ITEMS = 2048
@@ -400,6 +403,7 @@ class HubStore:
         self.database_path = self.data_dir / "team-hub.sqlite3"
         # Passive in-process prerequisite only: no stream, worker, or polling.
         self.mail_hint_broker = MailHintBroker()
+        self.notification_broker = NotificationBroker()
         self.signing_key_path = self.data_dir / "access-token-signing.key"
         self.bootstrap_proof_path = self.data_dir / "bootstrap-owner.proof"
         self.maintenance_fence_path = self.data_dir / "maintenance-fence.json"
@@ -3220,6 +3224,12 @@ class HubStore:
                     # Sibling object: clients that parse team_network_v1 with
                     # an exact key list keep working unchanged.
                     "team_messages_v1": self.team_messages_capability(),
+                    "team_message_search_v1": {
+                        "available": self._team_message_search_available(connection),
+                        "version": 1,
+                        "fields": ["subject", "body", "sender"],
+                        "max_query_chars": MAX_TEAM_MESSAGE_SEARCH_CHARS,
+                    },
                     "team_all_servers_alias_v1": self.team_all_servers_capability(),
                     "team_mail_subjects_v1": {
                         "available": True,
@@ -11767,6 +11777,33 @@ class HubStore:
     # -- validation helpers -------------------------------------------------
 
     @staticmethod
+    def _team_message_search_available(connection: sqlite3.Connection) -> bool:
+        try:
+            # Prepare an indexed, zero-result lookup in each required virtual
+            # table. Missing FTS support/indexes must not advertise a scan fallback.
+            for table in ("team_message_search", "team_message_sender_nodes", "team_message_sender_principals"):
+                connection.execute(f"SELECT rowid FROM {table} WHERE {table} MATCH ? LIMIT 0", ('"probe"',))
+            return True
+        except sqlite3.OperationalError:
+            return False
+
+    @staticmethod
+    def _team_message_search_expression(value: Any) -> str | None:
+        if value is None:
+            return None
+        if (
+            not isinstance(value, str)
+            or not 1 <= len(value) <= MAX_TEAM_MESSAGE_SEARCH_CHARS
+            or not value.strip()
+            or any(unicodedata.category(char) in {"Cc", "Cs"} for char in value)
+        ):
+            raise HubError("invalid_request", "Search must be 1–200 characters without control characters", 422)
+        # User syntax is never FTS syntax: punctuation separates literal words,
+        # and every word is quoted before the one server-owned prefix operator.
+        words = re.findall(r"[^\W_]+", unicodedata.normalize("NFC", value), re.UNICODE)
+        return " AND ".join('"' + word.replace('"', '""') + '"*' for word in words)
+
+    @staticmethod
     def _team_mail_subject(value: Any) -> str | None:
         if value is None:
             return None
@@ -12862,12 +12899,15 @@ class HubStore:
                         "team.skill.versioned",
                         timestamp,
                     )
+                is_bulletin = any(recipient[0] == "all" for recipient in resolved)
             # The write context has committed before publishing. Idempotent
             # early returns and rolled-back transactions never reach this hook.
             if kind == "message":
                 self._publish_team_mail_arrival(
                     team_id, int(row["queue_ordinal"]), message_id, resolved
                 )
+            if is_bulletin:
+                self._publish_team_bulletin_head(connection, team_id)
             return response
         except sqlite3.IntegrityError as exc:
             raise HubError("conflict", "Team message conflicts with existing data", 409) from exc
@@ -12892,6 +12932,56 @@ class HubStore:
                 # Retire it so its owner reconnects to the durable watermark.
                 with suppress(Exception):
                     self.mail_hint_broker.invalidate(team_id, node_id)
+            try:
+                self.notification_broker.publish_mail(MailArrival(team_id, node_id, sequence, message_id))
+            except Exception:
+                with suppress(Exception):
+                    self.notification_broker.invalidate(team_id, node_id)
+
+    def _publish_team_bulletin_head(
+        self, connection: sqlite3.Connection, team_id: str, *, message_id: str | None = None,
+    ) -> None:
+        # Called only after commit. Even hint preparation must not turn a
+        # successful content mutation into an apparent send failure. Reading a
+        # concurrent newer head is safe: hints coalesce, they are not receipts.
+        try:
+            if message_id is not None and connection.execute(
+                """SELECT 1 FROM team_message_recipients
+                   WHERE team_id=? AND message_id=? AND recipient_kind='all'""",
+                (team_id, message_id),
+            ).fetchone() is None:
+                return
+            change = self._team_bulletin_change(connection, team_id)
+            self.notification_broker.publish_bulletin(change)
+        except Exception:
+            with suppress(Exception):
+                self.notification_broker.invalidate(team_id)
+
+    @staticmethod
+    def _team_bulletin_change(connection: sqlite3.Connection, team_id: str) -> BulletinChange:
+        row = connection.execute(
+            """SELECT sequence,id,message_id,change_kind,message_version FROM team_bulletin_changes
+               WHERE team_id=? ORDER BY sequence DESC LIMIT 1""",
+            (team_id,),
+        ).fetchone()
+        if row is None:
+            return BulletinChange(team_id)
+        try:
+            return BulletinChange(team_id, int(row["sequence"]), str(row["id"]),
+                                  str(row["message_id"]), str(row["change_kind"]), int(row["message_version"]))
+        except ValueError as exc:
+            raise HubError("bulletin_cursor_unavailable", "Bulletin change cursor is unavailable", 409) from exc
+
+    @staticmethod
+    def _team_bulletin_anchor_matches(connection: sqlite3.Connection, anchor: BulletinChange) -> bool:
+        if anchor.through_sequence == 0:
+            return True
+        return connection.execute(
+            """SELECT 1 FROM team_bulletin_changes WHERE team_id=? AND sequence=? AND id=?
+               AND message_id=? AND change_kind=? AND message_version=?""",
+            (anchor.team_id, anchor.through_sequence, anchor.change_id, anchor.message_id,
+             anchor.change_kind, anchor.message_version),
+        ).fetchone() is not None
 
     @staticmethod
     def _team_mail_arrival(
@@ -12984,6 +13074,59 @@ class HubStore:
             subscription.close()
             raise
 
+    def team_notification_snapshot(
+        self, claims: AccessClaims, team_id: str, *, previous_cursor: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Read two authenticated indexed heads, never an Inbox/feed or count."""
+        try:
+            previous = NotificationCursor.from_dict(previous_cursor) if previous_cursor is not None else None
+        except ValueError as exc:
+            raise HubError("invalid_request", "Notification cursor is invalid", 422) from exc
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            self._require_network_scope(connection, claims, team_id, write=False)
+            recipient = str(self._caller_network_node(connection, claims, team_id)["node_id"])
+            if previous is not None and previous.mailbox != (team_id, recipient):
+                raise HubError("forbidden", "Notification cursor belongs to another mailbox", 403)
+            mail = self._team_mail_arrival(connection, team_id, recipient)
+            bulletin = self._team_bulletin_change(connection, team_id)
+            mail_reset = previous is None or (
+                previous.mail.through_sequence > mail.through_sequence
+                or not self._team_mail_anchor_matches(connection, previous.mail)
+            )
+            bulletin_reset = previous is None or (
+                previous.bulletin.through_sequence > bulletin.through_sequence
+                or not self._team_bulletin_anchor_matches(connection, previous.bulletin)
+            )
+            response = NotificationCursor(mail, bulletin, mail_reset, bulletin_reset).as_dict()
+            connection.execute("COMMIT")
+            return response
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def subscribe_team_notifications(
+        self, claims: AccessClaims, team_id: str, *, previous_cursor: dict[str, Any] | None = None,
+    ):
+        bound = NotificationCursor.from_dict(self.team_notification_snapshot(
+            claims, team_id, previous_cursor=previous_cursor,
+        ))
+        subscription = self.notification_broker.subscribe(team_id, bound.recipient_server_id)
+        try:
+            snapshot = self.team_notification_snapshot(claims, team_id, previous_cursor=previous_cursor)
+            cursor = NotificationCursor.from_dict(snapshot)
+            if cursor.mailbox != bound.mailbox:
+                raise HubError("forbidden", "Notification mailbox binding changed", 403)
+            subscription.seed(cursor)
+            return subscription, snapshot
+        except BaseException:
+            subscription.close()
+            raise
+
     def list_team_messages(
         self,
         claims: AccessClaims,
@@ -13003,6 +13146,7 @@ class HubStore:
         include_mailbox_state: bool = False,
         include_mailbox_coverage: bool = False,
         after_arrival_id: str | None = None,
+        q: str | None = None,
     ) -> dict[str, Any]:
         if box not in {"inbox", "feed", "sent"}:
             raise HubError("invalid_request", "Message box is invalid", 422)
@@ -13015,6 +13159,7 @@ class HubStore:
         if (from_kind is None) != (from_id is None):
             raise HubError("invalid_request", "Sender filter is invalid", 422)
         since_epoch = self._team_since(since)
+        search_expression = self._team_message_search_expression(q)
         connection = self.connect()
         try:
             connection.execute("BEGIN")
@@ -13076,14 +13221,54 @@ class HubStore:
             if since_epoch is not None:
                 where.append("m.created_at>=?")
                 params.append(since_epoch)
-            rows = connection.execute(
-                self._team_message_select()
-                + joins
-                + " WHERE "
-                + " AND ".join(where)
-                + " ORDER BY m.queue_ordinal ASC LIMIT ?",
-                (*params, limit + 1),
-            ).fetchall()
+            if q is not None:
+                if not self._team_message_search_available(connection):
+                    raise HubError("search_unavailable", "Indexed Team Messages search is unavailable", 503)
+                if not search_expression:
+                    # Punctuation-only input is an empty search, never an
+                    # accidental unfiltered mailbox read or coverage proof.
+                    where.append("0")
+                else:
+                    scoped_expression = 'scope:"' + team_id.replace('"', '""') + '" AND {subject body}: (' + search_expression + ')'
+                    where.append("""m.queue_ordinal IN (
+                        SELECT rowid FROM team_message_search WHERE team_message_search MATCH ?
+                        UNION
+                        SELECT sent.queue_ordinal FROM team_messages AS sent
+                        WHERE sent.team_id=? AND sent.sender_kind='server'
+                          AND sent.sender_node_id IN (
+                            SELECT n.id FROM team_message_sender_nodes
+                            JOIN nodes AS n ON n.rowid=team_message_sender_nodes.rowid
+                            WHERE team_message_sender_nodes MATCH ? AND n.team_id=?
+                          )
+                        UNION
+                        SELECT sent.queue_ordinal FROM team_messages AS sent
+                        WHERE sent.team_id=? AND sent.sender_kind='human'
+                          AND sent.sender_principal_id IN (
+                            SELECT p.id FROM team_message_sender_principals
+                            JOIN principals AS p ON p.rowid=team_message_sender_principals.rowid
+                            WHERE team_message_sender_principals MATCH ?
+                          )
+                    )""")
+                    params.extend((scoped_expression, team_id, search_expression, team_id, team_id, search_expression))
+            search_deadline = time.monotonic() + MAX_TEAM_MESSAGE_SEARCH_SECONDS if q is not None else None
+            if search_deadline is not None:
+                connection.set_progress_handler(lambda: int(time.monotonic() >= search_deadline), 1000)
+            try:
+                rows = connection.execute(
+                    self._team_message_select()
+                    + joins
+                    + " WHERE "
+                    + " AND ".join(where)
+                    + " ORDER BY m.queue_ordinal ASC LIMIT ?",
+                    (*params, limit + 1),
+                ).fetchall()
+            except sqlite3.OperationalError as exc:
+                if search_deadline is not None and "interrupted" in str(exc).lower():
+                    raise HubError("search_too_broad", "Search exceeded its work limit; use more specific words", 503) from exc
+                raise
+            finally:
+                if search_deadline is not None:
+                    connection.set_progress_handler(None, 0)
             visible = rows[:limit]
             messages = [
                 self._team_message_public(
@@ -13117,7 +13302,7 @@ class HubStore:
             coverage_latest: MailArrival | None = None
             if (
                 include_mailbox_coverage and box == "inbox" and address_kind == "server"
-                and not unread and from_kind is None and since_epoch is None
+                and not unread and from_kind is None and since_epoch is None and q is None
             ):
                 try:
                     anchor = MailArrival(team_id, str(address_id), after_sequence, after_arrival_id)
@@ -13549,9 +13734,11 @@ class HubStore:
                     "team.message.revised",
                     timestamp,
                 )
-                return self._team_revision_response_subject(
+                response = self._team_revision_response_subject(
                     connection, team_id, message_id, response, include_mail_subject
                 )
+            self._publish_team_bulletin_head(connection, team_id)
+            return response
         except sqlite3.IntegrityError as exc:
             raise HubError("conflict", "Team message revision conflicts", 409) from exc
         finally:
@@ -13706,7 +13893,9 @@ class HubStore:
                         "team.message.deleted",
                         timestamp,
                     )
-                return response
+            if inserted:
+                self._publish_team_bulletin_head(connection, team_id, message_id=message_id)
+            return response
         finally:
             connection.close()
 

@@ -59,6 +59,7 @@ class CodexSubagentConfigTests(unittest.TestCase):
             "CODEX_DEFAULT_SANDBOX_MODE": "workspace-write",
             "CODEX_PROVIDER_MCP_NAME": "fixture",
             "codex_runtime_settings": Mock(return_value=("", "", "")),
+            "CODEX_PROVIDER_STORE": SimpleNamespace(for_session=lambda session: None),
             "codex_provider_mcp_config": Mock(return_value=self.transport),
             "codex_app_server_service_tier": lambda value: value,
             "codex_thread_instructions": Mock(return_value="fixture instructions"),
@@ -99,6 +100,25 @@ class CodexSubagentConfigTests(unittest.TestCase):
         self.assertEqual(sanitize({"agents": {"max_threads": 17,
             "max_concurrent_threads_per_session": 23}}, source="fixture"),
             {"agents": {"max_concurrent_threads_per_session": 23}})
+
+    def test_chat_limit_set_and_clear_preserve_private_and_server_defaults(self):
+        self.write_settings({"thread_config": {"agents": {
+            "max_concurrent_threads_per_session": 12, "enabled": False,
+        }}})
+        original = {"agents": {"max_threads": 20, "default_subagent_model": "child-model"}}
+        session = {"id": "fixture", "subagent_limit": 3, "codex_config_overrides": original}
+        expected = {**self.transport, "agents.enabled": False,
+                    "agents.default_subagent_model": "child-model"}
+        self.assertEqual(self.params(session)["config"], {
+            **expected, "agents.max_concurrent_threads_per_session": 3})
+        session["subagent_limit"] = None
+        self.assertEqual(self.params(session)["config"], {
+            **expected, "agents.max_concurrent_threads_per_session": 20})
+        self.write_settings({})
+        self.assertEqual(self.params(session)["config"], {
+            **self.transport, "agents.default_subagent_model": "child-model",
+            "agents.max_concurrent_threads_per_session": 20})
+        self.assertEqual(original, {"agents": {"max_threads": 20, "default_subagent_model": "child-model"}})
 
     def test_invalid_limits_do_not_restore_hidden_default(self):
         for invalid in (True, False, 0, -1, "8", None):

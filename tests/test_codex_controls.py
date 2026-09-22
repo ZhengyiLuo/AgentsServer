@@ -669,13 +669,14 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(raised.exception.status_code, 409)
 
-    def test_permission_profile_cache_is_ttl_and_generation_scoped(self) -> None:
+    def test_permission_profile_cache_is_ttl_manager_and_generation_scoped(self) -> None:
         class Manager:
             ready = True
             generation = 4
 
         manager = Manager()
         agent_server.CODEX_PERMISSION_PROFILES_CACHE["/work"] = (
+            manager,
             4,
             agent_server.time.monotonic(),
             [{"id": "default", "allowed": True}],
@@ -684,11 +685,19 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
             agent_server.cached_codex_permission_profiles("/work", manager),
             [{"id": "default", "allowed": True}],
         )
+        other_manager = Manager()
+        self.assertIsNone(
+            agent_server.cached_codex_permission_profiles("/work", other_manager)
+        )
+        agent_server.CODEX_PERMISSION_PROFILES_CACHE["/work"] = (
+            manager, 4, agent_server.time.monotonic(), [{"id": "default"}],
+        )
         manager.generation = 5
         self.assertIsNone(
             agent_server.cached_codex_permission_profiles("/work", manager)
         )
         agent_server.CODEX_PERMISSION_PROFILES_CACHE["/work"] = (
+            manager,
             5,
             agent_server.time.monotonic()
             - agent_server.CODEX_PERMISSION_PROFILES_CACHE_SECONDS

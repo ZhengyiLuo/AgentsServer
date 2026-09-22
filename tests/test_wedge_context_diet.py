@@ -237,7 +237,7 @@ class ThreadInstructionTests(unittest.TestCase):
             self.assertNotIn("--chat-id chat-1", instructions)
 
     def test_policy_version_migrates_resumed_codex_threads(self) -> None:
-        self.assertEqual(agent_server.CODEX_THREAD_POLICY_VERSION, "10")
+        self.assertEqual(agent_server.CODEX_THREAD_POLICY_VERSION, "11")
 
     def test_static_addendum_is_format_safe(self) -> None:
         # Both preludes are rendered with str.format, so the appended static

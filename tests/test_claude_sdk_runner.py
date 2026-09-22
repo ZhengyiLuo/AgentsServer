@@ -2148,6 +2148,57 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                 "provider-credential",
             )
 
+    async def test_subagent_limit_is_chat_scoped_and_null_preserves_native_settings(self) -> None:
+        cap_name = "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"
+        manifest = Path(self.cwd) / ".manifest.json"
+        base = {**self.session}
+        base.pop("subagent_limit", None)
+        with patch.dict(os.environ, {cap_name: "9"}), patch.object(
+            agent_server, "claude_sdk_cli_path", return_value="/usr/bin/claude",
+        ), patch.object(
+            agent_server, "resolve_claude_resume_provider", return_value=(None, None),
+        ), patch.object(
+            agent_server, "create_claude_agent_options", side_effect=lambda **values: values,
+        ):
+            inherited, inherited_key, _ = agent_server.build_claude_sdk_options(
+                "chat-claude", base, self.cwd, manifest,
+            )
+            cleared, cleared_key, _ = agent_server.build_claude_sdk_options(
+                "chat-claude", {**base, "subagent_limit": None}, self.cwd, manifest,
+            )
+            limited, limited_key, _ = agent_server.build_claude_sdk_options(
+                "chat-claude", {**base, "subagent_limit": 3}, self.cwd, manifest,
+            )
+            sibling, _, _ = agent_server.build_claude_sdk_options(
+                "chat-sibling", {**base, "subagent_limit": 5}, self.cwd, manifest,
+            )
+            command = agent_server.build_claude_cmd(
+                "chat-claude", {**base, "subagent_limit": 3}, manifest,
+            )
+            inherited_command = agent_server.build_claude_cmd(
+                "chat-claude", {**base, "subagent_limit": None}, manifest,
+            )
+            self.assertEqual(os.environ[cap_name], "9")
+
+        self.assertEqual(inherited_key, cleared_key)
+        self.assertNotEqual(limited_key, inherited_key)
+        self.assertNotIn("settings", inherited)
+        self.assertNotIn("settings", cleared)
+        self.assertEqual(inherited["env"][cap_name], "9")
+        self.assertEqual(cleared["env"][cap_name], "9")
+        self.assertEqual(limited["env"][cap_name], "3")
+        self.assertEqual(sibling["env"][cap_name], "5")
+        self.assertEqual(json.loads(limited["settings"]), {"env": {cap_name: "3"}})
+        self.assertEqual(json.loads(sibling["settings"]), {"env": {cap_name: "5"}})
+        self.assertEqual(
+            json.loads(command[command.index("--settings") + 1]),
+            {"env": {cap_name: "3"}},
+        )
+        self.assertNotIn("--settings", inherited_command)
+        self.assertEqual(limited["setting_sources"], ["user", "project", "local"])
+        self.assertEqual(limited["thinking"], inherited["thinking"])
+        self.assertEqual(limited["permission_mode"], inherited["permission_mode"])
+
     async def test_permission_mode_options_hooks_and_plan_tools_are_wired(self) -> None:
         session = {**self.session, "claude_permission_mode": "plan"}
         captured_options: dict[str, object] = {}
@@ -2187,7 +2238,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(captured_options["permission_mode"], "plan")
-        self.assertEqual(agent_server.CLAUDE_SDK_CONFIGURATION_VERSION, 9)
+        self.assertEqual(agent_server.CLAUDE_SDK_CONFIGURATION_VERSION, 10)
         self.assertEqual(
             captured_options["disallowed_tools"],
             ["CronCreate", "Monitor", "ScheduleWakeup"],

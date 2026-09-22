@@ -14,7 +14,7 @@ import public_chat_transcript as transcript
 
 def expected_digest(content, messages):
     projected = json.dumps(messages, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(b"agentsdock-public-chat-preview-v1\x00" + hashlib.sha256(content).digest() + b"\x00" + projected).hexdigest()
+    return hashlib.sha256(b"agentsdock-public-chat-preview-v2\x00" + hashlib.sha256(content).digest() + b"\x00" + hashlib.sha256(projected).digest()).hexdigest()
 
 
 class PublicChatTranscriptTests(unittest.TestCase):
@@ -75,8 +75,52 @@ class PublicChatTranscriptTests(unittest.TestCase):
         result = transcript.read_public_transcript(self.path, projector)
         self.assertEqual([message["text"] for message in result["messages"]], ["Question", "Visible progress", "Answer"])
         self.assertEqual([call.args[0]["type"] for call in projector.call_args_list],
-                         ["turn_started", "reasoning_summary", "assistant_text", "turn_finished"])
+                         ["turn_started", "reasoning_summary", "artifact_created", "assistant_text", "turn_finished"])
         self.assertEqual(result["messages"][1], {"role": "assistant", "text": "Visible progress", "timestamp": 2})
+
+    def test_only_projected_user_attachments_and_committed_artifacts_publish_videos(self):
+        video = {"id": "video_ZmlsZQ." + "a" * 64, "filename": "demo.mp4",
+                 "content_type": "video/mp4", "size": 10}
+        content = self.write_events(
+            {"type": "turn_started", "prompt": "", "shared_videos": [video], "ts": 1},
+            {"type": "file_uploaded", "shared_videos": [video]},
+            {"type": "tool_finished", "shared_videos": [video]},
+            {"type": "artifact_created", "artifact": {"path": "/private/source.mp4"},
+             "text": "Private artifact metadata", "shared_videos": [video], "ts": 2},
+            {"type": "assistant_text", "run_id": "one", "text": "Published", "shared_videos": [video]},
+            {"type": "turn_finished", "run_id": "one", "result_text": "Published", "shared_videos": [video]},
+        )
+        result = self.read()
+        self.assertEqual(result["messages"], [
+            {"role": "user", "text": "", "timestamp": 1, "videos": [video]},
+            {"role": "assistant", "text": "", "timestamp": 2, "videos": [video]},
+            {"role": "assistant", "text": "Published"},
+        ])
+        self.assertEqual(result["digest"], expected_digest(content, result["messages"]))
+        self.assertNotIn("private", json.dumps(result["messages"]).lower())
+        streamed = []
+        reread = self.read(message_sink=streamed.append)
+        self.assertEqual(streamed, result["messages"])
+        self.assertEqual(reread["digest"], result["digest"])
+
+    def test_video_projection_change_invalidates_preview_and_later_artifacts_are_excluded(self):
+        video = {"id": "video_ZmlsZQ." + "a" * 64, "filename": "demo.mp4",
+                 "content_type": "video/mp4", "size": 10}
+        self.write_events({"type": "artifact_created", "shared_videos": [video]})
+        first = self.read()
+        changed = transcript.read_public_transcript(self.path,
+            lambda event: {**event, "shared_videos": [{**video, "id": "video_ZmlsZQ." + "b" * 64}]})
+        self.assertNotEqual(first["digest"], changed["digest"])
+        with self.path.open("ab") as stream:
+            stream.write(json.dumps({"type": "artifact_created", "shared_videos": [video]}).encode() + b"\n")
+        self.assertEqual(self.read(through_bytes=first["through_bytes"]), first)
+        self.assertEqual(len(self.read()["messages"]), 2)
+
+    def test_invalid_video_metadata_fails_explicitly_instead_of_partial_snapshot(self):
+        self.write_events({"type": "turn_started", "prompt": "Public"},
+                          {"type": "artifact_created", "shared_videos": [{"id": "/private/file.mp4"}]})
+        with self.assertRaisesRegex(transcript.PublicTranscriptError, "video metadata"):
+            self.read()
 
     def test_claude_full_text_and_aggregate_result_are_not_duplicated(self):
         first = "Full first paragraph.\n\nUnicode 中文 remains literal."
@@ -134,19 +178,75 @@ class PublicChatTranscriptTests(unittest.TestCase):
         with self.assertRaises(transcript.PublicTranscriptError):
             self.read()
 
-    def test_record_line_message_total_and_log_limits_fail_explicitly(self):
+    def test_record_message_output_and_work_limits_fail_explicitly(self):
         self.write_events({"type": "turn_started", "prompt": "中文"}, {"type": "assistant_text", "text": "answer"})
-        for constant, limit in (("MAX_LOG_BYTES", 1), ("MAX_LINE_BYTES", 8), ("MAX_RECORDS", 1),
-                                ("MAX_MESSAGES", 1), ("MAX_TEXT_BYTES", 6), ("MAX_MESSAGE_BYTES", 5)):
+        for constant, limit in (("MAX_LINE_BYTES", 8), ("MAX_SCAN_SECONDS", 0),
+                                ("MAX_TEXT_BYTES", 6), ("MAX_MESSAGE_BYTES", 5)):
             with self.subTest(limit=constant), mock.patch.object(transcript, constant, limit):
                 with self.assertRaises(transcript.PublicTranscriptError):
                     self.read()
 
     def test_invalid_boundaries_and_truncated_prefixes_are_rejected(self):
         content = self.write_events({"type": "turn_started", "prompt": "Public"})
-        for boundary in (True, 0, -1, 1.5, "1", transcript.MAX_LOG_BYTES + 1, len(content) + 1):
+        for boundary in (True, 0, -1, 1.5, "1", transcript.MAX_SNAPSHOT_BOUNDARY + 1, len(content) + 1):
             with self.subTest(boundary=boundary), self.assertRaises(transcript.PublicTranscriptError):
                 self.read(through_bytes=boundary)
+
+    def test_large_raw_noise_and_many_readable_messages_keep_the_complete_prefix(self):
+        expected = [{"role": "user" if index % 2 == 0 else "assistant",
+                     "text": f"Synthetic message {index}: " + "readable text " * 20} for index in range(2504)]
+        noise = json.dumps({"type": "tool_finished", "text": "x" * (128 * 1024)}).encode() + b"\n"
+        with self.path.open("wb") as stream:
+            for index, message in enumerate(expected):
+                if index == 1252:
+                    for _ in range(513):
+                        stream.write(noise)
+                field = "prompt" if message["role"] == "user" else "text"
+                kind = "turn_started" if message["role"] == "user" else "assistant_text"
+                stream.write(json.dumps({"type": kind, "run_id": str(index // 2), field: message["text"]}).encode() + b"\n")
+        boundary = self.path.stat().st_size
+        self.assertGreater(boundary, 64 * 1024 * 1024)
+        preview = self.read()
+        self.assertEqual(preview["messages"], expected)
+        self.assertEqual(preview["through_bytes"], boundary)
+        with self.path.open("ab") as stream:
+            stream.write(b'{"type":"assistant_text","text":"Not part of the reviewed prefix"}\n')
+        self.assertEqual(self.read(through_bytes=boundary), preview)
+
+    def test_actual_json_escaping_and_metadata_count_toward_output_budget(self):
+        self.write_events({"type": "turn_started", "prompt": "\x01" * 20})
+        with mock.patch.object(transcript, "MAX_TEXT_BYTES", 100):
+            with self.assertRaisesRegex(transcript.PublicTranscriptError, "2 MiB"):
+                self.read()
+
+    def test_streamed_share_has_no_whole_chat_two_mib_limit(self):
+        count = 24
+        content = self.write_events(*[
+            {"type": "assistant_text", "run_id": str(index), "text": f"Message {index}: " + "x" * (180 * 1024)}
+            for index in range(count)
+        ])
+        seen = []
+        result = self.read(message_sink=lambda message: seen.append((message["role"], message["text"][:20])))
+        self.assertGreater(len(content), 4 * 1024 * 1024)
+        self.assertEqual(result["messages"], [])
+        self.assertEqual(result["message_count"], count)
+        self.assertEqual(result["through_bytes"], len(content))
+        self.assertEqual(len(seen), count)
+        self.assertTrue(seen[0][1].startswith("Message 0:"))
+        self.assertTrue(seen[-1][1].startswith("Message 23:"))
+
+    def test_stream_and_preview_prove_the_same_exact_messages_and_boundary(self):
+        self.write_events({"type": "turn_started", "run_id": "one", "prompt": "Exact 中文\n text", "ts": 1},
+                          {"type": "assistant_text", "run_id": "one", "text": "First"},
+                          {"type": "assistant_text", "run_id": "one", "text": "Second"},
+                          {"type": "turn_finished", "run_id": "one", "result_text": "First Second"})
+        preview = self.read()
+        streamed = []
+        result = self.read(through_bytes=preview["through_bytes"], message_sink=streamed.append)
+        self.assertEqual(streamed, preview["messages"])
+        self.assertEqual(result["digest"], preview["digest"])
+        self.assertEqual(result["through_bytes"], preview["through_bytes"])
+        self.assertEqual(result["message_count"], 3)
 
     def test_empty_or_private_only_chat_is_not_publishable(self):
         for events in ([], [{"type": "tool_finished", "text": "Private"}], [{"type": "assistant_text", "text": "  "}]):

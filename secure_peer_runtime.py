@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager, suppress
 from datetime import datetime, timezone
 import asyncio
+import errno
 import hashlib
 import hmac
 import json
@@ -737,14 +738,39 @@ class SecurePeerRuntime:
                     **({
                         "mail_hint_subscriber": self._subscribe_peer_mail_hints,
                         "mail_hint_snapshot": self._peer_mail_hint_snapshot,
+                        "notification_hint_subscriber": self._subscribe_peer_notification_hints,
+                        "notification_hint_snapshot": self._peer_notification_hint_snapshot,
                     } if self._mail_hints.enabled else {}),
                 )
-                gateway.start()
+                self._start_host_gateway(gateway)
                 self._gateway = gateway
             with self._peer_admission:
                 self._peer_accepting = self._gateway is not None and not self._host_admission_closed
                 self._peer_admission.notify_all()
             self._pending_host_attachment = None
+
+    def _start_host_gateway(self, gateway: SecurePeerGateway) -> None:
+        try:
+            gateway.start()
+        except OSError as exc:
+            if exc.errno != errno.EADDRNOTAVAIL:
+                raise
+            # The trust store and Hub projection are already ready. Only an
+            # explicit endpoint change may recover a vanished interface; never
+            # widen the bind or select a replacement address automatically.
+            error = SecurePeerError(
+                "secure_peer_host_address_unavailable",
+                f"Secure peer host address {gateway.bind_ip}:{gateway.port} is no longer "
+                f"assigned to this server (errno {exc.errno}: {exc.strerror}). "
+                "Configure hosting with a current local IPv4 address.",
+                409,
+            )
+            self.mark_host_unavailable(
+                str(error),
+                error_code=error.code,
+                action="Configure hosting with a current local IPv4 address, or restore the previous address.",
+            )
+            raise error from exc
 
     def detach_host_hub(self, *, hub_store: HubStore) -> None:
         """Retire only this server's host role while preserving client state."""
@@ -796,11 +822,15 @@ class SecurePeerRuntime:
                 _resume_admission=False,
             )
         except Exception as exc:
-            self.mark_host_unavailable(
-                "Secure peer host could not be initialized",
-                error_code="secure_peer_host_initialization_failed",
-                action="Retry secure peer host initialization.",
-            )
+            if not (
+                isinstance(exc, SecurePeerError)
+                and exc.code == "secure_peer_host_address_unavailable"
+            ):
+                self.mark_host_unavailable(
+                    "Secure peer host could not be initialized",
+                    error_code="secure_peer_host_initialization_failed",
+                    action="Retry secure peer host initialization.",
+                )
             if self.logger is not None:
                 self.logger.warning(
                     "secure peer host attachment retry deferred error_type=%s",
@@ -845,10 +875,13 @@ class SecurePeerRuntime:
         if enabled:
             self.retry_host_attachment()
         with self._guard:
+            recovering_address = (
+                self._host_error_code == "secure_peer_host_address_unavailable"
+            )
             if enabled and (
                 self._host_store is None
                 or self._adapter is None
-                or self._host_error_code is not None
+                or (self._host_error_code is not None and not recovering_address)
             ):
                 raise SecurePeerError(
                     "host_unavailable",
@@ -869,11 +902,12 @@ class SecurePeerRuntime:
         with self._guard:
             old_gateway = self._gateway
             old_config = dict(self._config)
+            old_error = (self._host_error, self._host_error_code, self._host_action)
             new_gateway: SecurePeerGateway | None = None
             try:
                 if old_gateway is not None:
-                    old_gateway.stop()
                     self._gateway = None
+                    old_gateway.stop()
                 if enabled:
                     assert self._host_store is not None and self._adapter is not None and host is not None
                     new_gateway = SecurePeerGateway(
@@ -890,8 +924,14 @@ class SecurePeerRuntime:
                         relay_enabled=lambda: self._relay_enabled,
                         peer_heartbeat=self._record_authenticated_peer_heartbeat,
                         peer_revoker=self._revoke_authenticated_peer,
+                        **({
+                            "mail_hint_subscriber": self._subscribe_peer_mail_hints,
+                            "mail_hint_snapshot": self._peer_mail_hint_snapshot,
+                            "notification_hint_subscriber": self._subscribe_peer_notification_hints,
+                            "notification_hint_snapshot": self._peer_notification_hint_snapshot,
+                        } if self._mail_hints.enabled else {}),
                     )
-                    new_gateway.start()
+                    self._start_host_gateway(new_gateway)
                 next_config = {
                     "version": 1,
                     "server_identity": self.server_identity,
@@ -905,28 +945,58 @@ class SecurePeerRuntime:
                 self._host_error = None
                 self._host_error_code = None
                 self._host_action = None
+                if recovering_address:
+                    self._pending_host_attachment = None
             except BaseException:
                 if new_gateway is not None:
-                    new_gateway.stop()
-                # Restore the previous live listener when persistence failed.
-                if old_config["enabled"] and self._host_store is not None and self._adapter is not None:
-                    restored = SecurePeerGateway(
-                        self._host_store,
-                        str(old_config["advertised_host"]),
-                        int(old_config["listen_port"]),
-                        forwarder=self._forward_peer_request,
-                        resource_team_resolver=self._adapter.resource_team,
-                        attachment_max_bytes=(
-                            lambda: self._hub_store.team_attachment_max_bytes
-                            if self._hub_store is not None
-                            else 0
-                        ),
-                        relay_enabled=lambda: self._relay_enabled,
-                        peer_heartbeat=self._record_authenticated_peer_heartbeat,
-                        peer_revoker=self._revoke_authenticated_peer,
-                    )
-                    restored.start()
-                    self._gateway = restored
+                    with suppress(Exception):
+                        new_gateway.stop()
+                self._gateway = None
+                self._host_error, self._host_error_code, self._host_action = old_error
+                # A stale persisted endpoint was never live, so retrying it
+                # here would mask the requested endpoint/persistence failure.
+                if old_gateway is not None and self._host_store is not None and self._adapter is not None:
+                    try:
+                        restored = SecurePeerGateway(
+                            self._host_store,
+                            str(old_config["advertised_host"]),
+                            int(old_config["listen_port"]),
+                            forwarder=self._forward_peer_request,
+                            resource_team_resolver=self._adapter.resource_team,
+                            attachment_max_bytes=(
+                                lambda: self._hub_store.team_attachment_max_bytes
+                                if self._hub_store is not None
+                                else 0
+                            ),
+                            relay_enabled=lambda: self._relay_enabled,
+                            peer_heartbeat=self._record_authenticated_peer_heartbeat,
+                            peer_revoker=self._revoke_authenticated_peer,
+                            **({
+                                "mail_hint_subscriber": self._subscribe_peer_mail_hints,
+                                "mail_hint_snapshot": self._peer_mail_hint_snapshot,
+                                "notification_hint_subscriber": self._subscribe_peer_notification_hints,
+                                "notification_hint_snapshot": self._peer_notification_hint_snapshot,
+                            } if self._mail_hints.enabled else {}),
+                        )
+                        self._start_host_gateway(restored)
+                        self._gateway = restored
+                        self._host_error, self._host_error_code, self._host_action = old_error
+                    except Exception as restore_error:
+                        if not (
+                            isinstance(restore_error, SecurePeerError)
+                            and restore_error.code == "secure_peer_host_address_unavailable"
+                        ):
+                            self.mark_host_unavailable(
+                                f"Secure peer host listener could not be restored: {restore_error}",
+                                error_code="secure_peer_host_listener_failed",
+                                action="Restore the configured local endpoint and retry secure peer host initialization.",
+                            )
+                        if self._hub_store is not None:
+                            self._pending_host_attachment = (
+                                self._host_store.hub_id,
+                                self._hub_store.data_dir,
+                                self._hub_store,
+                            )
                 raise
             finally:
                 if not was_closed:
@@ -983,7 +1053,7 @@ class SecurePeerRuntime:
 
     def _pairing_completion_snapshot(
         self, pairing_id: str, *, expected_transcript_hash: str
-    ) -> tuple[dict[str, Any], int]:
+    ) -> tuple[dict[str, Any], int | None]:
         selected = self._outgoing_for_pairing(pairing_id)
         snapshot = self.client.auto_completion_snapshot(str(selected["connection_id"]))
         connection = snapshot["connection"]
@@ -992,7 +1062,13 @@ class SecurePeerRuntime:
         ):
             raise SecurePeerError("pairing_changed", "Pairing transcript changed", 409)
         state = str(snapshot.get("state") or "unavailable")
-        deadline = int(snapshot.get("deadline") or 0)
+        # Negotiated durable approvals have no decision deadline. The client
+        # validates that contract before persisting consent; a transport
+        # observation window must never expire that durable Join.
+        raw_deadline = snapshot.get("deadline")
+        deadline = int(raw_deadline) if raw_deadline is not None else None
+        if deadline == 0:
+            deadline = None
         if self._completion_closing:
             state = "unavailable"
         elif state == "completed" and not connection.get("active"):
@@ -1001,7 +1077,7 @@ class SecurePeerRuntime:
             state = "cancelled"
         elif state == "pending" and (self._host_role_active or connection.get("status") == "error"):
             state = "cancelled"
-        elif state == "pending" and deadline <= int(time.time()):
+        elif state == "pending" and deadline is not None and deadline <= int(time.time()):
             state = "expired"
         if state not in {"pending", "completed", "cancelled", "expired"}:
             state = "unavailable"
@@ -1036,7 +1112,9 @@ class SecurePeerRuntime:
                 )
                 if receipt["completion_state"] != "pending":
                     return receipt
-                remaining = max(0.0, min(observer_deadline - loop.time(), deadline - time.time()))
+                remaining = max(0.0, observer_deadline - loop.time())
+                if deadline is not None:
+                    remaining = min(remaining, max(0.0, deadline - time.time()))
                 try:
                     await asyncio.wait_for(changed.wait(), timeout=remaining)
                 except asyncio.TimeoutError:
@@ -1048,7 +1126,8 @@ class SecurePeerRuntime:
                         expected_transcript_hash=expected_transcript_hash,
                     )
                     return (
-                        {**latest, "completion_state": "expired"}
+                        {**latest, "completion_state": "unavailable",
+                         "reason": "observation_window_elapsed"}
                         if latest["completion_state"] == "pending"
                         else latest
                     )
@@ -1152,6 +1231,47 @@ class SecurePeerRuntime:
                 if exc.status_code not in {403, 404}:
                     raise
         self._notify_pairing_completion()
+        return self.status()
+
+    def update_connection_endpoint(
+        self,
+        connection_id: str,
+        *,
+        host_ip: str,
+        port: int,
+        expected_host_ip: str,
+        expected_port: int,
+        expected_host_server_identity: str,
+        expected_hub_id: str,
+    ) -> dict[str, Any]:
+        """Move an approved peer to an explicitly selected, verified endpoint."""
+
+        # Serialize with heartbeat, renewal, role changes and route retirement.
+        # This changes transport only: no re-pairing, route grant or activation.
+        with self._outbound_guard:
+            if self._host_role_active:
+                raise SecurePeerError(
+                    "host_role_active",
+                    "This server cannot change its saved Member connection while it is the Team Network host",
+                    409,
+                )
+            connection = self.client.update_connection_endpoint(
+                connection_id,
+                host_ip,
+                port,
+                expected_host_ip=expected_host_ip,
+                expected_port=expected_port,
+                expected_host_server_identity=expected_host_server_identity,
+                expected_hub_id=expected_hub_id,
+            )
+            self._client_failure_counts.pop(connection_id, None)
+            if connection.get("active"):
+                self._client_error = None
+        if connection.get("active"):
+            # Notify once: this also retires the old endpoint's hint stream.
+            # Updating an inactive saved connection must not disturb another
+            # connection's live stream or its transport error.
+            self._notify_pairing_completion()
         return self.status()
 
     def deactivate_connection(
@@ -1421,13 +1541,16 @@ class SecurePeerRuntime:
             "certificate_expires_at": _iso8601(item.get("certificate_expires_at")),
             "certificate_fingerprint": item.get("certificate_fingerprint"),
             "last_seen_at": _iso8601(item.get("last_seen_at")),
-            "expires_at": _iso8601(item.get("expires_at")),
+            "expires_at": _iso8601(None if item.get("expires_at") == 0 else item.get("expires_at")),
             "error": item.get("error"),
         }
 
     def _outgoing_pairing(self, item: Mapping[str, Any]) -> dict[str, Any]:
         connection_id = str(item.get("connection_id"))
         active = bool(item.get("active"))
+        pairing_deadline = item.get("expires_at")
+        if pairing_deadline is None:
+            pairing_deadline = item.get("pairing_expires_at")
         trust_state = self._trust_state(item.get("status"))
         transport_state = self._transport_state(
             item,
@@ -1463,7 +1586,7 @@ class SecurePeerRuntime:
             "certificate_expires_at": _iso8601(item.get("certificate_expires_at")),
             "certificate_fingerprint": item.get("certificate_fingerprint"),
             "last_seen_at": _iso8601(item.get("last_validated_at")),
-            "expires_at": _iso8601(item.get("expires_at") or item.get("pairing_expires_at")),
+            "expires_at": _iso8601(None if pairing_deadline == 0 else pairing_deadline),
             "error": item.get("error"),
         }
 
@@ -3702,17 +3825,29 @@ class SecurePeerRuntime:
     def subscribe_team_mail_hints(self, team_id: str, previous_cursor=None):
         return self._mail_hints.subscribe(team_id, previous_cursor)
 
+    def team_notification_hint_capability(self) -> dict[str, Any]:
+        return self._mail_hints.capability(version=2)
+
+    def subscribe_team_notification_hints(self, team_id: str, previous_cursor=None):
+        return self._mail_hints.subscribe(team_id, previous_cursor, version=2)
+
+    def _subscribe_peer_notification_hints(self, peer: PeerAuthorization, previous_cursor=None):
+        return self._subscribe_peer_mail_hints(peer, previous_cursor, version=2)
+
+    def _peer_notification_hint_snapshot(self, peer: PeerAuthorization, previous_cursor=None):
+        return self._peer_mail_hint_snapshot(peer, previous_cursor, version=2)
+
     def _peer_mail_authority(self, adapter, epoch: int) -> None:
         if (not self._mail_hints.enabled or self._completion_closing
                 or not self._peer_accepting or self._host_admission_closed
                 or self._host_admission_epoch != epoch or self._adapter is not adapter):
             raise SecurePeerError("hub_maintenance", "Mail stream authority is unavailable", 503)
 
-    def _subscribe_peer_mail_hints(self, peer: PeerAuthorization, previous_cursor=None):
+    def _subscribe_peer_mail_hints(self, peer: PeerAuthorization, previous_cursor=None, *, version: int = 1):
         adapter, epoch = self._adapter, self._host_admission_epoch
         self._peer_mail_authority(adapter, epoch)
         lease = adapter.subscribe_team_mail_hints(peer, previous_cursor,
-            authority_guard=lambda: self._peer_mail_authority(adapter, epoch))
+            authority_guard=lambda: self._peer_mail_authority(adapter, epoch), **({"version": 2} if version == 2 else {}))
         try:
             self._peer_mail_authority(adapter, epoch)
             return lease
@@ -3720,10 +3855,10 @@ class SecurePeerRuntime:
             lease.close()
             raise
 
-    def _peer_mail_hint_snapshot(self, peer: PeerAuthorization, previous_cursor=None):
+    def _peer_mail_hint_snapshot(self, peer: PeerAuthorization, previous_cursor=None, *, version: int = 1):
         adapter, epoch = self._adapter, self._host_admission_epoch
         self._peer_mail_authority(adapter, epoch)
-        result = adapter.team_mail_hint_snapshot(peer, previous_cursor)
+        result = adapter.team_mail_hint_snapshot(peer, previous_cursor, **({"version": 2} if version == 2 else {}))
         self._peer_mail_authority(adapter, epoch)
         return result
 
@@ -6714,6 +6849,7 @@ class SecurePeerRuntime:
                 include_mail_subject=flag("include_mail_subject"),
                 include_mailbox_coverage=flag("include_mailbox_coverage"),
                 after_arrival_id=query.get("after_arrival_id"),
+                q=query.get("q"),
             )
         if method == "GET" and pieces == ["deletions"]:
             return store.list_network_content_deletions(
@@ -6723,14 +6859,18 @@ class SecurePeerRuntime:
                 limit=int(query.get("limit", "50")),
             )
         if method == "GET" and len(pieces) == 2 and pieces[0] == "messages":
+            revision_options = {"include_revision": True} if flag("include_revision") else {}
             return store.get_team_message(
                 claims, team_id, pieces[1],
                 include_mail_subject=flag("include_mail_subject"),
+                **revision_options,
             )
         if method == "POST" and pieces == ["messages"]:
             return store.create_team_message(claims, team_id, dict(body or {}))
         if method == "POST" and len(pieces) == 3 and pieces[0] == "messages" and pieces[2] == "receipts":
             return store.record_team_message_receipt(claims, team_id, pieces[1], dict(body or {}))
+        if method == "POST" and len(pieces) == 3 and pieces[0] == "messages" and pieces[2] == "revisions":
+            return store.revise_team_message(claims, team_id, pieces[1], dict(body or {}))
         if method == "DELETE" and len(pieces) == 2 and pieces[0] == "messages":
             return store.delete_team_message(
                 claims,
@@ -6769,9 +6909,19 @@ class SecurePeerRuntime:
         after_sequence: int = 0,
         limit: int = 50,
         include_mail_subject: bool = False,
+        from_kind: str | None = None,
+        from_id: str | None = None,
     ) -> dict[str, Any]:
         if type(include_mail_subject) is not bool:
             raise SecurePeerError("invalid_request", "Mail subject projection flag is invalid", 422)
+        if (
+            (from_kind is None) != (from_id is None)
+            or (from_kind is not None and (
+                not isinstance(from_kind, str) or from_kind not in {"server", "human"}
+                or not isinstance(from_id, str) or not from_id
+            ))
+        ):
+            raise SecurePeerError("invalid_request", "Message sender filter is invalid", 422)
         realm = self.team_realm(team_id)
         result = self._team_hub_get(
             realm,
@@ -6783,6 +6933,7 @@ class SecurePeerRuntime:
                 "after_sequence": after_sequence,
                 "limit": limit,
                 "include_mail_subject": include_mail_subject,
+                **({"from_kind": from_kind, "from_id": from_id} if from_kind is not None else {}),
             },
         )
         result["team_id"] = realm["team_id"]
@@ -6794,14 +6945,20 @@ class SecurePeerRuntime:
         *,
         team_id: str | None = None,
         include_mail_subject: bool = False,
+        include_revision: bool = False,
     ) -> dict[str, Any]:
         if type(include_mail_subject) is not bool:
             raise SecurePeerError("invalid_request", "Mail subject projection flag is invalid", 422)
+        if type(include_revision) is not bool:
+            raise SecurePeerError("invalid_request", "Message revision projection flag is invalid", 422)
         realm = self.team_realm(team_id)
+        query = {"include_mail_subject": include_mail_subject}
+        if include_revision:
+            query["include_revision"] = True
         result = self._team_hub_get(
             realm,
             f"/v1/teams/{quote(realm['team_id'], safe='')}/network/messages/{quote(message_id, safe='')}",
-            {"include_mail_subject": include_mail_subject},
+            query,
         )
         result["team_id"] = realm["team_id"]
         return result
@@ -6898,7 +7055,7 @@ class SecurePeerRuntime:
         idempotency_key: str,
         provenance: Mapping[str, str],
     ) -> dict[str, Any]:
-        """Create one team message for a frozen @@ reference, with attachments."""
+        """Create or explicitly revise a message using a frozen @@ reference."""
 
         if "durable_server_binding" in reference:
             # Provider callers hold team_authorized_write's generation fence;
@@ -6914,6 +7071,38 @@ class SecurePeerRuntime:
             )
         team_path = f"/v1/teams/{quote(realm['team_id'], safe='')}/network"
         kind = str(payload.get("kind") or "message")
+        if kind == "bulletin_edit":
+            if not (
+                reference.get("kind") == "recipient"
+                and reference.get("recipient_kind") == "all"
+            ):
+                raise SecurePeerError(
+                    "team_reference_invalid", "Editing a Bulletin message requires a Bulletin route", 409
+                )
+            if (
+                attachment_paths or payload.get("attachments") or payload.get("attachment_ids")
+                or any(payload.get(field) is not None for field in (
+                    "title", "skill", "in_reply_to_message_id",
+                ))
+            ):
+                raise SecurePeerError(
+                    "invalid_request", "Bulletin edits replace only the body; title, attachments, and skill data are preserved", 422
+                )
+            message_id = payload.get("message_id")
+            expected_version = payload.get("expected_version")
+            if not isinstance(message_id, str) or re.fullmatch(r"[A-Za-z0-9_-]{8,240}", message_id) is None:
+                raise SecurePeerError("invalid_request", "An exact Bulletin message ID is required", 422)
+            if type(expected_version) is not int or expected_version < 1:
+                raise SecurePeerError("invalid_request", "expected_version must be a positive integer", 422)
+            return self._team_hub_post(
+                realm, f"{team_path}/messages/{quote(message_id, safe='')}/revisions",
+                {
+                    "body": str(payload.get("body") or ""),
+                    "body_format": str(payload.get("body_format") or "markdown"),
+                    "expected_version": expected_version,
+                    "idempotency_key": idempotency_key,
+                },
+            )
         if (
             (kind == "skill" or payload.get("skill") is not None)
             and reference.get("kind") != "skill"

@@ -23,6 +23,7 @@ _FUNCTIONS = {
     "is_codex_app_server_retry_notice",
     "codex_reasoning_text",
     "codex_app_server_reasoning_summary",
+    "codex_app_server_reasoning_plaintext",
     "session_lifecycle_lock",
     "maybe_notify_chat_mailbox_codex",
 }
@@ -114,6 +115,10 @@ class NativeTurnProjectionTests(unittest.IsolatedAsyncioTestCase):
             "codex_app_server_tool_output": lambda value: ("safe output", 0, False),
             "project_codex_notification": Mock(),
             "append_event": AsyncMock(),
+            "update_reasoning_summary_stream": AsyncMock(),
+            "reasoning_summary_stream_item": lambda *args: {},
+            "clear_reasoning_summary_stream": AsyncMock(),
+            "finish_reasoning_summary_stream": AsyncMock(),
             "claim_codex_control_terminal_publication": AsyncMock(return_value=claimed),
             "stop_codex_goal_resume": AsyncMock(),
             "finish_codex_control_terminal_publication": AsyncMock(),
@@ -121,6 +126,10 @@ class NativeTurnProjectionTests(unittest.IsolatedAsyncioTestCase):
             "release_codex_interactive_control_lease": Mock(),
             "logger": SimpleNamespace(warning=Mock()),
         }
+        async def persist_summary(session_id, payload, completed):
+            await namespace["append_event"](session_id, "reasoning_text" if payload.get("phase") == "reasoning" else "reasoning_summary", payload)
+            completed.add(("reasoning", payload["item_id"]) if payload.get("phase") == "reasoning" else payload["item_id"])
+        namespace["persist_reasoning_summary"] = persist_summary
         exec(_CODE, namespace)
         manager = SimpleNamespace(
             request=AsyncMock(), wait_for_notification_handler=AsyncMock(),
@@ -197,33 +206,33 @@ class NativeTurnProjectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.events("turn_started"), [])
         self.assertEqual([event["text"] for event in self.events("assistant_text")], ["Actual answer."])
 
-    async def test_reasoning_uses_only_public_summary_and_plan_has_separate_buffer(self):
-        class RawReasoning(dict):
+    async def test_reasoning_channels_are_distinct_and_encrypted_content_is_not_read(self):
+        class ExposedReasoning(dict):
             def get(self, key, default=None):
-                if key == "text":
-                    raise AssertionError("raw reasoning text must not be read")
+                if key == "encrypted_content":
+                    raise AssertionError("encrypted content must not be read")
                 return super().get(key, default)
 
-        raw = item("summary", "reasoning", summary=[{"text": "Public summary"}])
-        raw["params"]["item"] = RawReasoning(raw["params"]["item"])
+        raw = item("summary", "reasoning", summary=[{"text": "Public summary"}], text=["Exposed plaintext"])
+        raw["params"]["item"] = ExposedReasoning(raw["params"]["item"])
         events = await self.run_projection([
             started(),
-            notice("item/reasoning/textDelta", itemId="summary", delta="RAW PRIVATE DELTA"),
+            notice("item/reasoning/textDelta", itemId="summary", delta="Earlier exposed plaintext"),
             raw,
-            notice("item/reasoning/textDelta", itemId="raw-only", delta="RAW PRIVATE DELTA"),
-            item("raw-only", "reasoning", text="RAW PRIVATE ITEM"),
+            item("raw-only", "reasoning", content=[{"type": "reasoning_text", "text": "Typed plaintext"}]),
             notice("item/reasoning/summaryTextDelta", itemId="buffered", delta="Safe buffered summary"),
-            item("buffered", "reasoning", text="RAW PRIVATE ITEM"),
+            item("buffered", "reasoning"),
             notice("item/plan/delta", itemId="plan", delta="Public plan"),
             item("plan", "plan"),
             item("plan-text", "plan", text="Completed plan"),
             completed(),
         ])
-        self.assertEqual([(data["text"], data["phase"]) for data in self.events("reasoning_summary")], [
-            ("Public summary", "summary"), ("Safe buffered summary", "summary"),
+        self.assertEqual([(data["text"], data["phase"]) for kind, data in events if kind in {"reasoning_summary", "reasoning_text"}], [
+            ("Exposed plaintext", "reasoning"), ("Public summary", "summary"),
+            ("Typed plaintext", "reasoning"), ("Safe buffered summary", "summary"),
             ("Public plan", "plan"), ("Completed plan", "plan"),
         ])
-        self.assertNotIn("RAW PRIVATE", json.dumps(events))
+        self.assertNotIn("Earlier exposed plaintext", json.dumps(events))
         self.assert_clean_release()
 
     async def test_completed_summary_does_not_mix_plan_or_raw_deltas(self):

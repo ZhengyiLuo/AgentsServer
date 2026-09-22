@@ -2007,6 +2007,46 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
         await active.wait_result()
         await manager.close_all()
 
+    async def test_subagent_limit_reconfiguration_waits_for_background_agent_completion(self) -> None:
+        cap_name = "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"
+        handle = await self.manager.start_run(
+            "chat-limited", "Delegate", run_id="run-limited",
+            options={"env": {cap_name: "3"}}, configuration_key="limit-3",
+        )
+        client = self.factory.clients[0]
+        started = {
+            "type": "system", "subtype": "task_started",
+            "task_id": "agent-still-running", "task_type": "local_agent",
+        }
+        progress = {"type": "assistant", "text": "Still waiting for the agent"}
+        await client.emit(started)
+        await client.emit({"type": "result", "is_error": False, "result": "parent milestone"})
+        await client.emit(progress)
+        self.assertEqual(await asyncio.wait_for(handle.__anext__(), 1), started)
+        self.assertEqual(await asyncio.wait_for(handle.__anext__(), 1), progress)
+        self.assertFalse(handle.done)
+
+        with self.assertRaises(ClaudeSDKConfigurationConflict):
+            await self.manager.get(
+                "chat-limited", options={"env": {cap_name: "1"}},
+                configuration_key="limit-1",
+            )
+        self.assertFalse(client.disconnected)
+        self.assertEqual(len(self.factory.clients), 1)
+
+        await client.emit({
+            "type": "system", "subtype": "task_notification",
+            "task_id": "agent-still-running", "status": "completed",
+        })
+        await client.emit({"type": "result", "is_error": False, "result": "all done"})
+        await asyncio.wait_for(handle.wait_result(), 1)
+        replacement = await self.manager.get(
+            "chat-limited", options={"env": {cap_name: "1"}},
+            configuration_key="limit-1",
+        )
+        self.assertEqual(replacement.configuration_key, "limit-1")
+        self.assertTrue(client.disconnected)
+
     async def test_evict_disconnects_only_selected_chat(self) -> None:
         run = await self.manager.start_run(
             "chat-1",

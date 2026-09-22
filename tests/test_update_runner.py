@@ -190,6 +190,78 @@ class UpdateRunnerTests(unittest.TestCase):
             {"1.3.0-beta.2"},
         )
 
+    def test_one_zero_beta_bridge_preserves_numeric_ordering_and_track_selection(self):
+        releases = [
+            self.release("0.1.25"),
+            self.release("0.1.26-beta.66"),
+            self.release("1.0.0-beta.1"),
+            self.release("1.0.0"),
+            self.release("1.0.0-beta.2", draft=True),
+            self.release("2.0.0-beta.1", prerelease=False),
+        ]
+        self.assertEqual(
+            update_runner.release_candidates(releases, "beta"),
+            ["1.0.0-beta.1", "0.1.26-beta.66"],
+        )
+        self.assertEqual(
+            update_runner.stable_release_candidates(releases),
+            ["1.0.0", "0.1.25"],
+        )
+        for current in ("0.1.25", "0.1.26-beta.46", "0.1.26-beta.66"):
+            with self.subTest(current=current):
+                self.assertTrue(update_runner.release_transition_allowed(
+                    current, "1.0.0-beta.1", "beta",
+                ))
+                self.assertFalse(update_runner.release_transition_allowed(
+                    current, "1.0.0-beta.1", "stable",
+                ))
+        self.assertFalse(update_runner.release_transition_allowed(
+            "1.0.0-beta.1", "0.1.26-beta.66", "beta",
+        ))
+        self.assertLess(
+            update_runner.version_key("1.0.0-beta.1"),
+            update_runner.version_key("1.0.0"),
+        )
+        page = b'<a href="/ZhengyiLuo/AgentsServer/releases/tag/v1.0.0-beta.1">beta</a>'
+        self.assertEqual(update_runner.release_versions_from_html(page, "beta"), {"1.0.0-beta.1"})
+        self.assertEqual(update_runner.release_versions_from_html(page, "stable"), set())
+
+    def test_one_zero_beta_bridge_uses_signed_immutable_release_assets(self):
+        version = "1.0.0-beta.1"
+        private, payload, signature = self.signed_manifest(version, track="beta", prerelease=True)
+        assets = {
+            update_runner.RELEASES_API_URL: json.dumps([
+                self.release("0.1.26-beta.66"), self.release(version), self.release("0.1.25"),
+            ]).encode(),
+            update_runner.release_manifest_url(version): payload,
+            update_runner.release_signature_url(version): signature,
+        }
+        seen = []
+
+        def download(url, _limit, timeout=30.0):
+            seen.append(url)
+            return assets[url]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            public_path = Path(temporary) / "public.pem"
+            public_path.write_bytes(private.public_key().public_bytes(
+                serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo,
+            ))
+            with patch.object(update_runner, "download_bytes", side_effect=download):
+                manifest = update_runner.check_release(public_path, track="beta")
+            with self.assertRaisesRegex(RuntimeError, "requested stable track"):
+                update_runner.verify_manifest(payload, signature, public_path, track="stable")
+            with self.assertRaisesRegex(RuntimeError, "immutable release tag"):
+                update_runner.verify_manifest(
+                    payload, signature, public_path, track="beta", expected_version="1.0.0-beta.2",
+                )
+        self.assertEqual(manifest["version"], version)
+        self.assertEqual(seen, [
+            update_runner.RELEASES_API_URL,
+            update_runner.release_manifest_url(version),
+            update_runner.release_signature_url(version),
+        ])
+
     def test_signed_stable_release_uses_only_versioned_asset_urls(self):
         private, payload, signature = self.signed_manifest("1.2.3")
         releases = json.dumps([

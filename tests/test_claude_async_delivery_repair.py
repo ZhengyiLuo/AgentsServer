@@ -53,7 +53,8 @@ class AsyncDeliveryRepairTests(unittest.TestCase):
             return value if row.get("type") == "user" and isinstance(value, str) else None
         with patch.object(repair, "MAX_EVENTS_BYTES", 8192 if oversized else repair.MAX_EVENTS_BYTES):
             return self.cache.prepare("chat-one", "provider-one", self.events, self.root, normalize,
-                                      normalize_full_user=normalize)
+                                      normalize_full_user=normalize,
+                                      normalize_assistant=fixtures.CLEAN_ASSISTANT_TEXT)
 
     def test_completed_async_input_and_exact_assistant_replay_preserve_other_same_batch_rows(self):
         for oversized in (False, True):
@@ -129,3 +130,171 @@ class AsyncDeliveryRepairTests(unittest.TestCase):
         self.assertIsNotNone(self.cache.project_event("chat-one", self.imported))
         self.assertIsNone(self.cache.project_event("chat-one", self.rows[-1]))
         self.assertEqual(len(self.cache.signature("chat-one")), 1)
+
+
+class MailboxWakeRepairTests(unittest.TestCase):
+    prepare = AsyncDeliveryRepairTests.prepare
+
+    def setUp(self):
+        AsyncDeliveryRepairTests.setUp(self)
+        self.rows.remove(self.receipt)
+        self.prompt = "Unread agent mail is available. Read the authorized inbox when useful."
+        self.source_rows[0]["message"]["content"] = self.prompt
+        self.input["prompt"] = self.prompt
+        self.wake = {
+            "purpose": "chat_mailbox_wake", "mailbox_wake_id": "mailwake_" + "a" * 32,
+            "mailbox_wake_through_seq": 2, "provider_generated": True,
+            "provider_input_sha256": hashlib.sha256(self.prompt.encode()).hexdigest(),
+        }
+        for row in self.rows[:4]:
+            for key in ("conversation_mode", "conversation_id", "message_id", "cross_chat_envelope_id",
+                        "source_session_id", "target_session_id"):
+                row.pop(key, None)
+            row.update(self.wake)
+        self.rows[0]["prompt"] = ""
+
+    def test_exact_generated_wake_input_and_replayed_output_keep_native_output_and_human_followup(self):
+        for oversized in (False, True):
+            with self.subTest(oversized=oversized):
+                self.cache = repair.ClaudeMetadataRepairCache()
+                self.assertTrue(self.prepare(oversized=oversized))
+                self.assertTrue(self.cache.is_hidden("chat-one", self.input))
+                self.assertEqual(self.cache.project_event("chat-one", self.imported)["provider_history_repair"],
+                                 "source_proven_assistant_replay")
+                for event in (self.rows[0], self.native, self.rows[-3], self.rows[-2], self.rows[-1]):
+                    self.assertIsNone(self.cache.project_event("chat-one", event))
+                self.assertEqual(self.input["prompt"], self.prompt)
+                self.assertEqual(self.native["text"], "Full public report ending.")
+                with patch.object(repair, "_regular_stamp", side_effect=AssertionError("Unexpected repeat I/O")):
+                    self.assertTrue(self.cache.is_hidden("chat-one", self.input))
+                    self.assertFalse(self.cache.prepare("chat-one", "provider-one", self.events, self.root, lambda row: None))
+
+    def test_reported_decorated_mailbox_reply_has_one_visible_assistant(self):
+        # Same shape as native seq 2137 / imported seq 2145: public commentary,
+        # exact provider UUID, second-resolution native vs precise source time.
+        for oversized in (False, True):
+            with self.subTest(oversized=oversized):
+                self.setUp()
+                self.native.update(text="收到并回复了。", provider_message_id="12345678-1234-4234-8234-123456789abc")
+                self.source_rows[1].update(uuid=self.native["provider_message_id"])
+                self.source_rows[1]["message"]["content"][0]["text"] = "✅ 收到并回复了。"
+                self.imported["text"] = "✅ 收到并回复了。"
+                self.imported["provider_origin"]["event_id"] = self.native["provider_message_id"]
+                self.prepare(oversized=oversized)
+                self.assertIsNone(self.cache.project_event("chat-one", self.native))
+                self.assertTrue(self.cache.project_event("chat-one", self.imported)["metadata_only"])
+                self.assertEqual(self.native["text"], "收到并回复了。")
+                self.assertEqual(self.imported["text"], "✅ 收到并回复了。")
+
+    def test_wake_requires_exact_hash_unique_owned_occurrence_and_nonhuman_input(self):
+        mutations = [lambda: self.rows[0].update(provider_input_sha256="0" * 64),
+                     lambda: self.rows[0].pop("provider_generated"),
+                     lambda: self.rows[0].update(mailbox_wake_through_seq=True),
+                     lambda: self.rows[0].update(mailbox_wake_id="not-a-claim"),
+                     lambda: self.rows[2].update(provider_session_id="other-provider"),
+                     lambda: self.rows[3].update(stopped=True),
+                     lambda: self.rows[0].update(ts="2026-09-10T12:00:01.322Z"),
+                     lambda: self.input.pop("provider_origin"),
+                     lambda: self.input.update(provider_user_authored=True),
+                     lambda: self.source_rows[0].update(clientUserMessageId="human-quote"),
+                     lambda: self.source_rows.append({**self.source_rows[0], "uuid": "second-source"}),
+                     lambda: self.source_rows[0]["message"].update(content=self.prompt + " quoted")]
+        for mutate in mutations:
+            with self.subTest(mutation=mutate):
+                self.setUp()
+                mutate()
+                self.prepare()
+                self.assertFalse(self.cache.is_hidden("chat-one", self.input))
+
+    def test_wake_output_replay_requires_exact_provider_message_id(self):
+        for message_id in (None, "another-source"):
+            with self.subTest(message_id=message_id):
+                self.setUp()
+                self.native["provider_message_id"] = message_id
+                self.prepare()
+                self.assertTrue(self.cache.is_hidden("chat-one", self.input))
+                self.assertIsNone(self.cache.project_event("chat-one", self.imported))
+
+    def test_provider_startup_delay_uses_owned_interval_not_native_start_timestamp_equality(self):
+        self.rows[0]["ts"] = "2026-09-10T11:59:58.500Z"
+        for oversized in (False, True):
+            self.cache = repair.ClaudeMetadataRepairCache()
+            self.prepare(oversized=oversized)
+            self.assertTrue(self.cache.is_hidden("chat-one", self.input))
+
+    def forward(self, *, large=False, items=None):
+        self.prepare()
+        if large:
+            prefix = encode([{"type": "progress", "data": "x" * 1000}] * 20)
+            raw = prefix + encode(self.source_rows)
+            self.source.write_bytes(raw)
+            stat = self.source.stat()
+            self.checkpoint.update(previous_present=True, previous_source_offset=len(prefix),
+                                   previous_source_digest=hashlib.sha256(prefix).hexdigest())
+            self.checkpoint["cursor"].update(source_offset=len(raw), source_digest=hashlib.sha256(raw).hexdigest(),
+                                             source_dev=stat.st_dev, source_ino=stat.st_ino)
+        self.events.write_bytes(encode(self.rows[:4]))  # No import has been persisted yet.
+        if items is None:
+            items = [{"kind": "user", "text": self.prompt, "provider_origin": self.input.get("provider_origin")},
+                     {"kind": "assistant", "text": "The native result remains visible."}]
+        def normalize(row):
+            value = (row.get("message") or {}).get("content")
+            return value if row.get("type") == "user" and isinstance(value, str) else None
+        with patch.object(repair, "MAX_EVENTS_BYTES", 8192 if large else repair.MAX_EVENTS_BYTES):
+            result = repair.filter_native_claude_mailbox_wake_items(
+                "chat-one", "provider-one", self.events, items, sync_checkpoint=self.checkpoint,
+                root=self.root, normalize_user=normalize, normalize_full_user=normalize,
+                normalize_assistant=fixtures.CLEAN_ASSISTANT_TEXT)
+        return items, result
+
+    def test_first_import_silences_exact_decorated_wake_reply_before_publication(self):
+        for large in (False, True):
+            with self.subTest(large=large):
+                self.setUp()
+                self.source_rows[1]["message"]["content"][0]["text"] = "✅ " + self.native["text"]
+                item = {"kind": "assistant", "text": "✅ " + self.native["text"],
+                        "provider_origin": self.imported["provider_origin"]}
+                other = {**item, "provider_origin": {**item["provider_origin"], "event_id": "distinct-reply"}}
+                before, result = self.forward(large=large, items=[item, other])
+                self.assertEqual(result[0]["provider_history_repair"], "source_proven_assistant_replay")
+                self.assertTrue(result[0]["metadata_only"])
+                self.assertEqual(result[0]["text"], "")
+                self.assertEqual(result[1], other)
+                self.assertEqual(before[0]["text"], "✅ " + self.native["text"])
+                self.assertEqual(self.events.read_bytes(), encode(self.rows[:4]))
+
+    def test_first_import_decorated_reply_preserves_ambiguous_and_changed_content(self):
+        for mutate in (lambda: self.native.pop("provider_message_id"),
+                       lambda: self.native.update(provider_message_id="other-reply"),
+                       lambda: self.native.update(text="Changed public output"),
+                       lambda: self.rows[3].update(stopped=True)):
+            with self.subTest(mutation=mutate):
+                self.setUp()
+                raw = "✅ " + self.native["text"]
+                self.source_rows[1]["message"]["content"][0]["text"] = raw
+                item = {"kind": "assistant", "text": raw, "provider_origin": self.imported["provider_origin"]}
+                mutate()
+                before, result = self.forward(items=[item])
+                self.assertEqual(result, before)
+
+    def test_first_import_silences_only_exact_wake_in_small_and_large_source(self):
+        self.rows[0]["ts"] = "2026-09-10T11:59:58.500Z"
+        for large in (False, True):
+            with self.subTest(large=large):
+                before, result = self.forward(large=large)
+                self.assertEqual(result[0]["text"], "")
+                self.assertEqual(result[0]["provider_history_repair"], "source_proven_import")
+                self.assertTrue(result[0]["metadata_only"])
+                self.assertEqual(result[1], before[1])
+                self.assertEqual(before[0]["text"], self.prompt)
+
+    def test_first_import_keeps_human_ambiguous_unowned_or_out_of_interval_input(self):
+        for mutate in (lambda: self.source_rows[0].update(clientUserMessageId="genuine-human"),
+                       lambda: self.source_rows.append({**self.source_rows[0], "uuid": "another-identical-source"}),
+                       lambda: self.rows[2].update(provider_session_id="another-provider"),
+                       lambda: self.rows[0].update(ts="2026-09-10T12:00:01.322Z"),
+                       lambda: self.input.pop("provider_origin")):
+            with self.subTest(mutation=mutate):
+                self.setUp(); mutate()
+                before, result = self.forward()
+                self.assertEqual(result, before)

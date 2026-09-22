@@ -1,4 +1,80 @@
-# Team Mail hint transport — locally accepted candidate
+# Team Mail and Bulletin hint transport
+
+## V2 release availability
+
+The existing v1 mail lane is enabled by the application in beta.66 and
+`1.0.0-beta.1`. The historical v1 acceptance notes below retain their original
+candidate status. The v2 extension is published in `1.0.0-beta.3`; desktop
+indicators require AgentsDock `1.0.0-beta.2`. Publication does not install either
+component or restart an existing server.
+
+An authenticated `team_mail_hints_v2` health capability advertises `version:2`,
+the same `/api/team-mail-hints/events` path, protocol
+`agentsdock.team-mail-hints.v2`, `mailbox_coverage:true`, and
+`bulletin_coverage:true`. Its mailbox descriptor keeps the v1 shape. A client
+opens only one negotiated stream; old peers continue to use unchanged v1.
+Member v2 is available only after existing authenticated peer health explicitly
+advertises `mail_hints_v2_available:true`; missing support does not trigger probes.
+
+The subscription is `{version:2,team_id,previous_cursor}`. Snapshot and hint
+envelopes retain `{type,server_identity,hub_id,stream_id,cursor}`, with:
+
+```text
+cursor = {
+  version: 2,
+  mail: <unchanged v1 cursor, including reset>,
+  bulletin: {
+    version: 1, team_id, through_sequence, change_id, message_id,
+    change_kind, message_version, reset
+  }
+}
+```
+
+Bulletin IDs are `bchg_` plus 32 lowercase hex digits. Nonempty cursors identify
+one `tmsg_` message, a `created`, `revised`, or `deleted` change, and a positive
+message version. Empty Bulletin has sequence zero and null change/message IDs,
+kind and message version. Sequences are exact JavaScript-safe integers. Both
+reset flags are required and independent; hints always set both to false.
+
+Migration 22 adds a metadata-only immutable Bulletin change journal, appended
+inside the same transaction as a post, author revision, or deletion. It covers
+the current Bulletin feed (message/skill posts addressed to `all`), not legacy
+network-board entries. Existing posts establish a baseline without copying
+their bodies. Only committed writes publish hints. Rollback and idempotent
+replay do not notify; failed publication retires affected streams for a fresh
+durable snapshot without turning a successful post into a send failure.
+
+One bounded coalesced pair preserves separate mail and Bulletin heads. Bulletin
+changes never advance the mailbox arrival watermark or wake a v1 mail-only
+subscriber. The same Member upstream serves mixed v1/v2 desktop subscribers.
+There is no polling, automatic feed/body fetch, unread count query, new agent
+turn, or shared interactive-executor wait. Existing authentication, revocation,
+certificate expiry, maintenance and bounded writer fences apply to both lanes.
+
+The Bulletin cursor is an existence/change hint, not proof the user saw content.
+For explicit refresh, desktop captures the prior head, replaces the feed from
+fresh complete pages, and acknowledges that captured head only after reaching
+`has_more:false` in the unchanged server/Hub/team scope. A capped or failed
+scan cannot clear attention. A newer arrival remains pending; never acknowledge
+the latest head merely because the earlier refresh completed. No HTTP ack route
+is needed. Mail page coverage remains independently validated as before.
+
+Local validation: 104 guarded store/transport/API/manifest checks passed,
+including a 1,000-update coalescing burst, mixed v1/v2 subscribers, independent
+reset/restore anchors, subscribe/snapshot races, commit-only publication,
+rollback/replay, author-only revisions, upgrade/fallback, idle-query prohibition,
+revocation, migration backfill, and package/installer allowlists. V2 acceptance
+also exercises actual certificate-bound TLS over private socket pairs through
+the Hub commit, gateway/client, Member runtime and local websocket handler;
+both old/new local protocols share one upstream. Python-generated cursor frames
+and the actual desktop TypeScript parser were checked in both directions.
+The companion desktop passed an isolated Electron acceptance journey with
+dark/light and narrow translated layouts. A 200-hint burst performed no content
+requests and preserved the draft, focus and scroll container; refresh remained
+explicit. These checks do not claim a deployed UI, real-network performance,
+or production enablement.
+
+## Historical v1 acceptance notes
 
 This is not a shipped notification lane. Published beta58 is unchanged.
 `SecurePeerRuntime(mail_hints_enabled=False)` remains the reusable default;

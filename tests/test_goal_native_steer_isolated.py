@@ -15,6 +15,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock
 
 from codex_app_server import CodexAppServerError, CodexAppServerProtocolError, CodexAppServerRequestError
+from tests.test_goal_followup_admission_isolated import saved_route_snapshots
 
 
 SOURCE = (Path(__file__).resolve().parents[1] / "agent_server.py")
@@ -25,7 +26,8 @@ NAMES = {
     "requeue_native_steer_after_safe_rejection", "native_steer_requeue_event_payload",
     "join_task_despite_caller_cancellation", "concise_error_message",
     "is_codex_reconnect_notice", "is_codex_app_server_retry_notice",
-    "codex_reasoning_text", "codex_app_server_reasoning_summary",
+    "codex_reasoning_text", "codex_app_server_reasoning_summary", "codex_app_server_reasoning_plaintext",
+    "persist_reasoning_summary",
     "session_lifecycle_lock",
 }
 TREE = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
@@ -34,6 +36,9 @@ assert {node.name for node in NODES} == NAMES
 CODE = compile(ast.fix_missing_locations(ast.Module(body=[ast.ImportFrom(
     module="__future__", names=[ast.alias(name="annotations")], level=0,
 ), *NODES], type_ignores=[])), str(SOURCE), "exec")
+# The compiled allowlist is sufficient; do not retain the full server AST
+# throughout the suite and add unrelated GC work to asynchronous tests.
+del TREE, NODES
 
 
 class Subscription:
@@ -85,6 +90,7 @@ class NativeGoalSteerTests(unittest.IsolatedAsyncioTestCase):
             "CodexAppServerRequestError": CodexAppServerRequestError,
             "CodexAppServerSubscriptionClosed": type("SubscriptionClosed", (Exception,), {}),
             "CODEX_GOALS_ENABLED": True, "CODEX_GOAL_STEER_CLIENT_CAPABILITY": "codex_goal_steer_v1",
+            "PROVIDER_CROSS_CHAT_ROUTE_KIND_REFERENCE": "prompt_reference",
             "BACKEND_CODEX": "codex", "DEFAULT_BACKEND": "codex",
             "CODEX_APP_SERVER_LIFECYCLE_TIMEOUT_SECONDS": 2, "IDLE_KILL_SECONDS": 2,
             "ACTIVE": {"chat": self.active}, "CURRENT_TURNS": {"chat": self.current},
@@ -104,6 +110,13 @@ class NativeGoalSteerTests(unittest.IsolatedAsyncioTestCase):
             "codex_app_server_tool": lambda item: None,
             "project_codex_notification": Mock(),
             "append_event": append_event, "append_durable_event_batch": append_batch,
+            # These goal/child lifecycle fixtures do not host a live summary
+            # registry. Retain the real completed-summary commit above while
+            # isolating the unrelated transient transport and finalizer.
+            "update_reasoning_summary_stream": AsyncMock(),
+            "reasoning_summary_stream_item": lambda *args: {},
+            "clear_reasoning_summary_stream": AsyncMock(),
+            "finish_reasoning_summary_stream": AsyncMock(),
             "claim_codex_control_terminal_publication": AsyncMock(return_value=False),
             "stop_codex_goal_resume": AsyncMock(), "release_codex_control_thread": AsyncMock(),
             "finish_codex_control_terminal_publication": AsyncMock(),
@@ -140,6 +153,26 @@ class NativeGoalSteerTests(unittest.IsolatedAsyncioTestCase):
     async def send(self, request):
         return await self.ns["send_codex_goal_steer"]("chat", "operation", self.manager, "thread", "reservation", self.subscription, self.queue, request)
 
+    def ordinary_owner(self):
+        self.active.pop("codex_native_operation_kind", None)
+        self.active.pop("codex_control_reservation_id", None)
+        self.current.pop("codex_control_reservation_id", None)
+        self.current.pop("purpose", None)
+        self.active.update(
+            native_steer_queue=None,
+            codex_goal_steer_queue=self.queue,
+            codex_app_server_turn=SimpleNamespace(
+                turn_id="turn-1", thread_id="thread", _subscription=self.subscription,
+            ),
+            standalone_provider_context=False,
+        )
+
+    async def send_ordinary(self, request):
+        return await self.ns["send_codex_goal_steer"](
+            "chat", "operation", self.manager, "thread", "",
+            self.subscription, self.queue, request,
+        )
+
     def consumer(self):
         return asyncio.create_task(self.ns["consume_codex_native_turn"](
             "chat", "operation", "goal_resume", self.manager, "thread", "reservation", self.subscription, turn_id="turn-1",
@@ -166,6 +199,237 @@ class NativeGoalSteerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.current["run_id"], "operation")
         self.manager.request.assert_not_awaited()
 
+    async def test_first_turn_goal_steer_keeps_authority_and_ordinary_owner(self):
+        self.ordinary_owner()
+        authority = {"run_id": "operation", "proof": "original-runtime-proof"}
+        self.active["provider_authority"] = authority
+        original_handle = self.active["codex_app_server_turn"]
+        request = self.request()
+        pending = await self.send_ordinary(request)
+        result = await self.ns["commit_codex_goal_steer"](
+            "chat", "operation", "thread", "", pending,
+        )
+        self.assertEqual(len(self.calls), 1)
+        self.assertIs(self.calls[0][3]["notification_subscription"], self.subscription)
+        self.assertEqual((result["run_id"], result["interrupted"]), ("operation", False))
+        self.assertTrue(result["native_goal_steer"])
+        self.assertEqual(self.goal["status"], "active")
+        self.assertIs(self.active["provider_authority"], authority)
+        self.assertIs(self.active["codex_app_server_turn"], original_handle)
+        self.assertIs(self.active["codex_goal_steer_queue"], self.queue)
+        self.assertIsNone(self.active["native_steer_queue"])
+        self.assertNotIn("codex_native_operation_kind", self.active)
+        self.assertNotIn("codex_control_reservation_id", self.active)
+        self.assertNotIn("codex_control_reservation_id", self.current)
+        self.assertEqual(self.current["run_id"], "operation")
+        self.assertEqual([kind for kind, _ in self.events], [
+            "turn_unqueued", "turn_queue_delivery_fenced", "turn_queue_run_now", "turn_steered",
+        ])
+        self.manager.request.assert_not_awaited()
+        self.ns["release_codex_interactive_control_lease"].assert_not_called()
+        self.ns["release_codex_control_thread"].assert_not_awaited()
+
+    async def test_automatic_saved_routes_are_inert_for_goal_text_and_attachments(self):
+        for ordinary in (False, True):
+            for owner_routes in ([], saved_route_snapshots()[:1]):
+                for files in ([], ["file_synthetic_video"]):
+                    with self.subTest(ordinary=ordinary, owner_routes=bool(owner_routes), files=files):
+                        self.setUp()
+                        if ordinary:
+                            self.ordinary_owner()
+                            self.current["purpose"] = "scheduled_job"
+                        self.active.update(provider_model="gpt-6-astra", provider_effort="xhigh", provider_service_tier="priority")
+                        authority = self.active["provider_authority"] = {"proof": "original-authority", "routes": owner_routes}
+                        self.current["provider_cross_chat_route_snapshot"] = owner_routes
+                        self.current["provider_team_mail_route_snapshot"] = []
+                        active_before, current_before = dict(self.active), dict(self.current)
+                        request = self.request()
+                        request["selected"].update(
+                            prompt="Status report!", file_ids=files,
+                            model="gpt-6-astra", effort="xhigh",
+                            # Two targets are absent from the original owner's
+                            # ceiling: steering must not grant either of them.
+                            provider_cross_chat_route_snapshot=saved_route_snapshots(),
+                            provider_team_mail_route_snapshot=[{"route_id": "mail_" + "1" * 32, "revision": "rev_" + "2" * 32}],
+                        )
+                        forbidden = {
+                            name: Mock(side_effect=AssertionError(f"unexpected {name}"))
+                            for name in ("issue_native_steer_provider_authority", "native_steer_provider_actions", "prepare_steered_turn")
+                        }
+                        self.ns.update(forbidden)
+                        builder = self.ns["build_user_provider_prompt"] = Mock(return_value="Status report! [validated attachments]" if files else "Status report!")
+                        pending = await (self.send_ordinary(request) if ordinary else self.send(request))
+                        result = await self.ns["commit_codex_goal_steer"](
+                            "chat", "operation", "thread", "" if ordinary else "reservation", pending,
+                        )
+                        builder.assert_called_once_with("chat", "Status report!", files)
+                        self.assertEqual(self.calls[0][2], [{"type": "text", "text": builder.return_value, "text_elements": []}])
+                        self.assertEqual(self.active, active_before)
+                        self.assertEqual(self.current, current_before)
+                        self.assertIs(self.active["provider_authority"], authority)
+                        self.assertEqual(self.goal["status"], "active")
+                        self.assertFalse(result["interrupted"])
+                        self.assertEqual(sum(kind == "turn_steered" for kind, _ in self.events), 1)
+                        for call in forbidden.values():
+                            call.assert_not_called()
+                        self.manager.request.assert_not_awaited()
+
+    async def test_saved_routes_do_not_bypass_selected_grants_or_commands_at_writer_boundary(self):
+        changes = (
+            lambda selected: selected.update(chat_references=[{"session_id": "new-target"}]),
+            lambda selected: selected.update(team_references=[{"id": "new-team"}]),
+            lambda selected: selected.update(skill_selection={"name": "provider-command"}),
+            lambda selected: selected.update(prompt="/mail server remote New message"),
+            lambda selected: selected.update(purpose="scheduled_job"),
+            lambda selected: selected["provider_cross_chat_route_snapshot"].append(
+                {**saved_route_snapshots()[0], "route_kind": "prompt_reference"}),
+            lambda selected: self.current.update(skill_selection={"name": "provider-command"}),
+        )
+        for ordinary in (False, True):
+            for index, change in enumerate(changes):
+                with self.subTest(ordinary=ordinary, change=index):
+                    self.setUp()
+                    if ordinary:
+                        self.ordinary_owner()
+                        self.current["purpose"] = "scheduled_job"
+                    request = self.request()
+                    request["selected"]["provider_cross_chat_route_snapshot"] = saved_route_snapshots()
+
+                    async def mutate():
+                        change(request["selected"])
+
+                    self.before_rpc = mutate
+                    with self.assertRaises(self.ns["NativeSteerHandoffError"]) as caught:
+                        await (self.send_ordinary(request) if ordinary else self.send(request))
+                    self.assertTrue(caught.exception.safe_to_requeue)
+                    self.assertEqual(self.calls, [])
+                    self.assertTrue(request["selected"]["_native_delivery_fenced"])
+                    self.assertFalse(any(kind == "turn_steered" for kind, _ in self.events))
+                    self.assertEqual(self.goal["status"], "active")
+
+    async def test_ordinary_goal_final_write_guard_rejects_changed_owner(self):
+        mutations = {
+            "paused": lambda: self.goal.update(status="paused"),
+            "stopped": lambda: self.active.update(stop_requested=True),
+            "stop_request": lambda: self.ns["STOP_REQUESTS"].add("chat"),
+            "stopped_run": lambda: self.ns["STOPPED_RUNS"].add("operation"),
+            "turn_rollover": lambda: self.active.update(provider_turn_id="turn-2"),
+            "handle_rollover": lambda: setattr(self.active["codex_app_server_turn"], "turn_id", "turn-2"),
+            "handle_different_thread": lambda: setattr(self.active["codex_app_server_turn"], "thread_id", "other-thread"),
+            "handle_closed": lambda: setattr(self.active["codex_app_server_turn"], "_closed", True),
+            "handle_completed": lambda: setattr(self.active["codex_app_server_turn"], "_completed", True),
+            "handle_missing": lambda: self.active.pop("codex_app_server_turn"),
+            "subscription_replaced": lambda: setattr(self.active["codex_app_server_turn"], "_subscription", Subscription()),
+            "queue_replaced": lambda: self.active.update(codex_goal_steer_queue=asyncio.Queue(maxsize=1)),
+            "ordinary_lane_missing": lambda: self.active.pop("codex_goal_steer_queue"),
+            "provider_not_ready": lambda: self.active.update(provider_turn_ready=False),
+            "active_owner_replaced": lambda: self.active.update(run_id="successor"),
+            "current_owner_replaced": lambda: self.current.update(run_id="successor"),
+            "active_reservation_replaced": lambda: self.active.update(codex_control_reservation_id="successor"),
+            "current_reservation_replaced": lambda: self.current.update(codex_control_reservation_id="successor"),
+            "different_operation_kind": lambda: self.active.update(codex_native_operation_kind="compaction"),
+            "different_thread": lambda: self.active.update(provider_thread_id="different-thread"),
+            "different_goal": lambda: self.goal.update(id="different-goal"),
+            "different_objective": lambda: self.goal.update(objective="Different work"),
+            "manager_generation": lambda: setattr(self.manager, "generation", 2),
+            "closed_subscription": lambda: self.subscription.close(),
+            "standalone_provider": lambda: self.active.update(standalone_provider_context=True),
+            "lost_busy_slot": lambda: self.ns["BUSY_SESSIONS"].discard("chat"),
+            "exhausted_budget": lambda: self.ns["STORE"].sessions["chat"].update(codex_goal_time_budget_exhausted=True),
+            "runtime_changed": lambda: self.ns.update(queued_codex_runtime_matches_active=lambda *args: False),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                self.setUp()
+                self.ordinary_owner()
+                request = self.request()
+                request["selected"]["provider_cross_chat_route_snapshot"] = saved_route_snapshots()
+                async def change():
+                    mutate()
+                self.before_rpc = change
+                with self.assertRaises(self.ns["NativeSteerHandoffError"]) as caught:
+                    await self.send_ordinary(request)
+                self.assertTrue(caught.exception.safe_to_requeue)
+                self.assertEqual(self.calls, [])
+                self.assertTrue(request["selected"]["_native_delivery_fenced"])
+                self.assertFalse(any(kind == "turn_steered" for kind, _ in self.events))
+                self.manager.request.assert_not_awaited()
+
+    async def test_ordinary_goal_cannot_steer_through_generic_native_lane(self):
+        self.ordinary_owner()
+        self.active.pop("codex_goal_steer_queue")
+        self.active["native_steer_queue"] = self.queue
+        with self.assertRaises(self.ns["NativeSteerHandoffError"]) as caught:
+            await self.send_ordinary(self.request())
+        self.assertTrue(caught.exception.safe_to_requeue)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.events, [])
+
+    async def test_ordinary_goal_post_ack_owner_loss_is_uncertain_not_replayed(self):
+        self.ordinary_owner()
+        request = self.request()
+        pending = await self.send_ordinary(request)
+        self.current["run_id"] = "successor"
+        with self.assertRaises(self.ns["NativeSteerHandoffError"]) as caught:
+            await self.ns["commit_codex_goal_steer"](
+                "chat", "operation", "thread", "", pending,
+            )
+        self.assertFalse(caught.exception.safe_to_requeue)
+        self.assertTrue(caught.exception.delivery_uncertain)
+        self.assertEqual(len(self.calls), 1)
+        self.assertFalse(any(kind == "turn_steered" for kind, _ in self.events))
+        self.assertEqual(self.goal["status"], "active")
+        self.manager.request.assert_not_awaited()
+
+    async def test_goal_attachments_use_original_files_and_public_display_ids(self):
+        for ordinary in (False, True):
+            for visible in (None, [], ["file_visible"]):
+                with self.subTest(ordinary=ordinary, visible=visible):
+                    self.setUp()
+                    if ordinary:
+                        self.ordinary_owner()
+                    request = self.request()
+                    selected = request["selected"]
+                    selected.update(
+                        prompt="Review these two attachments ✓",
+                        display_prompt="Please review the attachments",
+                        file_ids=["file_original_a", "file_original_b"],
+                    )
+                    if visible is not None:
+                        selected["display_file_ids"] = visible
+                    compiled_prompt = "Review these two attachments ✓\n[Resolved attachment paths]"
+                    builder = Mock(return_value=compiled_prompt)
+                    self.ns["build_user_provider_prompt"] = builder
+                    pending = await (self.send_ordinary(request) if ordinary else self.send(request))
+                    await self.ns["commit_codex_goal_steer"](
+                        "chat", "operation", "thread", "" if ordinary else "reservation", pending,
+                    )
+                    builder.assert_called_once_with("chat", selected["prompt"], selected["file_ids"])
+                    self.assertEqual(self.calls[0][2], [
+                        {"type": "text", "text": compiled_prompt, "text_elements": []},
+                    ])
+                    expected_files = selected["file_ids"] if visible is None else visible
+                    for kind, event in self.events:
+                        if kind in {"turn_queue_run_now", "turn_steered"}:
+                            self.assertEqual(event["file_ids"], expected_files)
+                            self.assertEqual(event["prompt"], selected["display_prompt"])
+                            self.assertNotIn("Resolved attachment paths", json.dumps(event))
+                    self.assertEqual(self.goal["status"], "active")
+                    self.manager.request.assert_not_awaited()
+
+    async def test_invalid_goal_attachment_rejects_before_fence_or_send(self):
+        self.ordinary_owner()
+        request = self.request()
+        request["selected"]["file_ids"] = ["file_missing"]
+        self.ns["build_user_provider_prompt"] = Mock(side_effect=ValueError("attachment missing"))
+        with self.assertRaises(self.ns["NativeSteerHandoffError"]) as caught:
+            await self.send_ordinary(request)
+        self.assertTrue(caught.exception.safe_to_requeue)
+        self.assertFalse(caught.exception.delivery_uncertain)
+        self.assertEqual(self.events, [])
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.goal["status"], "active")
+
     async def test_final_write_guard_rechecks_pause_stop_owner_turn_budget_generation(self):
         changes = [lambda: self.goal.update(status="paused"), lambda: self.goal.update(status="blocked"),
                    lambda: self.active.update(stop_requested=True), lambda: self.ns["SERVER_MAINTENANCE_SESSIONS"].add("chat"),
@@ -177,6 +441,7 @@ class NativeGoalSteerTests(unittest.IsolatedAsyncioTestCase):
         for change in changes:
             self.setUp()
             request = self.request()
+            request["selected"]["provider_cross_chat_route_snapshot"] = saved_route_snapshots()
             async def mutate():
                 change()
             self.before_rpc = mutate
@@ -229,7 +494,9 @@ class NativeGoalSteerTests(unittest.IsolatedAsyncioTestCase):
         request = self.request()
         self.queue.put_nowait(request)
         task = self.consumer()
-        await asyncio.wait_for(asyncio.shield(request["future"]), 1)
+        # Ordering below proves fairness; this timeout is only a deadlock guard,
+        # not a one-second latency requirement on a shared CI runner.
+        await asyncio.wait_for(asyncio.shield(request["future"]), 5)
         self.assertLess(observed[0], 60)
         self.assertEqual(sum(kind == "reasoning_summary" for kind, _ in self.events), 60)
         await self.finish(task)

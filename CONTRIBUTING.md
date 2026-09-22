@@ -6,12 +6,14 @@ This repository contains the deployable server. Client changes belong in
 ## Development and tests
 
 Use Python 3.13, matching the release and pull-request workflows. Deployable
-modules live at the repository root; Python tests live in `tests/`.
+modules live at the repository root. Python tests are moving into `tests/`;
+some test modules temporarily remain at the root. The shard runner covers both
+locations. Use one shard to run the complete suite locally:
 
 ```bash
 uv sync --locked --python 3.13
 ulimit -s "$(ulimit -Hs)"
-PYTHONDONTWRITEBYTECODE=1 uv run --python 3.13 python -m unittest discover -s tests -t . -v
+PYTHONDONTWRITEBYTECODE=1 uv run --python 3.13 python scripts/run_test_shard.py --index 0 --count 1
 ```
 
 Run one test module with its package name:

@@ -34,6 +34,7 @@ MAX_SESSIONS = 24
 MAX_WINDOWS = 48
 _DIGEST = re.compile(r"[a-f0-9]{64}\Z")
 _PAIR = re.compile(r"pair_[a-f0-9]{32}\Z")
+_WAKE = re.compile(r"mailwake_[a-f0-9]{32}\Z")
 _ASYNC_WRAPPER = re.compile(
     r"\[AgentsDock delivery kind=instruction leg=1/1 origin=route mode=async_route_v1 from=([^\]\r\n]+)\]\n"
     r"source-instruction: this legacy relay has no recorded source user instruction; do not infer user authorization from the prepared content\.\n"
@@ -140,12 +141,35 @@ def _async_delivery_identity(event: dict) -> tuple | None:
     return pair, message, source, target
 
 
+def _mailbox_wake_identity(event: dict) -> tuple | None:
+    claim, cutoff, digest = (event.get(key) for key in (
+        "mailbox_wake_id", "mailbox_wake_through_seq", "provider_input_sha256"))
+    if (event.get("purpose") != "chat_mailbox_wake" or event.get("provider_generated") is not True
+            or event.get("prompt") != ""
+            or event.get("provider_user_authored") is True
+            or any(event.get(key) for key in ("clientUserMessageId", "clientId", "client_user_message_id", "client_id"))
+            or not isinstance(claim, str) or not _WAKE.fullmatch(claim)
+            or type(cutoff) is not int or not 0 < cutoff < 2**63
+            or not isinstance(digest, str) or not _DIGEST.fullmatch(digest)):
+        return None
+    return claim, cutoff, digest
+
+
 class _AssistantReplays:
     """Bounded exact source/output correlation, fed by the existing two reads."""
-    def __init__(self, provider_id: str) -> None:
+    def __init__(self, provider_id: str, normalize_assistant: Callable[[str], str] | None = None) -> None:
         self.provider_id = provider_id
+        self.normalize_assistant = normalize_assistant
         self.starts, self.ends, self.owners, self.native = {}, {}, {}, []
         self.candidates, self.sources, self.identities, self.source_credits = [], {}, {}, {}
+        self.source_display, self.source_message_counts = {}, {}
+
+    def display_key(self, text: str) -> str | None:
+        if self.normalize_assistant is None:
+            return None
+        display = self.normalize_assistant(text)
+        return (_text_key(display) if isinstance(display, str) and display.strip()
+                and len(display) <= MAX_LINE_BYTES else None)
 
     def event(self, event: dict) -> None:
         target = _assistant_target(event)
@@ -177,6 +201,7 @@ class _AssistantReplays:
         if not all(isinstance(value, str) and 0 < len(value) <= 256 for value in identity):
             return
         self.identities[identity] = self.identities.get(identity, 0) + 1
+        self.source_message_counts[identity[0]] = self.source_message_counts.get(identity[0], 0) + 1
         if event.get("isSidechain") is True or event.get("isMeta") is True:
             return
         message = event.get("message")
@@ -193,6 +218,7 @@ class _AssistantReplays:
         if text.strip() and len(text) <= MAX_LINE_BYTES:
             digest = _text_key(text.strip())
             self.sources.setdefault((identity, digest), []).append(offset)
+            self.source_display[(identity, digest)] = self.display_key(text)
             timestamp = _timestamp(identity[2])
             if timestamp is not None:
                 self.source_credits.setdefault((int(timestamp), digest), set()).add(identity)
@@ -200,7 +226,7 @@ class _AssistantReplays:
             raise _Unproven()
 
     def prove(self, eligible: dict) -> frozenset:
-        native = {}
+        native, identified = {}, {}
         for event, digest in self.native:
             run = event["run_id"]
             starts, ends = self.starts.get(run, ()), self.ends.get(run, ())
@@ -216,7 +242,9 @@ class _AssistantReplays:
                               and _async_delivery_identity(end) == delivery
                               and _async_delivery_identity(event) == delivery
                               and isinstance(event.get("provider_message_id"), str) and event["provider_message_id"])
-            if (not (scheduled or async_delivery)
+            mailbox_wake = (_mailbox_wake_identity(start)
+                            and isinstance(event.get("provider_message_id"), str) and event["provider_message_id"])
+            if (not (scheduled or async_delivery or mailbox_wake)
                     or provider_ids != {self.provider_id}
                     or end.get("exit_code") != 0 or end.get("stopped") is True
                     or any(type(row.get("seq")) is not int or not start["seq"] <= row["seq"] <= end["seq"]
@@ -233,6 +261,9 @@ class _AssistantReplays:
                     or not all(type(value) is int for value in seqs) or not seqs[0] < seqs[1] < seqs[2]):
                 continue
             native.setdefault((int(times[1]), digest), []).append(event)
+            message_id = event.get("provider_message_id")
+            if isinstance(message_id, str) and 0 < len(message_id) <= 256:
+                identified.setdefault(message_id, []).append((event, digest))
         counts = {}
         for target, _phase in self.candidates:
             key = (target[2], target[4])
@@ -243,6 +274,21 @@ class _AssistantReplays:
             batch = eligible.get(run)
             matches = native.get((int(_timestamp(identity[2])), digest), ())
             offsets = self.sources.get((identity, digest), ())
+            owned = identified.get(identity[0], ())
+            if owned:
+                # Prefer the immutable message owner over text/time buckets.
+                # A normalized match is permitted ONLY for one native UUID
+                # and one exact raw source record. The imported raw digest,
+                # checkpoint, phase and timestamp checks remain authoritative.
+                # Never use decoration equivalence for identityless messages.
+                matches = ()
+                if len(owned) == 1 and self.source_message_counts.get(identity[0]) == 1:
+                    event, native_digest = owned[0]
+                    canonical = self.source_display.get((identity, digest))
+                    if (int(_timestamp(event.get("ts"))) == int(_timestamp(identity[2]))
+                            and (native_digest == digest or
+                                 (canonical and canonical == self.display_key(event["text"])))):
+                        matches = (event,)
             if (batch is None or len(matches) != 1 or len(offsets) != 1
                     or self.identities.get(identity) != 1 or counts[(run, identity)] != 1):
                 continue
@@ -351,6 +397,179 @@ class _AsyncDeliveryInputs:
                 if first < seq < last and start < matched[0][1] <= end:
                     targets.add(target)
         return targets
+
+
+class _MailboxWakeInputs(_AsyncDeliveryInputs):
+    """Exact generated native input hash, current provider and checkpoint identity."""
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.wake_hashes = None
+
+    def source(self, event, offset):
+        if self.wake_hashes is None:
+            self.wake_hashes = {wake[2] for starts in self.native.starts.values() for start in starts
+                                if (wake := _mailbox_wake_identity(start)) is not None}
+        if not self.wake_hashes:
+            return
+        if event.get("type") != "user" or event.get("sessionId") != self.provider_id or self.normalize_full_user is None:
+            return
+        identity = (event.get("uuid"), self.provider_id, event.get("timestamp"))
+        if not all(isinstance(value, str) and 0 < len(value) <= 256 for value in identity):
+            return
+        self.source_counts[identity] = self.source_counts.get(identity, 0) + 1
+        if len(self.source_counts) > MAX_KEYS:
+            raise _Unproven()
+        if (any(event.get(key) is True for key in ("isMeta", "isCompactSummary", "isSidechain", "provider_user_authored"))
+                or any(event.get(key) for key in ("clientUserMessageId", "clientId", "client_user_message_id", "client_id"))):
+            return
+        full, display = self.normalize_full_user(event), self.normalize_user(event)
+        timestamp = _timestamp(identity[2])
+        if (isinstance(full, str) and full and len(full) <= MAX_LINE_BYTES
+                and _text_key(full) in self.wake_hashes
+                and isinstance(display, str) and display and timestamp is not None):
+            self.sources.setdefault(_text_key(full), []).append(
+                (identity, _text_key(display), offset))
+        if len(self.source_counts) + len(self.sources) > MAX_KEYS:
+            raise _Unproven()
+
+    def prove(self, eligible):
+        matches, credits, candidate_counts = {}, {}, {}
+        for target, identity in self.candidates:
+            key = (target[1], identity)
+            candidate_counts[key] = candidate_counts.get(key, 0) + 1
+        for run, starts in self.native.starts.items():
+            ends = self.native.ends.get(run, ())
+            if len(starts) != 1 or len(ends) != 1:
+                continue
+            start, end = starts[0], ends[0]
+            wake = _mailbox_wake_identity(start)
+            owners = (start, end, *self.native.owners.get(run, ()))
+            provider_ids = {row.get("provider_session_id") for row in owners
+                            if row.get("provider_session_id") not in (None, "")}
+            start_time, end_time = _timestamp(start.get("ts")), _timestamp(end.get("ts"))
+            if (wake is None or provider_ids != {self.provider_id}
+                    or end.get("exit_code") != 0 or end.get("stopped") is True
+                    or start_time is None or end_time is None or start_time > end_time
+                    or type(start.get("seq")) is not int or type(end.get("seq")) is not int
+                    or start["seq"] >= end["seq"]
+                    or any(type(row.get("seq")) is not int or not start["seq"] <= row["seq"] <= end["seq"]
+                           for row in self.native.owners.get(run, ()))):
+                continue
+            for identity, key, offset in self.sources.get(wake[2], ()):
+                timestamp = _timestamp(identity[2])
+                if (self.source_counts.get(identity) != 1 or timestamp is None
+                        or not start_time <= timestamp <= end_time):
+                    continue
+                matches.setdefault((identity, key), []).append((run, offset))
+                credits[run] = credits.get(run, 0) + 1
+        targets = set()
+        for target, identity in self.candidates:
+            seq, run, key = target
+            batch, matched = eligible.get(run), matches.get((identity, key), ())
+            if batch and len(matched) == 1 and candidate_counts[(run, identity)] == 1 and credits.get(matched[0][0]) == 1:
+                first, last, start, end = batch[:4]
+                if first < seq < last and start < matched[0][1] <= end:
+                    targets.add(target)
+        return targets
+
+
+def filter_native_claude_mailbox_wake_items(
+    session_id: str, provider_id: str, events: Path, items: list[dict], *,
+    sync_checkpoint: dict, root: Path, normalize_user: Callable,
+    normalize_full_user: Callable, source_path: Path | None = None,
+    normalize_assistant: Callable[[str], str] | None = None,
+) -> list[dict]:
+    """First-import wake input/output proof; never a text-only filter.
+
+    Parsed items omit human/client flags and may collapse repeated text, so the
+    exact checkpoint source is required to prove unique nonhuman ownership.
+    All failures retain the original items. Native output is never removed.
+    """
+    try:
+        if not items or len(items) > MAX_TARGETS:
+            return items
+        stamp = _regular_stamp(events)
+        native = _AssistantReplays(provider_id, normalize_assistant)
+        for event, _offset in _bounded_records(events, stamp, max(0, stamp[2] - MAX_EVENTS_BYTES), stamp[2]):
+            if (event.get("session_id") in (None, "", session_id)
+                    and (event.get("run_id") in native.starts or _mailbox_wake_identity(event))):
+                native.event(event)
+        if not any(_mailbox_wake_identity(start) for starts in native.starts.values() for start in starts):
+            return items
+        cursor = sync_checkpoint.get("cursor")
+        if (sync_checkpoint.get("version") != 1 or not isinstance(cursor, dict)
+                or cursor.get("version") != 1 or cursor.get("backend") != "claude"
+                or cursor.get("provider_session_id") != provider_id):
+            return items
+        path = cursor.get("source_path")
+        if not isinstance(path, str):
+            return items
+        source = Path(path)
+        if source_path is not None and source != source_path:
+            return items
+        if not source.is_absolute() or source.suffix != ".jsonl" or source.stem != provider_id or source.is_symlink():
+            return items
+        source = source.resolve(strict=True)
+        source.relative_to(root.resolve(strict=True))
+        source_stamp = _regular_stamp(source)
+        start, end = sync_checkpoint.get("previous_source_offset"), cursor.get("source_offset")
+        previous, expected = sync_checkpoint.get("previous_source_digest"), cursor.get("source_digest")
+        if (type(start) is not int or type(end) is not int or not 0 <= start < end <= source_stamp[2]
+                or (cursor.get("source_dev"), cursor.get("source_ino")) != source_stamp[:2]
+                or type(sync_checkpoint.get("previous_present")) is not bool
+                or not isinstance(expected, str) or not _DIGEST.fullmatch(expected)
+                or start == 0 and previous != ""
+                or start > 0 and (sync_checkpoint["previous_present"] is not True
+                    or not isinstance(previous, str) or not _DIGEST.fullmatch(previous))):
+            return items
+        proof = _MailboxWakeInputs(provider_id, native, normalize_user, normalize_full_user)
+        # Temporary proof coordinates only; no synthetic event is persisted.
+        batch = "import_mailbox_wake_filter"
+        assistant_targets = {}
+        for index, item in enumerate(items, 1):
+            if item.get("kind") == "user" and item.get("source_text_sha256") is None:
+                proof.event({**item, "seq": index, "run_id": batch, "type": "turn_started",
+                             "backend": "claude", "imported": True, "prompt": item.get("text")})
+            elif item.get("kind") == "assistant":
+                candidate = {**item, "seq": index, "run_id": batch, "type": "assistant_text",
+                             "backend": "claude", "imported": True}
+                native.event(candidate)
+                assistant_targets[index] = _assistant_target(candidate)
+        if source_stamp[2] <= MAX_EVENTS_BYTES:
+            digest, verified = hashlib.sha256(), set()
+            for event, offset, line in _records(source, source_stamp):
+                digest.update(line)
+                if offset == start and hmac.compare_digest(digest.hexdigest(), previous):
+                    verified.add(start)
+                if offset == end and hmac.compare_digest(digest.hexdigest(), expected):
+                    verified.add(end)
+                if offset <= end:
+                    proof.source(event, offset)
+                    native.source(event, offset)
+            if end not in verified or start and start not in verified:
+                return items
+        else:
+            # Same bounded proof as historical semantic windows: the caller has
+            # just verified this checkpoint. Recheck file identity and every
+            # candidate's exact source UUID/full hash, without a prefix rescan.
+            window_start = max(0, end - MAX_EVENTS_BYTES)
+            if start < window_start:
+                return items
+            for event, offset in _bounded_records(source, source_stamp, window_start, end):
+                proof.source(event, offset)
+                native.source(event, offset)
+        eligible = {batch: (0, len(items) + 1, start, end)}
+        targets, assistant_replays = proof.prove(eligible), native.prove(eligible)
+        projected = []
+        for index, item in enumerate(items, 1):
+            reason = ("source_proven_import" if (index, batch, _text_key(item.get("text", ""))) in targets
+                      else "source_proven_assistant_replay" if assistant_targets.get(index) in assistant_replays
+                      else None)
+            projected.append({**item, "text": "", "metadata_only": True,
+                              "provider_history_repair": reason} if reason else item)
+        return projected
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+        return items
 
 
 @dataclass(frozen=True)
@@ -507,7 +726,8 @@ def enrich_interruption_origins(events_path: Path, provider_id: str, origins: li
 
 def _prove(session_id: str, provider_id: str, events: Path, root: Path,
            normalize_user: Callable[[dict], str | None], events_stamp,
-           normalize_full_user: Callable[[dict], str | None] | None = None) -> _Proof:
+           normalize_full_user: Callable[[dict], str | None] | None = None,
+           normalize_assistant: Callable[[str], str] | None = None) -> _Proof:
     empty = _Proof(provider_id, events_stamp, None, None, frozenset())
     batches = {}
     candidates = []
@@ -516,13 +736,15 @@ def _prove(session_id: str, provider_id: str, events: Path, root: Path,
     terminal_counts = {}
     native_events = []
     scheduled_starts, scheduled_ends, candidate_origins = {}, {}, {}
-    assistant_replays = _AssistantReplays(provider_id)
+    assistant_replays = _AssistantReplays(provider_id, normalize_assistant)
     async_inputs = _AsyncDeliveryInputs(provider_id, assistant_replays, normalize_user, normalize_full_user)
+    wake_inputs = _MailboxWakeInputs(provider_id, assistant_replays, normalize_user, normalize_full_user)
     for event, _offset, _line in _records(events, events_stamp):
         if event.get("session_id") not in (None, "", session_id):
             continue
         assistant_replays.event(event)
         async_inputs.event(event)
+        wake_inputs.event(event)
         control = _native_control(event, session_id)
         if control is not None:
             native_events.append(control)
@@ -646,6 +868,7 @@ def _prove(session_id: str, provider_id: str, events: Path, root: Path,
                 verified.add((offset, wanted))
         assistant_replays.source(event, offset)
         async_inputs.source(event, offset)
+        wake_inputs.source(event, offset)
         origin = tracker.consume(event)
         if event.get("type") != "user":
             continue
@@ -733,6 +956,7 @@ def _prove(session_id: str, provider_id: str, events: Path, root: Path,
                         if (batch[3], batch[4]) in verified
                         and (batch[2] == 0 or (batch[2], batch[5]) in verified)}
     targets.update(async_inputs.prove(verified_batches))
+    targets.update(wake_inputs.prove(verified_batches))
     proven_assistants = assistant_replays.prove(verified_batches)
     corrected_counts = {}
     for (_seq, run, _key), _origin in corrected:
@@ -792,6 +1016,7 @@ def _bounded_records(path: Path, expected, start: int, end: int):
 
 def _prove_recent_scheduled(session_id: str, provider_id: str, events: Path, root: Path,
                             normalize_user, events_stamp, normalize_full_user, *,
+                            normalize_assistant: Callable[[str], str] | None = None,
                             event_window_end: int | None = None) -> _Proof:
     """Exact-origin scheduled duplicates and provider metadata in recent history.
 
@@ -810,8 +1035,9 @@ def _prove_recent_scheduled(session_id: str, provider_id: str, events: Path, roo
         raise _Unproven()
     starts, ends, batches, terminals, rows, candidates = {}, {}, {}, {}, {}, []
     origin_counts = {}
-    assistant_replays = _AssistantReplays(provider_id)
+    assistant_replays = _AssistantReplays(provider_id, normalize_assistant)
     async_inputs = _AsyncDeliveryInputs(provider_id, assistant_replays, normalize_user, normalize_full_user)
+    wake_inputs = _MailboxWakeInputs(provider_id, assistant_replays, normalize_user, normalize_full_user)
     previous_seq = 0
     for event, _offset in _bounded_records(
         events, events_stamp, max(0, window_end - MAX_EVENTS_BYTES), window_end,
@@ -824,6 +1050,7 @@ def _prove_recent_scheduled(session_id: str, provider_id: str, events: Path, roo
             continue
         assistant_replays.event(event)
         async_inputs.event(event)
+        wake_inputs.event(event)
         run = event.get("run_id")
         if not isinstance(run, str) or not run:
             continue
@@ -915,6 +1142,7 @@ def _prove_recent_scheduled(session_id: str, provider_id: str, events: Path, roo
     for event, offset in _bounded_records(source, source_stamp, window_start, checkpoint_end):
         assistant_replays.source(event, offset)
         async_inputs.source(event, offset)
+        wake_inputs.source(event, offset)
         if event.get("type") != "user" or event.get("sessionId") != provider_id:
             continue
         identity = (event.get("uuid"), provider_id, event.get("timestamp"))
@@ -957,6 +1185,7 @@ def _prove_recent_scheduled(session_id: str, provider_id: str, events: Path, roo
             targets.add(target)
             counts[run] = counts.get(run, 0) + 1
     targets.update(async_inputs.prove(eligible))
+    targets.update(wake_inputs.prove(eligible))
     proven_assistants = assistant_replays.prove(eligible)
     counts = {}
     for _seq, run, _key in targets:
@@ -1031,7 +1260,8 @@ class ClaudeMetadataRepairCache:
 
     def prepare_window(self, session_id: str, provider_id: str, events: Path, root: Path,
                        normalize_user: Callable[[dict], str | None], *, event_window_end: int,
-                       normalize_full_user: Callable[[dict], str | None] | None = None) -> ClaudeMetadataRepairWindow:
+                       normalize_full_user: Callable[[dict], str | None] | None = None,
+                       normalize_assistant: Callable[[str], str] | None = None) -> ClaudeMetadataRepairWindow:
         """Prove one explicitly requested historical page, never the entire ledger.
 
         Unchanged positive and negative windows are cached. Any observed log
@@ -1077,6 +1307,7 @@ class ClaudeMetadataRepairCache:
             try:
                 proof = _prove_recent_scheduled(session_id, provider_id, events, root,
                                                 normalize_user, stamp, normalize_full_user,
+                                                normalize_assistant=normalize_assistant,
                                                 event_window_end=event_window_end)
                 window = ClaudeMetadataRepairWindow(session_id, proof)
             except (OSError, ValueError, TypeError, KeyError, RuntimeError):
@@ -1095,6 +1326,7 @@ class ClaudeMetadataRepairCache:
     def prepare(self, session_id: str, provider_id: str, events: Path, root: Path,
                 normalize_user: Callable[[dict], str | None], *,
                 normalize_full_user: Callable[[dict], str | None] | None = None,
+                normalize_assistant: Callable[[str], str] | None = None,
                 refresh: bool = False) -> bool:
         """Prepare only this requested session; report a changed suppression map."""
         with self._lock:
@@ -1130,12 +1362,13 @@ class ClaudeMetadataRepairCache:
                     if stamp[2] > MAX_EVENTS_BYTES:
                         raise _Oversized()
                     proof = _prove(session_id, provider_id, events, root, normalize_user, stamp,
-                                   normalize_full_user)
+                                   normalize_full_user, normalize_assistant)
                 except _Oversized:
                     if normalize_full_user is None:
                         raise
                     proof = _prove_recent_scheduled(session_id, provider_id, events, root,
-                                                     normalize_user, stamp, normalize_full_user)
+                                                     normalize_user, stamp, normalize_full_user,
+                                                     normalize_assistant=normalize_assistant)
             except (OSError, ValueError, TypeError, KeyError, RuntimeError):
                 # Fail visible, including incomplete or oversized files. A
                 # failed admission must not retry on every page/socket read.

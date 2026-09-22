@@ -430,7 +430,7 @@ class CodexForkTurnsInstructionTests(unittest.TestCase):
         self.assertLessEqual(len(core.strip().splitlines()), 18)
 
     def test_policy_version_bumped_so_existing_threads_migrate(self) -> None:
-        self.assertEqual(agent_server.CODEX_THREAD_POLICY_VERSION, "10")
+        self.assertEqual(agent_server.CODEX_THREAD_POLICY_VERSION, "11")
 
 
 class FakeFinalizationManager:

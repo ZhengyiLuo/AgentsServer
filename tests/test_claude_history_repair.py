@@ -33,6 +33,9 @@ def load_server_repair(cache):
         module="__future__", names=[ast.alias(name="annotations")], level=0,
     ), *nodes], type_ignores=[]))
     namespace = load_projection()
+    # Use the real assistant display normalizer without importing the server.
+    from tests.test_claude_history_provenance_isolated import load_projection as provenance_projection
+    namespace["clean_assistant_text"] = provenance_projection()["clean_assistant_text"]
     namespace.update({
         "CLAUDE_METADATA_REPAIR_CACHE": cache,
         "CODEX_NATIVE_HISTORY_REPAIR_CACHE": SimpleNamespace(project_event=lambda *_: None),

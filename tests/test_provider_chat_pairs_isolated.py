@@ -644,7 +644,7 @@ class ChatPairTests(unittest.IsolatedAsyncioTestCase):
                         and isinstance(node.func, ast.Name) and node.func.id == "issue_cross_chat_capability")
         expression = next(keyword.value for keyword in issuance.keywords if keyword.arg == "async_route_v1")
         code = compile(ast.Expression(expression), "<actual-async-mode-issuance>", "eval")
-        self.namespace.update(delivery_record=None, req=SimpleNamespace(purpose=None, client_capabilities=[]))
+        self.namespace.update(delivery_record=None, mailbox_wake_claim=None, req=SimpleNamespace(purpose=None, client_capabilities=[]))
         self.assertFalse(eval(code, self.namespace))
         self.namespace["req"].client_capabilities = ["chat_conversation_async_route_v1"]
         self.assertTrue(eval(code, self.namespace))

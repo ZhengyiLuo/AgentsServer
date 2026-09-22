@@ -36,12 +36,13 @@ class ChatMailboxTests(unittest.TestCase):
         return self.connection
 
     def store(self, message_id, *, body="Synthetic message.", source="sender", target="recipient",
-              pair=PAIR, parent=None, mode="mailbox", status="stored"):
+              pair=PAIR, parent=None, mode="mailbox", status="stored", source_user_instruction=""):
         self.connection.execute("""INSERT INTO cross_chat_envelopes
             (id,kind,source_session_id,source_run_id,target_session_id,action,body,
-             authorization_kind,authorization_pair_id,status,created_at,delivery_mode,reply_to_message_id)
-            VALUES(?,'instruction',?,'example-run',?,'instruction',?,'configured_route',?,?,?,?,?)""",
-            (message_id, source, target, body, pair, status, NOW, mode, parent))
+             authorization_kind,authorization_pair_id,status,created_at,delivery_mode,reply_to_message_id,
+             source_user_instruction)
+            VALUES(?,'instruction',?,'example-run',?,'instruction',?,'configured_route',?,?,?,?,?,?)""",
+            (message_id, source, target, body, pair, status, NOW, mode, parent, source_user_instruction))
         return mailbox.store_message(self.connection, message_id, now=NOW)
 
     def read(self, request="example-read", **patch):
@@ -142,6 +143,39 @@ class ChatMailboxTests(unittest.TestCase):
         self.assertLessEqual(len(json.dumps(page, ensure_ascii=True).encode()), mailbox.MAX_PAGE_BYTES)
         unread = mailbox.list_messages(self.connection, "recipient", None, [PAIR], unread_only=True)
         self.assertEqual([row["message_id"] for row in unread["messages"]], ["large-two"])
+
+    def test_unicode_source_instruction_counts_toward_page_bytes_without_truncation(self):
+        instruction = "Render 😀\n" * 5_000
+        with self.transaction():
+            for message_id in ("source-first", "source-second"):
+                self.store(message_id, body="B" * 8_000, source_user_instruction=instruction)
+            first = self.read()
+        self.assertEqual([row["message_id"] for row in first["messages"]], ["source-first"])
+        self.assertEqual(first["messages"][0]["source_user_instruction"], instruction)
+        self.assertTrue(first["has_more"])
+        self.assertLess(len(json.dumps(first, ensure_ascii=False).encode("utf-8")), mailbox.MAX_PAGE_BYTES)
+        unread = mailbox.list_messages(self.connection, "recipient", "sender", [PAIR], unread_only=True)
+        self.assertEqual([row["message_id"] for row in unread["messages"]], ["source-second"])
+        with self.transaction():
+            second = self.read(after_seq=first["next_after_seq"])
+        self.assertEqual(second["messages"][0]["source_user_instruction"], instruction)
+        self.assertFalse(second["has_more"])
+
+    def test_legacy_read_page_that_outgrows_byte_budget_errors_without_dropping_messages(self):
+        with self.transaction():
+            for message_id in ("legacy-first", "legacy-second"):
+                self.store(message_id, body="B" * 45_000)
+            original = self.read()
+            # Old receipts did not count source text. Simulate their larger
+            # projection after upgrade without changing receipt membership.
+            self.connection.execute("UPDATE cross_chat_envelopes SET source_user_instruction=?",
+                                    ("😀" * 3_000,))
+        self.assertEqual(len(original["messages"]), 2)
+        with self.transaction(), self.assertRaisesRegex(mailbox.MailboxConflict, "retry was not truncated"):
+            self.read(reader_run_id="reconnected-reader")
+        page = self.connection.execute("SELECT message_ids_json FROM chat_mailbox_read_pages").fetchone()
+        self.assertEqual(json.loads(page[0]), ["legacy-first", "legacy-second"])
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM chat_mailbox_reads").fetchone()[0], 1)
 
     def test_fresh_run_continues_original_snapshot_without_consuming_late_arrivals(self):
         with self.transaction():
@@ -245,6 +279,107 @@ class ChatMailboxTests(unittest.TestCase):
             with self.assertRaises(mailbox.MailboxConflict):
                 self.store("reply-to-deleted", parent="deleted-parent")
         self.assertEqual(self.connection.execute("SELECT status FROM cross_chat_envelopes WHERE id='cancel-before-read'").fetchone()[0], "cancelled")
+
+    def test_wake_coalesces_duplicate_receipts_without_reading_or_relaunching(self):
+        with self.transaction():
+            self.store("wake-first")
+            latest = self.store("wake-second")
+            self.store("unauthorized-newer", pair=OTHER_PAIR)
+            claim = mailbox.claim_wake(self.connection, "recipient", [PAIR], now=NOW)
+            self.assertEqual(claim["through_seq"], latest["mailbox_seq"])
+            self.assertNotIn("body", claim)
+            mailbox.store_message(self.connection, "wake-second", now="later")
+            self.assertIsNone(mailbox.claim_wake(self.connection, "recipient", [PAIR], now=NOW))
+            self.assertFalse(mailbox.admit_wake(self.connection, "other", claim["claim_id"], "run", [PAIR], now=NOW))
+            self.assertFalse(mailbox.admit_wake(self.connection, "recipient", "wrong-claim", "run", [PAIR], now=NOW))
+            self.assertTrue(mailbox.admit_wake(self.connection, "recipient", claim["claim_id"], "run", [PAIR], now=NOW))
+            self.assertFalse(mailbox.admit_wake(self.connection, "recipient", claim["claim_id"], "run", [PAIR], now=NOW))
+            self.assertFalse(mailbox.release_wake(self.connection, "recipient", claim["claim_id"]))
+            self.assertIsNone(mailbox.claim_wake(self.connection, "recipient", [PAIR], now=NOW))
+        rows = self.connection.execute("SELECT read_at,read_id FROM chat_mailbox_messages").fetchall()
+        self.assertTrue(all(tuple(row) == (None, None) for row in rows))
+        self.assertTrue(all(tuple(row) == ("stored", None) for row in
+                            self.connection.execute("SELECT status,target_run_id FROM cross_chat_envelopes")))
+
+    def test_wake_cutoff_excludes_arrivals_during_reserved_or_admitted_attempt(self):
+        with self.transaction():
+            first = self.store("wake-first")
+            claim = mailbox.claim_wake(self.connection, "recipient", [PAIR], now=NOW)
+            later = self.store("wake-later")
+            self.assertIsNone(mailbox.claim_wake(self.connection, "recipient", [PAIR], now=NOW))
+            self.assertTrue(mailbox.admit_wake(self.connection, "recipient", claim["claim_id"], "first-run", [PAIR], now=NOW))
+            self.assertEqual(claim["through_seq"], first["mailbox_seq"])
+            # Runtime calls again only once idle; the ledger does not interrupt
+            # or infer whether the previous run is busy from message contents.
+            next_claim = mailbox.claim_wake(self.connection, "recipient", [PAIR], now=NOW)
+            self.assertEqual(next_claim["through_seq"], later["mailbox_seq"])
+            self.assertNotEqual(next_claim["claim_id"], claim["claim_id"])
+            self.assertFalse(mailbox.release_wake(self.connection, "recipient", claim["claim_id"]))
+            self.assertTrue(mailbox.admit_wake(self.connection, "recipient", next_claim["claim_id"], "second-run", [PAIR], now=NOW))
+            self.assertIsNone(mailbox.claim_wake(self.connection, "recipient", [PAIR], now=NOW))
+
+    def test_wake_admission_rechecks_current_route_cancel_delete_and_read(self):
+        for change in ("route", "cancel", "delete", "read"):
+            target = "recipient-" + change
+            with self.subTest(change=change), self.transaction():
+                self.store(change, target=target)
+                claim = mailbox.claim_wake(self.connection, target, [PAIR], now=NOW)
+                pairs = [PAIR]
+                if change == "route":
+                    pairs = []
+                elif change == "cancel":
+                    mailbox.cancel_message(self.connection, change, now=NOW)
+                elif change == "delete":
+                    mailbox.exclude_message(self.connection, change, target_session_id=target, reason="deleted", now=NOW)
+                else:
+                    self.read(target_session_id=target)
+                self.assertFalse(mailbox.admit_wake(self.connection, target, claim["claim_id"], "run", pairs, now=NOW))
+                self.assertTrue(mailbox.release_wake(self.connection, target, claim["claim_id"]))
+                self.assertIsNone(mailbox.claim_wake(self.connection, target, pairs, now=NOW))
+
+    def test_stop_suppresses_current_unread_cutoff_but_preserves_future_mail_and_admitted_claim(self):
+        with self.transaction():
+            self.store("first")
+            claim = mailbox.claim_wake(self.connection, "recipient", [PAIR], now=NOW)
+            other = self.store("other-route", pair=OTHER_PAIR)
+            cutoff = mailbox.suppress_wake(self.connection, "recipient", now=NOW)
+            self.assertEqual(cutoff, other["mailbox_seq"])
+            self.assertFalse(mailbox.admit_wake(self.connection, "recipient", claim["claim_id"], "run", [PAIR], now=NOW))
+            self.assertIsNone(mailbox.claim_wake(self.connection, "recipient", [PAIR, OTHER_PAIR], now=NOW))
+            future = self.store("after-stop")
+            next_claim = mailbox.claim_wake(self.connection, "recipient", [PAIR], now=NOW)
+            self.assertEqual(next_claim["through_seq"], future["mailbox_seq"])
+            self.assertTrue(mailbox.admit_wake(self.connection, "recipient", next_claim["claim_id"], "future-run", [PAIR], now=NOW))
+            mailbox.suppress_wake(self.connection, "recipient", now=NOW)
+            state = self.connection.execute("SELECT * FROM chat_mailbox_wakes").fetchone()
+            self.assertEqual((state["state"], state["claim_id"], state["run_id"]),
+                             ("admitted", next_claim["claim_id"], "future-run"))
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM chat_mailbox_messages WHERE read_at IS NULL").fetchone()[0], 3)
+
+    def test_wake_recovery_releases_only_unadmitted_and_transaction_rollback_is_safe(self):
+        with self.transaction():
+            self.store("reserved", target="reserved-target")
+            self.store("admitted", target="admitted-target")
+            reserved = mailbox.claim_wake(self.connection, "reserved-target", [PAIR], now=NOW)
+            admitted = mailbox.claim_wake(self.connection, "admitted-target", [PAIR], now=NOW)
+            self.assertTrue(mailbox.admit_wake(self.connection, "admitted-target", admitted["claim_id"], "run", [PAIR], now=NOW))
+        self.connection.close()
+        self.connection = sqlite3.connect(self.path)
+        self.connection.row_factory = sqlite3.Row
+        self.addCleanup(self.connection.close)
+        with self.transaction():
+            self.assertEqual(mailbox.recover_wakes(self.connection), 1)
+            self.assertEqual(mailbox.recover_wakes(self.connection), 0)
+            self.assertIsNone(mailbox.claim_wake(self.connection, "admitted-target", [PAIR], now=NOW))
+        self.connection.execute("BEGIN IMMEDIATE")
+        retry = mailbox.claim_wake(self.connection, "reserved-target", [PAIR], now=NOW)
+        self.assertNotEqual(retry["claim_id"], reserved["claim_id"])
+        mailbox.admit_wake(self.connection, "reserved-target", retry["claim_id"], "retry-run", [PAIR], now=NOW)
+        self.connection.rollback()
+        with self.transaction():
+            self.assertIsNotNone(mailbox.claim_wake(self.connection, "reserved-target", [PAIR], now=NOW))
+        with self.assertRaises(RuntimeError):
+            mailbox.recover_wakes(self.connection)
 
 
 if __name__ == "__main__":

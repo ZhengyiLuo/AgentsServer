@@ -1378,16 +1378,35 @@ print(json.dumps({"type":"result","subtype":"success","is_error":False,"result":
         ))
 
     async def test_idle_warning_is_emitted_once_per_idle_period(self) -> None:
-        agent_server.CURSOR_IDLE_WARN_SECONDS = 0.02
-        agent_server.CURSOR_IDLE_TIMEOUT_SECONDS = 0.12
-        events = await self._run_script(
-            """#!/usr/bin/env python3
+        # Process/guard startup is a separate idle period. Arm the short
+        # thresholds only after init so slow CI startup cannot add a warning
+        # before the single post-init idle period this test exercises.
+        startup_idle_deadline = (
+            agent_server.CURSOR_STARTUP_TIMEOUT_SECONDS
+            + agent_server.CURSOR_TURN_TIMEOUT_SECONDS
+        )
+        agent_server.CURSOR_IDLE_WARN_SECONDS = startup_idle_deadline
+        agent_server.CURSOR_IDLE_TIMEOUT_SECONDS = startup_idle_deadline
+        mark_ready = agent_server.mark_provider_turn_ready
+
+        async def arm_idle_after_ready(session_id, run_id, provider_session_id=None):
+            await mark_ready(session_id, run_id, provider_session_id)
+            self.assertTrue(agent_server.ACTIVE[session_id]["provider_turn_ready"])
+            agent_server.CURSOR_IDLE_WARN_SECONDS = 0.02
+            agent_server.CURSOR_IDLE_TIMEOUT_SECONDS = 0.12
+
+        with patch.object(
+            agent_server, "mark_provider_turn_ready", side_effect=arm_idle_after_ready,
+        ) as ready:
+            events = await self._run_script(
+                """#!/usr/bin/env python3
 import json, sys, time
 sys.stdin.read()
 print(json.dumps({"type":"system","subtype":"init","session_id":"cursor-sess-test","cwd":".","model":"Auto"}), flush=True)
 time.sleep(5)
 """
-        )
+            )
+        ready.assert_awaited_once_with(self.session_id, "run-cursor-1", "cursor-sess-test")
         warnings = [event for event in events if event["type"] == "idle_warning"]
         self.assertEqual(len(warnings), 1)
         terminal = next(event for event in events if event["type"] == "turn_finished")
@@ -1934,7 +1953,7 @@ class CursorFileDeliveryInstructionTests(unittest.TestCase):
             )
         current = agent_server.cursor_instruction_hash("chat-x", {}, manifest)
 
-        self.assertEqual(agent_server.CURSOR_PROMPT_POLICY_VERSION, "4")
+        self.assertEqual(agent_server.CURSOR_PROMPT_POLICY_VERSION, "5")
         self.assertNotEqual(previous, current)
 
 

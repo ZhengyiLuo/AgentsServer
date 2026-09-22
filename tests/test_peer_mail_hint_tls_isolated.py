@@ -47,12 +47,13 @@ class PeerMailHintTLSAcceptanceTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.store = SecurePeerStore(self.root / "host", "server_tls_fixture", HUB)
+        scopes = getattr(self, "requested_scopes", ["teamspace.read"])
         key = Ed25519PrivateKey.generate()
         request = build_pairing_request(key, server_identity="peer_tls_fixture",
             display_name="Isolated TLS peer", host_ca_fingerprint=self.store.ca_fingerprint,
-            requested_scopes=["teamspace.read"])
+            requested_scopes=scopes)
         submitted = self.store.submit_pairing(request, source_ip=SOURCE, source_port=40000)
-        self.store.approve_pairing(submitted["pairing_id"], TEAM, ["teamspace.read"], "owner_fixture",
+        self.store.approve_pairing(submitted["pairing_id"], TEAM, scopes, "owner_fixture",
             expected_peer_server_identity="peer_tls_fixture",
             expected_transcript_hash=submitted["transcript_hash"], idempotency_key=str(uuid.uuid4()))
         approved = self.store.poll_pairing(submitted["pairing_id"], submitted["poll_token"])

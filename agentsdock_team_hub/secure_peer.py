@@ -31,6 +31,7 @@ import ssl
 import stat
 import threading
 import time
+import unicodedata
 from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import parse_qsl, urlencode, urlsplit
 import uuid
@@ -45,6 +46,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID, ObjectIdentifier
 
 from .security import canonical_json, create_secret_file, ensure_private_directory, read_secret_file
 from .mail_hints import MailArrival, MailHintClosed
+from .notification_hints import NotificationCursor
 
 
 PROTOCOL_VERSION = 1
@@ -108,7 +110,7 @@ SCOPE_ORDER = (
     "cross_chat.instruction",
     "cross_chat.request_reply",
 )
-CAPABILITIES = frozenset({"teamspace", "cross_chat", "cert_renewal"})
+CAPABILITIES = frozenset({"teamspace", "cross_chat", "cert_renewal", "durable_pairing_approval"})
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{7,239}$")
 _LABEL_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,160}$")
@@ -215,22 +217,24 @@ class AttachmentFileLease:
 
 
 def _mail_hint_frame(value: Any, *, hub_id: str, team_id: str,
-                     recipient_server_id: str | None = None) -> dict[str, Any]:
+                     recipient_server_id: str | None = None, version: int = 1) -> dict[str, Any]:
     """Strict metadata only; the authenticated connection supplies its realm."""
     if (not isinstance(value, dict) or set(value) != {"type", "hub_id", "cursor"}
             or value["type"] not in {"snapshot", "hint"} or value["hub_id"] != hub_id):
         raise SecurePeerError("remote_invalid", "Invalid Mail hint frame", 502)
     try:
         raw = value["cursor"]
-        cursor = MailArrival.from_dict(raw)
-        if ("reset" not in raw or cursor.team_id != team_id
-                or (recipient_server_id is not None and cursor.recipient_server_id != recipient_server_id)
-                or (value["type"] == "hint" and raw["reset"])):
+        cursor = NotificationCursor.from_dict(raw) if version == 2 else MailArrival.from_dict(raw)
+        mail = cursor.mail if version == 2 else cursor
+        resets = [raw["mail"]["reset"], raw["bulletin"]["reset"]] if version == 2 else [raw.get("reset")]
+        if (any(type(reset) is not bool for reset in resets) or mail.team_id != team_id
+                or (recipient_server_id is not None and mail.recipient_server_id != recipient_server_id)
+                or (value["type"] == "hint" and any(resets))):
             raise ValueError("Mail hint scope changed")
     except (TypeError, ValueError) as exc:
         raise SecurePeerError("remote_invalid", "Invalid Mail hint cursor", 502) from exc
     return {"type": value["type"], "hub_id": hub_id,
-            "cursor": cursor.as_dict(reset=raw["reset"])}
+            "cursor": cursor.as_dict() if version == 2 else cursor.as_dict(reset=raw["reset"])}
 
 
 class PeerMailHintStream:
@@ -242,9 +246,11 @@ class PeerMailHintStream:
 
     def __init__(self, connection: Any, response: Any, sock: Any, *,
                  hub_id: str, team_id: str, expires_at: int,
-                 revalidate: Callable[[], None], clock: Callable[[], float] = time.time) -> None:
+                 revalidate: Callable[[], None], clock: Callable[[], float] = time.time,
+                 version: int = 1) -> None:
         self._connection, self._response, self._socket = connection, response, sock
         self._hub_id, self._team_id = hub_id, team_id
+        self._version = version
         self._expires_at, self._clock, self._revalidate = expires_at, clock, revalidate
         self._guard = threading.Lock()
         self._reader = threading.Lock()
@@ -278,11 +284,12 @@ class PeerMailHintStream:
                 if self._closed or self._clock() >= self._expires_at:
                     raise MailHintClosed("Mail hint authority expired")
                 frame = _mail_hint_frame(value, hub_id=self._hub_id, team_id=self._team_id,
-                                         recipient_server_id=self._recipient)
+                                         recipient_server_id=self._recipient, version=self._version)
                 if (frame["type"] == "snapshot") == self._initialized:
                     raise SecurePeerError("remote_invalid", "Mail hint snapshot order is invalid", 502)
                 self._initialized = True
-                self._recipient = frame["cursor"]["recipient_server_id"]
+                mail = frame["cursor"]["mail"] if self._version == 2 else frame["cursor"]
+                self._recipient = mail["recipient_server_id"]
                 return frame
         except BaseException:
             self.close()
@@ -1445,6 +1452,7 @@ class SecurePeerStore:
             "hub_id": self.hub_id,
             "host_ca_fingerprint": self.ca_fingerprint,
             "pairing_available": True,
+            "durable_pairing_approval_v1": True,
         }
 
     def cross_chat_consent_status(self) -> dict[str, Any]:
@@ -1723,7 +1731,7 @@ class SecurePeerStore:
         return int(
             connection.execute(
                 "UPDATE pairing_requests SET status='expired',decided_at=? "
-                "WHERE status='pending' AND expires_at<=?" + identity_clause,
+                "WHERE status='pending' AND expires_at>0 AND expires_at<=?" + identity_clause,
                 arguments,
             ).rowcount
         )
@@ -1747,7 +1755,7 @@ class SecurePeerStore:
                 raise SecurePeerError("invalid_request", "Pairing source endpoint is invalid", 400)
             source_endpoint = f"[{source_ip}]:{source_port}" if source_address.version == 6 else f"{source_ip}:{source_port}"
         timestamp = self._timestamp()
-        expires_at = min(
+        expires_at = 0 if "durable_pairing_approval" in normalized["capabilities"] else min(
             int(normalized["created_at"]) + PAIRING_TTL_SECONDS,
             timestamp + PAIRING_TTL_SECONDS,
         )
@@ -1778,7 +1786,7 @@ class SecurePeerStore:
                     raise SecurePeerError("idempotency_conflict", "request_id was reused with different content", 409)
                 if (
                     existing["status"] == "pending"
-                    and int(existing["expires_at"]) <= timestamp
+                    and 0 < int(existing["expires_at"]) <= timestamp
                 ):
                     connection.execute(
                         """UPDATE pairing_requests SET status='expired',decided_at=?
@@ -1803,11 +1811,11 @@ class SecurePeerStore:
                     "Pairing request time is outside the allowed window",
                     410,
                 )
-            if expires_at <= timestamp:
+            if 0 < expires_at <= timestamp:
                 raise SecurePeerError("pairing_expired", "Pairing request has expired", 410)
             connection.execute(
                 """UPDATE pairing_requests SET status='expired',decided_at=?
-                WHERE status='pending' AND expires_at<=?""",
+                WHERE status='pending' AND expires_at>0 AND expires_at<=?""",
                 (timestamp, timestamp),
             )
             connection.execute(
@@ -1843,19 +1851,6 @@ class SecurePeerStore:
             total_count = int(
                 connection.execute("SELECT COUNT(*) AS count FROM pairing_requests").fetchone()["count"]
             )
-            source_pending = (
-                int(
-                    connection.execute(
-                        """SELECT COUNT(*) AS count FROM pairing_requests
-                        WHERE status='pending' AND source_ip=?""",
-                        (source_ip,),
-                    ).fetchone()["count"]
-                )
-                if source_ip is not None
-                else 0
-            )
-            if source_pending >= 16:
-                raise SecurePeerError("rate_limited", "Too many pending pairings from this source", 429)
             if (
                 pending_count >= PAIRING_STATUS_LIMIT
                 or actionable_count + external_actionable_count
@@ -1923,7 +1918,7 @@ class SecurePeerStore:
         if row is None or not hmac.compare_digest(bytes(row["poll_token_hash"]), digest):
             raise SecurePeerError("pairing_unavailable", "Pairing is unavailable", 404)
         timestamp = self._timestamp()
-        if row["status"] == "pending" and int(row["expires_at"]) <= timestamp:
+        if row["status"] == "pending" and 0 < int(row["expires_at"]) <= timestamp:
             connection.execute(
                 "UPDATE pairing_requests SET status='expired',decided_at=? WHERE id=? AND status='pending'",
                 (timestamp, pairing_id),
@@ -2299,7 +2294,7 @@ class SecurePeerStore:
             row = connection.execute("SELECT * FROM pairing_requests WHERE id=?", (pairing_id,)).fetchone()
             if row is None:
                 raise SecurePeerError("pairing_unavailable", "Pairing is unavailable", 404)
-            if row["status"] == "pending" and int(row["expires_at"]) <= timestamp:
+            if row["status"] == "pending" and 0 < int(row["expires_at"]) <= timestamp:
                 self._expire_pending_pairings(
                     connection,
                     timestamp,
@@ -2456,7 +2451,7 @@ class SecurePeerStore:
             row = connection.execute("SELECT * FROM pairing_requests WHERE id=?", (pairing_id,)).fetchone()
             if row is None:
                 raise SecurePeerError("pairing_unavailable", "Pairing is unavailable", 404)
-            if row["status"] == "pending" and int(row["expires_at"]) <= timestamp:
+            if row["status"] == "pending" and 0 < int(row["expires_at"]) <= timestamp:
                 self._expire_pending_pairings(
                     connection,
                     timestamp,
@@ -5065,6 +5060,7 @@ def sanitize_proxy_request(
                     "include_mailbox_state",
                     "include_mailbox_coverage",
                     "after_arrival_id",
+                    "q",
                 }
             elif (
                 len(pieces) == 2
@@ -5197,6 +5193,11 @@ def sanitize_proxy_request(
             raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
         messages_route = path.endswith("/network/messages")
         mailbox_route = path.endswith("/network/mailbox")
+        if "q" in values and (
+            not 1 <= len(values["q"]) <= 200 or not values["q"].strip()
+            or any(unicodedata.category(char) in {"Cc", "Cs"} for char in values["q"])
+        ):
+            raise SecurePeerError("invalid_request", "Search query is invalid", 422)
         if "address_kind" in values and values["address_kind"] not in (
             {"server"}
             if mailbox_route
@@ -5458,6 +5459,8 @@ class SecurePeerGateway:
         | None = None,
         mail_hint_subscriber: Callable[[PeerAuthorization, Any], Any] | None = None,
         mail_hint_snapshot: Callable[[PeerAuthorization, Any], Mapping[str, Any]] | None = None,
+        notification_hint_subscriber: Callable[[PeerAuthorization, Any], Any] | None = None,
+        notification_hint_snapshot: Callable[[PeerAuthorization, Any], Mapping[str, Any]] | None = None,
     ) -> None:
         self.store = store
         self.bind_ip = canonical_peer_ipv4(bind_ip)
@@ -5472,6 +5475,8 @@ class SecurePeerGateway:
         # own finite budget, separate from interactive request admission.
         self.mail_hint_subscriber = mail_hint_subscriber
         self.mail_hint_snapshot = mail_hint_snapshot
+        self.notification_hint_subscriber = notification_hint_subscriber
+        self.notification_hint_snapshot = notification_hint_snapshot
         self._mail_guard = threading.Condition(threading.RLock())
         self._mail_streams: dict[object, tuple[str, Callable[[], None]]] = {}
         self._mail_hint_unsubscribe: Callable[[], None] | None = None
@@ -5715,7 +5720,9 @@ class SecurePeerGateway:
 
                 def _mail_hints(self, *, stream: bool) -> None:
                     callback = gateway.mail_hint_subscriber if stream else gateway.mail_hint_snapshot
-                    if callback is None:
+                    notification_callback = (gateway.notification_hint_subscriber if stream
+                                             else gateway.notification_hint_snapshot)
+                    if callback is None and notification_callback is None:
                         raise SecurePeerError("not_found", "Resource not found", 404)
                     self._reject_browser_headers()
                     peer = self._peer()
@@ -5724,13 +5731,19 @@ class SecurePeerGateway:
                         raise SecurePeerError("forbidden", "Team Mail read authority is required", 403)
                     value = _require_exact_keys(self._json_body(MAX_MAIL_HINT_FRAME_BYTES),
                         {"version", "team_id", "previous_cursor"}, context="Mail hint subscription")
-                    if type(value["version"]) is not int or value["version"] != 1 or value["team_id"] != peer.team_id:
+                    version = value["version"]
+                    if type(version) is not int or version not in (1, 2) or value["team_id"] != peer.team_id:
                         raise SecurePeerError("forbidden", "Mail hint team does not match peer authority", 403)
+                    if version == 2:
+                        callback = notification_callback
+                    if callback is None:
+                        raise SecurePeerError("not_found", "Resource not found", 404)
                     previous = value["previous_cursor"]
                     if previous is not None:
                         try:
-                            previous = MailArrival.from_dict(previous).as_dict()
-                            if previous["team_id"] != peer.team_id:
+                            parsed = NotificationCursor.from_dict(previous) if version == 2 else MailArrival.from_dict(previous)
+                            previous = parsed.as_dict()
+                            if parsed.mailbox[0] != peer.team_id:
                                 raise ValueError("Mail hint team changed")
                         except (TypeError, ValueError) as exc:
                             raise SecurePeerError("invalid_request", "Invalid Mail hint cursor", 422) from exc
@@ -5739,7 +5752,7 @@ class SecurePeerGateway:
                         if not isinstance(result, Mapping) or set(result) != {"hub_id", "cursor"}:
                             raise SecurePeerError("hub_unavailable", "Invalid Mail hint snapshot", 503)
                         frame = _mail_hint_frame({"type": "snapshot", **result},
-                            hub_id=gateway.store.hub_id, team_id=peer.team_id)
+                            hub_id=gateway.store.hub_id, team_id=peer.team_id, version=version)
                         self._json(200, {"hub_id": frame["hub_id"], "cursor": frame["cursor"]})
                         return
                     lease = callback(peer, previous)
@@ -5765,7 +5778,7 @@ class SecurePeerGateway:
                         certificate = self.connection.getpeercert(binary_form=True)
                         snapshot = _mail_hint_frame({"type": "snapshot", "hub_id": lease.hub_id,
                             "cursor": lease.snapshot}, hub_id=gateway.store.hub_id,
-                            team_id=peer.team_id, recipient_server_id=lease.recipient_server_id)
+                            team_id=peer.team_id, recipient_server_id=lease.recipient_server_id, version=version)
                         lease.revalidate()
                         watcher = gateway._mail_watcher
                         if watcher is None:
@@ -5792,7 +5805,7 @@ class SecurePeerGateway:
                                     raise MailHintClosed("Mail hint authority changed")
                                 packet = _mail_hint_frame({"type": kind, "hub_id": lease.hub_id, "cursor": cursor},
                                     hub_id=gateway.store.hub_id, team_id=peer.team_id,
-                                    recipient_server_id=lease.recipient_server_id)
+                                    recipient_server_id=lease.recipient_server_id, version=version)
                                 wire = canonical_json(packet) + b"\n"
                                 if len(wire) > MAX_MAIL_HINT_FRAME_BYTES:
                                     raise MailHintClosed("Mail hint frame exceeds bound")
@@ -5981,6 +5994,9 @@ class SecurePeerGateway:
                                     "mail_hints_available": bool(gateway.mail_hint_subscriber is not None
                                                                  and gateway.mail_hint_snapshot is not None
                                                                  and "teamspace.read" in peer.scopes),
+                                    "mail_hints_v2_available": bool(gateway.notification_hint_subscriber is not None
+                                                                    and gateway.notification_hint_snapshot is not None
+                                                                    and "teamspace.read" in peer.scopes),
                                 },
                             )
                             return
@@ -6359,7 +6375,7 @@ class SecurePeerGateway:
             self._server = server
             self._thread = thread
             try:
-                if self.mail_hint_subscriber is not None:
+                if self.mail_hint_subscriber is not None or self.notification_hint_subscriber is not None:
                     self._mail_watcher = _MailHintDisconnectWatcher()
                     self._mail_hint_unsubscribe = self.store.register_mail_hint_revoker(self.close_mail_hint_streams)
                 thread.start()
@@ -6583,6 +6599,7 @@ class SecurePeerClient:
         # One current authenticated capability receipt, not a per-peer cache
         # or polling lane. Existing activation/heartbeat health fills this.
         self._mail_hint_health: tuple[str, str, str, str, int, bool] | None = None
+        self._notification_hint_health: tuple[str, str, str, str, int, bool] | None = None
         self._pairing_request_guard = threading.RLock()
         self._pairing_capacity_lock = pairing_capacity_lock or threading.RLock()
         self._external_actionable_pairing_count = (
@@ -6606,7 +6623,10 @@ class SecurePeerClient:
             return False
         return (
             isinstance(capabilities, list)
-            and capabilities == list(self._pairing_capabilities)
+            and all(isinstance(item, str) for item in capabilities)
+            and capabilities == sorted(set(capabilities))
+            and [item for item in capabilities if item != "durable_pairing_approval"]
+            == [item for item in self._pairing_capabilities if item != "durable_pairing_approval"]
             and (
                 "cross_chat" in self._pairing_capabilities
                 or not any(scope.startswith("cross_chat.") for scope in requested_scopes)
@@ -6670,14 +6690,14 @@ class SecurePeerClient:
                 connection.execute("BEGIN IMMEDIATE")
                 connection.execute(
                     """UPDATE client_join_intents SET status='expired',updated_at=?
-                    WHERE status='pending' AND expires_at<=?""",
+                    WHERE status='pending' AND expires_at>0 AND expires_at<=?""",
                     (timestamp, timestamp),
                 )
                 rows = connection.execute(
                     """SELECT connection_id,pairing_id,pairing_expires_at
                     FROM client_connections
                     WHERE status='pending' AND pairing_expires_at IS NOT NULL
-                    AND pairing_expires_at<=?
+                    AND pairing_expires_at>0 AND pairing_expires_at<=?
                     ORDER BY pairing_expires_at,connection_id LIMIT ?""",
                     (timestamp, limit),
                 ).fetchall()
@@ -6888,6 +6908,11 @@ class SecurePeerClient:
                 connection.execute(
                     "ALTER TABLE client_connections "
                     "ADD COLUMN relay_available INTEGER NOT NULL DEFAULT 0"
+                )
+            if "endpoint_generation" not in columns:
+                connection.execute(
+                    "ALTER TABLE client_connections "
+                    "ADD COLUMN endpoint_generation INTEGER NOT NULL DEFAULT 0"
                 )
             stored_identity = connection.execute(
                 "SELECT value FROM client_meta WHERE key='server_identity'"
@@ -7386,7 +7411,9 @@ class SecurePeerClient:
                 host_ca_fingerprint=observed_fp,
                 request_id=canonical_request_id,
                 created_at=timestamp,
-                capabilities=self._pairing_capabilities,
+                capabilities=sorted({
+                    item for item in self._pairing_capabilities if item != "durable_pairing_approval"
+                } | ({"durable_pairing_approval"} if health.get("durable_pairing_approval_v1") is True else set())),
                 requested_scopes=requested_values,
             )
             connection_id = str(uuid.uuid4())
@@ -7455,7 +7482,7 @@ class SecurePeerClient:
                             connection_id,
                             canonical_request_id,
                             timestamp,
-                            timestamp + PAIRING_TTL_SECONDS,
+                            0 if "durable_pairing_approval" in request["capabilities"] else timestamp + PAIRING_TTL_SECONDS,
                             timestamp,
                         ),
                     )
@@ -7556,13 +7583,15 @@ class SecurePeerClient:
             or not isinstance(response.get("poll_token"), str)
             or _POLL_TOKEN_RE.fullmatch(response["poll_token"]) is None
             or type(response.get("expires_at")) is not int
+            or response.get("expires_at", -1) < 0
+            or (response.get("expires_at") == 0 and "durable_pairing_approval" not in request["capabilities"])
             or response.get("status")
             not in {"pending", "approved", "rejected", "cancelled", "expired"}
         ):
             self._retire_pairing_attempt(attempt)
             raise SecurePeerError("transcript_mismatch", "Pairing transcript confirmation failed", 409)
         response_received_at = self._timestamp()
-        if response["status"] == "pending" and (
+        if response["status"] == "pending" and response["expires_at"] != 0 and (
             response["expires_at"] <= response_received_at
             or response["expires_at"]
             > int(request["created_at"]) + PAIRING_TTL_SECONDS
@@ -7601,7 +7630,8 @@ class SecurePeerClient:
             if intent is not None:
                 # Even an already-approved POST replay must retain the original
                 # local authorization deadline after a lost initial response.
-                pairing_expires_at = min(int(intent["expires_at"]), response["expires_at"])
+                deadlines = [value for value in (int(intent["expires_at"]), response["expires_at"]) if value > 0]
+                pairing_expires_at = min(deadlines) if deadlines else 0
                 connection.execute(
                     "UPDATE client_join_intents SET expires_at=? WHERE connection_id=? AND request_id=?",
                     (pairing_expires_at, connection_id, canonical_request_id),
@@ -7710,13 +7740,14 @@ class SecurePeerClient:
             first_error: tuple[str, str] | None = None
             timestamp = self._timestamp()
             for row in rows:
-                if int(row["created_at"]) <= timestamp - PAIRING_ATTEMPT_RETENTION_SECONDS:
-                    retired += int(self._retire_pairing_attempt(row))
-                    continue
                 try:
                     request = json.loads(row["request_json"])
                     if not isinstance(request, dict):
                         raise PermissionError("persisted pairing request is invalid")
+                    if ("durable_pairing_approval" not in request.get("capabilities", [])
+                            and int(row["created_at"]) <= timestamp - PAIRING_ATTEMPT_RETENTION_SECONDS):
+                        retired += int(self._retire_pairing_attempt(row))
+                        continue
                     requested = SecurePeerStore._canonical_scopes(
                         request.get("requested_scopes")
                     )
@@ -7849,7 +7880,7 @@ class SecurePeerClient:
                 "SELECT status,expires_at FROM client_join_intents WHERE connection_id=?",
                 (canonical,),
             ).fetchone()
-            return {"state": row["status"], "deadline": int(row["expires_at"])} if row is not None else None
+            return {"state": row["status"], "deadline": int(row["expires_at"]) or None} if row is not None else None
         finally:
             connection.close()
 
@@ -7868,7 +7899,7 @@ class SecurePeerClient:
             row = connection.execute(
                 """SELECT c.*,i.status AS intent_state,i.expires_at AS intent_deadline,
                 (SELECT value FROM client_meta WHERE key='active_connection_id') AS active_id,
-                ((i.status='pending' AND i.expires_at>?
+                ((i.status='pending' AND (i.expires_at=0 OR i.expires_at>?)
                 AND c.status IN ('pending','approved')) OR
                 (i.status='completed' AND c.status='connected' AND c.connection_id=
                  (SELECT value FROM client_meta WHERE key='active_connection_id')))
@@ -7880,7 +7911,7 @@ class SecurePeerClient:
             ).fetchone()
             if row is None:
                 raise SecurePeerError("connection_unavailable", "Secure peer connection is unavailable", 404)
-            deadline = int(row["intent_deadline"]) if row["intent_deadline"] is not None else None
+            deadline = (int(row["intent_deadline"]) or None) if row["intent_deadline"] is not None else None
             state = row["intent_state"]
             if state == "pending" and deadline is not None and deadline <= timestamp:
                 state = "expired"
@@ -7910,13 +7941,13 @@ class SecurePeerClient:
                 """SELECT c.*,i.expires_at AS auto_completion_deadline,1 AS complete_on_approval
                 FROM client_connections c JOIN client_join_intents i
                 ON i.connection_id=c.connection_id AND i.request_id=c.pairing_request_id
-                WHERE i.status='pending' AND i.expires_at>?
+                WHERE i.status='pending' AND (i.expires_at=0 OR i.expires_at>?)
                 AND c.status IN ('pending','approved')
                 ORDER BY i.created_at,i.connection_id LIMIT ?""",
                 (self._timestamp(), bounded_limit),
             ).fetchall()
             return [
-                {**self._public_connection(row, active), "auto_completion_deadline": int(row["auto_completion_deadline"])}
+                {**self._public_connection(row, active), "auto_completion_deadline": int(row["auto_completion_deadline"]) or None}
                 for row in rows
             ]
         finally:
@@ -7928,7 +7959,7 @@ class SecurePeerClient:
         try:
             active = self._active_id(connection)
             rows = connection.execute(
-                """SELECT c.*,((i.status='pending' AND i.expires_at>?
+                """SELECT c.*,((i.status='pending' AND (i.expires_at=0 OR i.expires_at>?)
                 AND c.status IN ('pending','approved')) OR
                 (i.status='completed' AND c.status='connected' AND c.connection_id=
                  (SELECT value FROM client_meta WHERE key='active_connection_id')))
@@ -7948,7 +7979,7 @@ class SecurePeerClient:
         connection = self._connect()
         try:
             row = connection.execute(
-                """SELECT c.*,((i.status='pending' AND i.expires_at>?
+                """SELECT c.*,((i.status='pending' AND (i.expires_at=0 OR i.expires_at>?)
                 AND c.status IN ('pending','approved')) OR
                 (i.status='completed' AND c.status='connected' AND c.connection_id=
                  (SELECT value FROM client_meta WHERE key='active_connection_id')))
@@ -8117,6 +8148,17 @@ class SecurePeerClient:
         remote_status = response.get("status")
         if remote_status not in {"pending", "approved", "rejected", "cancelled", "expired"}:
             raise SecurePeerError("remote_invalid", "Pairing response status is invalid", 502)
+        if response.get("expires_at") == 0:
+            try:
+                request = json.loads(row["pairing_request_json"])
+                durable = (type(response["expires_at"]) is int
+                           and isinstance(request, dict)
+                           and self._pairing_request_matches_configured_policy(request)
+                           and "durable_pairing_approval" in request.get("capabilities", []))
+            except (TypeError, ValueError):
+                durable = False
+            if not durable:
+                raise SecurePeerError("remote_invalid", "Pairing response expiry is invalid", 502)
         timestamp = self._timestamp()
         certificate_path: str | None = row["certificate_path"]
         certificate_fp: str | None = row["certificate_fingerprint"]
@@ -8162,7 +8204,7 @@ class SecurePeerClient:
                 "SELECT expires_at FROM client_join_intents WHERE connection_id=? AND request_id=?",
                 (connection_id, row["pairing_request_id"]),
             ).fetchone()
-            if intent is not None and int(intent["expires_at"]) <= timestamp:
+            if intent is not None and 0 < int(intent["expires_at"]) <= timestamp:
                 # Network I/O and certificate validation may cross the original
                 # Join deadline. Recheck at the same commit that accepts approval.
                 remote_status = "expired"
@@ -8518,15 +8560,8 @@ class SecurePeerClient:
         with self._route_guard:
             return self._peer_health_locked(connection_id)
 
-    def _peer_health_locked(self, connection_id: str) -> dict[str, Any]:
-        row = self._connection_row(connection_id)
-        if row["status"] not in {"approved", "connected", "deactivated"}:
-            raise SecurePeerError("pairing_incomplete", "Secure peer connection is not approved", 409)
-        status, headers, raw, _leaf = self._request(
-            row["host_ip"], int(row["port"]), "GET", "/v1/peer/health",
-            context=self._pinned_context(row, mutual_tls=True)
-        )
-        value = self._decode_json_response(status, headers, raw)
+    @staticmethod
+    def _validate_peer_health_identity(row: Mapping[str, Any], value: Mapping[str, Any]) -> None:
         if (
             value.get("peer_id") != row["peer_id"]
             or value.get("team_id") != row["team_id"]
@@ -8537,8 +8572,138 @@ class SecurePeerClient:
             or value.get("certificate_expires_at") != row["certificate_expires_at"]
             or type(value.get("remote_route_delivery_available")) is not bool
             or ("mail_hints_available" in value and type(value["mail_hints_available"]) is not bool)
+            or ("mail_hints_v2_available" in value and type(value["mail_hints_v2_available"]) is not bool)
         ):
             raise SecurePeerError("host_identity_mismatch", "Connected peer health identity changed", 409)
+
+    def update_connection_endpoint(
+        self,
+        connection_id: str,
+        host_ip: str,
+        port: int,
+        *,
+        expected_host_server_identity: str,
+        expected_hub_id: str,
+        expected_host_ip: str | None = None,
+        expected_port: int | None = None,
+    ) -> dict[str, Any]:
+        """Move an approved connection only after pinned mTLS proves its identity.
+
+        Network I/O holds neither the route guard nor a database transaction,
+        so revocation remains immediate. The final transaction rejects changed
+        authority, renewal state, or endpoints rather than reviving old state.
+        """
+
+        canonical = _uuid(connection_id, "connection_id")
+        host = canonical_peer_ipv4(host_ip)
+        endpoint_port = canonical_peer_port(port)
+        expected_host = _identifier(expected_host_server_identity, "expected host identity")
+        expected_hub = _identifier(expected_hub_id, "expected hub id")
+        if (expected_host_ip is None) != (expected_port is None):
+            raise ValueError("expected host IP and port must be supplied together")
+        if expected_host_ip is not None:
+            expected_host_ip = canonical_peer_ipv4(expected_host_ip)
+            expected_port = canonical_peer_port(expected_port)
+
+        def renewals(database: sqlite3.Connection) -> list[dict[str, Any]]:
+            return [dict(item) for item in database.execute(
+                "SELECT * FROM client_renewals WHERE connection_id=? ORDER BY request_id",
+                (canonical,),
+            ).fetchall()]
+
+        with self._route_guard:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN")
+                row = connection.execute(
+                    "SELECT * FROM client_connections WHERE connection_id=?", (canonical,)
+                ).fetchone()
+                if row is None:
+                    raise SecurePeerError("connection_unavailable", "Secure peer connection is unavailable", 404)
+                if (
+                    row["host_server_identity"] != expected_host
+                    or row["hub_id"] != expected_hub
+                    or (expected_host_ip is not None and (
+                        row["host_ip"] != expected_host_ip or row["port"] != expected_port
+                    ))
+                ):
+                    raise SecurePeerError("connection_changed", "Secure peer connection identity or endpoint changed", 409)
+                if row["status"] not in {"approved", "connected", "deactivated"}:
+                    raise SecurePeerError("pairing_incomplete", "Secure peer connection is not approved", 409)
+                if int(row["certificate_expires_at"] or 0) <= self._timestamp() + 60:
+                    raise SecurePeerError("connection_unavailable", "Secure peer credential is expired or expiring", 409)
+                active = self._active_id(connection)
+                original_renewals = renewals(connection)
+                context = self._pinned_context(row, mutual_tls=True)
+            finally:
+                connection.close()
+
+        status, headers, raw, leaf = self._request(
+            host, endpoint_port, "GET", "/v1/peer/health", context=context
+        )
+        value = self._decode_json_response(status, headers, raw)
+        self._validate_initial_identity(
+            host_ip=host,
+            expected_host_server_identity=row["host_server_identity"],
+            leaf_der=leaf,
+            ca_pem=row["host_ca_certificate_pem"],
+            expected_ca_fingerprint=row["host_ca_fingerprint"],
+        )
+        self._validate_peer_health_identity(row, value)
+        with self._route_guard:
+            validated_at = self._timestamp()
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                current = connection.execute(
+                    "SELECT * FROM client_connections WHERE connection_id=?", (canonical,)
+                ).fetchone()
+                # Health timestamps/capabilities may change during the probe;
+                # every field carrying endpoint or connection authority must not.
+                health_fields = {"last_validated_at", "updated_at", "relay_available"}
+                if (
+                    current is None
+                    or any(current[key] != row[key] for key in row.keys() if key not in health_fields)
+                    or self._active_id(connection) != active
+                    or renewals(connection) != original_renewals
+                    or int(current["certificate_expires_at"] or 0) <= validated_at + 60
+                ):
+                    raise SecurePeerError("connection_changed", "Secure peer connection changed during endpoint validation", 409)
+                connection.execute(
+                    """UPDATE client_connections SET host_ip=?,port=?,
+                    endpoint_generation=endpoint_generation+1,last_validated_at=?,
+                    updated_at=?,relay_available=? WHERE connection_id=?""",
+                    (host, endpoint_port, validated_at, validated_at,
+                     int(value["remote_route_delivery_available"]), canonical),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+            finally:
+                connection.close()
+            if active == canonical:
+                self._mail_hint_health = (
+                    canonical, row["certificate_fingerprint"], row["hub_id"], row["team_id"],
+                    validated_at, value.get("mail_hints_available") is True,
+                )
+                self._notification_hint_health = (
+                    canonical, row["certificate_fingerprint"], row["hub_id"], row["team_id"],
+                    validated_at, value.get("mail_hints_v2_available") is True,
+                )
+            return self.get_connection(canonical)
+
+    def _peer_health_locked(self, connection_id: str) -> dict[str, Any]:
+        row = self._connection_row(connection_id)
+        if row["status"] not in {"approved", "connected", "deactivated"}:
+            raise SecurePeerError("pairing_incomplete", "Secure peer connection is not approved", 409)
+        status, headers, raw, _leaf = self._request(
+            row["host_ip"], int(row["port"]), "GET", "/v1/peer/health",
+            context=self._pinned_context(row, mutual_tls=True)
+        )
+        value = self._decode_json_response(status, headers, raw)
+        self._validate_peer_health_identity(row, value)
         validated_at = self._timestamp()
         connection = self._connect()
         try:
@@ -8563,10 +8728,18 @@ class SecurePeerClient:
             connection.close()
         self._mail_hint_health = (connection_id, row["certificate_fingerprint"], row["hub_id"],
                                   row["team_id"], validated_at, value.get("mail_hints_available") is True)
+        self._notification_hint_health = (connection_id, row["certificate_fingerprint"], row["hub_id"],
+                                         row["team_id"], validated_at, value.get("mail_hints_v2_available") is True)
         return value
 
     def mail_hint_capability(self, connection_id: str, certificate_fingerprint: str | None = None) -> bool:
         receipt = self._mail_hint_health
+        return bool(receipt is not None and receipt[0] == connection_id
+                    and (certificate_fingerprint is None or receipt[1] == certificate_fingerprint)
+                    and receipt[4] >= self._timestamp() - 120 and receipt[5])
+
+    def notification_hint_capability(self, connection_id: str, certificate_fingerprint: str | None = None) -> bool:
+        receipt = getattr(self, "_notification_hint_health", None)
         return bool(receipt is not None and receipt[0] == connection_id
                     and (certificate_fingerprint is None or receipt[1] == certificate_fingerprint)
                     and receipt[4] >= self._timestamp() - 120 and receipt[5])
@@ -8652,7 +8825,7 @@ class SecurePeerClient:
         def require_pending(connection: sqlite3.Connection, row: sqlite3.Row) -> None:
             if (
                 row["intent_status"] != "pending"
-                or int(row["intent_deadline"]) <= self._timestamp()
+                or 0 < int(row["intent_deadline"]) <= self._timestamp()
                 or row["status"] != "approved"
             ):
                 raise SecurePeerError("automatic_join_unavailable", "Automatic join is no longer authorized", 409)
@@ -8686,7 +8859,7 @@ class SecurePeerClient:
                 timestamp = self._timestamp()
                 changed = connection.execute(
                     """UPDATE client_join_intents SET status='completed',updated_at=?
-                    WHERE connection_id=? AND request_id=? AND status='pending' AND expires_at>?""",
+                    WHERE connection_id=? AND request_id=? AND status='pending' AND (expires_at=0 OR expires_at>?)""",
                     (timestamp, canonical, current["pairing_request_id"], timestamp),
                 ).rowcount
                 if changed != 1:
@@ -9392,17 +9565,22 @@ class SecurePeerClient:
             )
         return row
 
-    def _prepare_mail_hint_request(self, connection_id: str, previous_cursor: Any) -> tuple[Any, ssl.SSLContext, dict[str, Any]]:
+    def _prepare_mail_hint_request(self, connection_id: str, previous_cursor: Any, *, version: int = 1) -> tuple[Any, ssl.SSLContext, dict[str, Any]]:
+        if type(version) is not int or version not in (1, 2):
+            raise ValueError("Unsupported notification version")
         with self._route_guard:
             row = self._require_active_connection_locked(connection_id, relay_required=False)
             scopes = json.loads(row["requested_scopes_json"])
             if "teamspace.read" not in scopes:
                 raise SecurePeerError("forbidden", "Team Mail read authority is required", 403)
+            if version == 2 and not self.notification_hint_capability(connection_id, row["certificate_fingerprint"]):
+                raise SecurePeerError("unsupported", "Team notifications are not negotiated", 501)
             if previous_cursor is not None:
-                previous_cursor = MailArrival.from_dict(previous_cursor).as_dict()
-                if previous_cursor["team_id"] != row["team_id"]:
+                parsed = NotificationCursor.from_dict(previous_cursor) if version == 2 else MailArrival.from_dict(previous_cursor)
+                previous_cursor = parsed.as_dict()
+                if parsed.mailbox[0] != row["team_id"]:
                     raise SecurePeerError("forbidden", "Mail hint team changed", 403)
-            body = {"version": 1, "team_id": row["team_id"], "previous_cursor": previous_cursor}
+            body = {"version": version, "team_id": row["team_id"], "previous_cursor": previous_cursor}
             return row, self._pinned_context(row, mutual_tls=True), body
 
     def _revalidate_mail_hint_connection(self, connection_id: str, original: Any) -> None:
@@ -9413,19 +9591,25 @@ class SecurePeerClient:
             if any(current[key] != original[key] for key in fields):
                 raise MailHintClosed("Mail hint connection authority changed")
 
-    def team_mail_hint_snapshot(self, connection_id: str, previous_cursor: Any = None) -> dict[str, Any]:
-        row, context, body = self._prepare_mail_hint_request(connection_id, previous_cursor)
+    def team_notification_hint_snapshot(self, connection_id: str, previous_cursor: Any = None) -> dict[str, Any]:
+        return self.team_mail_hint_snapshot(connection_id, previous_cursor, version=2)
+
+    def open_notification_hint_stream(self, connection_id: str, previous_cursor: Any = None) -> PeerMailHintStream:
+        return self.open_mail_hint_stream(connection_id, previous_cursor, version=2)
+
+    def team_mail_hint_snapshot(self, connection_id: str, previous_cursor: Any = None, *, version: int = 1) -> dict[str, Any]:
+        row, context, body = self._prepare_mail_hint_request(connection_id, previous_cursor, version=version)
         status, headers, raw, _leaf = self._request(row["host_ip"], int(row["port"]), "POST",
             "/v1/mail-hints/snapshot", body=body, context=context, maximum_response=MAX_MAIL_HINT_FRAME_BYTES)
         value = self._decode_json_response(status, headers, raw)
         self._revalidate_mail_hint_connection(connection_id, row)
         if set(value) != {"hub_id", "cursor"}:
             raise SecurePeerError("remote_invalid", "Invalid Mail hint snapshot", 502)
-        frame = _mail_hint_frame({"type": "snapshot", **value}, hub_id=row["hub_id"], team_id=row["team_id"])
+        frame = _mail_hint_frame({"type": "snapshot", **value}, hub_id=row["hub_id"], team_id=row["team_id"], version=version)
         return {"hub_id": frame["hub_id"], "cursor": frame["cursor"]}
 
-    def open_mail_hint_stream(self, connection_id: str, previous_cursor: Any = None) -> PeerMailHintStream:
-        row, context, body = self._prepare_mail_hint_request(connection_id, previous_cursor)
+    def open_mail_hint_stream(self, connection_id: str, previous_cursor: Any = None, *, version: int = 1) -> PeerMailHintStream:
+        row, context, body = self._prepare_mail_hint_request(connection_id, previous_cursor, version=version)
         # No client route lock is retained across handshake or lifetime reads.
         connection = http.client.HTTPSConnection(row["host_ip"], int(row["port"]),
             timeout=self.timeout_seconds, context=context)
@@ -9457,7 +9641,7 @@ class SecurePeerClient:
             self._revalidate_mail_hint_connection(connection_id, row)
             return PeerMailHintStream(connection, response, sock, hub_id=row["hub_id"], team_id=row["team_id"],
                 expires_at=int(row["certificate_expires_at"]), clock=self._clock,
-                revalidate=lambda: self._revalidate_mail_hint_connection(connection_id, row))
+                revalidate=lambda: self._revalidate_mail_hint_connection(connection_id, row), version=version)
         except BaseException:
             if response is not None:
                 response.close()

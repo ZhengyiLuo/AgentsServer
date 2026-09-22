@@ -717,6 +717,7 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
             frozenset({
                 "cwd",
                 "backend",
+                "codex_provider",
                 "model",
                 "effort",
                 "system_prompt",
@@ -766,6 +767,7 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
             "folder": "General",
             "cwd": "/tmp",
             "backend": agent_server.BACKEND_CLAUDE,
+            "subagent_limit": 3,
         }
         child = {
             "id": child_id,
@@ -777,8 +779,9 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
         }
         sessions = {parent_id: parent}
 
-        async def create_child(*_args, **kwargs) -> dict:
+        async def create_child(request, **kwargs) -> dict:
             self.assertTrue(kwargs["initializing_fork"])
+            self.assertEqual(request.subagent_limit, parent["subagent_limit"])
             sessions[child_id] = child
             return child
 
@@ -2390,7 +2393,7 @@ class NativeCodexForkSafetyTests(unittest.IsolatedAsyncioTestCase):
         manager = Mock()
         manager.delete_thread = AsyncMock()
 
-        async def get_manager() -> Mock:
+        async def get_manager(_thread_id: str) -> Mock:
             self.assertNotIn(thread_id, thread_index)
             return manager
 
@@ -2400,7 +2403,7 @@ class NativeCodexForkSafetyTests(unittest.IsolatedAsyncioTestCase):
             thread_index,
         ), patch.object(
             agent_server,
-            "codex_app_server_manager",
+            "codex_app_server_manager_for_thread",
             new_callable=AsyncMock,
             side_effect=get_manager,
         ):
@@ -2684,7 +2687,7 @@ class NativeCodexForkSafetyTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await asyncio.wait_for(task, timeout=1)
 
-        cleanup.assert_awaited_once_with("thread-child")
+        cleanup.assert_awaited_once_with("thread-child", manager=manager)
         manager.read_thread.assert_not_awaited()
 
     async def test_cancelled_failed_journal_never_loses_provider_id(self) -> None:
@@ -2728,7 +2731,7 @@ class NativeCodexForkSafetyTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(task, timeout=1)
 
         self.assertEqual(raised.exception.thread_id, "thread-child")
-        cleanup.assert_awaited_once_with("thread-child")
+        cleanup.assert_awaited_once_with("thread-child", manager=manager)
         manager.read_thread.assert_not_awaited()
 
     async def test_unverifiable_provider_fork_is_deleted(self) -> None:

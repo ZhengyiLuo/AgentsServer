@@ -76,6 +76,13 @@ def initialize(connection: sqlite3.Connection) -> None:
             after_seq INTEGER NOT NULL, end_seq INTEGER NOT NULL,
             has_more INTEGER NOT NULL CHECK(has_more IN (0,1)), message_ids_json TEXT NOT NULL,
             PRIMARY KEY(read_id, after_seq))""",
+        """CREATE TABLE IF NOT EXISTS chat_mailbox_wakes (
+            target_session_id TEXT PRIMARY KEY,
+            last_attempt_seq INTEGER NOT NULL DEFAULT 0 CHECK(last_attempt_seq>=0),
+            suppressed_seq INTEGER NOT NULL DEFAULT 0 CHECK(suppressed_seq>=0),
+            claim_id TEXT UNIQUE, through_seq INTEGER NOT NULL DEFAULT 0 CHECK(through_seq>=0),
+            state TEXT CHECK(state IN ('reserved','admitted')), run_id TEXT,
+            updated_at TEXT NOT NULL)""",
         """CREATE INDEX IF NOT EXISTS chat_mailbox_sender_order
             ON chat_mailbox_messages(target_session_id, source_session_id, mailbox_seq)""",
         """CREATE INDEX IF NOT EXISTS chat_mailbox_unread_order
@@ -126,6 +133,10 @@ def _message(row: sqlite3.Row) -> dict:
             "reference_action": row["source_user_delegation_action"],
             "source_user_instruction": row["source_user_instruction"],
         }
+    else:
+        # Retain legacy source text for bounded ledger reads, without attesting
+        # it or exposing it as authority in provider/public projections.
+        message["source_user_instruction"] = row["source_user_instruction"] or ""
     return message
 
 
@@ -165,17 +176,15 @@ def store_message(connection: sqlite3.Connection, message_id: str, *, now: str,
             or row["in_reply_to_message_id"] != parent):
         raise MailboxConflict("Stored mailbox identity changed")
     message = _message(row)
-    if "user_delegation" in message:
-        # Reject before the caller commits, rather than accepting a delegated
-        # message that cannot be read. Preserve the full source constraints;
-        # never truncate them or silently downgrade the message to peer mail.
-        projected = {**message, "read_id": "x" * 240, "read_at": "x" * 64}
-        try:
-            size = len(json.dumps(projected, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-        except UnicodeEncodeError as exc:
-            raise MailboxConflict("User delegation must be valid UTF-8") from exc
-        if size + 8192 > MAX_PAGE_BYTES:
-            raise MailboxConflict("User delegation exceeds the bounded mailbox response; shorten the source instruction or message")
+    # Reject before commit if the complete message cannot fit in a bounded read.
+    # Preserve all attested source constraints; never truncate or downgrade them.
+    projected = {**message, "read_id": "x" * 240, "read_at": "x" * 64}
+    try:
+        size = len(json.dumps(projected, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise MailboxConflict("Mailbox message must be valid UTF-8") from exc
+    if size + 8192 > MAX_PAGE_BYTES:
+        raise MailboxConflict("Message and user delegation exceed the bounded mailbox response")
     return message
 
 
@@ -299,8 +308,10 @@ def read_sender(connection: sqlite3.Connection, *, target_session_id: str, sourc
         page = connection.execute("SELECT * FROM chat_mailbox_read_pages WHERE read_id=? AND after_seq=?",
                                   (batch["id"], after_seq)).fetchone()
     ids = json.loads(page["message_ids_json"])
-    messages, _ = _page(connection, clause + " AND m.message_id IN (SELECT value FROM json_each(?))",
-                         [*args, json.dumps(ids)], limit) if ids else ([], False)
+    messages, overflow = _page(connection, clause + " AND m.message_id IN (SELECT value FROM json_each(?))",
+                              [*args, json.dumps(ids)], limit) if ids else ([], False)
+    if overflow:
+        raise MailboxConflict("Stored mailbox read page exceeds the bounded response; retry was not truncated")
     return {"read_id": batch["id"], "snapshot_seq": batch["snapshot_seq"], "messages": messages,
             "next_after_seq": page["end_seq"] if page["has_more"] else None,
             "has_more": bool(page["has_more"]), "unavailable_count": len(ids) - len(messages), "replayed": replayed}
@@ -366,3 +377,94 @@ def mark_read_event_published(connection: sqlite3.Connection, message_id: str) -
     return connection.execute("""UPDATE chat_mailbox_messages SET read_event_published=1
         WHERE message_id=? AND read_at IS NOT NULL AND read_event_published=0""",
         (_identifier(message_id),)).rowcount == 1
+
+
+def claim_wake(connection: sqlite3.Connection, target_session_id: str,
+               allowed_pair_ids: Iterable[str], *, now: str) -> dict | None:
+    """Reserve one authorized unread cutoff; the caller must separately prove idle.
+
+    A wake is an execution attempt, not a read receipt. New arrivals can replace
+    an admitted attempt only when the runtime has again proved the chat idle.
+    """
+    _transaction(connection)
+    clause, args = _scope(target_session_id, None, allowed_pair_ids)
+    prior = connection.execute("SELECT * FROM chat_mailbox_wakes WHERE target_session_id=?",
+                               (target_session_id,)).fetchone()
+    if prior is not None and prior["state"] == "reserved":
+        return None
+    cutoff = max(prior["last_attempt_seq"], prior["suppressed_seq"]) if prior else 0
+    through_seq = connection.execute(f"""SELECT COALESCE(MAX(m.mailbox_seq),0) FROM {_JOIN}
+        WHERE {clause} AND m.read_at IS NULL AND m.mailbox_seq>?""", (*args, cutoff)).fetchone()[0]
+    if not through_seq:
+        return None
+    claim_id = "mailwake_" + uuid.uuid4().hex
+    connection.execute("""INSERT INTO chat_mailbox_wakes
+        (target_session_id,claim_id,through_seq,state,updated_at) VALUES(?,?,?,'reserved',?)
+        ON CONFLICT(target_session_id) DO UPDATE SET claim_id=excluded.claim_id,
+        through_seq=excluded.through_seq,state='reserved',run_id=NULL,updated_at=excluded.updated_at""",
+        (target_session_id, claim_id, through_seq, now))
+    return dict(connection.execute("SELECT * FROM chat_mailbox_wakes WHERE target_session_id=?",
+                                   (target_session_id,)).fetchone())
+
+
+def admit_wake(connection: sqlite3.Connection, target_session_id: str, claim_id: str,
+               run_id: str, allowed_pair_ids: Iterable[str], *, now: str) -> bool:
+    """Consume one reservation before provider launch, retaining ambiguous attempts.
+
+    Current route permission and unread state are rechecked within the claimed
+    cutoff. Even an identical repeated admission returns False: it is not a
+    second authorization to launch the provider.
+    """
+    _transaction(connection)
+    clause, args = _scope(target_session_id, None, allowed_pair_ids)
+    _identifier(claim_id)
+    _identifier(run_id)
+    claim = connection.execute("""SELECT * FROM chat_mailbox_wakes
+        WHERE target_session_id=? AND claim_id=? AND state='reserved'""",
+        (target_session_id, claim_id)).fetchone()
+    if claim is None:
+        return False
+    eligible = connection.execute(f"""SELECT 1 FROM {_JOIN} WHERE {clause}
+        AND m.read_at IS NULL AND m.mailbox_seq>? AND m.mailbox_seq<=? LIMIT 1""",
+        (*args, max(claim["last_attempt_seq"], claim["suppressed_seq"]), claim["through_seq"])).fetchone()
+    if eligible is None:
+        return False
+    return connection.execute("""UPDATE chat_mailbox_wakes SET state='admitted',run_id=?,
+        last_attempt_seq=MAX(last_attempt_seq,through_seq),updated_at=?
+        WHERE target_session_id=? AND claim_id=? AND state='reserved'""",
+        (run_id, now, target_session_id, claim_id)).rowcount == 1
+
+
+def release_wake(connection: sqlite3.Connection, target_session_id: str, claim_id: str) -> bool:
+    """Release only a known unlaunched reservation, never an admitted attempt."""
+    _transaction(connection)
+    return connection.execute("""UPDATE chat_mailbox_wakes
+        SET claim_id=NULL,through_seq=0,state=NULL,run_id=NULL
+        WHERE target_session_id=? AND claim_id=? AND state='reserved'""",
+        (_identifier(target_session_id), _identifier(claim_id))).rowcount == 1
+
+
+def suppress_wake(connection: sqlite3.Connection, target_session_id: str, *, now: str) -> int:
+    """Stop suppresses current unread mail, without reading it or future arrivals."""
+    _transaction(connection)
+    target_session_id = _identifier(target_session_id)
+    through_seq = connection.execute(f"""SELECT COALESCE(MAX(m.mailbox_seq),0) FROM {_JOIN}
+        WHERE {_VALID} AND m.target_session_id=? AND m.read_at IS NULL""",
+        (target_session_id,)).fetchone()[0]
+    connection.execute("""INSERT INTO chat_mailbox_wakes
+        (target_session_id,suppressed_seq,updated_at) VALUES(?,?,?)
+        ON CONFLICT(target_session_id) DO UPDATE
+        SET suppressed_seq=MAX(suppressed_seq,excluded.suppressed_seq),updated_at=excluded.updated_at""",
+        (target_session_id, through_seq, now))
+    connection.execute("""UPDATE chat_mailbox_wakes
+        SET claim_id=NULL,through_seq=0,state=NULL,run_id=NULL
+        WHERE target_session_id=? AND state='reserved'""", (target_session_id,))
+    return connection.execute("SELECT suppressed_seq FROM chat_mailbox_wakes WHERE target_session_id=?",
+                              (target_session_id,)).fetchone()[0]
+
+
+def recover_wakes(connection: sqlite3.Connection) -> int:
+    """Startup only: no provider may launch before its reservation is admitted."""
+    _transaction(connection)
+    return connection.execute("""UPDATE chat_mailbox_wakes
+        SET claim_id=NULL,through_seq=0,state=NULL,run_id=NULL WHERE state='reserved'""").rowcount

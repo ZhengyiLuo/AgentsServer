@@ -74,3 +74,60 @@ unrelated or ambiguous header fails proof. Original transcripts and stored
 events are not rewritten. The bounded repair cache is prepared on demand and
 does not add polling. Runtime cursor identities are distinct from human text,
 so a later identical human quotation cannot be consumed as a duplicate.
+
+## Native assistant replay equivalence
+
+Native Codex delivery removes leading emoji and shortcode decorations from
+assistant lines. The history source retains those decorations. A replay may
+therefore match the native-cleaned assistant body only when the exact public
+provider item ID also matches, within the already-proven provider thread and
+completed native turn. This applies both before importing new history and when
+projecting an already-imported duplicate.
+
+The original source digest, complete body, timestamps and checkpoint remain the
+proof boundary. No user text is normalized, and missing or conflicting item IDs,
+substantive body changes, private reasoning and truncated records do not gain
+this fallback. The original native event retains its scheduled-job ownership;
+only its proven imported replay is suppressed. Stored transcripts are unchanged,
+and this adds no polling or per-event filesystem reads.
+
+## Large native histories and incomplete proof
+
+Native-replay proof no longer rejects a chat merely because its event ledger
+exceeds 32 MiB or its Codex rollout exceeds 96 MiB. A Codex-local reader streams
+one pinned regular-file snapshot, retaining compact public identities and body
+hashes rather than tool output or full native messages. Source hashing stops at
+the newest checkpoint needed by the requested imported rows; later source bytes
+cannot retroactively change that frozen import. Relevant source messages retain
+the same exact timestamp, public item/turn identity, digest, and completed native
+owner requirements. Unrelated tool/private records are not retained as proof.
+
+This specifically covers cron prompts and silent mailbox-wake inputs replayed by
+provider history. The original native cron event keeps its `purpose`/`job_id`;
+only its proven duplicate becomes a silent imported boundary. A wake requires
+the original server-generated wake identity and full input hash. The provider's
+`user.text` label alone does not mean a server-authored cron/wake was a new human
+message. Genuine same-text input in an unrelated turn remains visible.
+
+The reader still bounds individual records (4 MiB), retained proof keys/targets,
+and elapsed work (30 seconds by default). Callers can supply a cooperative
+cancellation callback or an absolute monotonic deadline. Regular-file identity,
+size and modification time must remain unchanged throughout each read; altered,
+malformed, unavailable or incomplete evidence cannot produce a partial proof.
+These changes are confined to native Codex replay proof; the separate legacy
+goal/Claude readers and their budgets are unchanged.
+
+`CodexNativeHistoryProofUnavailable` distinguishes incomplete work from a
+completed negative result. Import callers must defer the whole batch without
+advancing its durable cursor when this is raised, rather than persisting the
+unverified items as new human text. Failed preparation is not cached as a
+successful empty proof. Preparation belongs to an explicit background history
+worker; event projection remains memory-only, with no polling or new per-event
+file reads. Stored user messages and provider transcripts are never rewritten.
+
+Focused regression coverage in `test_codex_native_history_repair.py` writes real
+tool-heavy fixtures larger than the incident's 48 MB ledger and 213 MB rollout,
+checks both new-import filtering and old cron/wake projection, and preserves a
+genuine identical user message. It also covers cancellation, work/key-budget
+exhaustion, concurrent source/ledger mutation, malformed sequence, unchanged
+original ownership, and a later source tail outside the frozen checkpoint.

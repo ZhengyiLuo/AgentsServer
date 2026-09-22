@@ -94,12 +94,13 @@ class AgentsDockChatsCLITests(unittest.TestCase):
         with patch.object(agentsdock_chats, "authority", return_value="capability"), \
                 patch.object(agentsdock_chats, "get_json", return_value={"routes": [
                     {"route_id": route, "available": True, "mode": "async_route_v1"}]}):
-            for receipt in (base, mailbox, *[{**mailbox, "state": state, "duplicate": True}
+            for receipt in (base, mailbox, {**mailbox, "wake_policy": "idle_only"}, *[{**mailbox, "state": state, "duplicate": True}
                                            for state in ("read", "cancelled", "deleted")]):
                 with patch.object(agentsdock_chats, "post_json", return_value=receipt):
                     self.assertEqual(args.handler(args), receipt)
             for receipt in ({**mailbox, "execution_started": True}, {**base, "delivery_mode": "mailbox"},
-                            {**mailbox, "state": "running"}):
+                            {**mailbox, "state": "running"}, {**mailbox, "wake_policy": "always"},
+                            {**base, "wake_policy": "idle_only"}, {**mailbox, "unexpected": "field"}):
                 with patch.object(agentsdock_chats, "post_json", return_value=receipt), self.assertRaises(agentsdock_chats.ChatsCLIError):
                     args.handler(args)
 

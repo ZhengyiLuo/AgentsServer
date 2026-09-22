@@ -46,6 +46,7 @@ class MailPipelineTLSAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         self.enterContext(mock.patch.object(tls, "TEAM", self.team))
         self.enterContext(mock.patch.object(tls, "HUB", self.hub.hub_id))
         self.tls = tls.PeerMailHintTLSAcceptanceTests()
+        self.tls.requested_scopes = getattr(self, "requested_scopes", ["teamspace.read"])
 
         def subscribe(peer, previous):
             lease = self.adapter.subscribe_team_mail_hints(peer, previous)
@@ -84,8 +85,8 @@ class MailPipelineTLSAcceptanceTests(unittest.IsolatedAsyncioTestCase):
             "pairing_id": self.tls.peer.pairing_id, "pairing_request_id": str(uuid.uuid4()),
             "poll_token": "isolated-unused-pairing-token", "peer_id": self.tls.peer.peer_id,
             "host_server_identity": "server_tls_fixture", "transcript_hash": "isolated-approved-binding",
-            "sas_json": "[]", "requested_scopes_json": '["teamspace.read"]',
-            "scopes_json": '["teamspace.read"]',
+            "sas_json": "[]", "requested_scopes_json": json.dumps(self.tls.requested_scopes),
+            "scopes_json": json.dumps(self.tls.requested_scopes),
             "certificate_fingerprint": self.tls.peer.certificate_fingerprint,
             "created_at": int(time.time()), "updated_at": int(time.time())}
         with closing(self.client._connect()) as connection:

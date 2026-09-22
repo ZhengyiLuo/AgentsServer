@@ -19,6 +19,8 @@ The desktop and mobile client is also open source:
 - Use Claude Code, Codex, Cursor, or OpenCode where supported by your server
   release, client, and installed CLI.
 - Run independent servers on the same machine.
+- Ask temporary [side questions](docs/NATIVE_SIDE_CHAT.md) in Codex or Claude chats.
+- Share [interactive chats](docs/INTERACTIVE_CHAT_SHARES.md) with scoped access.
 
 ## Get started
 

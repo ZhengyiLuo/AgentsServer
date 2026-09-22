@@ -63,10 +63,13 @@ class CompletedPrefixForkTests(unittest.IsolatedAsyncioTestCase):
         parent = {"id": "parent", "backend": "codex", "cwd": "/tmp", "codex_thread_id": "parent-thread"}
         with patch.object(server.STORE, "sessions", {"parent": parent}), patch.object(
             server, "fork_codex_thread", new_callable=AsyncMock, side_effect=RuntimeError("unsupported cutoff"),
-        ) as fork, patch.object(server.STORE, "create", new_callable=AsyncMock) as create, patch.object(server, "build_fork_memory") as memory:
+        ) as fork, patch.object(server.STORE, "create", new_callable=AsyncMock) as create, patch.object(server, "build_fork_memory") as memory, patch.object(server.logger, "warning") as warning:
             with self.assertRaises(server.HTTPException) as raised:
                 await server._fork_session_locked("parent", server.ForkSessionRequest(), completed_snapshot=self.events()[:3])
         self.assertEqual(raised.exception.status_code, 409)
+        self.assertNotIn("unsupported cutoff", raised.exception.detail)
+        warning.assert_called_once()
+        self.assertNotIn("unsupported cutoff", str(warning.call_args))
         self.assertEqual(fork.await_args.kwargs, {"last_turn_id": "done-turn"})
         create.assert_not_awaited()
         memory.assert_not_called()
@@ -109,6 +112,36 @@ class CompletedPrefixForkTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await server.fork_codex_thread("parent-thread", {"cwd": "/tmp", "backend": "codex"}, last_turn_id="done-turn"), "child-thread")
         self.assertEqual(manager.fork_thread.await_args.kwargs, {"last_turn_id": "done-turn"})
         manager.list_turns.assert_awaited_once_with("child-thread", limit=1, items_view="summary", sort_direction="desc")
+
+    async def test_codex_native_fork_accepts_canonicalized_workspace(self):
+        # Native Codex resolves the submitted symlink before returning cwd.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            alias = root / "alias"
+            alias.symlink_to(workspace, target_is_directory=True)
+            different = root / "different"
+            different.mkdir()
+            for returned_cwd in (workspace.resolve(), different.resolve()):
+                with self.subTest(returned_cwd=returned_cwd):
+                    manager = Mock(fork_thread=AsyncMock(return_value="child-thread"), read_thread=AsyncMock(return_value={
+                        "forkedFromId": "parent-thread", "cwd": str(returned_cwd),
+                    }), list_turns=AsyncMock(return_value=[{"id": "done-turn", "status": "completed"}]))
+                    with patch.object(server, "codex_app_server_manager", new_callable=AsyncMock, return_value=manager), patch.object(
+                        server, "persist_abandoned_fork_provider_thread", new_callable=AsyncMock, return_value=True,
+                    ), patch.object(server, "touch_codex_app_server_thread", new_callable=AsyncMock), patch.object(
+                        server, "retire_or_record_failed_codex_fork", new_callable=AsyncMock, return_value=True,
+                    ) as cleanup:
+                        if returned_cwd == workspace.resolve():
+                            self.assertEqual(await server.fork_codex_thread("parent-thread", {"cwd": str(alias), "backend": "codex"}, last_turn_id="done-turn"), "child-thread")
+                            manager.list_turns.assert_awaited_once_with("child-thread", limit=1, items_view="summary", sort_direction="desc")
+                            cleanup.assert_not_awaited()
+                        else:
+                            with self.assertRaisesRegex(server.CodexAppServerProtocolError, "working directory"):
+                                await server.fork_codex_thread("parent-thread", {"cwd": str(alias), "backend": "codex"}, last_turn_id="done-turn")
+                            cleanup.assert_awaited_once_with("child-thread", manager=manager)
+                            manager.list_turns.assert_not_awaited()
 
     def test_claude_missing_deferred_snapshot_never_launches_fresh(self):
         with self.assertRaisesRegex(ValueError, "refusing an empty resume"):

@@ -12,6 +12,7 @@ import json
 import os
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -1108,11 +1109,11 @@ class ClaudeHistoryMessageIdentityTests(unittest.TestCase):
                 self.assertEqual(self.cursor([external]), ([external], 1))
                 self.assertEqual(self.initial([user("Publish it"), external]), [external])
 
-    def test_legacy_cleaning_fallback_consumes_only_one_occurrence(self):
+    def test_missing_live_identity_does_not_hide_decorated_occurrences(self):
         self.live(identity=False)
         first, later = self.source(), self.source(message_id=self.later_id)
-        self.assertEqual(self.cursor([first, later]), ([later], len(self.events)))
-        self.assertEqual(self.initial([user("Publish it"), first, later]), [later])
+        self.assertEqual(self.cursor([first, later]), ([first, later], 1))
+        self.assertEqual(self.initial([user("Publish it"), first, later]), [first, later])
 
     def test_identityless_source_cannot_consume_known_live_message_credit(self):
         self.live()
@@ -1277,6 +1278,23 @@ class DurableHistoryCursorTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tempdir.cleanup)
+        # Native history proof reads the durable ledger directly, not the
+        # read_events mock. Keep that real evidence inside this test's state.
+        self.enterContext(patch.object(
+            agent_server, "events_path",
+            side_effect=lambda session_id: Path(self.tempdir.name) / f"{session_id}-events.jsonl",
+        ))
+
+    @staticmethod
+    def codex_provider_id(label: str) -> str:
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"history-cursor-fixture:{label}"))
+
+    @staticmethod
+    def write_event_ledger(path: Path, events: list[dict]) -> None:
+        path.write_text(
+            "".join(json.dumps(event, separators=(",", ":")) + "\n" for event in events),
+            encoding="utf-8",
+        )
 
     @staticmethod
     def timeline_event(seq: int, item: dict[str, str]) -> dict:
@@ -1317,13 +1335,20 @@ class DurableHistoryCursorTests(unittest.IsolatedAsyncioTestCase):
                 events.append(event)
                 committed.append(event)
                 next_seq += 1
+            DurableHistoryCursorTests.write_event_ledger(agent_server.events_path(_session_id), events)
             return committed
 
         return append
 
     @staticmethod
     def last_seq(events: list[dict]):
-        return lambda _path: int(events[-1]["seq"]) if events else 0
+        def read(path):
+            # Tests may add local events between sync passes. Mirror those too
+            # before the real native-proof filter consumes the ledger.
+            DurableHistoryCursorTests.write_event_ledger(path, events)
+            return int(events[-1]["seq"]) if events else 0
+
+        return read
 
     async def test_full_window_duplicate_pair_append_survives_rollover(self) -> None:
         maximum = agent_server.normalized_history_import_limit(None)
@@ -1356,7 +1381,10 @@ class DurableHistoryCursorTests(unittest.IsolatedAsyncioTestCase):
                 sess = {
                     "id": f"rollover-{backend}",
                     "backend": backend,
-                    provider_field: f"provider-{backend}",
+                    provider_field: (
+                        self.codex_provider_id("rollover")
+                        if backend == agent_server.BACKEND_CODEX else f"provider-{backend}"
+                    ),
                 }
                 live = {sess["id"]: dict(sess)}
                 events = [
@@ -1422,7 +1450,7 @@ class DurableHistoryCursorTests(unittest.IsolatedAsyncioTestCase):
         sess = {
             "id": "overflow",
             "backend": agent_server.BACKEND_CODEX,
-            "codex_thread_id": "overflow-thread",
+            "codex_thread_id": self.codex_provider_id("overflow"),
         }
         live = {sess["id"]: dict(sess)}
         events: list[dict] = []
@@ -1500,7 +1528,7 @@ class DurableHistoryCursorTests(unittest.IsolatedAsyncioTestCase):
         sess = {
             "id": "interleaved-passes",
             "backend": agent_server.BACKEND_CODEX,
-            "codex_thread_id": "interleaved-passes-thread",
+            "codex_thread_id": self.codex_provider_id("interleaved-passes"),
         }
         live = {sess["id"]: dict(sess)}
         events: list[dict] = []
@@ -1597,7 +1625,7 @@ class DurableHistoryCursorTests(unittest.IsolatedAsyncioTestCase):
         sess = {
             "id": "partial",
             "backend": agent_server.BACKEND_CODEX,
-            "codex_thread_id": "partial-thread",
+            "codex_thread_id": self.codex_provider_id("partial"),
         }
         live = {sess["id"]: dict(sess)}
         events: list[dict] = []
@@ -1651,7 +1679,7 @@ class DurableHistoryCursorTests(unittest.IsolatedAsyncioTestCase):
         sess = {
             "id": "replace",
             "backend": agent_server.BACKEND_CODEX,
-            "codex_thread_id": "replace-thread",
+            "codex_thread_id": self.codex_provider_id("replace"),
         }
         live = {sess["id"]: dict(sess)}
         events = [self.timeline_event(1, user("existing"))]
@@ -1714,7 +1742,7 @@ class DurableHistoryCursorTests(unittest.IsolatedAsyncioTestCase):
         sess = {
             "id": "divergent",
             "backend": agent_server.BACKEND_CODEX,
-            "codex_thread_id": "divergent-thread",
+            "codex_thread_id": self.codex_provider_id("divergent"),
         }
         live = {sess["id"]: dict(sess)}
         events = [self.timeline_event(1, user("existing prefix"))]
@@ -1771,7 +1799,7 @@ class DurableHistoryCursorTests(unittest.IsolatedAsyncioTestCase):
         sess = {
             "id": "mutated",
             "backend": agent_server.BACKEND_CODEX,
-            "codex_thread_id": "mutated-thread",
+            "codex_thread_id": self.codex_provider_id("mutated"),
         }
         live = {sess["id"]: dict(sess)}
         events = [self.timeline_event(1, user("existing"))]
@@ -1827,7 +1855,7 @@ class DurableHistoryCursorTests(unittest.IsolatedAsyncioTestCase):
         sess = {
             "id": "cross-format",
             "backend": agent_server.BACKEND_CODEX,
-            "codex_thread_id": "cross-format-thread",
+            "codex_thread_id": self.codex_provider_id("cross-format"),
         }
         response_item = {
             "type": "response_item",
@@ -1919,7 +1947,7 @@ class DurableHistoryCursorTests(unittest.IsolatedAsyncioTestCase):
         sess = {
             "id": "raw-checkpoint",
             "backend": agent_server.BACKEND_CODEX,
-            "codex_thread_id": "raw-checkpoint-thread",
+            "codex_thread_id": self.codex_provider_id("raw-checkpoint"),
         }
         with patch.object(
             agent_server, "provider_history_path", return_value=transcript
@@ -1983,7 +2011,7 @@ class DurableHistoryCursorTests(unittest.IsolatedAsyncioTestCase):
         sess = {
             "id": "truncated-checkpoints",
             "backend": agent_server.BACKEND_CODEX,
-            "codex_thread_id": "truncated-checkpoint-thread",
+            "codex_thread_id": self.codex_provider_id("truncated-checkpoint"),
         }
         events = [
             {"seq": index, "type": "assistant_text", "text": f"old-{index}"}
@@ -2006,7 +2034,7 @@ class DurableHistoryCursorTests(unittest.IsolatedAsyncioTestCase):
         sess = {
             "id": "late-overflow",
             "backend": agent_server.BACKEND_CODEX,
-            "codex_thread_id": "late-overflow-thread",
+            "codex_thread_id": self.codex_provider_id("late-overflow"),
         }
         with patch.object(
             agent_server, "provider_history_path", return_value=transcript
@@ -2074,7 +2102,7 @@ class DurableHistoryCursorTests(unittest.IsolatedAsyncioTestCase):
         sess = {
             "id": "crash",
             "backend": agent_server.BACKEND_CODEX,
-            "codex_thread_id": "crash-thread",
+            "codex_thread_id": self.codex_provider_id("crash"),
         }
         live = {sess["id"]: dict(sess)}
         events = [self.timeline_event(1, user("existing"))]
@@ -2138,10 +2166,11 @@ class DurableHistoryCursorTests(unittest.IsolatedAsyncioTestCase):
         transcript = Path(self.tempdir.name) / "ordered-crash.jsonl"
         event_path = Path(self.tempdir.name) / "ordered-crash-events.jsonl"
         transcript.write_text("", encoding="utf-8")
+        event_path.write_text("", encoding="utf-8")
         sess = {
             "id": "ordered-crash",
             "backend": agent_server.BACKEND_CODEX,
-            "codex_thread_id": "ordered-crash-thread",
+            "codex_thread_id": self.codex_provider_id("ordered-crash"),
         }
         live = {sess["id"]: dict(sess)}
         events: list[dict] = []
@@ -2240,7 +2269,7 @@ class DurableHistoryCursorTests(unittest.IsolatedAsyncioTestCase):
         sess = {
             "id": "cancel-save",
             "backend": agent_server.BACKEND_CODEX,
-            "codex_thread_id": "cancel-save-thread",
+            "codex_thread_id": self.codex_provider_id("cancel-save"),
         }
         live = {sess["id"]: dict(sess)}
         events = [self.timeline_event(1, user("existing"))]

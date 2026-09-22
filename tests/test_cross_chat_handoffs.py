@@ -1379,7 +1379,9 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             {"queued_id": "delivery", "purpose": "cross_chat_handoff_delivery"},
             {"queued_id": "normal", "purpose": None, "prompt": "Send this now"},
         ])
-        with patch.object(agent_server, "managed_server_update_admission_blocker", return_value=None), \
+        # The mocked waiter cannot clear its steering fence after admission.
+        with patch.object(agent_server, "STEERING_SESSIONS", set()), \
+                patch.object(agent_server, "managed_server_update_admission_blocker", return_value=None), \
                 patch.object(agent_server, "stop_turn", new_callable=AsyncMock, return_value={"stopped": False}), \
                 patch.object(agent_server, "append_durable_event", new_callable=AsyncMock), \
                 patch.object(agent_server, "schedule_steered_turn_slot_waiter"):
@@ -2526,7 +2528,10 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
                     queue_if_busy=False,
                 )
 
-        ensure_runtime.assert_awaited_once_with(agent_server.BACKEND_CURSOR)
+        ensure_runtime.assert_awaited_once_with(
+            agent_server.BACKEND_CURSOR,
+            session=agent_server.STORE.sessions["target"],
+        )
         self.assertNotIn("target", agent_server.BUSY_SESSIONS)
 
     def test_target_delivery_capabilities_require_native_or_ready_runtimes(self) -> None:

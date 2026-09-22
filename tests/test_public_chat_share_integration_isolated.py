@@ -17,6 +17,7 @@ from starlette.requests import Request
 
 from public_chat_share_routes import create_public_chat_share_router, redact_public_share_path
 from public_chat_transcript import PublicTranscriptError, make_public_event_projector, read_public_transcript
+from test_shared_chat_video_native_integration_isolated import install_media_glue, register_synthetic_video
 
 
 SOURCE = (Path(__file__).resolve().parents[1] / "agent_server.py")
@@ -45,6 +46,7 @@ def load_glue():
     future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
     module = ast.fix_missing_locations(ast.Module(body=[future, *selected], type_ignores=[]))
     exec(compile(module, str(SOURCE), "exec"), namespace)
+    install_media_glue(namespace, tree)
     return namespace, tree
 
 
@@ -65,6 +67,7 @@ class PublicChatShareIntegrationTests(unittest.TestCase):
         self.strip = Mock(side_effect=lambda text, **kwargs: text)
         self.glue.update({
             "AGENT_TOKEN": "native-share-admin-only", "STATE_DIR": self.root,
+            "FILES_ROOT": self.root / "files",
             "STORE": SimpleNamespace(sessions={"chat-one": {"id": "chat-one"}}),
             "DELETING_SESSIONS": set(), "DELETED_SESSION_TOMBSTONES": set(),
             "is_client_visible_event": lambda event: True,
@@ -117,6 +120,29 @@ class PublicChatShareIntegrationTests(unittest.TestCase):
         with self.assertRaises(PublicTranscriptError):
             self.glue["load_public_chat_share_transcript"]("../other", None)
 
+    def test_durable_adapter_replaces_raw_media_with_only_published_exact_chat_videos(self):
+        own = register_synthetic_video(self.glue["FILES_ROOT"])
+        other = register_synthetic_video(self.glue["FILES_ROOT"], "e", "chat-two")
+        fake = {"id": "video_ZmFrZQ." + "a" * 64, "filename": "fake.mp4", "content_type": "video/mp4", "size": 1}
+        events = [
+            {"type": "turn_started", "prompt": "Sent", "file_ids": [own], "shared_videos": [fake]},
+            {"type": "artifact_created", "artifact": {"id": own, "path": "/private/owner"}},
+            {"type": "turn_started", "prompt": "Other", "file_ids": [other]},
+            {"type": "assistant_text", "text": "Visible", "shared_videos": [fake]},
+            {"type": "file_uploaded", "file": {"id": own}},
+            {"type": "turn_queued", "prompt": "Unsent", "file_ids": [own]},
+        ]
+        self.events.write_text("".join(json.dumps({**event, "session_id": "chat-one"}) + "\n" for event in events))
+        result = self.glue["load_public_chat_share_transcript"]("chat-one", None)
+        messages = result["messages"]
+        self.assertEqual([message["text"] for message in messages], ["Sent", "", "Other", "Visible"])
+        self.assertEqual(messages[0]["videos"], messages[1]["videos"])
+        self.assertNotEqual(messages[0]["videos"][0]["id"], fake["id"])
+        self.assertNotIn("videos", messages[2])
+        self.assertNotIn("videos", messages[3])
+        self.assertNotIn("/private/owner", json.dumps(messages))
+        self.assertNotIn("file_ids", json.dumps(messages))
+
     def test_linked_session_directory_is_rejected(self):
         other = self.root / "other"
         other.mkdir()
@@ -144,13 +170,13 @@ class PublicChatShareIntegrationTests(unittest.TestCase):
             preview = client.post(base + "/preview", json={}, headers=headers).json()
             created = client.post(base, json={"confirmed_public": True, "through_bytes": preview["through_bytes"], "digest": preview["digest"]}, headers=headers)
             self.assertEqual(created.status_code, 201, created.text)
-            self.assertIsNone(created.json()["url"])
-            view = client.get(created.json()["path"])
+            self.assertEqual(created.json()["url"], "http://testserver" + created.json()["path"])
+            view = client.get(created.json()["token_url"])
             self.assertEqual(view.status_code, 200)
             self.assertIn("Reviewed text", view.text)
             self.assertNotIn("chat-one", view.text)
             self.assertEqual(client.delete(base + "/" + created.json()["share_id"], headers=headers).status_code, 200)
-            self.assertEqual(client.get(created.json()["path"]).status_code, 404)
+            self.assertEqual(client.get(created.json()["token_url"]).status_code, 404)
 
     def test_server_log_redactor_removes_public_bearer_and_query_credentials(self):
         token = "A" * 43

@@ -7,6 +7,7 @@ import agent_server
 
 class FakeCodexAppServerManager:
     def __init__(self, *, loaded: set[str] | None = None) -> None:
+        self.generation = 1
         self.loaded = set(loaded or set())
         self.active: dict[str, object] = {}
         self.start_calls: list[dict[str, object]] = []
@@ -130,8 +131,8 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
                     session,
                 )
 
-        # v10 migrates resumed threads onto the out-of-band provider tool.
-        self.assertEqual(agent_server.CODEX_THREAD_POLICY_VERSION, "10")
+        # v11 scopes messaging guidance to the out-of-band provider tool.
+        self.assertEqual(agent_server.CODEX_THREAD_POLICY_VERSION, "11")
         self.assertNotEqual(current_hash, previous_hash)
 
     def test_claude_policy_has_the_same_retry_and_context_hygiene_rules(self) -> None:
@@ -280,12 +281,64 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
             [{"type": "input_text", "text": resume_policy}],
         )
 
+    async def test_saved_subagent_limit_waits_for_reload_and_clear_inherits_configuration(self) -> None:
+        session = self.session(session_id="thread-existing", codex_thread_id="thread-existing")
+        manager = FakeCodexAppServerManager(loaded={"thread-existing"})
+        with patch.object(agent_server, "codex_user_developer_instructions", return_value=""), patch.object(
+            agent_server, "read_codex_thread_config_overrides", return_value={}
+        ), patch.object(agent_server, "touch_codex_app_server_thread", AsyncMock()):
+            session["codex_instruction_hash"] = agent_server.codex_thread_instruction_hash("chat-1", session)
+            session["subagent_limit"] = 3
+            await agent_server.ensure_codex_app_server_thread(manager, "chat-1", session, "/repo")
+            self.assertEqual(manager.resume_calls, [])
+            self.assertEqual(manager.unsubscribe_calls, [])
+            manager.loaded.clear()  # The existing explicit Reload provider action.
+            await agent_server.ensure_codex_app_server_thread(manager, "chat-1", session, "/repo")
+            self.assertEqual(manager.resume_calls[-1][1]["config"]["agents.max_concurrent_threads_per_session"], 3)
+            session["subagent_limit"] = None
+            manager.loaded.clear()
+            await agent_server.ensure_codex_app_server_thread(manager, "chat-1", session, "/repo")
+            self.assertNotIn("agents.max_concurrent_threads_per_session", manager.resume_calls[-1][1]["config"])
+            self.assertEqual(manager.inject_calls, [])
+
+    async def test_null_saved_on_same_session_while_resume_awaits_keeps_real_applied_cap_marker(self) -> None:
+        session = self.session(session_id="thread-existing", codex_thread_id="thread-existing", subagent_limit=3)
+        manager = FakeCodexAppServerManager()
+        resume_started, release_resume = asyncio.Event(), asyncio.Event()
+        original_resume = manager.resume_thread
+        async def resume(thread_id, params):
+            self.assertEqual(params["config"]["agents.max_concurrent_threads_per_session"], 3)
+            resume_started.set()
+            await release_resume.wait()
+            return await original_resume(thread_id, params)
+        manager.resume_thread = resume
+        with patch.object(agent_server, "codex_user_developer_instructions", return_value=""), patch.object(
+            agent_server, "read_codex_thread_config_overrides", return_value={}
+        ), patch.object(agent_server, "touch_codex_app_server_thread", AsyncMock()), patch.object(
+            agent_server.STORE, "sessions", {"chat-1": session}
+        ), patch.object(agent_server.STORE, "_lock", asyncio.Lock()), patch.object(agent_server.STORE, "save", AsyncMock()):
+            session["codex_instruction_hash"] = agent_server.codex_thread_instruction_hash("chat-1", session)
+            task = asyncio.create_task(agent_server.ensure_codex_app_server_thread(manager, "chat-1", session, "/repo"))
+            try:
+                await asyncio.wait_for(resume_started.wait(), 2)
+                session["subagent_limit"] = None  # PATCH mutates this exact STORE.sessions object.
+                release_resume.set()
+                await asyncio.wait_for(task, 2)
+            finally:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        self.assertIsNone(session["subagent_limit"])
+        self.assertEqual(session["_codex_subagent_limit_applied"]["limit"], 3)
+        self.assertEqual(session["_codex_subagent_limit_reset_pending"], session["_codex_subagent_limit_applied"]["process"])
+
     async def test_native_fork_is_rebound_to_child_chat_policy(self) -> None:
         manager = FakeCodexAppServerManager(loaded={"thread-fork"})
         child = self.session(
             id="chat-child",
             session_id=None,
             codex_thread_id=None,
+            subagent_limit=3,
         )
         save_provider_session = AsyncMock()
         with patch.object(
@@ -312,6 +365,12 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
             agent_server.STORE,
             "save_provider_session",
             save_provider_session,
+        ), patch.object(
+            agent_server.STORE, "sessions", {"chat-child": child},
+        ), patch.object(
+            agent_server.STORE, "_lock", asyncio.Lock(),
+        ), patch.object(
+            agent_server.STORE, "save", AsyncMock(),
         ):
             bound, instruction_hash = await agent_server.bind_forked_codex_thread(
                 "chat-child",
@@ -320,6 +379,8 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(bound, "thread-fork")
+        self.assertEqual(child["_codex_subagent_limit_applied"]["limit"], 3)
+        self.assertEqual(child["_codex_subagent_limit_applied"]["process"][1:], [manager._subagent_limit_instance, manager.generation])
         self.assertEqual(manager.unsubscribe_calls, ["thread-fork"])
         self.assertEqual(len(manager.resume_calls), 1)
         policy = manager.resume_calls[0][1]["developerInstructions"]

@@ -9,12 +9,40 @@ on:
         description: Existing or new release tag matching VERSION (for example v0.1.0)
         required: true
         type: string
+      prepare_only:
+        description: Test, package and sign for manual verification without publishing
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
 
 jobs:
+  test:
+    name: Tests (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+      - name: Lock and test assigned cases
+        run: |
+          uv lock --check
+          ulimit -s 65536
+          PYTHONFAULTHANDLER=1 uv run --python 3.13 python -X faulthandler scripts/run_test_shard.py --index ${{ matrix.shard }} --count 8
   release:
+    needs: test
     runs-on: ubuntu-latest
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
@@ -30,15 +58,6 @@ jobs:
           test "v$(cat VERSION)" = "$RELEASE_TAG"
           test "${RELEASE_TAG#v}" != "$RELEASE_TAG"
           [[ "${RELEASE_TAG#v}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
-      - name: Lock and test
-        run: |
-          uv lock --check
-          ulimit -s 65536
-          for source in tests/test_*.py; do
-            echo "Compiling $source"
-            PYTHONFAULTHANDLER=1 uv run --python 3.13 python -X faulthandler -m py_compile "$source"
-          done
-          PYTHONFAULTHANDLER=1 uv run --python 3.13 python -X faulthandler -m unittest discover -s tests -t . -v -p 'test_*.py'
       - name: Build release assets
         run: |
           rm -rf dist
@@ -54,7 +73,16 @@ jobs:
             -inkey "$RUNNER_TEMP/agents-server-release.pem" \
             -in dist/agents-server-manifest.json \
             -out dist/agents-server-manifest.sig
+      - name: Hold signed assets for manual verification
+        if: github.event_name == 'workflow_dispatch' && inputs.prepare_only
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-release-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
       - name: Publish GitHub release
+        if: github.event_name != 'workflow_dispatch' || !inputs.prepare_only
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -63,7 +91,12 @@ jobs:
           if [[ "${RELEASE_TAG#v}" == *-* ]]; then
             release_args+=(--prerelease)
           fi
+          notes_file="docs/RELEASE_${RELEASE_TAG#v}.md"
+          if [[ -s "$notes_file" ]]; then
+            release_args+=(--notes-file "$notes_file")
+          else
+            release_args+=(--generate-notes)
+          fi
           gh release create "$RELEASE_TAG" dist/* "${release_args[@]}" \
             --title "AgentsServer $RELEASE_TAG" \
-            --target "$GITHUB_SHA" \
-            --generate-notes
+            --target "$GITHUB_SHA"

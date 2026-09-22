@@ -14,8 +14,10 @@ import uuid
 from typing import Any, Callable
 
 from agentsdock_team_hub.mail_hints import MAIL_IDENTIFIER_RE, MailArrival
+from agentsdock_team_hub.notification_hints import NotificationCursor
 
 MAIL_WEBSOCKET_PROTOCOL = "agentsdock.team-mail-hints.v1"
+NOTIFICATION_WEBSOCKET_PROTOCOL = "agentsdock.team-mail-hints.v2"
 _SLOTS = threading.BoundedSemaphore(16)
 
 
@@ -83,11 +85,16 @@ class _MailSocketWriter:
 
 async def serve_team_mail_hints(ws: Any, runtime: Any, *, server_identity: str,
                                 authorized: Callable[[], bool], protocols: list[str]) -> None:
-    await ws.accept(subprotocol=MAIL_WEBSOCKET_PROTOCOL if MAIL_WEBSOCKET_PROTOCOL in protocols else None)
+    protocol = (NOTIFICATION_WEBSOCKET_PROTOCOL if NOTIFICATION_WEBSOCKET_PROTOCOL in protocols
+                else MAIL_WEBSOCKET_PROTOCOL if MAIL_WEBSOCKET_PROTOCOL in protocols else None)
+    version = 2 if protocol == NOTIFICATION_WEBSOCKET_PROTOCOL else 1
+    await ws.accept(subprotocol=protocol)
     if not authorized() or ws.query_params:
         await ws.close(code=4401)
         return
-    if MAIL_WEBSOCKET_PROTOCOL not in protocols or not runtime.team_mail_hint_capability().get("enabled"):
+    capability = (getattr(runtime, "team_notification_hint_capability", lambda: {}) if version == 2
+                  else runtime.team_mail_hint_capability)
+    if protocol is None or not capability().get("enabled"):
         await ws.close(code=4406)
         return
     if not _SLOTS.acquire(blocking=False):
@@ -107,12 +114,13 @@ async def serve_team_mail_hints(ws: Any, runtime: Any, *, server_identity: str,
             raise ValueError("Mail subscription frame is too large")
         request = json.loads(raw)
         if (not isinstance(request, dict) or set(request) != {"version", "team_id", "previous_cursor"}
-                or type(request["version"]) is not int or request["version"] != 1
+                or type(request["version"]) is not int or request["version"] != version
                 or not isinstance(request["team_id"], str) or MAIL_IDENTIFIER_RE.fullmatch(request["team_id"]) is None):
             raise ValueError("Mail subscription frame is invalid")
         if request["previous_cursor"] is not None:
-            previous = MailArrival.from_dict(request["previous_cursor"])
-            if previous.team_id != request["team_id"]:
+            previous = (NotificationCursor.from_dict(request["previous_cursor"]) if version == 2
+                        else MailArrival.from_dict(request["previous_cursor"]))
+            if previous.mailbox[0] != request["team_id"]:
                 await ws.close(code=4403)
                 return
 
@@ -123,7 +131,9 @@ async def serve_team_mail_hints(ws: Any, runtime: Any, *, server_identity: str,
         def run():
             lease = None
             try:
-                lease = runtime.subscribe_team_mail_hints(request["team_id"], request["previous_cursor"])
+                subscriber = (runtime.subscribe_team_notification_hints if version == 2
+                              else runtime.subscribe_team_mail_hints)
+                lease = subscriber(request["team_id"], request["previous_cursor"])
                 with guard:
                     holder["lease"] = lease
                 lease.set_aborter(abort)

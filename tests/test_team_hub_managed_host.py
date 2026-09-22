@@ -21,7 +21,7 @@ from fastapi.testclient import TestClient
 
 import agentsdock_team_hub.cli as team_hub_cli
 from agentsdock_team_hub.cli import main as cli_main
-from agentsdock_team_hub.database import LATEST_SCHEMA_VERSION, MIGRATIONS, _statements
+from agentsdock_team_hub.database import LATEST_SCHEMA_VERSION, MIGRATIONS, _statements, open_database
 from agentsdock_team_hub.service import (
     MANAGED_SERVER_SESSION_SCOPE_KEY,
     create_app,
@@ -733,6 +733,14 @@ sys.exit(10)
             connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             connection.execute("BEGIN IMMEDIATE")
             for trigger in (
+                "team_message_search_insert", "team_message_search_revision", "team_message_search_delete",
+                "team_message_sender_nodes_insert", "team_message_sender_nodes_update", "team_message_sender_nodes_delete",
+                "team_message_sender_principals_insert", "team_message_sender_principals_update", "team_message_sender_principals_delete",
+                "team_bulletin_created",
+                "team_bulletin_revised",
+                "team_bulletin_deleted",
+                "team_bulletin_changes_immutable",
+                "team_bulletin_changes_retained",
                 "team_mail_arrival_on_server_recipient",
                 "team_message_revisions_are_immutable",
                 "team_message_revisions_cannot_be_deleted",
@@ -747,6 +755,8 @@ sys.exit(10)
             ):
                 connection.execute(f"DROP TRIGGER {trigger}")
             for index in (
+                "team_messages_sender_node_order",
+                "team_bulletin_changes_by_team",
                 "team_mail_server_arrival_lookup",
                 "team_messages_parent_order",
                 "team_message_revisions_by_message",
@@ -758,6 +768,8 @@ sys.exit(10)
             ):
                 connection.execute(f"DROP INDEX {index}")
             for table in (
+                "team_message_search", "team_message_sender_nodes", "team_message_sender_principals",
+                "team_bulletin_changes",
                 "team_mail_arrivals",
                 "team_message_revisions",
                 "network_content_deletions",
@@ -797,6 +809,14 @@ sys.exit(10)
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_insert")
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_update")
             for trigger in (
+                "team_message_search_insert", "team_message_search_revision", "team_message_search_delete",
+                "team_message_sender_nodes_insert", "team_message_sender_nodes_update", "team_message_sender_nodes_delete",
+                "team_message_sender_principals_insert", "team_message_sender_principals_update", "team_message_sender_principals_delete",
+                "team_bulletin_created",
+                "team_bulletin_revised",
+                "team_bulletin_deleted",
+                "team_bulletin_changes_immutable",
+                "team_bulletin_changes_retained",
                 "team_mail_arrival_on_server_recipient",
                 "team_message_revisions_are_immutable",
                 "team_message_revisions_cannot_be_deleted",
@@ -808,6 +828,8 @@ sys.exit(10)
             ):
                 connection.execute(f"DROP TRIGGER {trigger}")
             for index in (
+                "team_messages_sender_node_order",
+                "team_bulletin_changes_by_team",
                 "team_mail_server_arrival_lookup",
                 "team_messages_parent_order",
                 "team_message_revisions_by_message",
@@ -819,6 +841,8 @@ sys.exit(10)
             ):
                 connection.execute(f"DROP INDEX {index}")
             for table in (
+                "team_message_search", "team_message_sender_nodes", "team_message_sender_principals",
+                "team_bulletin_changes",
                 "team_mail_arrivals",
                 "team_message_revisions",
                 "network_content_deletions",
@@ -851,6 +875,45 @@ sys.exit(10)
             connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         finally:
             connection.close()
+
+    def test_historical_schema4_schema5_schema21_migrate_once_from_exact_prefix(self) -> None:
+        for version in (4, 5, 21):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as temporary:
+                database = Path(temporary) / "historical.sqlite3"
+                connection = sqlite3.connect(database, isolation_level=None)
+                try:
+                    connection.execute("""CREATE TABLE schema_migrations (
+                        version INTEGER PRIMARY KEY, name TEXT NOT NULL,
+                        sha256 TEXT NOT NULL CHECK(length(sha256)=64), applied_at INTEGER NOT NULL
+                    )""")
+                    connection.execute("BEGIN IMMEDIATE")
+                    for migration in MIGRATIONS[:version]:
+                        for statement in _statements(migration.source):
+                            connection.execute(statement)
+                        connection.execute("INSERT INTO schema_migrations VALUES (?,?,?,1)",
+                            (migration.version, migration.name, migration.sha256))
+                        connection.execute(f"PRAGMA user_version = {migration.version}")
+                    connection.execute("COMMIT")
+                    self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], version)
+                    self.assertEqual(connection.execute(
+                        "SELECT name FROM sqlite_master WHERE name LIKE 'team_bulletin_%'"
+                    ).fetchall(), [])
+                finally:
+                    connection.close()
+                database.chmod(0o600)
+                for opening in range(2):
+                    connection = open_database(database)
+                    try:
+                        self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], LATEST_SCHEMA_VERSION)
+                        self.assertEqual([tuple(row) for row in connection.execute(
+                            "SELECT version,name,sha256 FROM schema_migrations ORDER BY version"
+                        )], [(migration.version, migration.name, migration.sha256) for migration in MIGRATIONS])
+                        self.assertEqual(connection.execute("SELECT COUNT(*) FROM team_bulletin_changes").fetchone()[0], 0)
+                        self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+                        if opening == 1:
+                            self.assertEqual(connection.total_changes, 0, "reopening must not reapply migration22")
+                    finally:
+                        connection.close()
 
     @classmethod
     def make_schema4_snapshot(
@@ -2061,6 +2124,9 @@ sys.exit(10)
                         "WHERE type = 'table' AND name = 'bootstrap_delegations'"
                     ).fetchone()
                 )
+                self.assertEqual(legacy.execute(
+                    "SELECT name FROM sqlite_master WHERE name LIKE 'team_bulletin_%'"
+                ).fetchall(), [])
             finally:
                 legacy.close()
 
@@ -2176,6 +2242,14 @@ sys.exit(10)
                     connection.close()
 
                 self.downgrade_database_to_schema5(store.database_path)
+                legacy = sqlite3.connect(store.database_path)
+                try:
+                    self.assertEqual(legacy.execute("PRAGMA user_version").fetchone()[0], 5)
+                    self.assertEqual(legacy.execute(
+                        "SELECT name FROM sqlite_master WHERE name LIKE 'team_bulletin_%'"
+                    ).fetchall(), [])
+                finally:
+                    legacy.close()
                 migrated = HubStore(data_dir, managed_host_identity=HOST_A)
                 connection = migrated.connect()
                 try:

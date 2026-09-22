@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 from fastapi import Request
 from starlette.responses import JSONResponse
 
+from agentsdock_team_hub.secure_peer import SecurePeerError
 from agentsdock_team_hub.service import (
     ManagedTransportIdentity,
     classify_managed_transport,
@@ -576,6 +577,16 @@ class ManagedTeamHubHost:
             error_code = str(
                 getattr(exc, "code", "secure_peer_host_recovery_failed")
             )
+            if (
+                isinstance(exc, SecurePeerError)
+                and error_code == "secure_peer_host_address_unavailable"
+            ):
+                self.secure_peer_manager.mark_host_unavailable(
+                    str(exc),
+                    error_code=error_code,
+                    action="Configure hosting with a current local IPv4 address, or restore the previous address.",
+                )
+                return
             self.secure_peer_manager.mark_host_unavailable(
                 (
                     "An existing secure peer connection could not be "
@@ -714,6 +725,16 @@ class ManagedTeamHubHost:
                 getattr(exc, "code", "secure_peer_host_recovery_failed"),
             )
             if self.secure_peer_manager is not None:
+                if (
+                    isinstance(exc, SecurePeerError)
+                    and exc.code == "secure_peer_host_address_unavailable"
+                ):
+                    self.secure_peer_manager.mark_host_unavailable(
+                        str(exc),
+                        error_code=exc.code,
+                        action="Configure hosting with a current local IPv4 address, or restore the previous address.",
+                    )
+                    return
                 self.secure_peer_manager.mark_host_unavailable(
                     "The secure peer host could not finish recovery.",
                     error_code=str(

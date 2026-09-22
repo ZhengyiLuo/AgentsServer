@@ -21,6 +21,7 @@ EXECUTION_MODULES = {
     "execution_uninstall.py",
     "update_recovery.py",
     "execution_activation.py",
+    "execution_legacy_runner.py",
     "execution_preparation.py",
     "execution_update_status.py",
     "update_handoff.py",

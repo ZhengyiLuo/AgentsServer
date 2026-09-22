@@ -2094,6 +2094,17 @@ chmod 755 "$project/.venv/bin/python"
                 "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
             }
 
+            # These lifecycle fixtures advertise disabled Hub health; inherited
+            # host settings must not silently enable a real candidate Hub.
+            for key in (
+                "AGENTSDOCK_TEAM_HUB_MODE",
+                "AGENTSDOCK_TEAM_HUB_TRANSPORT",
+                "AGENTSDOCK_TEAM_HUB_URL",
+                "AGENTSDOCK_TEAM_HUB_DIRECT_IP_URL",
+            ):
+                environment.pop(key, None)
+            environment["FAKE_TEAM_HUB_MODE"] = "disabled"
+
             for attempt in range(2):
                 result = subprocess.run(
                     ["bash", str(INSTALLER), "--execution-mode", "legacy", "--port", "17850", "--non-interactive"],
@@ -2380,6 +2391,17 @@ chmod 755 "$project/.venv/bin/python"
             }
             for name in ("AGENTSDOCK_STATE_DIR", "AGENTS_SERVER_STATE_DIR", "ZENITHBOT_AGENT_DIR"):
                 environment.pop(name, None)
+
+            # These lifecycle fixtures advertise disabled Hub health; inherited
+            # host settings must not silently enable a real candidate Hub.
+            for key in (
+                "AGENTSDOCK_TEAM_HUB_MODE",
+                "AGENTSDOCK_TEAM_HUB_TRANSPORT",
+                "AGENTSDOCK_TEAM_HUB_URL",
+                "AGENTSDOCK_TEAM_HUB_DIRECT_IP_URL",
+            ):
+                environment.pop(key, None)
+            environment["FAKE_TEAM_HUB_MODE"] = "disabled"
 
             result = subprocess.run(
                 ["bash", str(INSTALLER), "--execution-mode", "legacy", "--port", "17850", "--non-interactive"],
@@ -5931,6 +5953,17 @@ chmod 755 "$project/.venv/bin/python"
                 "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
             }
 
+            # These lifecycle fixtures advertise disabled Hub health; inherited
+            # host settings must not silently enable a real candidate Hub.
+            for key in (
+                "AGENTSDOCK_TEAM_HUB_MODE",
+                "AGENTSDOCK_TEAM_HUB_TRANSPORT",
+                "AGENTSDOCK_TEAM_HUB_URL",
+                "AGENTSDOCK_TEAM_HUB_DIRECT_IP_URL",
+            ):
+                environment.pop(key, None)
+            environment["FAKE_TEAM_HUB_MODE"] = "disabled"
+
             result = subprocess.run(
                 ["/bin/bash", str(INSTALLER), "--execution-mode", "legacy", "--port", "17850", "--non-interactive"],
                 env=environment,
@@ -6284,6 +6317,17 @@ exit 2
                 "FAKE_TEAM_HUB_ID": "",
                 "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
             })
+
+            # These lifecycle fixtures advertise disabled Hub health; inherited
+            # host settings must not silently enable a real candidate Hub.
+            for key in (
+                "AGENTSDOCK_TEAM_HUB_MODE",
+                "AGENTSDOCK_TEAM_HUB_TRANSPORT",
+                "AGENTSDOCK_TEAM_HUB_URL",
+                "AGENTSDOCK_TEAM_HUB_DIRECT_IP_URL",
+            ):
+                environment.pop(key, None)
+            environment["FAKE_TEAM_HUB_MODE"] = "disabled"
 
             result = subprocess.run(
                 ["bash", str(INSTALLER), "--execution-mode", "legacy", "--port", "17850", "--non-interactive"],

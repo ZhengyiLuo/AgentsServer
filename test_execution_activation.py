@@ -120,6 +120,32 @@ class ExecutionActivationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "authority"):
             bridge.admitted_update_id(self.args, {"update_id":"a"*32})
 
+    def test_only_missing_darwin_pid_can_use_legacy_process_proof(self):
+        self.args.managed_update_id = ""
+        self.args.platform = "Darwin"
+        status = {"update_id": "a" * 32}
+        with mock.patch("execution_legacy_runner.verify_legacy_runner", return_value="a" * 32) as verify:
+            self.assertEqual(bridge.admitted_update_id(self.args, status), "a" * 32)
+            verify.assert_called_once_with(self.args, status)
+        for invalid in (None, False, 0, -1, "123"):
+            with mock.patch("execution_legacy_runner.verify_legacy_runner") as verify:
+                with self.assertRaisesRegex(RuntimeError, "authority"):
+                    bridge.admitted_update_id(self.args, {**status, "runner_pid": invalid})
+                verify.assert_not_called()
+        with mock.patch("execution_legacy_runner.verify_legacy_runner") as verify:
+            with self.assertRaisesRegex(RuntimeError, "authority"):
+                bridge.admitted_update_id(self.args, {"update_id": "invalid"})
+            verify.assert_not_called()
+
+    def test_explicit_update_id_never_falls_back_to_legacy_process_proof(self):
+        self.args.platform = "Darwin"
+        self.args.managed_update_id = "a" * 32
+        with mock.patch("execution_legacy_runner.verify_legacy_runner") as verify:
+            self.assertEqual(bridge.admitted_update_id(self.args, {"update_id": "a" * 32}), "a" * 32)
+            with self.assertRaisesRegex(RuntimeError, "differs"):
+                bridge.admitted_update_id(self.args, {"update_id": "b" * 32})
+            verify.assert_not_called()
+
     def test_candidate_api_pin_is_read_without_executing_server(self):
         source = self.item.release_dir / "agent_server.py"
         source.write_text('raise RuntimeError("must not run")\nAPI_CONTRACT_VERSION = 28\n')

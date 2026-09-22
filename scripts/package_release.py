@@ -16,6 +16,7 @@ from pathlib import Path
 FILES = (
     "activation_transaction.py",
     "execution_activation.py",
+    "execution_legacy_runner.py",
     "execution_preparation.py",
     "update_preparation.py",
     "update_handoff.py",

@@ -180,6 +180,12 @@ def admitted_update_id(args: argparse.Namespace, status: dict[str, Any]) -> str:
     # Old macOS detached runners did not forward this ID for ordinary updates.
     # Derive it only when this installer descends from the exact admitted runner.
     runner = status.get("runner_pid")
+    if (args.platform == "Darwin" and "runner_pid" not in status
+            and re.fullmatch(r"[0-9a-f]{32}", str(identifier)) is not None):
+        # Pre-PID legacy runners require their full native process/session proof.
+        # Never downgrade a supplied but invalid runner identity to this path.
+        from execution_legacy_runner import verify_legacy_runner
+        return verify_legacy_runner(args, status)
     if type(runner) is not int or runner <= 1 or re.fullmatch(r"[0-9a-f]{32}", str(identifier)) is None:
         raise RuntimeError("legacy installer has no admitted runner authority")
     parent = os.getppid()

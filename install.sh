@@ -2288,7 +2288,7 @@ execution_stop_services() {
   fi
   # Legacy monoliths do not implement the private sealed-lease protocol. Bind
   # their existing authenticated durable idle drain over the PID-pinned socket.
-  if [[ ! -e "$STATE_ROOT/execution/worker.json" && ! -L "$STATE_ROOT/execution/worker.json" ]] \
+  if [[ ! -e "$INSTALL_ROOT/execution-layout.json" && ! -L "$INSTALL_ROOT/execution-layout.json" ]] \
     && native_pid="$(service_manager_main_pid "$service")"; then
     health_file="$(mktemp "$STATE_ROOT/admin/.execution-handoff.XXXXXXXX")" || return 1
     chmod 600 "$health_file" || return 1

@@ -374,7 +374,7 @@ with ProcessLease(Path(sys.argv[2]), "worker") as lease:
         branch = source[source.index("execution_stop_services() {"):source.index("backup_runtime_configuration() {")]
         (self.state/"admin").mkdir(exist_ok=True)
         log = self.base/"proof-requests"
-        script = ('set -eu\nSTATE_ROOT='+shlex.quote(str(self.state))+'\n'
+        script = ('set -eu\nSTATE_ROOT='+shlex.quote(str(self.state))+'\nINSTALL_ROOT='+shlex.quote(str(self.item.root))+'\n'
             + 'CANDIDATE_RUNTIME_ROOT=/candidate\nRELEASE_VERSION=2.0.0\nSERVICE_NAME=agents-server\nLEGACY_SERVICE_NAME=zenithbot-agent\n'
             + 'OS_NAME=Linux\nPORT=7850\nBIND_ADDRESS=127.0.0.1\nMANAGED_UPDATE_ID=owned-update\nEXECUTION_HANDOFF_FILE=\n'
             + 'service_manager_main_pid() { [[ "$1" == agents-server ]] && printf "123\\n"; }\n'
@@ -385,3 +385,59 @@ with ProcessLease(Path(sys.argv[2]), "worker") as lease:
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertEqual(log.read_text().splitlines(),['/api/health:core','/api/admin/update:native'])
         self.assertEqual(list((self.state/'admin').iterdir()),[])
+
+    def test_installer_fetches_legacy_proofs_with_stale_receipt_and_passes_them_to_real_guards(self):
+        import shlex
+        self.legacy_admission()
+        receipt = self.abandoned_worker()
+        original = receipt.read_bytes(), receipt.stat().st_ino
+        source = (Path(__file__).parent / "install.sh").read_text()
+        branch = source[source.index("execution_stop_services() {"):source.index("backup_runtime_configuration() {")]
+        arguments = self.base / "helper-arguments.json"
+        self.json_file(arguments, vars(self.args))
+        helper = self.base / "proof-helper.py"
+        helper.write_text('''import argparse, json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import execution_activation as bridge
+args = argparse.Namespace(**json.loads(Path(sys.argv[2]).read_bytes()))
+parser = argparse.ArgumentParser()
+parser.add_argument("--health-file", default="")
+parser.add_argument("--update-file", default="")
+parser.add_argument("--expected-native-pid", type=int, default=0)
+proof, _ = parser.parse_known_args(sys.argv[3:])
+for key, value in vars(proof).items(): setattr(args, key, value)
+class NativeFixture:
+    def snapshot(self): return {"worker": {"state": "running", "pid": 8123}}
+services = NativeFixture()
+bridge.verify_stop(args, {}, services, bridge.WorkerControl(services=services))
+bridge.seed_legacy_recovery(args, services)
+''')
+        log = self.base / "real-proof-requests"
+        prefix = ('set -eu\nSTATE_ROOT='+shlex.quote(str(self.state))+'\nINSTALL_ROOT='+shlex.quote(str(self.item.root))+'\n'
+            + 'CANDIDATE_RUNTIME_ROOT=/candidate\nRELEASE_VERSION=2.0.0\nSERVICE_NAME=agents-server\nLEGACY_SERVICE_NAME=zenithbot-agent\n'
+            + 'OS_NAME=Linux\nPORT=7850\nBIND_ADDRESS=127.0.0.1\nMANAGED_UPDATE_ID='+self.args.managed_update_id+'\nEXECUTION_HANDOFF_FILE=\n'
+            + 'service_manager_main_pid() { [[ "$1" == agents-server ]] && printf "8123\\n"; }\n'
+            + 'fetch_managed_json() { printf "%s:%s\\n" "$2" "$3" >> '+shlex.quote(str(log))+'; '
+            + 'if [[ "$2" == /api/health ]]; then cat '+shlex.quote(self.args.health_file)+' > "$4"; '
+            + 'else cat '+shlex.quote(self.args.update_file)+' > "$4"; fi; }\n'
+            + 'execution_activation_command() { '+shlex.join([sys.executable, str(helper), str(Path(__file__).parent), str(arguments)])+' "$@"; }\n')
+        result = subprocess.run(['/bin/bash','-c',prefix+branch+'execution_stop_services /candidate preflight\n'],capture_output=True,text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(log.read_text().splitlines(), ['/api/health:core', '/api/admin/update:native'])
+        intent = json.loads((self.state / "admin/server-update.json").read_bytes())["_activation_recovery"]
+        self.assertEqual(intent["update_id"], self.args.managed_update_id)
+        self.assertEqual((receipt.read_bytes(), receipt.stat().st_ino), original)
+        self.assertEqual(list((self.state / "admin").glob('.execution-*')), [])
+
+        # A valid split layout and a dangling layout link must never cause
+        # legacy public proof collection. Python remains the final authority.
+        bridge.publish(self.args, self.value())
+        for dangling in (False, True):
+            if dangling:
+                manifest = self.item.root / 'execution-layout.json'
+                manifest.unlink(); manifest.symlink_to(self.base / 'missing-layout')
+            log.unlink(missing_ok=True)
+            result = subprocess.run(['/bin/bash','-c',prefix+branch+'execution_stop_services /candidate preflight\n'],capture_output=True,text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(log.exists(), result.stderr)

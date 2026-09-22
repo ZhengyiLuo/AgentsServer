@@ -15,6 +15,11 @@ servers and recovery after the failed 1.0.4 upgrade.
   fork-history scans, and report failed scheduled turns accurately.
 
 Existing users should use the app's coordinated update and recovery controls.
+If the withdrawn 1.0.4 update already left the old server stuck, run
+`npx @agentsdock/server@1.0.5 recover` once on the server's computer, then retry
+the update in the app. This validates the exact unfinished transaction under
+the installation lock and only repairs failures before service takeover; it
+refuses unsafe or later-phase recovery without restarting the running server.
 The signed legacy server bridge remains available for older managed servers.
 Updates preserve existing server identity, credentials, chats and Team Hub data,
 and wait for idle before replacing execution. Multiple named services remain

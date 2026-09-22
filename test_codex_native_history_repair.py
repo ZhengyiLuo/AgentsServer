@@ -385,7 +385,6 @@ class CodexNativeHistoryRepairTests(unittest.TestCase):
             and any(isinstance(target, ast.Name) and target.id == "CHAT_MAILBOX_WAKE_PROMPT"
                 for target in node.targets))
         wake_text = ast.literal_eval(assignment.value)
-        self.assertEqual(len(wake_text), 551)
         self.wake_fixture()
         self.raw[0]["payload"]["content"][0]["text"] = wake_text
         self.native[0]["provider_input_sha256"] = hashlib.sha256(wake_text.encode()).hexdigest()

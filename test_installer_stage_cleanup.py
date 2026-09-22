@@ -92,6 +92,61 @@ cleanup
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(stage.exists())
 
+    def test_unarmed_only_rejection_never_falls_through_to_exit_rollback(self) -> None:
+        source = INSTALLER.read_text()
+        start = source.index('\nif [[ "$ACTIVATION_TRANSACTION_RESUMED" == "true" ]]; then\n  if [[ "${RECOVER_UNARMED_ONLY:-false}"')
+        block = source[start:source.index('\nif [[ "$TEAM_HUB_OPERATION_PENDING" == "true" ]]; then', start)]
+        for failure in ("load", "proof", "owner"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                stage = root / "stage"
+                stage.mkdir()
+                journal = root / ".activation-transaction"
+                journal.mkdir()
+                trace = root / "native-action"
+                script = f"""
+set -eu
+STAGE_DIR={shlex.quote(str(stage))}
+STAGE_DIR_DEVICE={stage.stat().st_dev}
+STAGE_DIR_INODE={stage.stat().st_ino}
+ACTIVATION_TRANSACTION_DIR={shlex.quote(str(journal))}
+ACTIVATION_TRANSACTION_ID=activation-aaaaaaaaaaaaaaaaaaaaaaaa
+ACTIVATION_TRANSACTION_PHASE=prepared
+ACTIVATION_TRANSACTION_RESUMED=true
+RECOVER_UNARMED_ONLY=true
+EXECUTION_MODE=split
+CANDIDATE_RUNTIME_ROOT="$STAGE_DIR"
+TEAM_HUB_RECOVERY_ATTEMPTED=false
+TEAM_HUB_OPERATION_PENDING=false
+TEAM_HUB_OPERATION_FINALIZED=false
+TEAM_HUB_REACTIVATION_FENCE_PENDING=false
+TEAM_HUB_REACTIVATION_FINALIZED=false
+TEAM_HUB_COLD_GUARD_PENDING=false
+SERVICE_STOPPED_FOR_COLD_HANDOFF=false
+CANDIDATE_SERVICE_MAY_HAVE_STARTED=false
+IN_EXIT_CLEANUP=false
+UV_INSTALLER=
+mask_install_signals() {{ :; }}
+stop_active_stage() {{ :; }}
+release_install_lock() {{ :; }}
+team_hub_transaction_requires_recovery() {{ return 1; }}
+load_pending_activation_transaction() {{ {'return 1' if failure == 'load' else ':'}; }}
+execution_activation_command() {{ {'return 1' if failure == 'proof' else 'echo required'}; }}
+native_action() {{ echo unsafe >> {shlex.quote(str(trace))}; }}
+execution_recovery_arm() {{ native_action; }}
+execution_recovery_command() {{ native_action; }}
+recover_pending_activation_transaction() {{ native_action; }}
+restore_previous_release_transaction() {{ native_action; }}
+{self.cleanup_function}
+trap cleanup EXIT
+{block}
+"""
+                result = subprocess.run(["/bin/bash", "-c", script], text=True, capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(trace.exists(), result.stderr)
+                self.assertTrue(stage.exists())
+                self.assertTrue(journal.exists())
+
     def test_failed_cleanup_preserves_stage_until_its_transaction_settles(self) -> None:
         for acknowledged, settles in ((True, False), (False, False), (True, True)):
             with self.subTest(acknowledged=acknowledged, settles=settles), tempfile.TemporaryDirectory() as temporary:

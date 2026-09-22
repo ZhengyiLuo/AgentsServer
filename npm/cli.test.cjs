@@ -37,6 +37,124 @@ function updateArgs(f, origin) {
   return ['update', '--server-url', origin, '--server-identity', 'server-one', '--server-instance-id', 'process-one', '--token-file', f.tokenFile, '--manifest', f.manifest, '--signature', f.signature]
 }
 
+function pendingRecovery(f) {
+  const install = path.join(f.home, '.local/share/agents-server')
+  const journalDirectory = path.join(install, '.activation-transaction')
+  const state = path.join(f.home, '.agentsdock')
+  fs.mkdirSync(journalDirectory, { recursive: true, mode: 0o700 })
+  fs.chmodSync(install, 0o755) // Existing installations triggering the incident.
+  fs.mkdirSync(state, { mode: 0o700 })
+  fs.writeFileSync(path.join(state, 'server-identity'), 'server-one\n', { mode: 0o600 })
+  const journal = { format: 3, transaction_id: `activation-${'a'.repeat(24)}`, release_version: '1.0.4',
+    release_dir: path.join(install, 'releases/1.0.4'), phase: 'rolling-back', rollback_from: 'prepared', intent: 'server-update',
+    env_path: path.join(f.home, '.config/agents-server/env'), service_path: path.join(f.home, '.config/systemd/user/agents-server.service'),
+    service_state: 'running', execution: { api_contract: 28, gateway_state: 'absent', runtime_dir: path.join(state, 'execution') },
+    hub: { kind: 'server-update', host_identity: 'server-one', data_dir: path.join(state, 'team-hub') } }
+  const manifest = path.join(journalDirectory, 'manifest.json')
+  const write = () => fs.writeFileSync(manifest, JSON.stringify(journal), { mode: 0o600 })
+  write()
+  return { install, journalDirectory, manifest, state, journal, write }
+}
+
+test('recover accepts no selectors, force flags or installer arguments', () => {
+  assert.deepEqual(parse(['recover']), { command: 'recover', options: {} })
+  for (const args of [['--force'], ['--release-version', '1.0.4'], ['--port', '7850'], ['--server-url', 'https://remote.example'], ['--dry-run']]) assert.throws(() => parse(['recover', ...args]), /Unsupported/)
+})
+
+test('recover with no installation or no journal never creates files or starts an installer', async t => {
+  const f = fixture(t)
+  assert.equal(await run(['recover'], f.context), 0)
+  assert.deepEqual(fs.readdirSync(f.home), [])
+  fs.mkdirSync(path.join(f.home, '.local/share/agents-server'), { recursive: true })
+  const root = path.join(f.home, '.local/share/agents-server'), before = fs.statSync(root)
+  assert.equal(await run(['recover'], f.context), 0)
+  assert.equal(fs.statSync(root).ino, before.ino)
+  assert.deepEqual(fs.readdirSync(root), [])
+  assert.equal(f.calls.length, 0)
+  assert.match(f.output.join('\n'), /No changes were made/)
+})
+
+test('recover delegates exact old journal pins to newer bundled installer and treats verified retirement as success', async t => {
+  const f = fixture(t), r = pendingRecovery(f)
+  const env = { HOME: '/wrong/home', PATH: '/usr/bin:/bin', BASH_ENV: '/malicious', PYTHONPATH: '/unrelated', AGENTSDOCK_AGENT_TOKEN: 'must-not-leak' }
+  let invocation
+  const result = await run(['recover'], { ...f.context, env, spawn: (...args) => {
+    invocation = args
+    fs.rmSync(r.journalDirectory, { recursive: true })
+    return { status: 75 }
+  } })
+  assert.equal(result, 0)
+  assert.deepEqual(invocation[1], [path.join(f.packageRoot, 'server/install.sh'), '--recover-only', '--recover-unarmed-only', '--non-interactive', '--execution-mode', 'split', '--expected-activation-id', r.journal.transaction_id, '--release-version', '1.0.4', '--expected-api-contract', '28', '--expected-server-identity', 'server-one'])
+  assert.deepEqual(invocation[2].env, { HOME: f.home, PATH: '/usr/bin:/bin' })
+  assert.match(f.output.at(-1), /retry the update; the server has not been upgraded/)
+})
+
+test('recovery rejects unsafe directories and control files without spawning or changing them', async t => {
+  const changes = [
+    (f, r) => { fs.renameSync(r.install, r.install + '-other'); fs.symlinkSync(r.install + '-other', r.install) },
+    (f, r) => { fs.renameSync(path.join(f.home, '.local'), path.join(f.home, 'other')); fs.symlinkSync(path.join(f.home, 'other'), path.join(f.home, '.local')) },
+    (f, r) => fs.chmodSync(r.install, 0o777),
+    (f, r) => fs.chmodSync(r.journalDirectory, 0o755),
+    (f, r) => { fs.renameSync(r.journalDirectory, r.journalDirectory + '-other'); fs.symlinkSync(r.journalDirectory + '-other', r.journalDirectory) },
+    (f, r) => { fs.renameSync(r.manifest, r.manifest + '-other'); fs.symlinkSync(r.manifest + '-other', r.manifest) },
+    (f, r) => fs.linkSync(r.manifest, r.manifest + '-other'),
+    (f, r) => fs.chmodSync(r.manifest, 0o644),
+    (f, r) => fs.writeFileSync(r.manifest, Buffer.alloc(256 * 1024 + 1)),
+    (f, r) => fs.writeFileSync(r.manifest, '{bad JSON'),
+    (f, r) => { fs.renameSync(r.manifest, r.manifest + '-other'); fs.mkdirSync(r.manifest) },
+    (f, r) => { const identity = path.join(r.state, 'server-identity'); fs.renameSync(identity, identity + '-other'); fs.symlinkSync(identity + '-other', identity) },
+    (f, r) => fs.chmodSync(path.join(r.state, 'server-identity'), 0o644),
+    (f) => { f.context.uid++ },
+  ]
+  for (const change of changes) {
+    const f = fixture(t), r = pendingRecovery(f)
+    change(f, r)
+    const before = fs.lstatSync(r.install)
+    await assert.rejects(run(['recover'], f.context))
+    assert.equal(f.calls.length, 0)
+    assert.equal(fs.lstatSync(r.install).ino, before.ino)
+  }
+})
+
+test('recovery rejects different identity, layout, later phase and existing owner without installer', async t => {
+  const changes = [
+    r => { r.journal.hub.host_identity = 'different-server' },
+    r => { r.journal.phase = 'stopping'; r.journal.rollback_from = null },
+    r => { r.journal.rollback_from = 'candidate-starting' },
+    r => { r.journal.service_state = 'stopped' },
+    r => { r.journal.env_path = '/other/env' },
+    r => { r.journal.service_path = '/other/service' },
+    r => { r.journal.execution.runtime_dir = '/other/execution' },
+    r => { r.journal.execution.gateway_state = 'running' },
+    r => { r.journal.execution.api_contract = 0 },
+    r => { r.journal.hub.data_dir = '/other/team-hub' },
+    r => { r.journal.transaction_id = '../../other' },
+    r => { r.journal.release_version = '../other' },
+    r => { r.journal.format = 2 },
+    r => fs.mkdirSync(path.join(r.install, '.activation-recovery', r.journal.transaction_id), { recursive: true, mode: 0o700 }),
+    r => { const parent = path.join(r.install, '.activation-recovery'); fs.mkdirSync(parent, { mode: 0o700 }); fs.symlinkSync('/nonexistent', path.join(parent, r.journal.transaction_id)) },
+  ]
+  for (const change of changes) {
+    const f = fixture(t), r = pendingRecovery(f)
+    change(r); r.write()
+    const before = fs.readFileSync(r.manifest)
+    await assert.rejects(run(['recover'], f.context))
+    assert.equal(f.calls.length, 0)
+    assert.deepEqual(fs.readFileSync(r.manifest), before)
+  }
+})
+
+test('recovery does not mask failure, claim retirement with a journal, or relax payload version checks', async t => {
+  const f = fixture(t), r = pendingRecovery(f)
+  assert.equal(await run(['recover'], { ...f.context, spawn: () => ({ status: 9 }) }), 9)
+  await assert.rejects(run(['recover'], { ...f.context, spawn: () => ({ status: 75 }) }), /journal remains/)
+  await assert.rejects(run(['recover'], { ...f.context, env: { AGENTS_SERVER_INSTALL_DIR: r.install } }), /Custom installation selector/)
+  await assert.rejects(run(['recover'], { ...f.context, uid: 0 }), /without sudo/)
+  fs.writeFileSync(path.join(f.packageRoot, 'server/VERSION'), '1.0.4\n')
+  await assert.rejects(run(['recover'], f.context), /payload versions do not match/)
+  assert.equal(f.calls.length, 0)
+})
+
 test('rejects arbitrary installer flags and invalid values before delegation', () => {
   for (const args of [['install', '--release-version', '9.9.9'], ['install', '--instance', 'other'], ['install', '--port', '0'], ['install', '--port', '65536'], ['install', '--bind', 'anything;command'], ['install', '--port', '7850', '--port', '7851']]) assert.throws(() => parse(args))
   assert.throws(() => parse(['update']), /Required/)

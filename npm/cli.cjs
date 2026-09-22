@@ -11,11 +11,13 @@ const https = require('node:https')
 const { spawnSync } = require('node:child_process')
 
 const HELP = `Usage: agentsdock-server install [--port PORT] [--bind IP] [--non-interactive] [--dry-run]
+       agentsdock-server recover
        agentsdock-server update --server-url URL --server-identity ID --server-instance-id ID
          --token-file PATH --manifest PATH --signature PATH
        agentsdock-server --version
 
 install: fresh default user service only; existing installations must use managed updates.
+recover: on the server computer, recover an interrupted pre-activation migration; then retry the app update.
 update: verify the signed descriptor and request an update when the exact server is idle.
 No installation hooks run when this npm package is installed.
 `
@@ -29,7 +31,7 @@ function parse(argv) {
   }
   const values = command === 'install' ? ['--port', '--bind'] : command === 'update'
     ? ['--server-url', '--server-identity', '--server-instance-id', '--token-file', '--manifest', '--signature'] : []
-  if (!['install', 'update'].includes(command)) throw new Error('Use install, update, or --help.')
+  if (!['install', 'update', 'recover'].includes(command)) throw new Error('Use install, update, recover, or --help.')
   const flags = command === 'install' ? ['--non-interactive', '--dry-run'] : []
   const options = {}
   for (let index = 0; index < args.length; index++) {
@@ -108,6 +110,74 @@ function ensureFreshInstall(context) {
   }
 }
 
+function recoveryContext(context) {
+  if (context.uid === 0) throw new Error('Run as the user who owns the server, without sudo.')
+  if (!['darwin', 'linux'].includes(context.platform)) throw new Error('Server recovery requires Linux or Apple silicon macOS.')
+  for (const name of ROOT_SELECTORS) if (context.env[name]) throw new Error(`Custom installation selector ${name} is unsupported by recovery; no installer was started.`)
+  const inspect = filename => {
+    try { return fs.lstatSync(filename) } catch (error) { if (error.code !== 'ENOENT') throw error; return null }
+  }
+  const directory = (filename, { optional = false, privateDirectory = false } = {}) => {
+    const info = inspect(filename)
+    if (!info && optional) return null
+    if (!info || !info.isDirectory() || info.isSymbolicLink() || info.uid !== context.uid ||
+        (info.mode & (privateDirectory ? 0o077 : 0o022)) !== 0 || (info.mode & 0o500) !== 0o500) {
+      throw new Error('Recovery requires owned, unlinked, safely permissioned default installation directories.')
+    }
+    return info
+  }
+  const readPrivate = (filename, limit) => {
+    const fd = fs.openSync(filename, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK)
+    try {
+      const info = fs.fstatSync(fd)
+      if (!info.isFile() || info.uid !== context.uid || (info.mode & 0o077) !== 0 || info.nlink !== 1 || info.size > limit) {
+        throw new Error('Recovery requires a bounded, private, current-user-owned regular control file.')
+      }
+      const bytes = fs.readFileSync(fd)
+      if (bytes.length > limit) throw new Error('Recovery control file exceeded its size limit.')
+      return bytes
+    } finally { fs.closeSync(fd) }
+  }
+  directory(context.home)
+  let root = context.home
+  for (const component of ['.local', 'share', 'agents-server']) {
+    root = path.join(root, component)
+    if (!directory(root, { optional: true })) return null
+  }
+  const rootInfo = directory(root)
+  const journalDirectory = path.join(root, '.activation-transaction')
+  if (!directory(journalDirectory, { optional: true, privateDirectory: true })) return null
+  const journal = JSON.parse(readPrivate(path.join(journalDirectory, 'manifest.json'), 256 * 1024))
+  const origin = ['rolling-back', 'rolled-back', 'rollback-healthy'].includes(journal.phase) ? journal.rollback_from : journal.phase
+  const config = path.join(context.home, '.config/agents-server')
+  const state = path.join(context.home, '.agentsdock')
+  const service = context.platform === 'darwin' ? path.join(context.home, 'Library/LaunchAgents/com.agentsdock.server.plist') : path.join(context.home, '.config/systemd/user/agents-server.service')
+  if (journal.format !== 3 || !['prepared', 'guarded'].includes(origin) || journal.intent !== 'server-update' ||
+      !/^activation-[0-9a-f]{24}$/.test(journal.transaction_id) ||
+      !/^\d+\.\d+\.\d+(?:-beta\.[1-9]\d*)?$/.test(journal.release_version) ||
+      journal.release_dir !== path.join(root, 'releases', journal.release_version) ||
+      journal.env_path !== path.join(config, 'env') || journal.service_path !== service ||
+      journal.service_state !== 'running' || journal.execution?.gateway_state !== 'absent' ||
+      journal.execution?.runtime_dir !== path.join(state, 'execution') ||
+      !Number.isSafeInteger(journal.execution?.api_contract) || journal.execution.api_contract < 1 ||
+      journal.hub?.kind !== 'server-update' || journal.hub?.data_dir !== path.join(state, 'team-hub')) {
+    throw new Error('This journal is not a supported interrupted pre-activation migration; no installer was started.')
+  }
+  directory(state, { privateDirectory: true })
+  const identity = readPrivate(path.join(state, 'server-identity'), 1024).toString('utf8').trim()
+  if (!/^[A-Za-z0-9_.:-]{8,240}$/.test(identity) || journal.hub.host_identity !== identity) {
+    throw new Error('The pending migration belongs to a different server identity; no installer was started.')
+  }
+  // The installer validates complete native configuration, links, ownership and
+  // authenticated incumbent health under its lock. These checks only select
+  // the exact existing transaction; they never grant recovery authority.
+  const ownerParent = path.join(root, '.activation-recovery')
+  if (directory(ownerParent, { optional: true, privateDirectory: true }) && inspect(path.join(ownerParent, journal.transaction_id))) {
+    throw new Error('This activation already has a recovery owner; no competing recovery was started.')
+  }
+  return { root, rootInfo, journalDirectory, journal, identity }
+}
+
 function validateOrigin(value) {
   const url = new URL(value)
   if (url.username || url.password || url.search || url.hash || !['', '/'].includes(url.pathname)) throw new Error('Server URL must be an origin without credentials, path, query, or fragment.')
@@ -162,6 +232,29 @@ async function run(argv, overrides = {}) {
   const payload = path.join(context.packageRoot, 'server')
   const payloadVersion = readRegular(path.join(payload, 'VERSION'), 200).toString('utf8').trim()
   if (payloadVersion !== metadata.version) throw new Error('Package and server payload versions do not match.')
+  if (command === 'recover') {
+    const recovery = recoveryContext(context)
+    if (!recovery) { context.print('No unfinished default server migration was found. No changes were made.'); return 0 }
+    const installer = path.join(payload, 'install.sh')
+    readRegular(installer, 2 * 1024 * 1024)
+    const args = [installer, '--recover-only', '--recover-unarmed-only', '--non-interactive', '--execution-mode', 'split',
+      '--expected-activation-id', recovery.journal.transaction_id, '--release-version', recovery.journal.release_version,
+      '--expected-api-contract', String(recovery.journal.execution.api_contract), '--expected-server-identity', recovery.identity]
+    const env = { HOME: context.home }
+    for (const key of ['PATH', 'USER', 'LOGNAME', 'SHELL', 'TMPDIR', 'LANG', 'LC_ALL', 'TERM', 'TERMINFO', 'SSL_CERT_FILE', 'SSL_CERT_DIR']) {
+      if (context.env[key]) env[key] = context.env[key]
+    }
+    const result = context.spawn('/bin/bash', args, { stdio: 'inherit', env })
+    if (result.error) throw new Error('Could not launch the bundled recovery installer.')
+    if (![0, 75].includes(result.status)) return Number.isInteger(result.status) ? result.status : 1
+    const rootAfter = fs.lstatSync(recovery.root)
+    if (!rootAfter.isDirectory() || rootAfter.isSymbolicLink() || rootAfter.dev !== recovery.rootInfo.dev || rootAfter.ino !== recovery.rootInfo.ino) {
+      throw new Error('Installation ownership changed during recovery; verify the server before retrying.')
+    }
+    try { fs.lstatSync(recovery.journalDirectory); throw new Error('The activation journal remains; recovery is not complete.') } catch (error) { if (error.code !== 'ENOENT') throw error }
+    context.print('The interrupted migration was recovered. Reconnect to AgentsDock and retry the update; the server has not been upgraded by this command.')
+    return 0
+  }
   if (command === 'install') {
     ensureFreshInstall(context)
     const installer = path.join(payload, 'install.sh')
@@ -193,4 +286,4 @@ async function run(argv, overrides = {}) {
 }
 
 if (require.main === module) run(process.argv.slice(2)).then(code => { process.exitCode = code }).catch(error => { process.stderr.write(`agentsdock-server: ${error.message}\n`); process.exitCode = 1 })
-module.exports = { parse, readRegular, ensureFreshInstall, validateOrigin, run }
+module.exports = { parse, readRegular, ensureFreshInstall, recoveryContext, validateOrigin, run }

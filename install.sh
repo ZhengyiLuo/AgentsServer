@@ -60,6 +60,7 @@ EXECUTION_RECOVERY_HELPER=""
 EXECUTION_HANDOFF_FILE=""
 PREPARE_ONLY="false"
 RECOVER_ONLY="false"
+RECOVER_UNARMED_ONLY="false"
 EXPECTED_ACTIVATION_ID=""
 source_inventory=""
 PREPARED_RECEIPT=""
@@ -179,6 +180,8 @@ changing services/state. --activate-prepared PATH consumes that exact receipt.
 Both require --expected-api-contract and --prepared-archive-sha256 pins.
 --recover-only finishes only an existing split activation with matching release
 and API pins; it never creates a new installation.
+--recover-unarmed-only additionally requires proof that takeover never began and
+no recovery owner exists; no native service will be started or restarted.
 
 --expected-api-contract pins candidate health to the signed release descriptor.
 It is used by the coordinated updater before committing activation.
@@ -226,6 +229,7 @@ while (($#)); do
     --execution-handoff-file) EXECUTION_HANDOFF_FILE="${2:-}"; shift 2 ;;
     --prepare-only) PREPARE_ONLY="true"; shift ;;
     --recover-only) RECOVER_ONLY="true"; shift ;;
+    --recover-unarmed-only) RECOVER_UNARMED_ONLY="true"; shift ;;
     --expected-activation-id) EXPECTED_ACTIVATION_ID="${2:-}"; shift 2 ;;
     --prepared-receipt) PREPARED_RECEIPT="${2:-}"; shift 2 ;;
     --activate-prepared) ACTIVATE_PREPARED="${2:-}"; shift 2 ;;
@@ -350,6 +354,10 @@ fi
 
 if [[ -n "$EXPECTED_SERVER_IDENTITY" ]] && [[ ! "$EXPECTED_SERVER_IDENTITY" =~ ^[A-Za-z0-9_.:-]{8,240}$ ]]; then
   echo "Expected server identity is invalid." >&2
+  exit 2
+fi
+if [[ "$RECOVER_UNARMED_ONLY" == "true" && "$RECOVER_ONLY" != "true" ]]; then
+  echo "--recover-unarmed-only requires --recover-only." >&2
   exit 2
 fi
 if [[ -n "$EXPECTED_TEAM_HUB_ID" ]] && [[ ! "$EXPECTED_TEAM_HUB_ID" =~ ^[A-Za-z0-9_.:-]{8,240}$ ]]; then
@@ -6518,6 +6526,11 @@ recover_pending_activation_transaction() {
 }
 
 if [[ "$ACTIVATION_TRANSACTION_RESUMED" == "true" ]]; then
+  if [[ "${RECOVER_UNARMED_ONLY:-false}" == "true" ]]; then
+    # A rejected explicit recovery probe must not fall through EXIT's ordinary
+    # rollback path, which can restart services for a later activation phase.
+    TEAM_HUB_RECOVERY_ATTEMPTED="true"
+  fi
   if ! load_pending_activation_transaction; then
     echo "The pending activation transaction could not be verified for recovery." >&2
     exit 1
@@ -6527,6 +6540,10 @@ if [[ "$ACTIVATION_TRANSACTION_RESUMED" == "true" ]]; then
     case "$recovery_state" in
       unarmed) ;;
       required)
+        if [[ "${RECOVER_UNARMED_ONLY:-false}" == "true" ]]; then
+          echo "This activation requires a recovery owner; no native service was started or restarted." >&2
+          exit 1
+        fi
         execution_recovery_arm "$CANDIDATE_RUNTIME_ROOT" || exit 1
         execution_recovery_command observe-lock || exit 1
         ;;

@@ -2224,15 +2224,24 @@ execution_activation_command() {
   shift 2
   local runtime=""
   local candidate=""
+  local python_path=""
   for candidate in "$ACTIVATION_TRANSACTION_DIR/candidate.retired" "$preferred" "$STAGE_DIR" "$RELEASE_DIR" "$SOURCE_DIR"; do
     if [[ -f "$candidate/execution_activation.py" && -x "$candidate/.venv/bin/python" ]]; then
       runtime="$candidate"
       break
     fi
   done
-  [[ -n "$runtime" ]] || { echo "The retained split activation helper is unavailable." >&2; return 1; }
+  if [[ -z "$runtime" || "$operation" == "recovery-state" ]]; then
+    # A pre-takeover failure in an older installer may have removed its stage.
+    # Run this verified source's helpers with an existing trusted interpreter.
+    [[ -f "$SOURCE_DIR/execution_activation.py" ]] || return 1
+    runtime="$SOURCE_DIR"
+    python_path="$(install_lock_python)" || return 1
+  else
+    python_path="$runtime/.venv/bin/python"
+  fi
   run_without_server_secrets env PYTHONPATH="$runtime" \
-    "$runtime/.venv/bin/python" -B "$runtime/execution_activation.py" "$operation" \
+    "$python_path" -B "$runtime/execution_activation.py" "$operation" \
     --root "$INSTALL_ROOT" --config-root "$CONFIG_ROOT" --state-root "$STATE_ROOT" \
     --home "$HOME" --platform "$OS_NAME" --release-dir "$RELEASE_DIR" \
     --bind "$BIND_ADDRESS" --port "$PORT" \
@@ -2528,6 +2537,7 @@ activation_transaction_command() {
   shift
   local runtime_root=""
   local candidate=""
+  local python_path=""
   for candidate in \
     "$ACTIVATION_TRANSACTION_DIR/candidate.retired" \
     "$preferred_root" \
@@ -2541,9 +2551,15 @@ activation_transaction_command() {
       break
     fi
   done
-  [[ -n "$runtime_root" ]] || return 1
+  if [[ -z "$runtime_root" ]]; then
+    [[ -f "$SOURCE_DIR/activation_transaction.py" ]] || return 1
+    runtime_root="$SOURCE_DIR"
+    python_path="$(install_lock_python)" || return 1
+  else
+    python_path="$runtime_root/.venv/bin/python"
+  fi
   run_without_server_secrets env PYTHONPATH="$runtime_root" \
-    "$runtime_root/.venv/bin/python" -B "$runtime_root/activation_transaction.py" "$@"
+    "$python_path" -B "$runtime_root/activation_transaction.py" "$@"
 }
 
 record_activation_phase() {
@@ -2697,10 +2713,32 @@ activate_transaction_files() {
 
 finish_activation_transaction() {
   local runtime_root="${1:-$CANDIDATE_RUNTIME_ROOT}"
+  local recovery_owner_required="true"
+  local recovery_state=""
   [[ -n "$ACTIVATION_TRANSACTION_ID" ]] || return 0
   if [[ "${EXECUTION_MODE:-legacy}" == "split" ]]; then
+    if [[ -z "${EXECUTION_RECOVERY_HELPER:-}" ]]; then
+      recovery_state="$(execution_activation_command recovery-state "$runtime_root")" || return 1
+      case "$recovery_state" in
+        unarmed)
+          recovery_owner_required="false"
+          # A resumed rollback-healthy journal still needs fresh authenticated
+          # incumbent health before its last durable recovery record is retired.
+          if [[ "$PRIOR_SERVICE_STATE" == "running" ]]; then
+            wait_for_previous_release_health || return 1
+          fi
+          ;;
+        required) ;;
+        *) return 1 ;;
+      esac
+    fi
     execution_activation_command release "$runtime_root" || return 1
-    execution_recovery_command complete || return 1
+    if [[ "$recovery_owner_required" == "true" ]]; then
+      if [[ -z "${EXECUTION_RECOVERY_HELPER:-}" ]]; then
+        execution_recovery_arm "$runtime_root" || return 1
+      fi
+      execution_recovery_command complete || return 1
+    fi
   fi
   if activation_transaction_command "$runtime_root" finish \
       --root "$INSTALL_ROOT" \
@@ -2711,13 +2749,16 @@ finish_activation_transaction() {
       --release-dir "$RELEASE_DIR" \
       --release-version "$RELEASE_VERSION" \
       --transaction-id "$ACTIVATION_TRANSACTION_ID" >/dev/null; then
-    if [[ "${EXECUTION_MODE:-legacy}" == "split" ]]; then
+    if [[ "${EXECUTION_MODE:-legacy}" == "split" && "$recovery_owner_required" == "true" ]]; then
       execution_recovery_command finalized || return 1
     fi
     ACTIVATION_TRANSACTION_ID=""
     ACTIVATION_TRANSACTION_PHASE=""
     ACTIVATION_ROLLBACK_FROM=""
     ACTIVATION_HUB_KIND=""
+    # Recovery intentionally exits 75 so callers retry the requested install.
+    # Its verified terminal transaction must not enter generic EXIT rollback.
+    TEAM_HUB_RECOVERY_ATTEMPTED="true"
     return 0
   fi
   return 1
@@ -3075,6 +3116,36 @@ if action == "acquire":
                 candidate.rmdir()
             except FileNotFoundError:
                 pass
+elif action == "normalize-root":
+    # Legacy installers created 0755 roots. Tighten only our validated inode,
+    # while holding the exact installation lock; never chmod through a link.
+    expected = (int(raw_device), int(raw_inode))
+    directory_descriptor, directory_info = open_lock_directory()
+    root_descriptor = None
+    try:
+        if (directory_info.st_dev, directory_info.st_ino) != expected:
+            raise RuntimeError("AgentsServer install lock ownership changed")
+        owner_pid, _owner_identity = read_owner(directory_descriptor)
+        if owner_pid != pid:
+            raise RuntimeError("AgentsServer install lock owner changed")
+        root_descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        pinned = os.fstat(root_descriptor)
+        if ((pinned.st_dev, pinned.st_ino) != (root_info.st_dev, root_info.st_ino)
+                or pinned.st_uid != os.geteuid() or pinned.st_mode & 0o022):
+            raise PermissionError("AgentsServer install root changed before normalization")
+        linked_lock = os.stat(".install-lock", dir_fd=root_descriptor, follow_symlinks=False)
+        if (linked_lock.st_dev, linked_lock.st_ino) != expected:
+            raise RuntimeError("AgentsServer install lock ownership changed")
+        os.fchmod(root_descriptor, 0o700)
+        os.fsync(root_descriptor)
+        linked_root = root.lstat()
+        if ((linked_root.st_dev, linked_root.st_ino) != (pinned.st_dev, pinned.st_ino)
+                or stat.S_IMODE(linked_root.st_mode) != 0o700):
+            raise RuntimeError("AgentsServer install root changed during normalization")
+    finally:
+        if root_descriptor is not None:
+            os.close(root_descriptor)
+        os.close(directory_descriptor)
 elif action == "release":
     expected = (int(raw_device), int(raw_inode))
     directory_descriptor, directory_info = open_lock_directory()
@@ -3214,8 +3285,17 @@ cleanup() {
   if [[ -n "${source_inventory:-}" ]]; then
     rm -f "$source_inventory"
   fi
+  # An unfinished activation or recovery owner may still need this exact
+  # runtime. Check before releasing exclusion, including a journal published
+  # just before the shell received its transaction ID.
+  local preserve_activation_stage="false"
+  if [[ -n "$ACTIVATION_TRANSACTION_ID" \
+    || -e "$ACTIVATION_TRANSACTION_DIR" || -L "$ACTIVATION_TRANSACTION_DIR" ]]; then
+    preserve_activation_stage="true"
+  fi
   release_install_lock
-  if [[ -n "$STAGE_DIR_DEVICE" && -n "$STAGE_DIR_INODE" ]]; then
+  if [[ "$preserve_activation_stage" != "true" \
+    && -n "$STAGE_DIR_DEVICE" && -n "$STAGE_DIR_INODE" ]]; then
     local cleanup_python=""
     cleanup_python="$(install_lock_python 2>/dev/null \
       || command -v python3 2>/dev/null || true)"
@@ -3276,6 +3356,8 @@ acquire_install_lock() {
     return 1
   fi
   INSTALL_LOCK_HELD="true"
+  install_lock_control normalize-root \
+    "$INSTALL_LOCK_DEVICE" "$INSTALL_LOCK_INODE" || return 1
 }
 
 validate_exclusive_install_state() {
@@ -4122,6 +4204,10 @@ restore_previous_release_transaction() {
   fi
   local rollback_from_phase="${ACTIVATION_ROLLBACK_FROM:-$ACTIVATION_TRANSACTION_PHASE}"
   local rollback_control_runtime="$CANDIDATE_RUNTIME_ROOT"
+  local before_link_takeover="false"
+  case "$rollback_from_phase" in
+    prepared|guarded|quiescing|quiesced) before_link_takeover="true" ;;
+  esac
   if [[ "$rollback_from_phase" == "fencing" \
     && "$TEAM_HUB_COLD_GUARD_PENDING" == "true" \
     && "$TEAM_HUB_REACTIVATION_FENCE_PENDING" != "true" ]]; then
@@ -4176,7 +4262,7 @@ restore_previous_release_transaction() {
       *) ;;
     esac
 
-    if [[ "$rollback_from_phase" != "quiescing" && "$rollback_from_phase" != "quiesced" ]] \
+    if [[ "$before_link_takeover" != "true" ]] \
       && { [[ "$TEAM_HUB_OPERATION_PENDING" == "true" ]] \
         || [[ "$TEAM_HUB_REACTIVATION_FENCE_PENDING" == "true" ]]; }; then
       if ! restore_team_hub_snapshot; then
@@ -4213,7 +4299,7 @@ restore_previous_release_transaction() {
     fi
   fi
 
-  if [[ "$rollback_from_phase" == "quiescing" || "$rollback_from_phase" == "quiesced" ]] \
+  if [[ "$before_link_takeover" == "true" ]] \
     && [[ "$TEAM_HUB_OPERATION_PENDING" == "true" ]]; then
     # Candidate links/state were never exposed. Retire only this admitted fence;
     # restoring an older Hub snapshot here could overwrite an incumbent's work.
@@ -4232,12 +4318,25 @@ restore_previous_release_transaction() {
   TEAM_HUB_REACTIVATION_FINALIZED="true"
   TEAM_HUB_OPERATION_PENDING="false"
   TEAM_HUB_REACTIVATION_FENCE_PENDING="false"
-  if ! acknowledge_team_hub_restore_receipt "$rollback_control_runtime" true; then
+  # Pre-link rollback never restored a snapshot and therefore has no restore
+  # receipt. Even an allow-missing acknowledgement takes the exclusive Hub
+  # runtime lease, which still belongs to the unchanged incumbent.
+  if [[ "$before_link_takeover" != "true" ]] \
+    && ! acknowledge_team_hub_restore_receipt "$rollback_control_runtime" true; then
     echo "The restored Team Hub generation could not be acknowledged safely." >&2
     return 1
   fi
 
   case "$rollback_from_phase" in
+    prepared|guarded)
+    # Neither native service was touched. Verify the incumbent without a
+    # restart, including when resuming a partially completed rollback.
+    if [[ "$PRIOR_SERVICE_STATE" == "running" ]] \
+      && ! wait_for_previous_release_health; then
+      echo "The unchanged previous server and Team Hub identities could not be verified; rollback is incomplete." >&2
+      return 1
+    fi
+    ;;
     quiescing|quiesced|linking|linked|stopping|stopped|fencing|fenced|authorizing|authority)
     if [[ "$PRIOR_SERVICE_STATE" != "absent" ]]; then
       if ! restore_prior_service_state; then
@@ -6424,8 +6523,15 @@ if [[ "$ACTIVATION_TRANSACTION_RESUMED" == "true" ]]; then
     exit 1
   fi
   if [[ "${EXECUTION_MODE:-legacy}" == "split" ]]; then
-    execution_recovery_arm "$CANDIDATE_RUNTIME_ROOT" || exit 1
-    execution_recovery_command observe-lock || exit 1
+    recovery_state="$(execution_activation_command recovery-state "$CANDIDATE_RUNTIME_ROOT")" || exit 1
+    case "$recovery_state" in
+      unarmed) ;;
+      required)
+        execution_recovery_arm "$CANDIDATE_RUNTIME_ROOT" || exit 1
+        execution_recovery_command observe-lock || exit 1
+        ;;
+      *) exit 1 ;;
+    esac
   fi
   if recover_pending_activation_transaction; then
     exit 0

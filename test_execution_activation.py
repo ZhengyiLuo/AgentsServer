@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sys
 import subprocess
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -360,6 +361,7 @@ with ProcessLease(Path(sys.argv[2]), "worker") as lease:
         log=self.base/'finalization-order'
         prefix='set -eu\nEXECUTION_MODE=split\nCANDIDATE_RUNTIME_ROOT=/candidate\nINSTALL_ROOT=/install\nCURRENT_LINK=/install/current\nPREVIOUS_LINK=/install/previous\nENV_FILE=/config/env\nRELEASE_DIR=/install/releases/2.0.0\nRELEASE_VERSION=2.0.0\nACTIVATION_TRANSACTION_ID=activation-0123456789abcdef01234567\n'
         prefix+='LOG='+shlex.quote(str(log))+'\n'
+        prefix+='EXECUTION_RECOVERY_HELPER=/retained/execution_recovery.py\n'
         prefix+='execution_activation_command() { printf "lease:%s\\n" "$1" >> "$LOG"; }\n'
         prefix+='execution_recovery_command() { printf "owner:%s\\n" "$1" >> "$LOG"; }\n'
         prefix+='activation_service_config_path() { printf /service; }\n'
@@ -367,6 +369,117 @@ with ProcessLease(Path(sys.argv[2]), "worker") as lease:
         result=subprocess.run(['/bin/bash','-c',prefix+block+'\nfinish_activation_transaction /candidate\ntest -z "$ACTIVATION_TRANSACTION_ID"\n'],capture_output=True,text=True)
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertEqual(log.read_text().splitlines(),['lease:release','owner:complete','journal:finish','owner:finalized'])
+
+    def test_pre_quiescence_rollback_finalizes_only_with_proven_recovery_state(self):
+        import shlex
+        source = (Path(__file__).parent / "install.sh").read_text()
+        block = source[source.index("finish_activation_transaction() {"):
+                       source.index("\nassert_env_backup_team_hub_config() {")]
+        for state, arm_succeeds in (("unarmed", False), ("required", True), ("required", False), ("invalid", False)):
+            with self.subTest(state=state, arm_succeeds=arm_succeeds):
+                log = self.base / (state + "-" + str(arm_succeeds))
+                prefix = '''set -eu
+EXECUTION_MODE=split
+CANDIDATE_RUNTIME_ROOT=/candidate
+INSTALL_ROOT=/install
+CURRENT_LINK=/install/current
+PREVIOUS_LINK=/install/previous
+ENV_FILE=/config/env
+RELEASE_DIR=/install/releases/2.0.0
+RELEASE_VERSION=2.0.0
+ACTIVATION_TRANSACTION_ID=activation-0123456789abcdef01234567
+ACTIVATION_TRANSACTION_PHASE=rollback-healthy
+ACTIVATION_ROLLBACK_FROM=prepared
+EXECUTION_RECOVERY_HELPER=
+PRIOR_SERVICE_STATE=running
+wait_for_previous_release_health() { printf 'incumbent:health\n' >> "$LOG"; }
+execution_activation_command() {
+  printf 'lease:%s\n' "$1" >> "$LOG"
+  [[ "$1" != recovery-state ]] || printf '%s\n' "$RECOVERY_STATE"
+}
+execution_recovery_arm() {
+  printf 'owner:arm\n' >> "$LOG"
+  [[ "$ARM_SUCCEEDS" = true ]] || return 99
+  EXECUTION_RECOVERY_HELPER=/retained/execution_recovery.py
+}
+execution_recovery_command() {
+  test -n "$EXECUTION_RECOVERY_HELPER" || return 98
+  printf 'owner:%s\n' "$1" >> "$LOG"
+}
+activation_service_config_path() { printf /service; }
+activation_transaction_command() { printf 'journal:%s\n' "$2" >> "$LOG"; }
+'''
+                prefix += "LOG=" + shlex.quote(str(log)) + "\nARM_SUCCEEDS=" + str(arm_succeeds).lower() + "\nRECOVERY_STATE=" + state + "\n"
+                result = subprocess.run(["/bin/bash", "-c", prefix + block
+                    + "\nfinish_activation_transaction /candidate\n"], capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, arm_succeeds or state == "unarmed", result.stderr)
+                expected = ['lease:recovery-state']
+                if state == "unarmed":
+                    expected += ['incumbent:health', 'lease:release', 'journal:finish']
+                elif state == "required":
+                    expected += ['lease:release', 'owner:arm']
+                if state == "required" and arm_succeeds:
+                    expected += ['owner:complete', 'journal:finish', 'owner:finalized']
+                self.assertEqual(log.read_text().splitlines(), expected)
+
+    def test_missing_pre_takeover_candidate_can_recover_only_without_an_owner(self):
+        item = fixtures.ActivationLayout(self.base / "pre-takeover")
+        item.service = self.item.service
+        self.identifier = self.tests.begin(item)
+        self.item = item
+        self.args.root = str(item.root)
+        self.args.config_root = str(item.config_root)
+        self.args.release_dir = str(item.release_dir)
+        shutil.rmtree(item.candidate_source)
+        native = mock.Mock(spec=["assert_absent"])
+        self.assertEqual(bridge.recovery_state(self.args, self.value(), native=native), "unarmed")
+        native.assert_absent.assert_called_once()
+        recovery = item.root / ".activation-recovery"
+        recovery.mkdir(mode=0o700)
+        owner = recovery / self.identifier
+        owner.mkdir(mode=0o700)
+        self.assertEqual(bridge.recovery_state(self.args, self.value(), native=native), "required")
+        owner.rmdir()
+        wants = item.service.parent / "default.target.wants"
+        wants.mkdir()
+        enabled = wants / ("agents-server-recovery-" + self.identifier.removeprefix("activation-") + ".service")
+        enabled.symlink_to(item.service.parent / enabled.name)
+        self.assertEqual(bridge.recovery_state(self.args, self.value(), native=native), "required")
+        enabled.unlink()
+        native.assert_absent.side_effect = RuntimeError("recovery job still loaded")
+        with self.assertRaisesRegex(RuntimeError, "still loaded"):
+            bridge.recovery_state(self.args, self.value(), native=native)
+        native.assert_absent.side_effect = None
+        recovery.chmod(0o755)
+        with self.assertRaises(PermissionError):
+            bridge.recovery_state(self.args, self.value(), native=native)
+        recovery.chmod(0o700)
+        item.env.write_bytes(b"changed config\n")
+        with self.assertRaisesRegex(RuntimeError, "configuration"):
+            bridge.recovery_state(self.args, self.value(), native=native)
+
+    def test_link_takeover_cannot_skip_recovery_ownership(self):
+        native = mock.Mock(spec=["assert_absent"])
+        self.assertEqual(bridge.recovery_state(self.args, self.value(), native=native), "required")
+        native.assert_absent.assert_not_called()
+
+    def test_pre_takeover_rollback_cannot_skip_owner_with_changed_current_link(self):
+        item = fixtures.ActivationLayout(self.base / "pre-takeover")
+        item.service = self.item.service
+        self.identifier = self.tests.begin(item)
+        self.item = item
+        self.args.root = str(item.root)
+        self.args.config_root = str(item.config_root)
+        self.args.release_dir = str(item.release_dir)
+        self.tests.invoke("record", *self.tests.owned_args(item, self.identifier), "--phase", "rolling-back")
+        item.current.unlink()
+        native = mock.Mock(spec=["assert_absent"])
+        with self.assertRaisesRegex(RuntimeError, "before link takeover"):
+            bridge.recovery_state(self.args, self.value(), native=native)
+        item.current.symlink_to(item.release_dir)
+        with self.assertRaisesRegex(RuntimeError, "before link takeover"):
+            bridge.recovery_state(self.args, self.value(), native=native)
+        native.assert_absent.assert_not_called()
 
     def test_legacy_admission_fetches_native_admin_header_before_stop(self):
         import shlex, subprocess

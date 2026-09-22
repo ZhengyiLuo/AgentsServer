@@ -180,6 +180,39 @@ ACTIVATION_TRANSACTION_DIR={root / '.activation-transaction'!s}
 {self.lock_functions}
 """
 
+    def test_legacy_install_root_becomes_private_under_its_owned_lock(self) -> None:
+        for mode in (0o755, 0o750, 0o700):
+            with self.subTest(mode=oct(mode)), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                root.chmod(mode)
+                before = root.stat().st_ino
+                result = subprocess.run(
+                    ["/bin/bash", "-c", self._lock_prefix(root)
+                     + "set -e\nacquire_install_lock\nrelease_install_lock\n"],
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(root.stat().st_mode & 0o777, 0o700)
+                self.assertEqual(root.stat().st_ino, before)
+
+    def test_unsafe_or_busy_install_root_is_not_normalized(self) -> None:
+        for unsafe in (True, False):
+            with self.subTest(unsafe=unsafe), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                mode = 0o775 if unsafe else 0o755
+                root.chmod(mode)
+                if not unsafe:
+                    lock = root / ".install-lock"
+                    lock.mkdir(mode=0o700)
+                    (lock / "pid").write_text(str(os.getpid()))
+                    (lock / "pid").chmod(0o600)
+                result = subprocess.run(
+                    ["/bin/bash", "-c", self._lock_prefix(root) + "acquire_install_lock\n"],
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(root.stat().st_mode & 0o777, mode)
+
     def test_empty_install_lock_is_atomically_replaced_and_released(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -507,6 +540,93 @@ test "$(grep -c '^health$' "$LOG")" = 1
 """.replace("__PHASE__",phase)
             result=subprocess.run(["/bin/bash","-c",self._rollback_script(body)],text=True,capture_output=True)
             self.assertEqual(result.returncode,0,result.stderr)
+
+    def test_pre_quiescence_failure_preserves_live_incumbent_and_clears_exact_fence(self) -> None:
+        for phase in ("prepared", "guarded"):
+            for resumed in (False, True):
+                with self.subTest(phase=phase, resumed=resumed):
+                    body = """
+set -e
+ACTIVATION_TRANSACTION_PHASE=__CURRENT__
+ACTIVATION_ROLLBACK_FROM=__ORIGINAL__
+rm -f "$SUPPRESSION" "$RECEIPT"
+record_activation_phase() { log "record:$1"; ACTIVATION_TRANSACTION_PHASE="$1"; }
+clear_team_hub_operation_fence() { log clear-fence; }
+restore_previous_release_transaction
+! grep -q '^suppress$' "$LOG"
+! grep -q '^stop$' "$LOG"
+! grep -q '^restore-hub$' "$LOG"
+! grep -q '^restore-service$' "$LOG"
+test "$(grep -c '^clear-fence$' "$LOG")" = 1
+test "$(grep -c '^health$' "$LOG")" = 1
+test "$(grep -c '^finish$' "$LOG")" = 1
+""".replace("__CURRENT__", "rolled-back" if resumed else phase).replace("__ORIGINAL__", phase)
+                    result = subprocess.run(["/bin/bash", "-c", self._rollback_script(body)],
+                                            capture_output=True, text=True, check=False)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_durability_failure_rollback_uses_real_controls_with_live_hub_lease(self) -> None:
+        from agentsdock_team_hub.store import HubStore
+        begin = self.installer_source.index('if [[ "${EXECUTION_MODE:-legacy}" == "split" ]]; then\n  if ! execution_activation_command durability')
+        end = self.installer_source.index('\nfi\n', begin) + len('\nfi\n')
+        controls = _between(self.installer_source, "clear_team_hub_operation_fence() {",
+                            "clear_team_hub_reactivation_fence() {")
+        controls += _between(self.installer_source, "restore_team_hub_snapshot() {", "port_has_listener() {")
+        for phase in ("prepared", "guarded"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                runtime = root / "runtime"
+                (runtime / ".venv/bin").mkdir(parents=True)
+                interpreter = runtime / ".venv/bin/python"
+                interpreter.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + ' "$@"\n')
+                interpreter.chmod(0o755)
+                (runtime / "agentsdock_team_hub").symlink_to(ROOT / "agentsdock_team_hub", target_is_directory=True)
+                identity, operation = "a" * 24, "b" * 32
+                hub = HubStore(root / "hub", managed_host_identity=identity)
+                snapshot = hub.maintenance_snapshot_and_fence("server-update", operation_id=operation)
+                marker = hub.maintenance_fence_path.stat()
+                database_before = hub.database_path.read_bytes()
+                lease = HubStore.acquire_managed_runtime_lease(root / "hub")
+                self.addCleanup(HubStore.release_managed_runtime_lease, lease)
+                values = {
+                    "CANDIDATE_RUNTIME_ROOT": str(runtime), "STAGE_DIR": str(runtime),
+                    "TEAM_HUB_DATA_DIR": str(root / "hub"), "TEAM_HUB_SNAPSHOT": str(snapshot),
+                    "EXPECTED_SERVER_IDENTITY": identity, "EXPECTED_TEAM_HUB_ID": hub.hub_id,
+                    "TEAM_HUB_OPERATION_ID": operation, "TEAM_HUB_OPERATION_FENCE_DEVICE": str(marker.st_dev),
+                    "TEAM_HUB_OPERATION_FENCE_INODE": str(marker.st_ino), "EXECUTION_MODE": "split",
+                    "ACTIVATION_TRANSACTION_PHASE": phase, "ACTIVATION_ROLLBACK_FROM": "",
+                    "TEAM_HUB_STARTUP_AUTHORITY_PENDING": "false", "COLD_TEAM_HUB_HANDOFF": "false",
+                }
+                body = '\n'.join(name + '=' + shlex.quote(value) for name, value in values.items())
+                body += '\n' + controls + '\n'
+                body += "team_hub_control_runtime() { printf '%s\\n%s\\n' " + shlex.quote(sys.executable) + ' ' + shlex.quote(str(ROOT)) + "; }\n"
+                body += '''
+run_without_server_secrets() { "$@"; }
+rm -f "$SUPPRESSION" "$RECEIPT"
+record_activation_phase() {
+  if [[ "$1" = rolling-back ]]; then ACTIVATION_ROLLBACK_FROM="$ACTIVATION_TRANSACTION_PHASE"; fi
+  log "record:$1"; ACTIVATION_TRANSACTION_PHASE="$1"
+}
+execution_activation_command() { [[ "$1" != durability ]]; }
+execution_recovery_arm() { return 97; }
+execution_stop_services() { return 96; }
+cleanup_test() {
+  trap - EXIT
+  restore_previous_release_transaction || exit 95
+  test -z "$ACTIVATION_TRANSACTION_ID" || exit 94
+  ! grep -Eq '^(stop|restore-service|restore-hub)$' "$LOG" || exit 93
+  test "$(grep -c '^health$' "$LOG")" = 1 || exit 92
+  exit 0
+}
+trap cleanup_test EXIT
+'''
+                body += self.installer_source[begin:end]
+                result = subprocess.run(["/bin/bash", "-c", self._rollback_script(body)],
+                                        capture_output=True, text=True, check=False, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(hub.maintenance_fence_path.exists())
+                self.assertEqual(hub.database_path.read_bytes(), database_before)
+                self.assertFalse((root / "hub/.restore-completion.json").exists())
 
     def test_resuming_restored_files_never_reenters_rollback_or_reapplies_snapshot(self) -> None:
         body = """

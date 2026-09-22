@@ -25422,9 +25422,13 @@ def scan_queued_turns_from_events(
                     order.append(queued_id)
             elif event_type in {"turn_queue_updated", "turn_queue_run_now"} and queued_id in pending:
                 pending[queued_id].update(async_route_queue_fields({**pending[queued_id], **event}))
-                if event_type == "turn_queue_run_now":
+                if event_type == "turn_queue_run_now" and event.get("native_goal_steer") is not True:
                     pending[queued_id]["_paused_after_stop"] = False
                     pending[queued_id].pop("_native_delivery_fenced", None)
+                # A goal follow-up continues an existing provider turn. Its
+                # run-now marker does not authorize another launch or clear an
+                # uncertain-delivery fence: only the accepted turn_steered
+                # marker below consumes it. Keep a truncated batch paused.
                 legacy_generated_replay = (
                     event_type == "turn_queue_run_now"
                     and event.get("replays_interrupted_message")
@@ -25506,7 +25510,10 @@ def scan_queued_turns_from_events(
                     order = seen + [qid for qid in order if qid not in seen]
                 except Exception:
                     pass
-            elif event_type in {"turn_started", "turn_unqueued"} and queued_id:
+            elif queued_id and (
+                event_type in {"turn_started", "turn_unqueued"}
+                or is_native_goal_steer_event(event)
+            ):
                 pending.pop(queued_id, None)
                 if queued_id in order:
                     order.remove(queued_id)

@@ -33,6 +33,9 @@ class InstallerStageCleanupTests(unittest.TestCase):
         stage: Path,
         stage_device: int,
         stage_inode: int,
+        transaction_id: str = "",
+        rollback_settles: bool = False,
+        failed: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         script = f"""
 set -u
@@ -41,8 +44,9 @@ STAGE_DIR_DEVICE={stage_device}
 STAGE_DIR_INODE={stage_inode}
 UV_INSTALLER=
 IN_EXIT_CLEANUP=false
-ACTIVATION_TRANSACTION_ID=
-ACTIVATION_TRANSACTION_PHASE=
+ACTIVATION_TRANSACTION_ID={shlex.quote(transaction_id)}
+ACTIVATION_TRANSACTION_DIR={shlex.quote(str(stage.parent / '.activation-transaction'))}
+ACTIVATION_TRANSACTION_PHASE=prepared
 TEAM_HUB_RECOVERY_ATTEMPTED=false
 TEAM_HUB_OPERATION_PENDING=false
 TEAM_HUB_OPERATION_FINALIZED=false
@@ -54,8 +58,14 @@ CANDIDATE_SERVICE_MAY_HAVE_STARTED=false
 mask_install_signals() {{ :; }}
 stop_active_stage() {{ :; }}
 release_install_lock() {{ :; }}
+team_hub_transaction_requires_recovery() {{ return 1; }}
+restore_previous_release_transaction() {{
+  {str(rollback_settles).lower()} || return 1
+  rmdir "$ACTIVATION_TRANSACTION_DIR" || return 1
+  ACTIVATION_TRANSACTION_ID=
+}}
 {self.cleanup_function}
-true
+{str(not failed).lower()}
 cleanup
 """
         return subprocess.run(
@@ -81,6 +91,29 @@ cleanup
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(stage.exists())
+
+    def test_failed_cleanup_preserves_stage_until_its_transaction_settles(self) -> None:
+        for acknowledged, settles in ((True, False), (False, False), (True, True)):
+            with self.subTest(acknowledged=acknowledged, settles=settles), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                stage = root / "stage"
+                stage.mkdir()
+                marker = stage / "candidate-marker"
+                marker.write_bytes(b"exact retained runtime\n")
+                identity = stage.stat(follow_symlinks=False)
+                journal = root / ".activation-transaction"
+                journal.mkdir(mode=0o700)
+                result = self._run_cleanup(
+                    stage=stage, stage_device=identity.st_dev, stage_inode=identity.st_ino,
+                    transaction_id="activation-" + "a" * 24 if acknowledged else "",
+                    rollback_settles=settles, failed=True,
+                )
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(journal.exists(), not settles)
+                self.assertEqual(stage.exists(), not settles)
+                if not settles:
+                    self.assertEqual(marker.read_bytes(), b"exact retained runtime\n")
+                    self.assertEqual(stage.stat().st_ino, identity.st_ino)
 
     def test_cleanup_never_removes_a_replacement_at_the_old_stage_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -93,6 +93,42 @@ def owned_args(value: dict[str, Any], root: Path) -> argparse.Namespace:
         release_version=value["release_version"], transaction_id=value["transaction_id"])
 
 
+def recovery_state(args: argparse.Namespace, value: dict[str, Any], *, native=None) -> str:
+    """Prove an activation failed before any native takeover or recovery owner."""
+    phase = value.get("rollback_from") or value["phase"]
+    if phase not in {"prepared", "guarded"}:
+        return "required"
+    root = files._path(args.root)
+    files._owned_directory(root, private=True)
+    # The generic rolling-back validator deliberately permits mixed links and
+    # observed configurations. This exemption requires the stricter original
+    # pre-takeover view even while that rollback is being resumed.
+    activation._validate_invocation(owned_args(value, root), {**value, "phase": phase},
+                                    allow_missing_candidate=True)
+    from execution_recovery import DIRECTORY, RecoveryService, _service_path
+    parent = root / DIRECTORY
+    if parent.exists() or parent.is_symlink():
+        files._path(parent)
+        files._owned_directory(parent, private=True)
+        owner = parent / value["transaction_id"]
+        if owner.exists() or owner.is_symlink():
+            return "required"
+    registration = {"transaction_id": value["transaction_id"], "platform": args.platform, "home": args.home}
+    path = files._path(_service_path(registration))
+    if path.exists() or path.is_symlink():
+        return "required"
+    if args.platform == "Linux":
+        wants = path.parent / "default.target.wants"
+        if wants.exists() or wants.is_symlink():
+            files._path(wants)
+            files._owned_directory(wants)
+            enabled = wants / path.name
+            if enabled.exists() or enabled.is_symlink():
+                return "required"
+    (native or RecoveryService(registration)).assert_absent(path)
+    return "unarmed"
+
+
 def publish(args: argparse.Namespace, value: dict[str, Any]) -> None:
     layout = command_layout(args, environment=True)
     layout.validate()
@@ -462,7 +498,7 @@ def _verify_stop(args: argparse.Namespace, value: dict[str, Any], services: Nati
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("detect", "snapshot", "candidate-api-contract", "preflight", "durability", "publish", "stop", "start", "suppress", "restore", "verify", "verify-restored", "previous-worker", "release"))
+    parser.add_argument("command", choices=("detect", "snapshot", "candidate-api-contract", "preflight", "durability", "publish", "stop", "start", "suppress", "restore", "verify", "verify-restored", "previous-worker", "release", "recovery-state"))
     for name in ("root", "config-root", "state-root", "home", "platform", "release-dir", "bind"):
         parser.add_argument("--" + name, required=name == "root")
     parser.add_argument("--port", type=int)
@@ -520,7 +556,9 @@ def main(argv: list[str] | None = None) -> int:
         seed_legacy_recovery(args, services)
         return 0
     value = transaction(args)
-    if args.command == "durability":
+    if args.command == "recovery-state":
+        print(recovery_state(args, value))
+    elif args.command == "durability":
         from execution_durability import flush_activation
         flush_activation(layout.install_root, value)
         if transaction(args) != value:

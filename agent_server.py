@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import base64
 import codecs
+import copy
 import ctypes
 import errno
 import fcntl
@@ -115,6 +116,7 @@ from provider_commands import (
 )
 from update_runner import atomic_json as atomic_update_json
 from update_runner import (
+    ReleaseRateLimitedError,
     ReleaseUnavailableError,
     check_release,
     server_update_status_lock,
@@ -72601,7 +72603,7 @@ def reconcile_pending_server_update_after_startup(
                 npm_manifest = verify_npm_release_envelope(
                     current["_npm_release"], SERVER_UPDATE_PUBLIC_KEY, expected_version=target,
                 )
-                valid = npm_manifest["track"] == track == server_release_track(SERVER_VERSION)
+                valid = npm_manifest["track"] == track
             except Exception:
                 valid = False
         if not valid:
@@ -73193,17 +73195,68 @@ async def quiesce_managed_update_service_cgroup(
     )
 
 
-async def signed_release_manifest(
-    track: Literal["stable", "beta"] = "stable",
-) -> dict[str, Any]:
-    if not SERVER_UPDATE_PUBLIC_KEY.is_file():
-        raise HTTPException(status_code=503, detail="release verification key is missing from this server installation")
+RELEASE_CHECK_CACHE_SECONDS = 300.0
+_RELEASE_CHECK_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+_RELEASE_CHECK_TASKS: dict[tuple[str, str], asyncio.Task[dict[str, Any]]] = {}
+_RELEASE_CHECK_RETRY_AT = 0.0
+
+
+def release_check_rate_limit_error() -> HTTPException:
+    delay = max(1, math.ceil(_RELEASE_CHECK_RETRY_AT - time.monotonic()))
+    return HTTPException(
+        status_code=429,
+        detail={
+            "code": "server_update_release_rate_limited",
+            "message": f"GitHub temporarily limited update requests. Try again in {delay} seconds. Your server is still running.",
+            "action": f"Try the update again in {delay} seconds. No server restart is needed.",
+            "retryable": True,
+            "retry_after_seconds": delay,
+        },
+        headers={"Retry-After": str(delay)},
+    )
+
+
+async def _fetch_signed_release_manifest(key: tuple[str, str]) -> dict[str, Any]:
+    global _RELEASE_CHECK_RETRY_AT
     try:
-        return await asyncio.to_thread(check_release, SERVER_UPDATE_PUBLIC_KEY, track)
+        manifest = await asyncio.to_thread(check_release, Path(key[0]), key[1])
+        _RELEASE_CHECK_CACHE[key] = (
+            time.monotonic() + RELEASE_CHECK_CACHE_SECONDS, copy.deepcopy(manifest),
+        )
+        return manifest
+    except ReleaseRateLimitedError as exc:
+        _RELEASE_CHECK_RETRY_AT = max(
+            _RELEASE_CHECK_RETRY_AT, time.monotonic() + exc.retry_after_seconds,
+        )
+        raise release_check_rate_limit_error() from exc
     except ReleaseUnavailableError as exc:
+        _RELEASE_CHECK_CACHE.pop(key, None)
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"signed release check failed: {exc}") from exc
+    finally:
+        _RELEASE_CHECK_TASKS.pop(key, None)
+
+
+async def signed_release_manifest(
+    track: Literal["stable", "beta"] = "stable", *, refresh: bool = False,
+) -> dict[str, Any]:
+    if not SERVER_UPDATE_PUBLIC_KEY.is_file():
+        raise HTTPException(status_code=503, detail="release verification key is missing from this server installation")
+    key = (str(SERVER_UPDATE_PUBLIC_KEY.resolve()), track)
+    cached = _RELEASE_CHECK_CACHE.get(key)
+    if not refresh and cached is not None and time.monotonic() < cached[0]:
+        return copy.deepcopy(cached[1])
+    if time.monotonic() < _RELEASE_CHECK_RETRY_AT:
+        raise release_check_rate_limit_error()
+    task = _RELEASE_CHECK_TASKS.get(key)
+    if task is None:
+        task = asyncio.create_task(_fetch_signed_release_manifest(key))
+        _RELEASE_CHECK_TASKS[key] = task
+        # Closing a Settings request must not cancel another client's check.
+        # Consume errors even if every requesting client disconnects.
+        task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+    return copy.deepcopy(await asyncio.shield(task))
 
 
 TEAM_HUB_MODE, TEAM_HUB_CONFIG_ERROR = configured_team_hub_mode(
@@ -80883,11 +80936,6 @@ async def _start_server_update(
                     **status, "phase": "current", "reconciliation": "current",
                     "update_available": False, "message": f"AgentsServer {SERVER_VERSION} satisfies this application release.",
                 }
-        if npm_manifest is not None and npm_manifest["track"] != server_release_track(SERVER_VERSION):
-            raise HTTPException(409, server_update_error_detail(
-                "server_update_channel_conflict", "Automatic updates cannot change this server's release channel.",
-                action="Choose the server release channel explicitly in Settings.", retryable=False,
-            ))
         if ensure:
             if (status.get("phase") in SERVER_UPDATE_ACTIVE_PHASES
                     or managed_server_update_is_pending(status)):
@@ -80972,7 +81020,7 @@ async def _start_server_update(
                 npm_manifest = verify_npm_release_envelope(
                     npm_release, SERVER_UPDATE_PUBLIC_KEY, expected_version=requested,
                 )
-                if npm_manifest["track"] != track or track != server_release_track(SERVER_VERSION):
+                if npm_manifest["track"] != track:
                     raise ValueError("release channel changed")
             except Exception as exc:
                 raise HTTPException(400, "the saved signed npm release descriptor is invalid") from exc
@@ -81018,14 +81066,16 @@ async def _start_server_update(
                 checked_at=update_utc_now(),
             )
         if (
-            track == "stable"
+            npm_manifest is None
+            and track == "stable"
             and server_release_track(SERVER_VERSION) == "beta"
+            and version_key(requested) < version_key(SERVER_VERSION)
         ):
             # Beta-to-stable is the only transition allowed to move backward
             # in SemVer precedence. Resolve the signed channel again at the
             # exact admission point so a caller or a recovered idle schedule
             # cannot use that exception to select an arbitrary old release.
-            latest_manifest = await signed_release_manifest("stable")
+            latest_manifest = await signed_release_manifest("stable", refresh=True)
             latest_stable = str(latest_manifest.get("version") or "").strip()
             if latest_stable != requested:
                 raise HTTPException(

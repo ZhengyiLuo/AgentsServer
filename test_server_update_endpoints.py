@@ -4969,7 +4969,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
             "server_update_target_superseded",
         )
         self.assertEqual(raised.exception.detail["latest_version"], "1.0.1")
-        latest.assert_awaited_once_with("stable")
+        latest.assert_awaited_once_with("stable", refresh=True)
         run_tmux.assert_not_called()
 
     async def test_recovered_pending_beta_switch_revalidates_latest_stable(self):
@@ -5016,7 +5016,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["error_code"], "server_update_target_superseded")
         self.assertTrue(status["update_available"])
         self.assertTrue(status["checked_at"])
-        latest.assert_awaited_once_with("stable")
+        latest.assert_awaited_once_with("stable", refresh=True)
         run_tmux.assert_not_called()
 
     async def test_start_rejects_version_that_does_not_match_track(self):

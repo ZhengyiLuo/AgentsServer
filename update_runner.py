@@ -10,6 +10,7 @@ from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import signal
@@ -22,6 +23,7 @@ import time
 import urllib.request
 from urllib.error import HTTPError, URLError
 from pathlib import Path
+from email.utils import parsedate_to_datetime
 from typing import Any, Callable
 
 from cryptography.hazmat.primitives import serialization
@@ -31,7 +33,6 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 RELEASE_REPOSITORY = "ZhengyiLuo/AgentsServer"
 RELEASE_BASE = f"https://github.com/{RELEASE_REPOSITORY}/releases"
 RELEASES_API_URL = f"https://api.github.com/repos/{RELEASE_REPOSITORY}/releases?per_page=100"
-RELEASES_PAGE_URL = f"https://github.com/{RELEASE_REPOSITORY}/releases"
 MAX_METADATA_BYTES = 1_000_000
 MAX_ARCHIVE_BYTES = 200 * 1024 * 1024
 SERVER_IDLE_CHECK_TIMEOUT_SECONDS = 10.0
@@ -98,6 +99,39 @@ SECURE_PEER_HEALTH_REQUIREMENTS = {
 
 class ReleaseUnavailableError(RuntimeError):
     """Raised when the repository has not published a signed release yet."""
+
+
+class ReleaseRateLimitedError(RuntimeError):
+    """The release host asked us to wait before requesting more metadata."""
+
+    def __init__(self, retry_after_seconds: int):
+        self.retry_after_seconds = max(1, retry_after_seconds)
+        super().__init__("GitHub temporarily limited update requests. Try again shortly.")
+
+
+def release_rate_limit_delay(error: HTTPError) -> int | None:
+    headers = {name.lower(): value for name, value in (error.headers or {}).items()}
+    if error.code != 429 and not (
+        error.code == 403 and (
+            headers.get("x-ratelimit-remaining") == "0" or "retry-after" in headers
+        )
+    ):
+        return None
+    delays = []
+    retry_after = headers.get("retry-after", "")
+    try:
+        delays.append(float(retry_after))
+    except ValueError:
+        try:
+            delays.append(parsedate_to_datetime(retry_after).timestamp() - time.time())
+        except (ValueError, TypeError, OverflowError):
+            pass
+    try:
+        delays.append(float(headers.get("x-ratelimit-reset", "")) - time.time())
+    except ValueError:
+        pass
+    valid = [math.ceil(delay) for delay in delays if math.isfinite(delay) and delay > 0]
+    return max(valid, default=60)
 
 
 class UpdateOwnershipLostError(RuntimeError):
@@ -940,24 +974,6 @@ def release_versions_from_html(content: bytes, track: str = "stable") -> set[str
     }
 
 
-def release_candidates_from_public_pages(track: str = "stable", max_pages: int = 20) -> list[str]:
-    track = normalized_release_track(track)
-    versions: set[str] = set()
-    for page in range(1, max_pages + 1):
-        url = RELEASES_PAGE_URL if page == 1 else f"{RELEASES_PAGE_URL}?page={page}"
-        content = download_bytes(url, MAX_METADATA_BYTES)
-        versions.update(release_versions_from_html(content, track))
-        next_page = f"{RELEASES_PAGE_URL.removeprefix('https://github.com')}?page={page + 1}"
-        if next_page not in content.decode("utf-8", "replace"):
-            break
-    return sorted(versions, key=version_key, reverse=True)
-
-
-def stable_release_candidates_from_public_pages(max_pages: int = 20) -> list[str]:
-    """Backward-compatible stable release discovery."""
-    return release_candidates_from_public_pages("stable", max_pages)
-
-
 def verify_manifest(
     manifest_bytes: bytes,
     signature: bytes,
@@ -1090,6 +1106,26 @@ def check_release(
     expected_version: str | None = None,
     require_latest: bool = False,
 ) -> dict[str, Any]:
+    try:
+        return _check_release(
+            public_key_path, track, expected_version=expected_version,
+            require_latest=require_latest,
+        )
+    except HTTPError as exc:
+        delay = release_rate_limit_delay(exc)
+        if delay is not None:
+            exc.close()
+            raise ReleaseRateLimitedError(delay) from exc
+        raise
+
+
+def _check_release(
+    public_key_path: Path,
+    track: str = "stable",
+    *,
+    expected_version: str | None = None,
+    require_latest: bool = False,
+) -> dict[str, Any]:
     track = normalized_release_track(track)
     if expected_version is not None:
         version = str(expected_version).strip()
@@ -1139,9 +1175,9 @@ def check_release(
     except HTTPError as exc:
         if exc.code == 404:
             raise ReleaseUnavailableError("No signed AgentsServer release has been published yet.") from exc
-        if exc.code not in {403, 429}:
-            raise
-        candidates = release_candidates_from_public_pages(track)
+        # Do not turn a rejected API request into a burst of HTML requests.
+        # The caller shares the Retry-After delay across subsequent checks.
+        raise
     else:
         try:
             releases = json.loads(releases_bytes)

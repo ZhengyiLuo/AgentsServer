@@ -47,6 +47,7 @@ bootstrap_native_macos_architecture() {
 
 bootstrap_native_macos_architecture "$@"
 unset AGENTS_SERVER_NATIVE_ARCH_REEXEC
+REQUESTED_INSTALL_ARGUMENTS=("$@")
 
 PORT="7850"
 BIND_ADDRESS="0.0.0.0"
@@ -525,6 +526,11 @@ refuse_execution_layout() {
         return 1
       fi
       EXECUTION_MODE="split"
+    elif [[ "$detected" == "legacy" \
+      && -d "$INSTALL_ROOT/.activation-transaction" ]]; then
+      # Recovery belongs to the recorded installation, even when this request
+      # will migrate it to split services after the old journal is retired.
+      EXECUTION_MODE="legacy"
     fi
   fi
 }
@@ -704,6 +710,13 @@ team_hub_control_runtime() {
 clear_team_hub_operation_fence() {
   [[ "$TEAM_HUB_OPERATION_PENDING" == "true" ]] || return 0
   local allow_missing="${2:-false}"
+  if [[ "$allow_missing" == "true" \
+    && "${PRESERVE_INCOMING_TEAM_HUB_FENCE:-false}" == "true" ]]; then
+    # The previous rollback already consumed its fence. A new request may
+    # have fenced the healthy incumbent before discovering that old journal.
+    # Finish the old rollback without clearing the new request's admission.
+    return 0
+  fi
   local runtime=""
   local python_path=""
   local source_root=""
@@ -740,6 +753,21 @@ if not cleared and sys.argv[8] != "true":
     "$TEAM_HUB_OPERATION_FENCE_INODE" \
     "$allow_missing"
 }
+
+incoming_team_hub_operation_control() (
+  # Keep the admitted request separate from variables loaded from an older
+  # activation journal. Recovery must not lose or adopt its fence ownership.
+  TEAM_HUB_OPERATION_PENDING="true"
+  TEAM_HUB_DATA_DIR="${INCOMING_TEAM_HUB_OPERATION[0]}"
+  EXPECTED_TEAM_HUB_ID="${INCOMING_TEAM_HUB_OPERATION[1]}"
+  EXPECTED_SERVER_IDENTITY="${INCOMING_TEAM_HUB_OPERATION[2]}"
+  TEAM_HUB_OPERATION_ID="${INCOMING_TEAM_HUB_OPERATION[3]}"
+  TEAM_HUB_SNAPSHOT="${INCOMING_TEAM_HUB_OPERATION[4]}"
+  TEAM_HUB_OPERATION_FENCE_DEVICE="${INCOMING_TEAM_HUB_OPERATION[5]}"
+  TEAM_HUB_OPERATION_FENCE_INODE="${INCOMING_TEAM_HUB_OPERATION[6]}"
+  PRESERVE_INCOMING_TEAM_HUB_FENCE="false"
+  "$@"
+)
 
 clear_team_hub_reactivation_fence() {
   [[ "$TEAM_HUB_REACTIVATION_FENCE_PENDING" == "true" ]] || return 0
@@ -3293,6 +3321,14 @@ cleanup() {
   if [[ -n "${source_inventory:-}" ]]; then
     rm -f "$source_inventory"
   fi
+  if [[ "$exit_status" != "0" \
+    && "${PRESERVE_INCOMING_TEAM_HUB_FENCE:-false}" == "true" ]]; then
+    # The new request never reached takeover when old-journal recovery failed.
+    # Release its own fence, even though recovery loaded a different operation.
+    if ! incoming_team_hub_operation_control clear_team_hub_operation_fence "$SOURCE_DIR" true; then
+      echo "The unstarted update could not release its Team Hub maintenance fence." >&2
+    fi
+  fi
   # An unfinished activation or recovery owner may still need this exact
   # runtime. Check before releasing exclusion, including a journal published
   # just before the shell received its transaction ID.
@@ -4648,9 +4684,15 @@ acknowledge_team_hub_restore_receipt() {
     --expected-operation-id "$operation_id"
   )
   [[ "$allow_missing" != "true" ]] || arguments+=(--allow-missing)
-  run_without_server_secrets env PYTHONPATH="$runtime_root" \
-    "$runtime_root/.venv/bin/python" -m agentsdock_team_hub.cli \
-    "${arguments[@]}" >/dev/null
+  # Use this installer's receipt helper with the retained interpreter. Older
+  # helpers require an exclusive database lease even for an absent receipt,
+  # which wedges recovery after the restored incumbent is already healthy.
+  (
+    cd "$SOURCE_DIR" || exit 1
+    run_without_server_secrets env PYTHONPATH="$SOURCE_DIR" \
+      "$runtime_root/.venv/bin/python" -m agentsdock_team_hub.cli \
+      "${arguments[@]}" >/dev/null
+  )
 }
 
 port_has_listener() {
@@ -6486,6 +6528,8 @@ load_pending_activation_transaction() {
 
 recover_pending_activation_transaction() {
   [[ "$ACTIVATION_TRANSACTION_RESUMED" == "true" ]] || return 0
+  local retry_guidance=" Run the installer again."
+  [[ "${PRESERVE_INCOMING_TEAM_HUB_FENCE:-false}" != "true" ]] || retry_guidance=""
   case "$ACTIVATION_TRANSACTION_PHASE" in
     committing|committed)
       if ! complete_activation_commit; then
@@ -6503,7 +6547,7 @@ recover_pending_activation_transaction() {
       if ! finish_activation_transaction "$STAGE_DIR"; then
         return 1
       fi
-      echo "Retired the previously verified rollback. Run the installer again." >&2
+      echo "Retired the previously verified rollback.$retry_guidance" >&2
       return 75
       ;;
     rolled-back)
@@ -6511,7 +6555,7 @@ recover_pending_activation_transaction() {
         echo "The pending rollback could not restore its prior service state; its journal remains for retry." >&2
         return 1
       fi
-      echo "Recovered the exact pre-activation release and service state. Run the installer again." >&2
+      echo "Recovered the exact pre-activation release and service state.$retry_guidance" >&2
       return 75
       ;;
     *)
@@ -6519,21 +6563,54 @@ recover_pending_activation_transaction() {
         echo "The pending activation could not be rolled back safely; its journal remains for retry." >&2
         return 1
       fi
-      echo "Recovered the exact pre-activation release and service state. Run the installer again." >&2
+      echo "Recovered the exact pre-activation release and service state.$retry_guidance" >&2
       return 75
       ;;
   esac
 }
 
 if [[ "$ACTIVATION_TRANSACTION_RESUMED" == "true" ]]; then
+  INCOMING_TEAM_HUB_OPERATION=()
+  if [[ "$TEAM_HUB_OPERATION_PENDING" == "true" ]]; then
+    INCOMING_TEAM_HUB_OPERATION=(
+      "$TEAM_HUB_DATA_DIR" "$EXPECTED_TEAM_HUB_ID" "$EXPECTED_SERVER_IDENTITY"
+      "$TEAM_HUB_OPERATION_ID" "$TEAM_HUB_SNAPSHOT"
+      "$TEAM_HUB_OPERATION_FENCE_DEVICE" "$TEAM_HUB_OPERATION_FENCE_INODE"
+    )
+  fi
   if [[ "${RECOVER_UNARMED_ONLY:-false}" == "true" ]]; then
     # A rejected explicit recovery probe must not fall through EXIT's ordinary
     # rollback path, which can restart services for a later activation phase.
     TEAM_HUB_RECOVERY_ATTEMPTED="true"
   fi
   if ! load_pending_activation_transaction; then
+    if [[ "${#INCOMING_TEAM_HUB_OPERATION[@]}" != "0" ]] \
+      && { [[ -z "$ACTIVATION_TRANSACTION_ID" ]] \
+        || [[ "$ACTIVATION_HUB_KIND" != "server-update" ]] \
+        || [[ "${INCOMING_TEAM_HUB_OPERATION[3]}" != "$TEAM_HUB_OPERATION_ID" ]]; }; then
+      # Loading can fail after copying only part of the old context. No old
+      # recovery has begun; clean up the separately admitted new request.
+      PRESERVE_INCOMING_TEAM_HUB_FENCE="true"
+      TEAM_HUB_RECOVERY_ATTEMPTED="true"
+    fi
     echo "The pending activation transaction could not be verified for recovery." >&2
     exit 1
+  fi
+  if [[ "${#INCOMING_TEAM_HUB_OPERATION[@]}" != "0" ]] \
+    && { [[ "$ACTIVATION_HUB_KIND" != "server-update" ]] \
+      || [[ "${INCOMING_TEAM_HUB_OPERATION[3]}" != "$TEAM_HUB_OPERATION_ID" ]]; }; then
+    PRESERVE_INCOMING_TEAM_HUB_FENCE="true"
+    case "$ACTIVATION_TRANSACTION_PHASE" in
+      rolled-back|rollback-healthy) ;;
+      *)
+        # An unfinished takeover belongs to its existing recovery owner. The
+        # new request has not touched services or data and must not strand Hub
+        # maintenance while that earlier operation is being recovered.
+        TEAM_HUB_RECOVERY_ATTEMPTED="true"
+        echo "The previous activation is still recovering; the new update was not started." >&2
+        exit 75
+        ;;
+    esac
   fi
   if [[ "${EXECUTION_MODE:-legacy}" == "split" ]]; then
     recovery_state="$(execution_activation_command recovery-state "$CANDIDATE_RUNTIME_ROOT")" || exit 1
@@ -6554,6 +6631,17 @@ if [[ "$ACTIVATION_TRANSACTION_RESUMED" == "true" ]]; then
     exit 0
   else
     recovery_status=$?
+    if [[ "$recovery_status" == "75" \
+      && "${PRESERVE_INCOMING_TEAM_HUB_FENCE:-false}" == "true" \
+      && "$RECOVER_ONLY" != "true" ]]; then
+      # Recovery skipped candidate staging. The old journal is now retired;
+      # re-enter this admitted request with its original arguments and fence.
+      # Successful exec skips EXIT cleanup; failed exec still releases it.
+      release_install_lock || exit 1
+      resume_install_signals
+      echo "Continuing the requested AgentsServer $REQUESTED_RELEASE_VERSION update."
+      exec /bin/bash "$SOURCE_DIR/install.sh" "${REQUESTED_INSTALL_ARGUMENTS[@]}"
+    fi
     exit "$recovery_status"
   fi
 fi

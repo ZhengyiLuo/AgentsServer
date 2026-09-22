@@ -249,15 +249,42 @@ class ServerUpdateEnsureTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(raised.exception.detail["retryable"])
         self.write.assert_not_called()
 
-    async def test_channel_change_and_signature_tampering_are_rejected_before_mutation(self):
-        for request, code in ((self.request("1.0.5"), "server_update_channel_conflict"),
-                              (self.request(), "server_update_descriptor_invalid")):
-            if code == "server_update_descriptor_invalid":
-                request.signature_base64 = base64.b64encode(b"x" * 64).decode()
-            with self.subTest(code=code), self.assertRaises(HTTPException) as raised:
-                await self.ns["ensure_server_update"](request)
-            self.assertEqual(raised.exception.detail["code"], code)
+    async def test_signed_app_channel_survives_busy_reservation_restart_and_resume(self):
+        for current, target in (("1.0.4-beta.9", "1.0.5"), ("1.0.3", "1.0.5-beta.1")):
+            with self.subTest(current=current, target=target):
+                self.ns["SERVER_VERSION"] = current
+                self.status = {"phase": "idle", "track": update_runner.release_track(current), "current_version": current}
+                self.ns["signed_release_manifest"] = AsyncMock(side_effect=AssertionError("The paired signed release needs no channel rediscovery"))
+                request = self.request(target)
+                result = await self.ns["ensure_server_update"](request)
+                self.assertEqual(result["phase"], "pending")
+                self.assertEqual(result["target_version"], target)
+                self.assertEqual(result["track"], update_runner.release_track(target))
+                receipt = dict(self.status)
+                self.assertEqual(self.ns["reconcile_pending_server_update_after_startup"](receipt), receipt)
+                resumed = await self.ns["advance_pending_server_update_once"]()
+                self.assertEqual(resumed["schedule_id"], receipt["schedule_id"])
+                self.assertEqual(resumed["_npm_release"], receipt["_npm_release"])
+                self.ns["signed_release_manifest"].assert_not_called()
+
+    async def test_signature_tampering_is_rejected_before_mutation(self):
+        request = self.request()
+        request.signature_base64 = base64.b64encode(b"x" * 64).decode()
+        with self.assertRaises(HTTPException) as raised:
+            await self.ns["ensure_server_update"](request)
+        self.assertEqual(raised.exception.detail["code"], "server_update_descriptor_invalid")
         self.write.assert_not_called()
+
+    async def test_legacy_forward_beta_promotion_needs_no_channel_rediscovery(self):
+        self.ns["SERVER_VERSION"] = "1.0.4-beta.9"
+        self.ns["signed_release_manifest"] = AsyncMock(side_effect=AssertionError("Forward promotion does not use the downgrade exception"))
+        result = await self.ns["_start_server_update"](self.ns["ServerUpdateRequest"](
+            version="1.0.5", track="stable", when_idle=True,
+            expected_server_identity="server-current", expected_server_instance_id="instance-current",
+        ))
+        self.assertEqual(result["phase"], "pending")
+        self.assertEqual(result["target_version"], "1.0.5")
+        self.ns["signed_release_manifest"].assert_not_called()
 
     async def test_endpoint_requires_auth_and_fresh_instance_before_verification(self):
         body = self.request()

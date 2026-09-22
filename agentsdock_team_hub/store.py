@@ -2759,6 +2759,15 @@ class HubStore:
         identity = _identity(expected_host_identity)
         hub_id = _identity(expected_hub_id)
         operation_id = _maintenance_operation_id(expected_operation_id)
+        if allow_missing:
+            with cls.maintenance_control_lock(root):
+                if cls._read_restore_completion_receipt_unlocked(root) is None:
+                    # A previous attempt may have acknowledged the restore and
+                    # restarted the incumbent before recording final health.
+                    # There is no database work left: its live runtime lease
+                    # must not prevent this idempotent receipt retirement.
+                    cls._fsync_directory(root)
+                    return
         lease = cls.acquire_managed_runtime_lease(root)
         try:
             with cls.maintenance_control_lock(root):

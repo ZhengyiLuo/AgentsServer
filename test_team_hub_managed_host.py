@@ -2054,14 +2054,21 @@ sys.exit(10)
                 expected_operation_id=operation_id,
             )
             self.assertFalse(receipt_path.exists())
-            HubStore.acknowledge_restored_maintenance_snapshot(
-                data_dir,
-                snapshot,
-                expected_host_identity=HOST_A,
-                expected_hub_id=store.hub_id,
-                expected_operation_id=operation_id,
-                allow_missing=True,
-            )
+            # The restored server may already be healthy when the installer
+            # retries its final journal retirement. A no-op acknowledgement
+            # must not require stopping that live Hub to take its lease.
+            lease = HubStore.acquire_managed_runtime_lease(data_dir)
+            try:
+                HubStore.acknowledge_restored_maintenance_snapshot(
+                    data_dir,
+                    snapshot,
+                    expected_host_identity=HOST_A,
+                    expected_hub_id=store.hub_id,
+                    expected_operation_id=operation_id,
+                    allow_missing=True,
+                )
+            finally:
+                HubStore.release_managed_runtime_lease(lease)
             self.assertEqual(
                 HubStore(data_dir, managed_host_identity=HOST_A).hub_id,
                 store.hub_id,

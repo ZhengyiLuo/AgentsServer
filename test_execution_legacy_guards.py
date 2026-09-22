@@ -76,6 +76,8 @@ class LegacyExecutionLayoutGuardTests(unittest.TestCase):
                     with self.subTest(script=script, marker=name, kind=kind):
                         marker = self.marker(name, kind)
                         before = marker.lstat()
+                        contents = (os.readlink(marker) if kind == "symlink" else
+                                    marker.read_bytes() if kind == "file" else None)
                         try:
                             result = self.run_script(script, *(["--yes"] if script == "uninstall.sh" else []))
                             self.assertNotEqual(result.returncode, 0, result.stdout)
@@ -85,7 +87,17 @@ class LegacyExecutionLayoutGuardTests(unittest.TestCase):
                                 self.assertRegex(result.stderr, "execution (configuration|activation|layout)|execution-layout.json|separate gateway/execution layout")
                             else:
                                 self.assertIn("separate gateway/execution layout", result.stderr)
-                            self.assertEqual(marker.lstat(), before)
+                            after = marker.lstat()
+                            # Read-only inspection may update access time. Keep
+                            # checking identity, metadata and contents exactly.
+                            for field in ("st_dev", "st_ino", "st_mode", "st_nlink",
+                                          "st_uid", "st_gid", "st_size",
+                                          "st_mtime_ns", "st_ctime_ns"):
+                                self.assertEqual(getattr(after, field), getattr(before, field), field)
+                            if kind == "symlink":
+                                self.assertEqual(os.readlink(marker), contents)
+                            elif kind == "file":
+                                self.assertEqual(marker.read_bytes(), contents)
                             self.assertEqual(set(self.install.iterdir()), {marker})
                             self.assertFalse((self.home / "config").exists())
                             self.assertFalse((self.home / "state").exists())

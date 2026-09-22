@@ -26,6 +26,22 @@ changing directories does not create a second service. Use AgentsDock's managed
 update controls for an existing server. Multiple named services are not enabled
 by this package.
 
+## Recover a failed 1.0.4 migration
+
+If the withdrawn 1.0.4 update left an existing server stuck, run this once as
+the server's user, on the computer hosting it:
+
+```sh
+npx @agentsdock/server@1.0.5 recover
+```
+
+Then choose **Retry server update** in AgentsDock's Settings → Updates. This
+command does not install or upgrade a server. It validates the exact unfinished
+default installation transaction and only repairs migrations that failed before
+service takeover, preserving the running server. It refuses later-phase,
+custom-root or unsafe recovery; it does not restart services. If no unfinished
+transaction exists, it makes no changes. Do not use `sudo`.
+
 ## Managed updates
 
 Prefer AgentsDock's update control. For automation, the explicit CLI accepts a

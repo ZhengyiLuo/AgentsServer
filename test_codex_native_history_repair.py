@@ -606,7 +606,7 @@ class CodexNativeHistoryRepairTests(unittest.TestCase):
 
         def records_then_expire(path, *args, **kwargs):
             yield from original(path, *args, **kwargs)
-            if path == self.source:
+            if path == self.source.resolve():
                 clock["now"] = 6.0
 
         with mock.patch.object(repair, "_native_records", side_effect=records_then_expire), \

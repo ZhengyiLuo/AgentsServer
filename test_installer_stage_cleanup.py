@@ -94,8 +94,11 @@ cleanup
 
     def test_unarmed_only_rejection_never_falls_through_to_exit_rollback(self) -> None:
         source = INSTALLER.read_text()
-        start = source.index('\nif [[ "$ACTIVATION_TRANSACTION_RESUMED" == "true" ]]; then\n  if [[ "${RECOVER_UNARMED_ONLY:-false}"')
-        block = source[start:source.index('\nif [[ "$TEAM_HUB_OPERATION_PENDING" == "true" ]]; then', start)]
+        block = _between(
+            source,
+            '\nif [[ "$ACTIVATION_TRANSACTION_RESUMED" == "true" ]]; then\n',
+            '\nif [[ "$TEAM_HUB_OPERATION_PENDING" == "true" ]]; then',
+        )
         for failure in ("load", "proof", "owner"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)

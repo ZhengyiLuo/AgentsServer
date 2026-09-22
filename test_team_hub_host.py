@@ -1785,7 +1785,7 @@ class VendoredTeamHubParityTests(unittest.TestCase):
             "secure_peer_hub.py": "1f3f8c23b9de7180889fe04f9532af7e9000941526687a558bf6250cf647fa26",
             "security.py": "0c1895c7443e7be07a2f53c7e4c4228e3ee04c65d6cd36f039b7bbba1813e4fa",
             "service.py": "449462013919687089c8a227fa5b83e65fc2c6fc601cd09952a51300ab81255f",
-            "store.py": "fd575a19d3408dbfa92c26009f126b8163f9c1862c6ea75684bfc1c31434aa55",
+            "store.py": "c519e4d9c8a6a02dd630aa2035842df33f2574e44f7ae5a709d4bba92a42a3f4",
         }
         entries = list(vendored.rglob("*"))
         for path in entries:

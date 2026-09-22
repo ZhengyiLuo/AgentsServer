@@ -7,6 +7,8 @@ Every mutating operation requires its owned outer transaction and install lock.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import ast
 import json
@@ -15,6 +17,7 @@ from pathlib import Path
 import re
 import shlex
 import subprocess
+import stat
 from typing import Any
 
 import activation_transaction as activation
@@ -287,10 +290,95 @@ def require_retired_legacy_intent(layout: files.ExecutionLayout, previous: Any, 
     no_journal()
 
 
+@contextmanager
+def legacy_process(args: argparse.Namespace, layout: files.ExecutionLayout,
+                   services: NativeServices, control: WorkerControl):
+    """Classify the incumbent without treating abandoned metadata as a process.
+
+    A rolled-back monolith does not manage split-process receipts. Only a dead
+    same-install receipt, an unheld worker lease, and native-authenticated legacy
+    health allow that receipt to be ignored. Nothing here removes it or contacts
+    its callback. The caller must still prove the complete legacy admission.
+    """
+    if files.active_worker_release(layout.install_root) is not None:
+        yield False
+        return
+    path = layout.runtime_dir / "worker.json"
+    before = services.snapshot()["worker"]
+    if not path.exists() and not path.is_symlink():
+        yield True
+        if path.exists() or path.is_symlink() or files.active_worker_release(layout.install_root) is not None:
+            raise RuntimeError("execution ownership changed during legacy admission")
+        return
+    if not args.health_file:
+        raise RuntimeError("stale worker receipt requires authenticated legacy health")
+    health_bytes = activation._read_private(Path(args.health_file), maximum=1024 * 1024)
+    health = json.loads(health_bytes)
+    if (not isinstance(health, dict) or any(health.get(key) is not None for key in ("execution_service", "gateway"))
+            or args.expected_native_pid != before.get("pid")
+            or not args.expected_server_identity or health.get("server_identity") != args.expected_server_identity):
+        raise RuntimeError("worker receipt is not associated with authenticated legacy health")
+    files._path(layout.runtime_dir)
+    files._owned_directory(layout.runtime_dir, private=True)
+    directory = layout.runtime_dir.stat()
+    record = control.worker_record(layout)
+    if (type(record.get("schema")) is not int or record["schema"] != 1
+            or type(record.get("protocol")) is not int or record["protocol"] != files.PROTOCOL_VERSION
+            or type(record.get("pid")) is not int or record["pid"] <= 1
+            or re.fullmatch(r"[0-9a-f]{32}", str(record.get("instance_id"))) is None
+            or not isinstance(record.get("version"), str) or not record["version"]
+            or record.get("public_bind") != layout.bind
+            or type(record.get("public_port")) is not int or record["public_port"] != layout.port):
+        raise RuntimeError("abandoned worker receipt is invalid")
+    receipt_bytes, _mode = files._read_file(path, private=True)
+    receipt = path.lstat()
+    lock_path = layout.runtime_dir / "worker.lock"
+    fd = os.open(lock_path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        lock = os.fstat(fd)
+        if (not stat.S_ISREG(lock.st_mode) or lock.st_uid != os.getuid() or lock.st_nlink != 1
+                or stat.S_IMODE(lock.st_mode) != 0o600 or lock.st_size != 0):
+            raise RuntimeError("abandoned worker lock is not an owned private lease")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        def recheck():
+            files._path(layout.runtime_dir)
+            files._owned_directory(layout.runtime_dir, private=True)
+            for target, expected in ((layout.runtime_dir, directory), (path, receipt), (lock_path, lock)):
+                current = target.lstat()
+                if (current.st_dev, current.st_ino, current.st_mode, current.st_uid, current.st_nlink, current.st_size) != (
+                        expected.st_dev, expected.st_ino, expected.st_mode, expected.st_uid, expected.st_nlink, expected.st_size):
+                    raise RuntimeError("abandoned worker ownership changed during admission")
+            if (files._read_file(path, private=True)[0] != receipt_bytes
+                    or control.worker_record(layout) != record
+                    or activation._read_private(Path(args.health_file), maximum=1024 * 1024) != health_bytes
+                    or files.active_worker_release(layout.install_root) is not None
+                    or services.snapshot()["worker"] != before):
+                raise RuntimeError("legacy worker classification changed during admission")
+            try:
+                os.kill(record["pid"], 0)
+            except ProcessLookupError:
+                pass
+            else:
+                raise RuntimeError("abandoned worker PID is still alive")
+
+        recheck()
+        yield True
+        recheck()
+    finally:
+        os.close(fd)
+
+
 def seed_legacy_recovery(args: argparse.Namespace, services: NativeServices) -> None:
     layout = command_layout(args)
-    if services.snapshot()["worker"]["state"] != "running" or (layout.runtime_dir / "worker.json").exists():
+    if services.snapshot()["worker"]["state"] != "running":
         return
+    with legacy_process(args, layout, services, WorkerControl()) as legacy:
+        if legacy:
+            _seed_legacy_recovery(args, layout)
+
+
+def _seed_legacy_recovery(args: argparse.Namespace, layout: files.ExecutionLayout) -> None:
     from update_recovery import activation_intent
     import update_runner as updates
     status_path = layout.state_root / "admin/server-update.json"
@@ -317,8 +405,13 @@ def verify_stop(args: argparse.Namespace, value: dict[str, Any], services: Nativ
     if before["state"] != "running":
         return
     layout = command_layout(args)
-    record_path = layout.runtime_dir / "worker.json"
-    if record_path.exists() or record_path.is_symlink():
+    with legacy_process(args, layout, services, control) as legacy:
+        _verify_stop(args, value, services, control, layout, before, legacy)
+
+
+def _verify_stop(args: argparse.Namespace, value: dict[str, Any], services: NativeServices,
+                 control: WorkerControl, layout: files.ExecutionLayout, before: dict, legacy: bool) -> None:
+    if not legacy:
         record, status = control.status(layout)
         lease = status.get("lease")
         if (record["pid"] != before.get("pid") or not isinstance(lease, dict)

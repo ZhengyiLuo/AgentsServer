@@ -1,10 +1,12 @@
 """Outer installer service boundary tests; native commands are explicit test doubles."""
 from __future__ import annotations
 import argparse
+import fcntl
 import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -74,6 +76,7 @@ class ExecutionActivationTests(unittest.TestCase):
         self.assertFalse(self.item.service.with_name("agents-server-gateway.service").exists())
 
     def test_existing_worker_requires_exact_sealed_epoch_before_any_stop(self):
+        bridge.publish(self.args, self.value())
         self.json_file(self.state / "execution/worker.json", {})
         value = self.value(); operation = value["execution"]["operation_id"]
         record = {"pid":8123, "instance_id":"old-epoch", "release_root":str(self.item.old_source)}
@@ -85,6 +88,126 @@ class ExecutionActivationTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 bridge.verify_stop(self.args, value, self.services, self.control)
         self.services.stop.assert_not_called()
+
+    def legacy_admission(self):
+        update = "a" * 32
+        self.args.managed_update_id = update
+        self.args.release_version = "2.0.0"
+        self.args.api_contract = 28
+        self.args.candidate_source = str(self.item.release_dir)
+        self.json_file(self.state / "admin/server-update.json", {
+            "update_id": update, "phase": "installing", "target_version": "2.0.0"})
+        self.args.health_file = self.json_file(self.state / "health.json", {
+            "active_count": 0, "update_blocking_queued_count": 0,
+            "server_identity": self.args.expected_server_identity,
+            "update_service_cgroup": {"safe": True, "unknown_descendant_count": 0}})
+        self.args.update_file = self.json_file(self.state / "update-proof.json", {
+            "update_id": update, "phase": "installing", "server_identity": self.args.expected_server_identity})
+
+    def abandoned_worker(self):
+        # Use the real process lease and abrupt death: normal __exit__ would
+        # remove its receipt. No synthetic dead PID or mocked lock result.
+        script = '''import sys, signal
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from execution_service import ProcessLease
+with ProcessLease(Path(sys.argv[2]), "worker") as lease:
+    lease.publish(version="2.0.0", release_root=sys.argv[3], callback_origin="http://127.0.0.1:12345", public_bind="127.0.0.1", public_port=7850)
+    print("ready", flush=True)
+    signal.pause()
+'''
+        child = subprocess.Popen([sys.executable, "-c", script, str(Path(__file__).parent),
+            str(self.state / "execution"), str(self.item.release_dir)], stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(child.stdout.readline().strip(), "ready")
+        finally:
+            child.kill(); child.wait(timeout=10); child.stdout.close()
+        path = self.state / "execution/worker.json"
+        self.assertEqual(json.loads(path.read_bytes())["pid"], child.pid)
+        return path
+
+    def test_published_candidate_crash_rollback_then_retry_keeps_receipt_and_seeds_new_intent(self):
+        bridge.publish(self.args, self.value())
+        receipt = self.abandoned_worker()
+        saved = receipt.read_bytes(), receipt.stat().st_ino
+        self.tests.rollback(self.item, self.identifier)
+        self.tests.invoke("finish", *self.tests.owned_args(self.item, self.identifier))
+        self.assertFalse((self.item.root / ".activation-transaction").exists())
+        self.assertFalse((self.item.root / "execution-layout.json").exists())
+        self.assertEqual(self.item.service.read_bytes(), self.item.original_service)
+        self.item.release_dir.mkdir(mode=0o700, exist_ok=True)  # Next staged candidate.
+        self.legacy_admission()
+        control = bridge.WorkerControl()
+        with mock.patch.object(control, "status", side_effect=AssertionError("stale callback must not be contacted")):
+            bridge.verify_stop(self.args, {}, self.services, control)
+        bridge.seed_legacy_recovery(self.args, self.services)
+        intent = json.loads((self.state / "admin/server-update.json").read_bytes())["_activation_recovery"]
+        self.assertEqual(intent["update_id"], self.args.managed_update_id)
+        self.assertEqual(intent["candidate_binding"]["inode"], self.item.release_dir.stat().st_ino)
+        self.assertEqual((receipt.read_bytes(), receipt.stat().st_ino), saved)
+        self.services.stop.assert_not_called()
+
+    def test_stale_receipt_requires_private_dead_same_install_unheld_worker(self):
+        self.legacy_admission()
+        receipt = self.abandoned_worker()
+        original = json.loads(receipt.read_bytes())
+        control = bridge.WorkerControl()
+        status_path = self.state / "admin/server-update.json"
+        status_bytes = status_path.read_bytes()
+
+        def reject():
+            for operation in (lambda: bridge.verify_stop(self.args, {}, self.services, control),
+                              lambda: bridge.seed_legacy_recovery(self.args, self.services)):
+                with self.assertRaises((RuntimeError, ValueError, OSError)):
+                    operation()
+            self.assertEqual(status_path.read_bytes(), status_bytes)
+            self.services.stop.assert_not_called()
+
+        for change in ({"pid": os.getpid()}, {"schema": True}, {"protocol": True},
+                       {"release_root": str(self.base / "foreign/releases/2.0.0")},
+                       {"callback_origin": "http://192.0.2.1:12345"}, {"instance_id": "bad"},
+                       {"public_port": 9999}):
+            with self.subTest(change=change):
+                self.json_file(receipt, {**original, **change}); reject()
+        self.json_file(receipt, original)
+        for target in (receipt, receipt.with_name("worker.lock")):
+            target.chmod(0o644); reject(); target.chmod(0o600)
+            backup = target.with_suffix(".backup"); target.rename(backup); target.symlink_to(backup)
+            reject(); target.unlink(); backup.rename(target)
+        with receipt.with_name("worker.lock").open("rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            reject()
+        with mock.patch.object(bridge.os, "kill", side_effect=PermissionError("unknown process owner")):
+            reject()
+        health = json.loads(Path(self.args.health_file).read_bytes())
+        for key in ("execution_service", "gateway"):
+            for invalid in ({}, False, "legacy", {"pid": original["pid"]}):
+                with self.subTest(key=key, invalid=invalid):
+                    self.json_file(Path(self.args.health_file), {**health, key: invalid}); reject()
+        self.json_file(Path(self.args.health_file), {**health, "execution_service": None, "gateway": None})
+        bridge.verify_stop(self.args, {}, self.services, control)
+
+    def test_stale_receipt_rechecks_native_pid_and_receipt_while_holding_lock(self):
+        self.legacy_admission()
+        path = self.abandoned_worker()
+        record = json.loads(path.read_bytes())
+        layout = bridge.command_layout(self.args)
+        for mutation in (lambda: self.json_file(path, {**record, "pid": os.getpid()}),
+                         lambda: path.with_name("worker.lock").write_bytes(b"changed"),
+                         lambda: bridge.publish(self.args, self.value()),
+                         lambda: setattr(self.services.snapshot, "return_value", {
+                             "worker": {"state": "running", "pid": 999}, "gateway": {"state": "absent"}})):
+            self.json_file(path, record)
+            path.with_name("worker.lock").write_bytes(b"")
+            (self.item.root / "execution-layout.json").unlink(missing_ok=True)
+            self.services.snapshot.return_value = {"worker": {"state": "running", "pid": 8123}}
+            with self.assertRaises(RuntimeError):
+                with bridge.legacy_process(self.args, layout, self.services, bridge.WorkerControl()) as legacy:
+                    self.assertTrue(legacy)
+                    with path.with_name("worker.lock").open("rb") as lock:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    mutation()
 
     def test_legacy_monolith_requires_authenticated_exact_idle_durable_update(self):
         update = "11111111-1111-4111-8111-111111111111"

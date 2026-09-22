@@ -2,6 +2,8 @@
 import argparse
 import hashlib
 import json
+import subprocess
+import sys
 import shutil
 import tempfile
 from pathlib import Path
@@ -90,6 +92,32 @@ class LegacyRetryTests(unittest.TestCase):
         bridge.seed_legacy_recovery(self.args, self.services)  # Same candidate is idempotent.
         self.assertEqual({p: p.read_bytes() for p in before}, before)
         self.native.assert_called_once()
+        self.services.stop.assert_not_called()
+
+    def test_restored_monolith_with_dead_candidate_receipt_reseeds_retired_intent(self):
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait(timeout=10)
+        self.args.expected_native_pid = 999
+        self.args.health_file = str(self.state / "health.json")
+        self.write(Path(self.args.health_file), {"server_identity": "owned-server",
+            "active_count": 0, "update_blocking_queued_count": 0,
+            "execution_service": None, "gateway": None,
+            "update_service_cgroup": {"safe": True, "unknown_descendant_count": 0}})
+        self.write(Path(self.args.update_file), {"update_id": "b" * 32,
+            "phase": "installing", "server_identity": "owned-server"})
+        receipt = self.state / "execution/worker.json"
+        self.write(receipt, {"schema": 1, "protocol": 1, "role": "worker", "pid": child.pid,
+            "instance_id": "d" * 32, "release_root": str(self.first), "version": "2.0.0",
+            "callback_origin": "http://127.0.0.1:12345", "public_bind": "127.0.0.1", "public_port": 7850})
+        lock = receipt.with_name("worker.lock"); lock.touch(mode=0o600)
+        original = receipt.read_bytes(), receipt.stat().st_ino
+        control = bridge.WorkerControl()
+        with mock.patch.object(control, "status", side_effect=AssertionError("no stale callback request")):
+            bridge.verify_stop(self.args, {}, self.services, control)
+        bridge.seed_legacy_recovery(self.args, self.services)
+        self.assertEqual(json.loads(self.status.read_bytes())["_activation_recovery"]["update_id"], "b" * 32)
+        self.native.assert_called_once()  # Real retired-owner evidence was validated.
+        self.assertEqual((receipt.read_bytes(), receipt.stat().st_ino), original)
         self.services.stop.assert_not_called()
 
     def test_pending_or_linked_journal_prevents_replacement(self):

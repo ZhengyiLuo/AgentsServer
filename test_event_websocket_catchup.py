@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import json
 import tempfile
 import threading
@@ -29,6 +30,13 @@ class FakeWebSocket:
 
 
 class EventWebSocketCatchupTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        # Earlier cases in a shard leave cyclic mock/fixture graphs behind.
+        # Collect them before this fresh loop enters real socket deadlines;
+        # otherwise an unrelated full collection can stall a timed fake send.
+        gc.collect()
+
     async def test_live_summary_is_opt_in_and_does_not_wake_share_projection(self) -> None:
         hub = agent_server.SubscriberHub()
         legacy, opted, plaintext = FakeWebSocket(), FakeWebSocket(), FakeWebSocket()

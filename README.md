@@ -91,6 +91,32 @@ and personal machine paths outside tracked source.
   server from another Mac, iPhone, or iPad.
 - Optional: a user-level `systemd` service on Linux.
 
+### OpenCode beta backend
+
+The `1.0.7-beta.6` candidate adds optional OpenCode support for the matching
+desktop beta. Install **OpenCode CLI 1.18.29** and authenticate a supported
+provider as the server's user. The server does not install OpenCode or copy
+credentials from another runtime. Set `OPENCODE_BIN` if the executable is not
+on the service's `PATH`, then use **Settings → Runtimes → Recheck CLIs** in
+AgentsDock. Other backends remain usable when OpenCode is absent.
+
+Supported flows include new chats, native contextual follow-ups, streamed
+text/tools, attachments, queued follow-ups, Stop, and explicitly selected
+skills from documented local roots. The default permission mode preserves
+OpenCode's own settings, which may allow shell commands. Full access explicitly
+allows tools; Plan only enforces a read-only tool policy, not an OS sandbox.
+Changing permissions or the working directory starts fresh native context
+while keeping the visible chat history. Stop and uncertain failures also
+discard the native resume binding and leave a visible reset marker.
+
+OpenCode does not yet support external history import, public forks, side
+chats, live steering, native goals, or cross-chat routes. Selected skills need
+the separate negotiated provider-command capability. Provider catalog/readiness
+checks do not prove model authentication or endpoint compatibility; some free
+endpoints reject custom-agent or permission-controlled requests. Use a provider
+that supports these native OpenCode requests. Release acceptance and availability
+are recorded separately in the development log.
+
 ### Optional: tmux
 
 tmux is not required to run AgentsServer, chat with agents, or use jobs,

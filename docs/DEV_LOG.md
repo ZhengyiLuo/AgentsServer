@@ -1,5 +1,27 @@
 # Development and release log
 
+## 2026-09-22 — Prepare optional OpenCode beta backend
+
+- Integrate OpenCode CLI 1.18.29 support into the maintained server alongside
+  the current Claude/Codex/Cursor runtime, lifecycle and history corrections.
+  Add model discovery, permission policies, native resume/reset handling,
+  file attachments and validated local skill selection. Include the new runtime
+  module in packaging, installation and compatibility export inventories.
+- Fix enforced-resume Stop/error cleanup to clear the original durable binding,
+  not an in-flight fork's identity. Preserve replacement-run ownership. Redact
+  run-private helper authority/capability material from normal and error output,
+  and recheck the exact local CLI contract at turn admission rather than trusting
+  cached readiness after an in-place upgrade. Add regression reproductions.
+- Provider, HTTP contract, history/mailbox, packaging and recovery regressions
+  pass. Through an isolated native desktop app, verify a real tool-based task,
+  contextual follow-up, Stop during a shell tool, upload/read of a text
+  attachment and retained history after reload.
+- The free provider rejects enforced Plan requests. Record a visible failure,
+  not a successful policy check. Authenticated permission/skill acceptance and
+  final signed-package acceptance remain pending before publication.
+- Target `1.0.7-beta.6` through the signed GitHub update path, independently
+  of desktop installation. No npm publication or production deployment.
+
 ## 2026-09-21 — Avoid redundant history scans on chat switches — source acceptance
 
 - Return unchanged timeline deltas before looking up fork provenance. For new

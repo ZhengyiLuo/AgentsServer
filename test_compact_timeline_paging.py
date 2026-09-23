@@ -774,6 +774,63 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    def test_provider_resets_survive_bounded_history_reload_and_pagination(self) -> None:
+        for context in ("chat", "scheduled", "digest"):
+            with self.subTest(context=context):
+                metadata = {"run_id": "opencode-reset-run", "backend": "opencode"}
+                if context == "scheduled":
+                    metadata.update(job_id="reset-job", purpose="scheduled_job")
+                elif context == "digest":
+                    metadata.update(
+                        digest_job_id="reset-digest", purpose="handoff_digest",
+                        source_session_id=self.session_id, target_session_id="target-chat",
+                    )
+                reset = self.event(
+                    2, "provider_session_reset", **metadata,
+                    previous_provider_session_id="ses_before_reset",
+                    message="The interrupted provider context was quarantined.",
+                )
+                events = [
+                    self.event(1, "turn_started", **metadata), reset,
+                    *[self.event(seq, "tool_finished", **metadata, tool={"name": "read"})
+                      for seq in range(3, 27)],
+                    self.event(27, "turn_finished", **metadata, result_text="Completed after reset"),
+                ]
+                self.write_events(events)
+                index = agent_server.build_timeline_index(self.session_id)
+                landmark = next(item for item in index["landmarks"] if item["key"] == "event:event-2")
+                self.assertEqual(landmark["kind"], "system")
+                self.assertEqual(landmark["title"], "Provider Context Reset")
+                self.assertEqual(landmark["start_seq"], 2)
+                for clear_cache in (False, True):
+                    if clear_cache:
+                        agent_server.TIMELINE_INDEX_CACHE.clear()
+                    page = agent_server.read_semantic_timeline_page(
+                        self.session_id, after=1, semantic_before=3, limit=1, tail=False,
+                    )
+                    self.assertEqual(page["semantic_item_count"], 1)
+                    self.assertEqual(page["events"], [reset])
+                    safe = agent_server.client_safe_event(page["events"][0])
+                    self.assertEqual(safe["backend"], "opencode")
+                    self.assertEqual(safe["previous_provider_session_id"], "ses_before_reset")
+                    self.assertEqual(safe["message"], reset["message"])
+
+    def test_provider_reset_rebuilds_pre_reset_projection_cache(self) -> None:
+        self.write_events([
+            self.event(1, "turn_started", run_id="reset-cache-run", backend="opencode"),
+            self.event(2, "provider_session_reset", run_id="reset-cache-run", backend="opencode",
+                       previous_provider_session_id="ses_before_reset", message="Provider context reset"),
+            self.event(3, "turn_finished", run_id="reset-cache-run", backend="opencode"),
+        ])
+        agent_server.build_timeline_index(self.session_id)
+        cached = agent_server.timeline_index_cached_entry(self.session_id)
+        self.assertIsNotNone(cached)
+        cached["projection_version"] = 6
+        cached["payload"] = {"landmarks": [{"key": "old-reset-hidden-sentinel"}]}
+        rebuilt = agent_server.build_timeline_index(self.session_id)
+        self.assertNotIn("old-reset-hidden-sentinel", json.dumps(rebuilt))
+        self.assertIn("event:event-2", [item["key"] for item in rebuilt["landmarks"]])
+
     def test_semantic_cursor_keeps_interleaved_job_segments_chronological(self) -> None:
         events: list[dict[str, object]] = []
         seq = 0

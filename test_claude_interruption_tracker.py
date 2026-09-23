@@ -87,6 +87,35 @@ class ClaudeInterruptionTrackerTests(unittest.TestCase):
         rows[-1]["message"]["content"][0]["text"] = "[Request interrupted by user for tool use]"
         self.assertEqual(self.classify(rows)[0][-1]["cause"], "unknown")
 
+    def test_parallel_tool_results_keep_provenance_across_history_cursor(self):
+        prompt, assistant, first_result, _, _ = lineage()
+        second_result = raw(6, parentUuid=assistant["uuid"], message={"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "second-tool", "content": "done"}]})
+        _, cursor = self.classify([prompt, assistant, first_result])
+        for parent in (first_result["uuid"], second_result["uuid"]):
+            marker = raw(7, text=MARKER, parentUuid=parent)
+            output, context = self.classify([second_result, marker], cursor)
+            self.assertEqual(output[-1]["kind"], "interruption")
+            self.assertEqual(context["anchor_event_id"], prompt["uuid"])
+            # The same literal in a new human prompt remains user-authored.
+            marker["promptId"] = "a13a89e4-1234-4234-8234-123456789abc"
+            self.assertIsNone(self.classify([second_result, marker], cursor)[0][-1])
+
+    def test_branch_cursor_is_bounded_and_cannot_cross_new_prompt(self):
+        rows = lineage()[:2]
+        for number in range(3, 150):
+            rows.append(raw(number, "assistant", parentUuid=rows[-1]["uuid"]))
+        _, context = self.classify(rows)
+        self.assertEqual(len(context["branch_event_ids"]), 128)
+        restored = ClaudeInterruptionTracker(context)
+        exported = restored.export_context()
+        exported["branch_event_ids"].clear()
+        self.assertEqual(len(restored.export_context()["branch_event_ids"]), 128)
+        new_prompt = raw(200, promptId="a13a89e4-1234-4234-8234-123456789abc",
+                         parentUuid=rows[-1]["uuid"])
+        old_marker = raw(201, text=MARKER, parentUuid=rows[-1]["uuid"])
+        self.assertIsNone(self.classify([new_prompt, old_marker], context)[0][-1])
+
     def test_context_carries_across_cursor_without_content_or_extra_fields(self):
         rows = lineage()
         _, context = self.classify(rows[:-1])

@@ -30,6 +30,7 @@ from claude_sdk_client import (
     reject_nondurable_scheduler_hook,
     reject_subagent_provider_tool_hook,
     reject_untracked_background_hook,
+    _parse_claude_sdk_message,
 )
 
 
@@ -532,6 +533,104 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self) -> None:
         await self.manager.close_all()
+
+    async def test_native_busy_goal_clear_reserves_receipt_after_aborted_run(self) -> None:
+        for background in (False, True):
+            with self.subTest(background=background):
+                chat = f"goal-{background}"
+                handle = await self.manager.start_run(
+                    chat, "/goal finish the task", run_id="goal-run", options={},
+                    configuration_key="same", validated_provider_command_name="goal",
+                )
+                client = self.factory.clients[-1]
+                if background:
+                    await client.emit({"type": "system", "subtype": "task_started",
+                        "task_id": "child", "task_type": "local_agent"})
+                    await asyncio.wait_for(handle.__anext__(), 1)
+                generation = self.manager._supervisors[chat].control_generation
+                clear = asyncio.create_task(self.manager.clear_goal(
+                    chat, run_id="goal-run", expected_generation=generation,
+                ))
+                for _ in range(100):
+                    if len(client.query_envelopes) == 2:
+                        break
+                    await asyncio.sleep(0)
+                self.assertEqual(client.query_envelopes[1][0]["priority"], "now")
+                self.assertEqual(client.query_envelopes[1][0]["message"]["content"], "/goal clear")
+                clear_call = next(index for index, call in enumerate(client.calls)
+                    if call[:2] == ("query", "/goal clear"))
+                self.assertEqual(client.calls[clear_call - 1], ("interrupt",))
+                aborted = {"type": "result",
+                    "subtype": "error_during_execution" if background else "success",
+                    "is_error": background,
+                    "terminal_reason": "aborted_tools" if background else "aborted_streaming",
+                    "result": "partial"}
+                await client.emit(aborted)
+                self.assertEqual(await asyncio.wait_for(handle.wait_result(), 1), aborted)
+                self.assertFalse(clear.done())
+                self.assertFalse(client.disconnected)
+                with self.assertRaises(ClaudeSDKRunActive):
+                    await self.manager.start_run(chat, "next", run_id="next", options={}, configuration_key="same")
+                await client.emit({"type": "assistant", "local_command_run": {
+                    "command": "goal", "args": "clear"}, "content": []})
+                await client.emit({"type": "result", "subtype": "success", "is_error": False,
+                    "local_command": "goal", "result": "Goal cleared: finish the task"})
+                result, returned_generation = await asyncio.wait_for(clear, 1)
+                self.assertEqual(returned_generation, generation)
+                self.assertEqual(result["result"], "Goal cleared: finish the task")
+                self.assertEqual(client.disconnected, background)
+                next_handle = await self.manager.start_run(chat, "next", run_id="next", options={}, configuration_key="same")
+                self.assertFalse(next_handle.done)
+
+    async def test_goal_clear_rejects_stale_owner_without_query(self) -> None:
+        await self.manager.start_run("goal", "work", run_id="current", options={}, configuration_key="same")
+        for arguments in ({"run_id": "previous"}, {"run_id": "current", "expected_generation": "previous"}):
+            with self.assertRaises(ClaudeSDKGenerationChanged):
+                await self.manager.clear_goal("goal", **arguments)
+        self.assertEqual(len(self.factory.clients[0].query_envelopes), 1)
+
+    async def test_goal_clear_before_replay_ack_ends_uncertain_run(self) -> None:
+        self.factory.auto_ack = False
+        handle = await self.manager.start_run("goal", "work", run_id="current", options={}, configuration_key="same")
+        client = self.factory.clients[0]
+        clear = asyncio.create_task(self.manager.clear_goal("goal", run_id="current"))
+        for _ in range(100):
+            if len(client.query_envelopes) == 2:
+                break
+            await asyncio.sleep(0)
+        await client.emit({"type": "result", "terminal_reason": "aborted_streaming"})
+        with self.assertRaises(ClaudeSDKQueryError):
+            await asyncio.wait_for(handle.wait_result(), 1)
+        self.assertFalse(client.disconnected)
+        await client.emit({"type": "assistant", "local_command_run": {"command": "goal", "args": "clear"}})
+        await client.emit({"type": "result", "local_command": "goal", "is_error": False, "result": "Goal cleared"})
+        result, _ = await asyncio.wait_for(clear, 1)
+        self.assertFalse(result["is_error"])
+        self.assertTrue(client.disconnected)
+
+    async def test_goal_clear_timeout_retires_exact_owner(self) -> None:
+        await self.manager.start_run("goal", "work", run_id="current", options={}, configuration_key="same")
+        self.manager._supervisors["goal"]._control_timeout_seconds = 0.01
+        with self.assertRaises(ClaudeSDKControlTimeout):
+            await self.manager.clear_goal("goal", run_id="current")
+        self.assertTrue(self.factory.clients[0].disconnected)
+        self.assertNotIn("goal", self.manager._supervisors)
+        resumed = await self.manager.start_run(
+            "goal", "continue", run_id="after-timeout", options={}, configuration_key="same",
+        )
+        await self.factory.clients[1].emit({"type": "result", "result": "resumed"})
+        result = await asyncio.wait_for(resumed.wait_result(), 1)
+        self.assertEqual(result["result"], "resumed")
+
+    def test_sdk_parser_preserves_native_local_goal_provenance(self) -> None:
+        message = _parse_claude_sdk_message({"type": "result", "subtype": "success",
+            "duration_ms": 1, "duration_api_ms": 0, "is_error": False, "num_turns": 0,
+            "session_id": "provider", "total_cost_usd": 0, "usage": {}, "result": "Goal cleared",
+            "local_command": "goal", "terminal_reason": "completed"})
+        self.assertEqual(message.local_command, "goal")
+        self.assertEqual(message.terminal_reason, "completed")
+        event = {"type": "active_goal", "value": None}
+        self.assertEqual(_parse_claude_sdk_message(event), event)
 
     async def test_pending_mail_hint_is_exact_root_checkpoint_without_new_query(self) -> None:
         calls = []

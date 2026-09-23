@@ -51,6 +51,7 @@ FILES = (
     "agentsdock_team.py",
     "provider_commands.py",
     "claude_sdk_client.py",
+    "claude_goals.py",
     "claude_background_reconciliation.py",
     "codex_app_server.py",
     "codex_auth.py",

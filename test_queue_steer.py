@@ -3178,6 +3178,77 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
             ["queued-steer"],
         )
 
+    async def test_pending_stop_restores_queue_without_starting_promotion(self) -> None:
+        selected = agent_server.QUEUED_TURNS["chat-1"][0]
+        earlier = {"queued_id": "earlier", "prompt": "Earlier", "backend": "codex"}
+        later = {"queued_id": "later", "prompt": "Later", "backend": "codex"}
+        agent_server.QUEUED_TURNS["chat-1"] = deque([earlier, selected, later])
+        agent_server.BUSY_SESSIONS.add("chat-1")
+        with (
+            patch.object(agent_server, "stop_turn", AsyncMock(return_value={
+                "stopped": False, "pending": True,
+            })),
+            patch.object(agent_server, "append_event", AsyncMock(return_value={})) as event,
+            patch.object(agent_server, "append_durable_event", AsyncMock()) as durable,
+            patch.object(agent_server, "schedule_steered_turn_slot_waiter") as waiter,
+        ):
+            result = await run_queued_turn_now("chat-1", "queued-steer")
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["deferred"])
+        self.assertFalse(result["interrupted"])
+        self.assertIn("Stop is still finishing", result["message"])
+        self.assertEqual(list(agent_server.QUEUED_TURNS["chat-1"]), [earlier, selected, later])
+        self.assertNotIn("_update_transitioning", selected)
+        self.assertNotIn("chat-1", agent_server.RUN_NOW_TURNS)
+        self.assertNotIn("chat-1", agent_server.STEERING_SESSIONS)
+        self.assertEqual(event.await_args.args[1], "turn_deferred")
+        durable.assert_not_awaited()
+        waiter.assert_not_called()
+
+    async def test_claude_send_now_uses_bounded_stop_for_exact_run(self) -> None:
+        agent_server.STORE.sessions["chat-1"]["backend"] = "claude"
+        agent_server.QUEUED_TURNS["chat-1"][0]["backend"] = "claude"
+        agent_server.CURRENT_TURNS["chat-1"]["backend"] = "claude"
+        agent_server.ACTIVE["chat-1"] = {
+            "run_id": "run-original", "backend": "claude",
+            "transport": agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+            "provider_turn_ready": True,
+        }
+        with (
+            patch.object(agent_server, "stop_turn", AsyncMock(return_value={"stopped": True})) as stop,
+            patch.object(agent_server, "append_durable_event", AsyncMock(return_value={})),
+            patch.object(agent_server, "schedule_steered_turn_slot_waiter") as waiter,
+        ):
+            result = await run_queued_turn_now("chat-1", "queued-steer")
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["interrupted"])
+        self.assertTrue(stop.await_args.kwargs["hard_terminalize_on_timeout"])
+        self.assertEqual(stop.await_args.kwargs["expected_run_id"], "run-original")
+        waiter.assert_called_once_with("chat-1", "queued-steer")
+
+    async def test_claude_replaced_stop_owner_leaves_selection_queued(self) -> None:
+        agent_server.ACTIVE["chat-1"] = {
+            "run_id": "run-original", "backend": "claude",
+            "transport": agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+            "provider_turn_ready": True,
+        }
+        agent_server.BUSY_SESSIONS.add("chat-1")
+        with (
+            patch.object(agent_server, "stop_turn", AsyncMock(return_value={
+                "stopped": False, "pending": False, "superseded": True,
+            })),
+            patch.object(agent_server, "append_event", AsyncMock(return_value={})),
+            patch.object(agent_server, "append_durable_event", AsyncMock()) as durable,
+            patch.object(agent_server, "schedule_steered_turn_slot_waiter") as waiter,
+        ):
+            result = await run_queued_turn_now("chat-1", "queued-steer")
+        self.assertTrue(result["deferred"])
+        self.assertFalse(result["interrupted"])
+        self.assertNotIn("chat-1", agent_server.RUN_NOW_TURNS)
+        self.assertEqual(agent_server.QUEUED_TURNS["chat-1"][0]["queued_id"], "queued-steer")
+        durable.assert_not_awaited()
+        waiter.assert_not_called()
+
     async def test_background_retry_emits_one_deferred_notice_for_the_queue_item(self) -> None:
         append_event = AsyncMock(return_value={})
 

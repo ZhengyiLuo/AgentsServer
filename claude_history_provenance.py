@@ -16,6 +16,7 @@ INTERRUPTION_MARKERS = frozenset({
 })
 _UUID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\Z")
 _TIME = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)\Z")
+_MAX_BRANCH_EVENTS = 128
 
 
 def _uuid(value) -> str | None:
@@ -41,7 +42,15 @@ def normalize_claude_interruption_context(value, provider_session_id=None) -> di
         return empty
     if provider_session_id and value["session_id"] != provider_session_id:
         return empty
-    return {"version": 1, **{key: value[key] for key in keys}}
+    context = {"version": 1, **{key: value[key] for key in keys}}
+    branch_ids = value.get("branch_event_ids")
+    if branch_ids is not None:
+        if (not isinstance(branch_ids, list) or not 1 <= len(branch_ids) <= _MAX_BRANCH_EVENTS
+                or any(not _uuid(item) for item in branch_ids)
+                or context["last_event_id"] not in branch_ids):
+            return empty
+        context["branch_event_ids"] = list(dict.fromkeys(branch_ids))
+    return context
 
 
 class ClaudeInterruptionTracker:
@@ -49,7 +58,7 @@ class ClaudeInterruptionTracker:
         self._context = normalize_claude_interruption_context(initial_context)
 
     def export_context(self) -> dict:
-        return dict(self._context)
+        return normalize_claude_interruption_context(self._context)
 
     def consume(self, event) -> dict | None:
         if not isinstance(event, dict):
@@ -79,15 +88,21 @@ class ClaudeInterruptionTracker:
             and blocks[0]["text"] in INTERRUPTION_MARKERS
         )
         context = self._context
+        # Parallel tool results can be siblings of the same assistant record.
+        # Keep their proven parents across incremental cursor reads; immediate
+        # adjacency alone is not Claude's transcript ancestry contract.
+        branch_ids = context.get("branch_event_ids", [context.get("last_event_id")])
         continued = (
             session_id is not None and session_id == context.get("session_id")
-            and parent_id is not None and parent_id == context.get("last_event_id")
+            and parent_id is not None and parent_id in branch_ids
+            and (prompt_id is None or prompt_id == context.get("prompt_id"))
         )
         origin = None
         if marker and session_id and timestamp and (
             event.get("isMeta") is True
             or (continued and prompt_id is not None and prompt_id == context.get("prompt_id")
-                and event_id != context.get("anchor_event_id"))
+                and event_id != context.get("anchor_event_id")
+                and parent_id != context.get("anchor_event_id"))
         ):
             origin = {
                 "provider": "claude", "kind": "interruption", "cause": "unknown",
@@ -112,9 +127,11 @@ class ClaudeInterruptionTracker:
         )
         if real_prompt:
             self._context = {"version": 1, "session_id": session_id, "prompt_id": prompt_id,
-                             "anchor_event_id": event_id, "last_event_id": event_id}
+                             "anchor_event_id": event_id, "last_event_id": event_id,
+                             "branch_event_ids": [event_id]}
         elif continued:
-            self._context = {**context, "last_event_id": event_id}
+            self._context = {**context, "last_event_id": event_id,
+                             "branch_event_ids": [*branch_ids, event_id][-_MAX_BRANCH_EVENTS:]}
         else:
             self._context = {"version": 1}
         return origin

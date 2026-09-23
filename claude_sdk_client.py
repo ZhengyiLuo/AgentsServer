@@ -585,7 +585,31 @@ def default_claude_sdk_client_factory(options: Any) -> ClaudeSDKClientProtocol:
         raise ClaudeSDKUnavailable(
             "claude-agent-sdk is not installed; use the claude -p fallback"
         ) from exc
-    return ClaudeSDKClient(options=options)
+    class GoalAwareClaudeSDKClient(ClaudeSDKClient):
+        async def receive_messages(self) -> AsyncIterator[Any]:
+            # SDK 0.2.130 drops local-command provenance and active_goal. Keep
+            # those native fields without changing parsing of normal messages.
+            if self._query is None:
+                raise ClaudeSDKSupervisorClosed("Claude SDK client is not connected")
+            async for data in self._query.receive_messages():
+                message = _parse_claude_sdk_message(data)
+                if message is not None:
+                    yield message
+
+    return GoalAwareClaudeSDKClient(options=options)
+
+
+def _parse_claude_sdk_message(data: dict[str, Any]) -> Any:
+    from claude_agent_sdk._internal.message_parser import parse_message
+
+    if data.get("type") == "active_goal":
+        return data
+    message = parse_message(data)
+    if message is not None:
+        for field in ("local_command", "local_command_run"):
+            if field in data:
+                setattr(message, field, data[field])
+    return message
 
 
 def create_claude_agent_options(**kwargs: Any) -> Any:
@@ -1234,6 +1258,17 @@ class _Interrupt:
 
 
 @dataclass
+class _ClearGoal:
+    run_id: str
+    expected_generation: str | None
+    response: asyncio.Future[tuple[dict[str, Any], str]]
+    generation: str | None = None
+    acknowledged: bool = False
+    retire_after_receipt: bool = False
+    cancelled: bool = False
+
+
+@dataclass
 class _GetContextUsage:
     response: asyncio.Future[dict[str, Any] | None]
 
@@ -1349,6 +1384,7 @@ class ClaudeSDKSupervisor:
         self._receiver_task: asyncio.Task[None] | None = None
         self._ack_timeout_task: asyncio.Task[None] | None = None
         self._active_run: ClaudeSDKRunHandle | None = None
+        self._pending_goal_clear: _ClearGoal | None = None
         self._inflight_tasks: set[str] = set()
         self._background_reconciliation_hook: _BackgroundReconciliationHook | None = None
         self._pending_mail_hint_hook: _PendingMailHintHook | None = None
@@ -1393,7 +1429,7 @@ class ClaudeSDKSupervisor:
 
     @property
     def is_active(self) -> bool:
-        return self.active_run_id is not None
+        return self.active_run_id is not None or self._pending_goal_clear is not None
 
     @property
     def connected(self) -> bool:
@@ -1489,6 +1525,29 @@ class ClaudeSDKSupervisor:
         assert self._commands is not None
         await self._commands.put(_Interrupt(run_id=run_id, response=response))
         return await asyncio.shield(response)
+
+    async def clear_goal(
+        self, *, run_id: str, expected_generation: str | None = None,
+    ) -> tuple[dict[str, Any], str]:
+        """Interrupt the owned turn, then clear its native goal."""
+
+        loop = self._ensure_actor()
+        response: asyncio.Future[tuple[dict[str, Any], str]] = loop.create_future()
+        command = _ClearGoal(str(run_id), expected_generation, response)
+        assert self._commands is not None
+        await self._commands.put(command)
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(response), self._control_timeout_seconds,
+            )
+        except (TimeoutError, asyncio.CancelledError) as exc:
+            command.cancelled = True
+            response.cancel()
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise ClaudeSDKControlTimeout(
+                "Claude did not confirm clearing the goal; its state is unknown"
+            ) from exc
 
     async def get_context_usage(self) -> dict[str, Any] | None:
         """Sample usage through the chat actor that owns the SDK client."""
@@ -1834,6 +1893,12 @@ class ClaudeSDKSupervisor:
                 )
 
     async def _disconnect_current_client(self) -> None:
+        pending = self._pending_goal_clear
+        self._pending_goal_clear = None
+        if pending is not None and not pending.response.done():
+            pending.response.set_exception(ClaudeSDKSupervisorClosed(
+                "Claude disconnected before confirming that the goal was cleared"
+            ))
         self._connection_retired.set()
         self._cancel_ack_timeout()
         if self._pending_mail_hint_hook is not None:
@@ -1931,6 +1996,12 @@ class ClaudeSDKSupervisor:
         await task
 
     async def _handle_start(self, command: _StartRun) -> None:
+        if self._pending_goal_clear is not None:
+            if not command.response.done():
+                command.response.set_exception(ClaudeSDKRunActive(
+                    "Claude is still confirming that its goal was cleared"
+                ))
+            return
         if self._active_run is not None and not self._active_run.done:
             if not command.response.done():
                 command.response.set_exception(
@@ -2115,6 +2186,57 @@ class ClaudeSDKSupervisor:
             self._schedule_ack_timeout(handle)
         if not command.response.done():
             command.response.set_result(handle)
+
+    async def _handle_clear_goal(self, command: _ClearGoal) -> None:
+        if command.cancelled or command.response.done():
+            return
+        active = self._active_run
+        if (active is None or active.done or active.run_id != command.run_id
+                or self._client is None or not self._connected):
+            command.response.set_exception(ClaudeSDKGenerationChanged(
+                "The Claude run changed before its goal could be cleared"
+            ))
+            return
+        if self._pending_goal_clear is not None:
+            command.response.set_exception(ClaudeSDKRunActive(
+                "Claude is already clearing its goal"
+            ))
+            return
+        generation = self.control_generation
+        if command.expected_generation is not None and command.expected_generation != generation:
+            command.response.set_exception(ClaudeSDKGenerationChanged(
+                "The Claude connection changed before its goal could be cleared"
+            ))
+            return
+        command.generation = generation
+        self._pending_goal_clear = command
+        active._background_reconciliation_aborted = True
+
+        async def clear_frame() -> AsyncIterator[dict[str, Any]]:
+            yield {
+                "type": "user", "message": {"role": "user", "content": "/goal clear"},
+                "parent_tool_use_id": None, "uuid": str(uuid.uuid4()), "priority": "now",
+            }
+
+        try:
+            # Priority-now interrupts model streaming but can wait behind a
+            # running tool. The SDK control channel cancels that tool first.
+            # Keep the receipt lane installed before interrupting: Claude may
+            # emit the old turn's aborted Result before the clear is delivered.
+            await self._deliver_query_bounded(
+                self._client.interrupt(), run_id=command.run_id,
+            )
+            if command.cancelled or command.response.done():
+                return
+            await self._deliver_query_bounded(
+                self._client.query(clear_frame()), run_id=command.run_id,
+            )
+        except Exception as exc:
+            self._pending_goal_clear = None
+            if not command.response.done():
+                command.response.set_exception(ClaudeSDKQueryError(
+                    f"Claude goal-clear delivery is uncertain: {exc}"
+                ))
 
     async def _handle_interrupt(self, command: _Interrupt) -> None:
         active = self._active_run
@@ -2570,11 +2692,37 @@ class ClaudeSDKSupervisor:
     async def _handle_received(self, command: _ReceivedMessage) -> None:
         if command.generation != self._generation:
             return
+        pending = self._pending_goal_clear
+        if pending is not None:
+            local_run = _message_field(command.message, "local_command_run")
+            if isinstance(local_run, dict) and local_run.get("command") == "goal" and local_run.get("args") == "clear":
+                pending.acknowledged = True
+                return
+            if (pending.acknowledged and self._is_result_message(command.message)
+                    and _message_field(command.message, "local_command") == "goal"):
+                self._pending_goal_clear = None
+                value = {field: _message_field(command.message, field) for field in (
+                    "result", "is_error", "subtype", "session_id", "local_command",
+                )}
+                if not pending.response.done():
+                    pending.response.set_result((value, str(pending.generation)))
+                if pending.retire_after_receipt:
+                    await self._disconnect_current_client()
+                return
         active = self._active_run
         if active is None or active.done:
             return
         self._last_used_at = time.monotonic()
         if not active.acknowledged:
+            if (pending is not None and self._is_result_message(command.message)
+                    and _result_forces_run_end(command.message)):
+                # Priority-now can beat the original replay ACK. End that
+                # uncertain run, but retain the connection for the clear receipt.
+                pending.retire_after_receipt = True
+                self._fail_active(ClaudeSDKQueryError(
+                    "Claude goal clear interrupted the query before its replay acknowledgment"
+                ))
+                return
             if active._acknowledge(command.message):
                 self._cancel_ack_timeout()
                 return
@@ -2617,7 +2765,10 @@ class ClaudeSDKSupervisor:
                 # frames after this logical run has ended. Retire only this
                 # chat's connection so those late frames cannot cross the next
                 # query's replay-ACK boundary and terminate a fresh run.
-                await self._disconnect_current_client()
+                if self._pending_goal_clear is not None:
+                    self._pending_goal_clear.retire_after_receipt = True
+                else:
+                    await self._disconnect_current_client()
             return
 
         subtype, task_id, task_type, status = _task_lifecycle_fields(
@@ -2710,6 +2861,8 @@ class ClaudeSDKSupervisor:
                     await self._handle_get_mcp_status(command)
                 elif isinstance(command, _GetServerInfo):
                     await self._handle_get_server_info(command)
+                elif isinstance(command, _ClearGoal):
+                    await self._handle_clear_goal(command)
                 elif isinstance(command, _GetSideQuestionClient):
                     await self._handle_get_side_question_client(command)
                 elif isinstance(command, _MutateMCPServer):
@@ -3028,6 +3181,46 @@ class ClaudeSDKSupervisorManager:
         if supervisor is None:
             return False
         return await supervisor.interrupt(run_id=run_id)
+
+    async def clear_goal(
+        self, chat_id: str, *, run_id: str,
+        expected_generation: str | None = None,
+    ) -> tuple[dict[str, Any], str]:
+        """Send a native clear only to the existing owner of the exact run."""
+
+        self._bind_loop()
+        assert self._lock is not None
+        clean_chat_id = str(chat_id)
+        async with self._lock:
+            supervisor = self._supervisors.get(clean_chat_id)
+            if (supervisor is None or supervisor.closed or not supervisor.connected
+                    or supervisor.active_run_id != str(run_id)):
+                raise ClaudeSDKGenerationChanged(
+                    "The Claude run changed before its goal could be cleared"
+                )
+            self._pins[clean_chat_id] = self._pins.get(clean_chat_id, 0) + 1
+            generation = supervisor.snapshot().generation
+        retire = False
+        try:
+            value, revision = await supervisor.clear_goal(
+                run_id=str(run_id), expected_generation=expected_generation,
+            )
+            async with self._lock:
+                if (self._supervisors.get(clean_chat_id) is not supervisor
+                        or supervisor.closed or supervisor.snapshot().generation != generation):
+                    raise ClaudeSDKGenerationChanged(
+                        "The Claude owner changed while clearing its goal"
+                    )
+            return value, revision
+        except (ClaudeSDKControlTimeout, ClaudeSDKQueryError, asyncio.CancelledError):
+            retire = True
+            raise
+        finally:
+            if retire:
+                await self._retire_exact_supervisor(
+                    clean_chat_id, supervisor, task_name_prefix="claude-sdk-goal-retire",
+                )
+            await self._unpin_mcp_supervisor(clean_chat_id, supervisor)
 
     async def get_context_usage(
         self,

@@ -22,6 +22,7 @@ from types import MappingProxyType
 from typing import Callable
 
 from claude_history_provenance import ClaudeInterruptionTracker
+from claude_goals import ClaudeGoalHistoryNormalizer, is_claude_synthetic_no_response
 
 
 MAX_BYTES = 96 * 1024 * 1024
@@ -163,6 +164,7 @@ class _AssistantReplays:
         self.starts, self.ends, self.owners, self.native = {}, {}, {}, []
         self.candidates, self.sources, self.identities, self.source_credits = [], {}, {}, {}
         self.source_display, self.source_message_counts = {}, {}
+        self.source_parents, self.source_users, self.source_input = OrderedDict(), {}, {}
 
     def display_key(self, text: str) -> str | None:
         if self.normalize_assistant is None:
@@ -195,11 +197,30 @@ class _AssistantReplays:
             raise _Unproven()
 
     def source(self, event: dict, offset: int) -> None:
-        if event.get("type") != "assistant" or event.get("sessionId") != self.provider_id:
+        if event.get("sessionId") != self.provider_id or event.get("isSidechain") is True:
             return
         identity = (event.get("uuid"), self.provider_id, event.get("timestamp"))
         if not all(isinstance(value, str) and 0 < len(value) <= 256 for value in identity):
             return
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        text = content if isinstance(content, str) else "\n".join(
+            part["text"] for part in content if isinstance(part, dict) and part.get("type") == "text"
+            and isinstance(part.get("text"), str)) if isinstance(content, list) else ""
+        parent_input = self.source_parents.get(event.get("parentUuid"))
+        tool_result = isinstance(content, list) and any(isinstance(part, dict) and part.get("type") == "tool_result" for part in content)
+        if event.get("type") == "user" and event.get("isMeta") is not True and text.strip() and not tool_result:
+            self.source_users.setdefault(identity, []).append((offset, _text_key(text.strip())))
+            parent_input = identity
+        self.source_parents[identity[0]] = parent_input
+        while len(self.source_parents) > 256:
+            self.source_parents.popitem(last=False)
+        if len(self.source_users) > MAX_KEYS:
+            raise _Unproven()
+        if event.get("type") != "assistant":
+            return
+        if parent_input is not None:
+            self.source_input[identity] = parent_input
         self.identities[identity] = self.identities.get(identity, 0) + 1
         self.source_message_counts[identity[0]] = self.source_message_counts.get(identity[0], 0) + 1
         if event.get("isSidechain") is True or event.get("isMeta") is True:
@@ -224,6 +245,34 @@ class _AssistantReplays:
                 self.source_credits.setdefault((int(timestamp), digest), set()).add(identity)
         if len(self.identities) + len(self.sources) > MAX_KEYS:
             raise _Unproven()
+
+    def exact_owned_sources(self) -> tuple[set, set]:
+        """Exact native assistant UUID also proves its source input ancestry."""
+        owners = {}
+        for event, digest in self.native:
+            message_id, run = event.get("provider_message_id"), event["run_id"]
+            starts, ends = self.starts.get(run, ()), self.ends.get(run, ())
+            if (not isinstance(message_id, str) or not 0 < len(message_id) <= 256
+                    or len(starts) != 1 or len(ends) != 1
+                    or starts[0].get("purpose") in ("scheduled_job", "cross_chat_handoff_delivery", "chat_mailbox_wake")):
+                continue
+            records = [starts[0], event, ends[0], *self.owners.get(run, ())]
+            ids = {row.get("provider_session_id") for row in records if row.get("provider_session_id")}
+            if (ids != {self.provider_id} or not all(type(row.get("seq")) is int for row in (starts[0], event, ends[0]))
+                    or not starts[0]["seq"] < event["seq"] < ends[0]["seq"]):
+                continue
+            owners.setdefault((message_id, digest), []).append(starts[0].get("prompt"))
+        assistants, users = set(), set()
+        for (identity, digest), offsets in self.sources.items():
+            matches = owners.get((identity[0], digest), ())
+            if len(matches) != 1 or len(offsets) != 1 or self.source_message_counts.get(identity[0]) != 1:
+                continue
+            assistants.add((identity, digest))
+            source_input = self.source_input.get(identity)
+            inputs = self.source_users.get(source_input, ())
+            if len(inputs) == 1 and isinstance(matches[0], str) and inputs[0][1] == _text_key(matches[0].strip()):
+                users.add((source_input, inputs[0][1], inputs[0][0]))
+        return assistants, users
 
     def prove(self, eligible: dict) -> frozenset:
         native, identified = {}, {}
@@ -307,6 +356,14 @@ class _AssistantReplays:
                 continue
             first, last, start, end = batch[:4]
             if first < seq < last and start < offsets[0] <= end:
+                proven.add(target)
+        exact, _inputs = self.exact_owned_sources()
+        for target, _phase in self.candidates:
+            _kind, seq, run, digest, identity = target
+            batch = eligible.get(run)
+            offsets = self.sources.get((identity, digest), ())
+            if (batch and (identity, digest) in exact and len(offsets) == 1
+                    and batch[0] < seq < batch[1] and batch[2] < offsets[0] <= batch[3]):
                 proven.add(target)
         return frozenset(proven)
 
@@ -479,11 +536,11 @@ def filter_native_claude_mailbox_wake_items(
     normalize_full_user: Callable, source_path: Path | None = None,
     normalize_assistant: Callable[[str], str] | None = None,
 ) -> list[dict]:
-    """First-import wake input/output proof; never a text-only filter.
+    """First-import native input/output proof; never a text-only filter.
 
     Parsed items omit human/client flags and may collapse repeated text, so the
-    exact checkpoint source is required to prove unique nonhuman ownership.
-    All failures retain the original items. Native output is never removed.
+    exact checkpoint source is required to prove unique native ownership.
+    All failures retain the original items. Live output is never removed.
     """
     try:
         if not items or len(items) > MAX_TARGETS:
@@ -491,10 +548,9 @@ def filter_native_claude_mailbox_wake_items(
         stamp = _regular_stamp(events)
         native = _AssistantReplays(provider_id, normalize_assistant)
         for event, _offset in _bounded_records(events, stamp, max(0, stamp[2] - MAX_EVENTS_BYTES), stamp[2]):
-            if (event.get("session_id") in (None, "", session_id)
-                    and (event.get("run_id") in native.starts or _mailbox_wake_identity(event))):
+            if event.get("session_id") in (None, "", session_id):
                 native.event(event)
-        if not any(_mailbox_wake_identity(start) for starts in native.starts.values() for start in starts):
+        if not native.starts:
             return items
         cursor = sync_checkpoint.get("cursor")
         if (sync_checkpoint.get("version") != 1 or not isinstance(cursor, dict)
@@ -560,9 +616,16 @@ def filter_native_claude_mailbox_wake_items(
                 native.source(event, offset)
         eligible = {batch: (0, len(items) + 1, start, end)}
         targets, assistant_replays = proof.prove(eligible), native.prove(eligible)
+        _assistants, owned_inputs = native.exact_owned_sources()
         projected = []
         for index, item in enumerate(items, 1):
+            origin = item.get("provider_origin") or {}
+            identity = (origin.get("event_id"), origin.get("session_id"), origin.get("timestamp"))
+            input_owned = item.get("kind") == "user" and any(
+                source == identity and digest == _text_key(item.get("text", "").strip()) and start < offset <= end
+                for source, digest, offset in owned_inputs)
             reason = ("source_proven_import" if (index, batch, _text_key(item.get("text", ""))) in targets
+                      or input_owned
                       else "source_proven_assistant_replay" if assistant_targets.get(index) in assistant_replays
                       else None)
             projected.append({**item, "text": "", "metadata_only": True,
@@ -582,15 +645,19 @@ class _Proof:
     interruptions: tuple[tuple[tuple[int, str, str], str], ...] = ()
     companions: frozenset[tuple[str, int, str]] = frozenset()
     assistant_replays: frozenset[tuple] = frozenset()
+    goal_commands: tuple = ()
     interruption_index: MappingProxyType = field(init=False, repr=False)
+    goal_command_index: MappingProxyType = field(init=False, repr=False)
     cache_signature: frozenset = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "interruption_index", MappingProxyType(dict(self.interruptions)))
+        object.__setattr__(self, "goal_command_index", MappingProxyType(dict(self.goal_commands)))
         object.__setattr__(self, "cache_signature", self.targets | frozenset(
             ("interruption", key, origin) for key, origin in self.interruptions)
             | frozenset(("companion", *key) for key in self.companions)
-            | frozenset(("assistant_replay", *key) for key in self.assistant_replays))
+            | frozenset(("assistant_replay", *key) for key in self.assistant_replays)
+            | frozenset(("goal_command", key, text) for key, text in self.goal_commands))
 
     def signature(self) -> frozenset:
         return self.cache_signature
@@ -851,6 +918,9 @@ def _prove(session_id: str, provider_id: str, events: Path, root: Path,
     interruptions = {}
     interruption_count = 0
     tracker = ClaudeInterruptionTracker()
+    goal_history = ClaudeGoalHistoryNormalizer()
+    goal_sources = {}
+    synthetic_sources = {}
     steer_intervals = _steer_intervals(native_events, provider_id)
     scheduled_ranges = {}
     for run, starts in scheduled_starts.items():
@@ -870,6 +940,17 @@ def _prove(session_id: str, provider_id: str, events: Path, root: Path,
         async_inputs.source(event, offset)
         wake_inputs.source(event, offset)
         origin = tracker.consume(event)
+        normalized_goal = goal_history.consume(event)
+        identity = (event.get("uuid"), event.get("sessionId"), event.get("timestamp"))
+        if is_claude_synthetic_no_response(event) and identity[1] == provider_id:
+            synthetic_sources.setdefault(identity, []).append(offset)
+        if normalized_goal is not event and identity[1] == provider_id:
+            raw_goal = normalize_user(event)
+            if isinstance(raw_goal, str):
+                goal_sources.setdefault((identity, _text_key(raw_goal)), []).append(
+                    (offset, normalized_goal["message"]["content"]))
+        if len(goal_sources) + len(synthetic_sources) > MAX_TARGETS:
+            raise _Unproven()
         if event.get("type") != "user":
             continue
         text = normalize_user(event)
@@ -907,6 +988,8 @@ def _prove(session_id: str, provider_id: str, events: Path, root: Path,
             raise _Unproven()
     targets = set()
     corrected = []
+    goal_commands = []
+    _owned_assistants, owned_inputs = assistant_replays.exact_owned_sources()
     candidate_counts = {}
     candidate_origin_counts = {}
     run_candidate_counts = {}
@@ -927,6 +1010,29 @@ def _prove(session_id: str, provider_id: str, events: Path, root: Path,
             and (end, expected) in verified
             and (start == 0 or (start, previous) in verified)
         ):
+            continue
+        if any(identity == candidate_origins.get(target) and digest == key and start < offset <= end
+               for identity, digest, offset in owned_inputs):
+            targets.add(target)
+            continue
+        commands = goal_sources.get((candidate_origins.get(target), key), ())
+        if len(commands) == 1 and start < commands[0][0] <= end:
+            canonical = commands[0][1]
+            native_time = _timestamp(candidate_origins[target][2])
+            owners = []
+            for native_run, starts in assistant_replays.starts.items():
+                ends = assistant_replays.ends.get(native_run, ())
+                if len(starts) != 1 or len(ends) != 1 or starts[0].get("prompt") != canonical:
+                    continue
+                records = [starts[0], ends[0], *assistant_replays.owners.get(native_run, ())]
+                provider_ids = {row.get("provider_session_id") for row in records if row.get("provider_session_id")}
+                first, last = _timestamp(starts[0].get("ts")), _timestamp(ends[0].get("ts"))
+                if provider_ids == {provider_id} and first is not None and last is not None and native_time is not None and first <= native_time <= last:
+                    owners.append(native_run)
+            if len(owners) == 1:
+                targets.add(target)
+            else:
+                goal_commands.append((target, canonical))
             continue
         # A scheduled wake is ordinary provider user input, not isMeta. Prove
         # its complete text, native occurrence interval, exact source identity
@@ -958,6 +1064,16 @@ def _prove(session_id: str, provider_id: str, events: Path, root: Path,
     targets.update(async_inputs.prove(verified_batches))
     targets.update(wake_inputs.prove(verified_batches))
     proven_assistants = assistant_replays.prove(verified_batches)
+    synthetic_targets = set()
+    for target, _phase in assistant_replays.candidates:
+        _kind, seq, run, digest_key, identity = target
+        batch = verified_batches.get(run)
+        offsets = synthetic_sources.get(identity, ())
+        if (batch and batch[0] < seq < batch[1] and len(offsets) == 1
+                and batch[2] < offsets[0] <= batch[3]
+                and digest_key == _text_key("No response requested.")):
+            synthetic_targets.add(target)
+    proven_assistants = proven_assistants | frozenset(synthetic_targets)
     corrected_counts = {}
     for (_seq, run, _key), _origin in corrected:
         corrected_counts[run] = corrected_counts.get(run, 0) + 1
@@ -975,7 +1091,7 @@ def _prove(session_id: str, provider_id: str, events: Path, root: Path,
             companions.add(("history_imported", eligible_batches[run][0], run))
             companions.add(("turn_finished", eligible_batches[run][1], run))
     return _Proof(provider_id, events_stamp, source, source_stamp, frozenset(targets),
-                  tuple(corrected), frozenset(companions), proven_assistants)
+                  tuple(corrected), frozenset(companions), proven_assistants, tuple(goal_commands))
 
 
 def _bounded_records(path: Path, expected, start: int, end: int):
@@ -1223,6 +1339,9 @@ class ClaudeMetadataRepairWindow:
 def _project_proof_event(session_id: str, event: dict, proof: _Proof | None) -> dict | None:
     if proof is None or event.get("session_id") not in (None, "", session_id):
         return None
+    canonical = proof.goal_command_index.get(_target(event))
+    if canonical is not None:
+        return {**event, "prompt": canonical, "provider_history_repair": "source_proven_goal_command"}
     if proof.assistant_replays and _assistant_target(event) in proof.assistant_replays:
         return {**event, "text": "", "metadata_only": True,
                 "provider_history_repair": "source_proven_assistant_replay"}
@@ -1388,9 +1507,11 @@ class ClaudeMetadataRepairCache:
                 inputs = previous.targets | proof.targets
                 interruptions = {**dict(previous.interruptions), **dict(proof.interruptions)}
                 assistants = previous.assistant_replays | proof.assistant_replays
+                commands = {**dict(previous.goal_commands), **dict(proof.goal_commands)}
                 entries = ([(key[0], key[1], "input", key) for key in inputs]
                            + [(key[0], key[1], "interruption", key) for key in interruptions]
-                           + [(key[1], key[2], "assistant", key) for key in assistants])
+                           + [(key[1], key[2], "assistant", key) for key in assistants]
+                           + [(key[0], key[1], "goal_command", key) for key in commands])
                 entries.sort(key=lambda entry: entry[0], reverse=True)
                 evicted_runs = {entry[1] for entry in entries[MAX_TARGETS:]}
                 retained = entries[:MAX_TARGETS]
@@ -1403,7 +1524,8 @@ class ClaudeMetadataRepairCache:
                                frozenset(key for _, _, kind, key in retained if kind == "input"),
                                tuple((key, interruptions[key]) for _, _, kind, key in retained if kind == "interruption"),
                                frozenset(companions),
-                               frozenset(key for _, _, kind, key in retained if kind == "assistant"))
+                               frozenset(key for _, _, kind, key in retained if kind == "assistant"),
+                               tuple((key, commands[key]) for _, _, kind, key in retained if kind == "goal_command"))
             with self._lock:
                 cancelled = self._preparation_cancelled
                 self._preparing_session = None

@@ -463,6 +463,79 @@ class ClaudeInterruptionRepairTests(unittest.TestCase):
     def correction(self):
         return self.cache.project_interruption("chat-1", self.target)
 
+    def test_old_parallel_tool_result_import_is_repaired_without_cursor_migration(self):
+        prompt, assistant, _, marker = self.source_rows()
+        results = [self.raw(number, parentUuid=assistant["uuid"], message={"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": f"tool-{number}", "content": "done"}]}) for number in (3, 5)]
+        marker["parentUuid"] = results[-1]["uuid"]
+        self.fixture([prompt, assistant, *results, marker], start=4)
+        self.assertTrue(self.prepare())
+        self.assertEqual(self.correction()["type"], "provider_interruption")
+
+    def test_native_goal_attachment_proves_command_rewrite_without_hiding_quoted_xml(self):
+        goal = self.raw(1, type="attachment", message=None,
+            attachment={"type": "goal_status", "sentinel": True, "met": False, "condition": "Finish"})
+        wrapper = "<command-name>/goal</command-name>\n <command-message>goal</command-message>\n <command-args>Finish</command-args>"
+        command = self.raw(2, parentUuid=goal["uuid"], message={"role": "user", "content": wrapper})
+        self.fixture([goal, command], start=1)
+        self.target["prompt"] = wrapper
+        self.target["provider_origin"] = {"provider": "claude", "event_id": command["uuid"],
+            "session_id": self.PROVIDER, "timestamp": self.TIME}
+        self.events.write_bytes(encode(self.rows))
+        self.assertTrue(self.prepare())
+        self.assertEqual(self.cache.project_event("chat-1", self.target)["prompt"], "/goal Finish")
+        self.assertFalse(self.cache.is_hidden("chat-1", self.target))
+        quoted = {**self.target, "provider_origin": {**self.target["provider_origin"], "event_id": self.raw(99)["uuid"]}, "seq": 55}
+        self.assertIsNone(self.cache.project_event("chat-1", quoted))
+
+    def owned_followup_fixture(self, *, linked=True, same_uuid=True):
+        user = self.raw(1)
+        assistant = self.raw(2, type="assistant", parentUuid=user["uuid"] if linked else self.raw(99)["uuid"],
+            message={"role": "assistant", "content": [{"type": "text", "text": "Owned answer"}]})
+        common = {"session_id": "chat-1", "backend": "claude", "run_id": "native-one",
+                  "provider_session_id": self.PROVIDER, "ts": self.TIME}
+        native = [
+            {**common, "type": "turn_started", "seq": 1, "prompt": "Real question"},
+            {**common, "type": "assistant_text", "seq": 2, "phase": "commentary", "text": "Owned answer",
+             "provider_message_id": assistant["uuid"] if same_uuid else self.raw(98)["uuid"]},
+            {**common, "type": "turn_finished", "seq": 3, "exit_code": 0, "result_text": "Owned answer"},
+        ]
+        self.fixture([user, assistant], start=0, native=native)
+        def origin(row):
+            return {"provider": "claude", "event_id": row["uuid"], "session_id": self.PROVIDER,
+                    "timestamp": row["timestamp"]}
+        self.target.update(prompt="Real question", provider_origin=origin(user))
+        imported = {**self.target, "type": "assistant_text", "seq": 18527,
+                    "text": "Owned answer", "provider_origin": origin(assistant)}
+        imported.pop("prompt")
+        self.rows[-1]["seq"] = 18528
+        self.rows.insert(-1, imported)
+        self.events.write_bytes(encode(self.rows))
+        return imported
+
+    def test_exact_native_followup_repairs_existing_and_prevents_first_import_duplicates(self):
+        imported = self.owned_followup_fixture()
+        self.assertTrue(self.prepare())
+        self.assertTrue(self.cache.is_hidden("chat-1", self.target))
+        self.assertTrue(self.cache.project_event("chat-1", imported)["metadata_only"])
+        items = [{"kind": "user", "text": self.target["prompt"], "provider_origin": self.target["provider_origin"]},
+                 {"kind": "assistant", "text": imported["text"], "provider_origin": imported["provider_origin"]}]
+        result = repair.filter_native_claude_mailbox_wake_items(
+            "chat-1", self.PROVIDER, self.events, items, source_path=self.source, root=self.root,
+            sync_checkpoint=self.rows[3]["_history_sync_checkpoint"],
+            normalize_user=self.normalize, normalize_full_user=self.normalize)
+        self.assertTrue(all(item.get("metadata_only") for item in result))
+        self.assertTrue(all("metadata_only" not in item for item in items))
+
+    def test_same_text_requires_exact_native_uuid_and_user_ancestry(self):
+        for linked, same_uuid in ((False, True), (True, False)):
+            with self.subTest(linked=linked, same_uuid=same_uuid):
+                self.cache = repair.ClaudeMetadataRepairCache()
+                imported = self.owned_followup_fixture(linked=linked, same_uuid=same_uuid)
+                self.prepare()
+                self.assertFalse(self.cache.is_hidden("chat-1", self.target))
+                self.assertEqual(self.cache.project_event("chat-1", imported) is not None, same_uuid)
+
     def native_steer(self):
         common = {"session_id": "chat-1", "backend": "claude", "ts": self.TIME}
         return [

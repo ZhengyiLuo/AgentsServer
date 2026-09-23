@@ -23,6 +23,7 @@ NEW_MODULES = {
     "title_generation.py",
     "chat_mailbox.py",
     "claude_background_reconciliation.py",
+    "claude_goals.py",
     "team_mail_runtime.py", "team_mail_websocket.py",
     "team_mail_grants.py",
     "claude_history_repair.py", "claude_history_provenance.py", "codex_history_repair.py", "public_chat_shares.py",

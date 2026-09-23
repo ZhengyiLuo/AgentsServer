@@ -98,6 +98,7 @@ from claude_sdk_client import (
     ClaudeSDKQueryError,
     ClaudeSDKRunActive,
     ClaudeSDKSupervisorClosed,
+    ClaudeSDKSupervisorError,
     ClaudeSDKSupervisorManager,
     ClaudeSDKUnavailable,
     canonical_claude_mcp_identifier,
@@ -155,6 +156,7 @@ from codex_history_repair import (
     codex_public_item_origin, filter_native_codex_history_items,
 )
 from claude_history_provenance import ClaudeInterruptionTracker, normalize_claude_interruption_context
+from claude_goals import ClaudeGoalProjection
 from claude_background_reconciliation import (
     CONSUMED_EVENT as CLAUDE_BACKGROUND_CONSUMED_EVENT,
     RECONCILED_EVENT as CLAUDE_BACKGROUND_RECONCILED_EVENT,
@@ -24135,19 +24137,31 @@ async def _run_queued_turn_now_once(
                 "_agentsdock_force_send_phase",
                 "stopping_active_turn",
             )
+        claude_sdk_stop_run_id = (
+            str(active_turn.get("run_id") or interrupted_turn.get("run_id") or "").strip()
+            if active_turn.get("transport") == CLAUDE_TRANSPORT_AGENT_SDK
+            else ""
+        )
         stop_result = await stop_turn(
             session_id,
+            expected_run_id=claude_sdk_stop_run_id or None,
             emit_event=False,
             schedule_queue=False,
             require_provider_turn_ready=True,
             cascade_codex_subagents=False,
             cascade_claude_subagents=False,
-            hard_terminalize_on_timeout=False,
+            hard_terminalize_on_timeout=bool(claude_sdk_stop_run_id),
             pause_queued_turns_on_stop=False,
             preserve_active_goal=True,
         )
-        interrupted = bool(stop_result.get("stopped") or stop_result.get("pending"))
-        deferred = bool(stop_result.get("deferred"))
+        # A pending interrupt has not released the provider slot. Promoting it
+        # would publish "Starting" and leave an unbounded BUSY waiter behind.
+        deferred = bool(
+            stop_result.get("deferred")
+            or stop_result.get("pending")
+            or stop_result.get("superseded")
+        )
+        interrupted = bool(stop_result.get("stopped")) and not deferred
         if deferred:
             already_notified = bool(selected.get("_turn_deferred_notified"))
             selected["_turn_deferred_notified"] = True
@@ -24160,10 +24174,21 @@ async def _run_queued_turn_now_once(
                 queue_items.insert(insert_at, selected)
                 QUEUED_TURNS[session_id] = deque(queue_items)
                 remaining = len(queue_items)
-            message = (
-                "The provider is still starting, so the current turn was not interrupted. "
-                "This message remains queued; try Force Send again shortly."
-            )
+            if stop_result.get("pending"):
+                message = (
+                    "Stop is still finishing. This message remains queued; "
+                    "try Force Send again shortly."
+                )
+            elif stop_result.get("superseded"):
+                message = (
+                    "The active turn changed before it could be stopped. "
+                    "This message remains queued; try Force Send again shortly."
+                )
+            else:
+                message = (
+                    "The provider is still starting, so the current turn was not interrupted. "
+                    "This message remains queued; try Force Send again shortly."
+                )
             if not already_notified:
                 await append_event(session_id, "turn_deferred", {
                     "queued_id": queued_id,
@@ -31484,6 +31509,7 @@ TIMELINE_INDEX_HIDDEN_TYPES = {
     "codex_goal_updated",
     "codex_goal_cleared",
     "claude_subagents_stopped",
+    "claude_goal_changed",
     "claude_background_tasks_reconciled",
     "claude_background_task_reconciliation_consumed",
     # Legacy beta servers briefly emitted usage as timeline events. Keep those
@@ -46121,6 +46147,9 @@ def claude_history_event_item(
     *,
     expected_session_id: str | None = None,
 ) -> dict[str, Any] | None:
+    from claude_goals import is_claude_synthetic_no_response
+    if is_claude_synthetic_no_response(event):
+        return None
     if event.get("isSidechain") is True:
         # Provider-owned child transcript rows are not parent-chat messages.
         # The structured scope flag, never interruption wording, establishes
@@ -46192,15 +46221,18 @@ def parse_claude_history_events(
     expected_session_id: str | None = None,
     interruption_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    from claude_goals import ClaudeGoalHistoryNormalizer
     items: deque[dict[str, Any]] = deque(
         maxlen=normalized_history_import_limit(limit)
     )
     tracker = ClaudeInterruptionTracker()
+    goal_history = ClaudeGoalHistoryNormalizer()
     for event in events:
         if not isinstance(event, dict):
             tracker = ClaudeInterruptionTracker()
             continue
         origin = tracker.consume(event)
+        event = goal_history.consume(event)
         if origin is not None:
             add_history_item(items, "interruption", message_text(event.get("message")), provider_origin=origin)
         else:
@@ -47931,6 +47963,10 @@ def parse_provider_history_delta(
     source_context = source_text_context if source_text_context is not None else {}
     blocked_on_unseen_message = False
     tracker = ClaudeInterruptionTracker(interruption_context) if backend == BACKEND_CLAUDE else None
+    from claude_goals import ClaudeGoalHistoryNormalizer
+    goal_history = ClaudeGoalHistoryNormalizer() if backend == BACKEND_CLAUDE else None
+    if goal_history is not None:
+        goal_history.seed(path, start)
     for event, record_end in bounded_jsonl_records_range(
         path,
         start,
@@ -47946,6 +47982,8 @@ def parse_provider_history_delta(
         if tracker is not None and event is None:
             tracker = ClaudeInterruptionTracker()
         origin = tracker.consume(event) if tracker is not None else None
+        if goal_history is not None:
+            event = goal_history.consume(event)
         if event is not None:
             if backend == BACKEND_CLAUDE:
                 item = normalized_history_item(
@@ -62830,6 +62868,9 @@ async def run_claude_sdk(
                             cwd=cwd,
                         )
                         provider_persisted_id = message_provider_id
+                if provider_id and claude_sdk_type(message) != "StreamEvent":
+                    with suppress(Exception):
+                        await refresh_claude_goal(session_id, provider_id=provider_id)
                 projected_result = await project_claude_sdk_message(
                     session_id,
                     current_run_id,
@@ -63613,6 +63654,14 @@ async def run_claude_sdk(
                     provider_id,
                     cwd=cwd,
                 )
+
+        # Native goal verdicts are persisted before the terminal result. The
+        # provider, not an app-owned continuation loop, decides when to finish.
+        with suppress(Exception):
+            await refresh_claude_goal(session_id, provider_id=provider_id)
+            if (CLAUDE_GOAL_PENDING.get(session_id) or {}).get("run_id") == current_run_id:
+                CLAUDE_GOAL_PENDING.pop(session_id, None)
+                await append_event(session_id, "claude_goal_changed", {})
 
         stopped = bool(
             cancelled_error is not None
@@ -84264,6 +84313,124 @@ async def manage_claude_mcp(
                     SERVER_MAINTENANCE_SESSIONS.discard(session_id)
 
 
+CLAUDE_GOAL_PROJECTIONS: dict[str, ClaudeGoalProjection] = {}
+CLAUDE_GOAL_PATHS: dict[str, Path] = {}
+CLAUDE_GOAL_LOCKS: dict[str, asyncio.Lock] = {}
+CLAUDE_GOAL_PENDING: dict[str, dict[str, Any]] = {}
+
+
+async def refresh_claude_goal(
+    session_id: str, *, provider_id: str | None = None, notify: bool = True,
+) -> dict[str, Any] | None:
+    """Project provider-owned goal records during existing runtime activity."""
+    session = STORE.sessions.get(session_id)
+    if not session or str(session.get("backend") or DEFAULT_BACKEND) != BACKEND_CLAUDE:
+        return None
+    provider_id = provider_id or claude_provider_id_for_session(session)
+    if not provider_id:
+        return None
+    async with CLAUDE_GOAL_LOCKS.setdefault(session_id, asyncio.Lock()):
+        projection = CLAUDE_GOAL_PROJECTIONS.get(session_id)
+        if projection is None or projection.provider_session_id != provider_id:
+            projection = ClaudeGoalProjection(provider_id)
+            CLAUDE_GOAL_PROJECTIONS[session_id] = projection
+            CLAUDE_GOAL_PATHS.pop(session_id, None)
+        path = CLAUDE_GOAL_PATHS.get(session_id)
+        if path is not None and not await asyncio.to_thread(path.exists):
+            CLAUDE_GOAL_PATHS.pop(session_id, None)
+            path = None
+        if path is None:
+            path = await asyncio.to_thread(find_claude_history, provider_id)
+            if path is not None:
+                CLAUDE_GOAL_PATHS[session_id] = path
+        if path is None:
+            return None
+        was_caught_up = projection.caught_up
+        changed = await asyncio.to_thread(projection.refresh, path)
+        if not projection.caught_up:
+            return None
+        changed = changed or not was_caught_up
+        goal = projection.goal
+        pending = CLAUDE_GOAL_PENDING.get(session_id)
+        if pending and goal and goal.get("set_at") != pending.get("previous_set_at"):
+            CLAUDE_GOAL_PENDING.pop(session_id, None)
+            changed = True
+        if changed and notify:
+            await append_event(session_id, "claude_goal_changed", {})
+        return dict(goal) if goal else None
+
+
+def require_claude_goal_session(session_id: str) -> dict[str, Any]:
+    session = STORE.sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="session not found")
+    if str(session.get("backend") or DEFAULT_BACKEND) != BACKEND_CLAUDE:
+        raise HTTPException(status_code=400, detail="Goals here require a Claude chat")
+    if CLAUDE_TRANSPORT == CLAUDE_TRANSPORT_PRINT or not claude_sdk_dependency_available():
+        raise HTTPException(status_code=409, detail="Claude Goals require the Claude Agent SDK")
+    return session
+
+
+async def start_claude_goal_command(session_id: str, argument: str) -> dict[str, Any]:
+    session = require_claude_goal_session(session_id)
+    snapshot, inventory = await discover_session_provider_commands(session_id, session)
+    command = next((record for record in inventory.records
+                    if record.public.get("invocation") == "/goal"), None)
+    if snapshot["support"].get("available") is not True or command is None:
+        raise HTTPException(status_code=409, detail="This Claude installation does not offer /goal. Update Claude Code to use Goals.")
+    return await start_turn(session_id, TurnRequest(
+        prompt=f"/goal {argument}",
+        skill_selection=SkillSelection(id=command.public["id"], revision=inventory.revision),
+        client_capabilities=[CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY],
+    ), queue_if_busy=False)
+
+
+class ClaudeGoalRequest(BaseModel):
+    condition: str = Field(min_length=1, max_length=4000)
+
+
+@app.put("/api/sessions/{session_id}/claude/goal")
+async def put_claude_goal(session_id: str, req: ClaudeGoalRequest) -> dict[str, Any]:
+    require_claude_goal_session(session_id)
+    condition = req.condition.strip()
+    if not condition or condition.lower() == "clear":
+        raise HTTPException(status_code=400, detail="Enter a completion condition for Claude")
+    previous = await refresh_claude_goal(session_id, notify=False)
+    accepted = await start_claude_goal_command(session_id, condition)
+    # Bind pending display state only after actual admission. A competing
+    # request or an older run's cleanup cannot clear the winner's operation.
+    async with ACTIVE_LOCK:
+        if str((ACTIVE.get(session_id) or {}).get("run_id") or "") == accepted.get("run_id"):
+            CLAUDE_GOAL_PENDING[session_id] = {
+                "run_id": accepted["run_id"],
+                "previous_set_at": (previous or {}).get("set_at"),
+            }
+    return await claude_runtime_snapshot(session_id)
+
+
+@app.delete("/api/sessions/{session_id}/claude/goal")
+async def delete_claude_goal(session_id: str) -> dict[str, Any]:
+    require_claude_goal_session(session_id)
+    cleared_live = False
+    # Serialize with ordinary turn admission while the native priority command
+    # interrupts the current turn and returns its separate clear receipt.
+    async with session_lifecycle_lock(session_id):
+        ensure_session_not_deleting(session_id)
+        async with ACTIVE_LOCK:
+            active = dict(ACTIVE.get(session_id) or {})
+        if active.get("transport") == CLAUDE_TRANSPORT_AGENT_SDK:
+            manager = await claude_sdk_manager()
+            try:
+                await manager.clear_goal(session_id, run_id=str(active.get("run_id") or ""))
+            except ClaudeSDKSupervisorError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            cleared_live = True
+    if not cleared_live:
+        await start_claude_goal_command(session_id, "clear")
+    await refresh_claude_goal(session_id)
+    return await claude_runtime_snapshot(session_id)
+
+
 async def claude_runtime_snapshot(session_id: str) -> dict[str, Any]:
     session = STORE.sessions.get(session_id)
     if not session:
@@ -84301,12 +84468,17 @@ async def claude_runtime_snapshot(session_id: str) -> dict[str, Any]:
         status = {"type": "idle"}
     else:
         status = {"type": "notLoaded"}
+    goal = await refresh_claude_goal(session_id, notify=False) if is_claude else None
     return {
         "available": bool(is_claude and configured and sdk_available),
         "transport": CLAUDE_TRANSPORT,
         "interactive_capability": CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY,
         "persisted_session": bool(claude_provider_id_for_session(session)),
         "session_loaded": loaded,
+        "goal": goal,
+        "goal_starting": session_id in CLAUDE_GOAL_PENDING,
+        "goal_loading": bool(is_claude and claude_provider_id_for_session(session)
+                             and not getattr(CLAUDE_GOAL_PROJECTIONS.get(session_id), "caught_up", False)),
         "stop_fence_pending": session_id in CLAUDE_STOP_FENCE_SESSIONS,
         "status": status,
         "pending_interactions": pending,
@@ -84325,6 +84497,7 @@ async def claude_runtime_snapshot(session_id: str) -> dict[str, Any]:
             "permission_modes": True,
             "context_usage_refresh": True,
             "mcp_management": bool(is_claude and configured and sdk_available),
+            "goals": bool(is_claude and configured and sdk_available),
         },
         "fallback_transport": CLAUDE_TRANSPORT_PRINT,
     }

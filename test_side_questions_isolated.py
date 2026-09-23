@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+from contextlib import suppress
 import json
 from pathlib import Path
 import re
@@ -10,6 +11,7 @@ import tempfile
 import sys
 from types import SimpleNamespace
 import unittest
+import uuid
 from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import HTTPException
@@ -694,6 +696,53 @@ class ServerGlueTests(unittest.TestCase):
         self.assertIn("'side_questions': side_questions.capability()", ast.unparse(health))
 
 
+class SideApprovalBridgeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_side_approval_uses_existing_validator_without_registering_parent(self):
+        source = Path(__file__).with_name("agent_server.py")
+        names = {"handle_codex_server_request", "public_codex_interaction", "validate_codex_interaction_response",
+                 "resolve_codex_interaction", "finish_codex_interaction_locked", "cancel_codex_interactions"}
+        selected = [node for node in ast.parse(source.read_text()).body
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
+        requested = asyncio.Event()
+        async def append(*args):
+            if args[1] == "codex_interaction_requested":
+                requested.set()
+        registry = {}
+        no_parent = Mock(side_effect=AssertionError("Side fork must not use the parent registry"))
+        scope = dict(asyncio=asyncio, uuid=uuid, suppress=suppress, HTTPException=HTTPException,
+            CODEX_INTERACTION_METHODS={"item/commandExecution/requestApproval"},
+            CODEX_PENDING_INTERACTIONS=registry, CODEX_PENDING_INTERACTIONS_LOCK=asyncio.Lock(),
+            CODEX_INTERACTION_HANDLER_TASKS={}, CODEX_APPROVAL_ITEM_CACHE={}, MAX_CODEX_PENDING_INTERACTIONS=8,
+            DELETING_SESSIONS=set(), DELETED_SESSION_TOMBSTONES=set(),
+            session_lifecycle_lock=lambda sid: asyncio.Lock(),
+            codex_session_id_for_thread=no_parent, codex_request_is_interactive=no_parent,
+            existing_codex_app_server_manager_for_thread=no_parent,
+            bounded_codex_interaction_value=lambda value: value, now_iso=lambda: "now",
+            register_session_task=Mock(), update_codex_pending_session_metadata=AsyncMock(),
+            append_event=append, decline_server_request=AsyncMock(return_value={"decision": "decline"}),
+            _CODEX_CANCEL_INTERACTION_FUTURE=object())
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[ast.ImportFrom(
+            module="__future__", names=[ast.alias(name="annotations")], level=0), *selected], type_ignores=[])),
+            str(source), "exec"), scope)
+        params = {"threadId": "side-fork", "availableDecisions": ["accept", "decline"]}
+        task = asyncio.create_task(scope["handle_codex_server_request"](1, "item/commandExecution/requestApproval",
+            params, side_session_id="chat", side_owner_is_current=lambda: True))
+        await asyncio.wait_for(requested.wait(), 1)
+        interaction_id = next(iter(registry))
+        self.assertEqual(registry[interaction_id]["thread_id"], "side-fork")
+        await scope["cancel_codex_interactions"]("chat", resolution="turn_stopped")
+        self.assertFalse(registry[interaction_id]["future"].done())
+        with self.assertRaises(HTTPException):
+            await scope["resolve_codex_interaction"]("chat", interaction_id, {"decision": "acceptForSession"})
+        await scope["resolve_codex_interaction"]("chat", interaction_id, {"decision": "accept"})
+        self.assertEqual(await task, {"decision": "accept"})
+        self.assertEqual(registry, {})
+        owner = Mock(side_effect=[True, False])
+        self.assertEqual(await scope["handle_codex_server_request"](2, "item/commandExecution/requestApproval",
+            params, side_session_id="chat", side_owner_is_current=owner), {"decision": "decline"})
+        no_parent.assert_not_called()
+
+
 class ServerCallbackTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):
@@ -719,7 +768,8 @@ class ServerCallbackTests(unittest.IsolatedAsyncioTestCase):
         self.parent_queue = {"chat": [{"prompt": "queued work"}]}
         self.manager = SimpleNamespace(ask_side_question=AsyncMock(return_value={
             "answer": "Native Claude answer", "context_note": "Native context"}))
-        self.codex = SimpleNamespace(ask=AsyncMock(return_value="Native Codex answer"), close=AsyncMock())
+        self.codex = SimpleNamespace(ask=AsyncMock(return_value="Native Codex answer"), close=AsyncMock(),
+                                     closed=False, thread_id="side-fork")
         self.codex_factory = Mock(return_value=self.codex)
         self.options = SimpleNamespace(resume="claude-parent")
         self.namespace = dict(asyncio=asyncio, side_questions=side, STATE_DIR=root,
@@ -733,11 +783,50 @@ class ServerCallbackTests(unittest.IsolatedAsyncioTestCase):
             ACTIVE=self.parent_active, QUEUED_TURNS=self.parent_queue,
             session_codex_thread_id=lambda session: session.get("codex_thread_id"),
             existing_cwd=lambda value: value, codex_manifest_path=lambda sid: str(root / "unused-manifest"),
+            codex_runtime_settings=lambda session: (session.get("model", ""), session.get("effort", ""), ""),
+            codex_effective_thread_config=lambda session: {}, flatten_codex_config_overrides=lambda value: value,
+            codex_app_server_service_tier=lambda value: value,
+            CODEX_APPROVAL_POLICIES={"never", "on-request", "untrusted"}, CODEX_DEFAULT_APPROVAL_POLICY="never",
+            CODEX_APPROVAL_REVIEWERS={"user", "auto_review", "guardian_subagent"}, CODEX_DEFAULT_APPROVALS_REVIEWER="user",
+            CODEX_SANDBOX_MODES={"read-only", "workspace-write", "danger-full-access"}, CODEX_DEFAULT_SANDBOX_MODE="danger-full-access",
+            CODEX_SANDBOX_POLICY_TYPES={"read-only": "readOnly", "workspace-write": "workspaceWrite", "danger-full-access": "dangerFullAccess"},
+            CODEX_DEFAULT_PERMISSION_PROFILE=None, CODEX_PROVIDER_MCP_NAME="_agentsdock_internal_provider_9f3a2c71",
+            handle_codex_server_request=AsyncMock(),
             build_claude_sdk_options=Mock(return_value=(self.options, "configuration", "synthetic-claude")),
             claude_sdk_manager=AsyncMock(return_value=self.manager),
             runner_env=lambda: {"AGENTSDOCK_CHAT_ID": "parent", "HOME": "/synthetic"})
         self.namespace["public_chat_share_session_exists"] = lambda sid: sid in self.namespace["STORE"].sessions
         exec(self.code, self.namespace)
+
+    async def test_codex_side_fork_carries_parent_permissions_and_scopes_approval_owner(self):
+        self.session.update(backend="codex", cwd="/project", codex_approval_policy="on-request",
+                            codex_permission_profile=":workspace-write", codex_approvals_reviewer="user")
+        self.namespace["codex_effective_thread_config"] = lambda session: {
+            "model_reasoning_summary": "detailed",
+            "mcp_servers._agentsdock_internal_provider_9f3a2c71.url": "parent-only-secret",
+        }
+        with patch.dict(sys.modules, {"codex_side_question": SimpleNamespace(NativeCodexSideChat=self.codex_factory)}):
+            chat = await self.namespace["create_native_side_chat"]("chat")
+            await chat.ask("Read a new file", history=[])
+        options = self.codex_factory.call_args.kwargs
+        self.assertEqual(options["cwd"], "/project")
+        for key in ("fork_overrides", "turn_overrides"):
+            self.assertEqual(options[key]["permissions"], ":workspace-write")
+            self.assertEqual(options[key]["approvalPolicy"], "on-request")
+            self.assertEqual(options[key]["runtimeWorkspaceRoots"], ["/project"])
+            self.assertNotIn("sandbox", options[key])
+            self.assertNotIn("sandboxPolicy", options[key])
+        self.assertEqual(options["fork_overrides"]["config"], {"model_reasoning_summary": "detailed"})
+        bridge = self.namespace["handle_codex_server_request"]
+        async def owns(*args, **kwargs):
+            self.assertEqual(kwargs["side_session_id"], "chat")
+            return kwargs["side_owner_is_current"]()
+        bridge.side_effect = owns
+        callback = options["server_request_handler"]
+        self.assertTrue(await callback(1, "item/commandExecution/requestApproval", {"threadId": "side-fork"}))
+        self.assertFalse(await callback(2, "item/commandExecution/requestApproval", {"threadId": "codex-parent"}))
+        self.session["codex_thread_id"] = "replacement"
+        self.assertFalse(await callback(3, "item/commandExecution/requestApproval", {"threadId": "side-fork"}))
 
     async def test_codex_auth_reservation_rejects_side_chat_before_provider_creation(self):
         self.session["backend"] = "codex"

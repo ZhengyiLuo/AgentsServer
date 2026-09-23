@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import codex_side_question as adapter
 import codex_provider
+from claude_sdk_client import CLAUDE_PROVIDER_MCP_SERVER_NAME
 from side_questions import SideQuestionError
 
 
@@ -17,8 +18,9 @@ def protocol_schema():
     return {"definitions": {
         "ThreadForkParams": {"properties": {
             "ephemeral": {"type": "boolean"},
-            **{name: {} for name in ("excludeTurns", "runtimeWorkspaceRoots", "baseInstructions",
-                                    "developerInstructions", "config", "sandbox", "approvalPolicy")},
+            **{name: {} for name in ("excludeTurns", "runtimeWorkspaceRoots", "cwd",
+                                    "developerInstructions", "config", "sandbox", "approvalPolicy",
+                                    "permissions", "approvalsReviewer")},
         }},
         "TurnStartParams": {"properties": {"environments": {
             "type": ["array", "null"], "description": "Empty disables environment access for this turn.",
@@ -39,13 +41,13 @@ def completed(status="completed", error=None):
 
 
 class ConfigurationTests(unittest.TestCase):
-    def test_requires_native_ephemeral_fork_and_explicit_empty_turn_environments(self):
+    def test_requires_native_fork_permissions_not_unused_environment_isolation(self):
         self.assertTrue(adapter.supports_native_side_chat(protocol_schema()))
-        for invalid in ({}, {"type": ["array", "null"], "description": "Optional environments"}):
-            with self.subTest(invalid=invalid):
-                schema = protocol_schema()
-                schema["definitions"]["TurnStartParams"]["properties"]["environments"] = invalid
-                self.assertFalse(adapter.supports_native_side_chat(schema))
+        schema = protocol_schema()
+        del schema["definitions"]["TurnStartParams"]
+        self.assertTrue(adapter.supports_native_side_chat(schema))
+        self.assertFalse(adapter._supports_empty_turn_environments(schema))
+        self.assertTrue(adapter._supports_empty_turn_environments(protocol_schema()))
         for field in protocol_schema()["definitions"]["ThreadForkParams"]["properties"]:
             schema = protocol_schema()
             del schema["definitions"]["ThreadForkParams"]["properties"][field]
@@ -54,6 +56,7 @@ class ConfigurationTests(unittest.TestCase):
             self.assertFalse(adapter.supports_native_side_chat(malformed))
 
     def test_disables_model_selected_subagents_and_legacy_notification_commands(self):
+        # Title generation and endpoint probes still use this separate helper.
         config = adapter.isolated_config()
         self.assertIs(config["agents.enabled"], False)
         self.assertEqual(config["notify"], [])
@@ -68,6 +71,25 @@ class ConfigurationTests(unittest.TestCase):
         for name in ("apps", "plugins", "hooks", "multi_agent", "multi_agent_v2", "goals",
                      "memories", "image_generation", "shell_tool", "browser_use", "computer_use"):
             self.assertIs(config[f"features.{name}"], False)
+
+    def test_side_chat_keeps_native_tools_and_excludes_only_parent_run_authority(self):
+        name = CLAUDE_PROVIDER_MCP_SERVER_NAME
+        parent = {"features.shell_tool": True, "web_search": "live",
+                  "mcp_servers": {"ordinary": {"enabled": True}, name: {"http_headers": {"secret": "parent"}}},
+                  f"mcp_servers.{name}.http_headers": {"secret": "parent"},
+                  "shell_environment_policy.exclude": ["PRIVATE_KEY"]}
+        before = json.dumps(parent, sort_keys=True)
+        config = adapter.side_chat_config(parent)
+        self.assertTrue(config["features.shell_tool"])
+        self.assertEqual(config["web_search"], "live")
+        self.assertEqual(config["mcp_servers"], {"ordinary": {"enabled": True}})
+        self.assertFalse(config[f"mcp_servers.{name}.enabled"])
+        self.assertFalse(config[f"mcp_servers.{name}.required"])
+        self.assertEqual(config[f"mcp_servers.{name}.url"], "http://127.0.0.1:0")
+        self.assertNotIn(f"mcp_servers.{name}.http_headers", config)
+        self.assertEqual(config["shell_environment_policy.exclude"], ["PRIVATE_KEY"])
+        self.assertFalse(config["agents.enabled"])
+        self.assertEqual(json.dumps(parent, sort_keys=True), before)
 
 
 class AdapterTests(unittest.IsolatedAsyncioTestCase):
@@ -96,33 +118,37 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
     async def answer(self):
         return await adapter.answer_side_question("side question", parent_thread_id="parent-thread", executable="synthetic-codex",
             model="synthetic-model", env={"HOME": "/synthetic/auth", "PATH": "/bin",
-                                         "AGENTSDOCK_CHAT_ID": "parent", "CODEX_THREAD_ID": "parent"})
+                                         "AGENTSDOCK_CHAT_ID": "parent", "CODEX_THREAD_ID": "parent"},
+            cwd="/synthetic/workspace", fork_overrides={"runtimeWorkspaceRoots": ["/synthetic/workspace"],
+                "approvalPolicy": "on-request", "sandbox": "workspace-write"},
+            turn_overrides={"approvalPolicy": "on-request", "sandboxPolicy": {"type": "workspaceWrite"}})
 
-    async def test_forks_native_parent_history_without_workspace_authority(self):
+    async def test_forks_native_history_with_parent_workspace_and_permissions(self):
         self.assertEqual(await self.answer(), "Answer")
         args, options = self.factory.call_args
         self.prepare_catalog.assert_not_awaited()
         self.assertNotIn("before_start", options)
         self.assertEqual(args, ("synthetic-codex",))
         self.assertEqual(options["env_factory"](), {"HOME": "/synthetic/auth", "PATH": "/bin"})
-        self.assertTrue(options["cwd"].split("/")[-1].startswith("agentsdock-side-chat-"))
-        self.verify.assert_awaited_once_with("synthetic-codex", options["cwd"], options["env_factory"]())
-        self.client.request.assert_awaited_once_with("config/read", {"includeLayers": False})
+        self.assertEqual(options["cwd"], "/synthetic/workspace")
+        self.assertTrue(Path(self.verify.await_args.args[1]).name.startswith("agentsdock-side-chat-"))
+        self.client.request.assert_not_awaited()
         source, params = self.client.fork_thread.await_args.args
         self.assertEqual(source, "parent-thread")
         self.client.start_thread.assert_not_awaited()
         self.assertTrue(params["ephemeral"])
         self.assertTrue(params["excludeTurns"])
-        self.assertEqual(params["runtimeWorkspaceRoots"], [])
+        self.assertEqual(params["runtimeWorkspaceRoots"], ["/synthetic/workspace"])
         self.assertNotIn("environments", params)  # Unsupported on native forks.
         self.assertNotIn("dynamicTools", params)
         self.assertNotIn("deferGoalContinuation", params)
         self.assertEqual(params["cwd"], options["cwd"])
-        self.assertEqual(params["approvalPolicy"], "never")
-        self.assertEqual(params["sandbox"], "read-only")
+        self.assertEqual(params["approvalPolicy"], "on-request")
+        self.assertEqual(params["sandbox"], "workspace-write")
+        self.assertNotIn("baseInstructions", params)
         self.assertEqual(params["model"], "synthetic-model")
         self.assertNotIn("sqlite_home", params["config"])
-        self.assertEqual(params["config"]["log_dir"], str(Path(options["cwd"]) / "log"))
+        self.assertEqual(params["config"]["log_dir"], str(Path(self.verify.await_args.args[1]) / "log"))
         self.assertEqual(params["config"]["history.persistence"], "none")
         # These must be process startup overrides, not only thread overrides:
         # app-server can initialize databases before thread/start.
@@ -134,10 +160,11 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(cli_config[key], params["config"][key])
         self.assertNotIn("threadId", params)
         self.assertNotIn("parentThreadId", params)
-        self.assertIs(params["config"]["mcp_servers"]["ordinary"]["enabled"], False)
-        self.assertIs(params["config"]["mcp_servers"]["dotted.name"]["enabled"], False)
+        self.assertNotIn("mcp_servers", params["config"])
+        self.assertIs(params["config"][f"mcp_servers.{CLAUDE_PROVIDER_MCP_SERVER_NAME}.enabled"], False)
         self.client.start_turn.assert_awaited_once_with("temporary-thread",
-            [{"type": "text", "text": "side question"}], overrides={"environments": []})
+            [{"type": "text", "text": "side question"}],
+            overrides={"approvalPolicy": "on-request", "sandboxPolicy": {"type": "workspaceWrite"}})
         self.client.read_thread.assert_awaited_once_with("temporary-thread", include_turns=False)
         self.turn.close.assert_awaited_once()
         self.client.close.assert_awaited_once()
@@ -151,8 +178,8 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(options["env_factory"](), supplied)
         self.assertFalse(any(value.startswith("sqlite_home=") for value in options["app_server_args"]))
         self.assertTrue(self.client.fork_thread.await_args.args[1]["ephemeral"])
-        self.assertEqual(self.client.fork_thread.await_args.args[1]["runtimeWorkspaceRoots"], [])
-        self.assertEqual(self.client.start_turn.await_args.kwargs["overrides"]["environments"], [])
+        self.assertNotIn("runtimeWorkspaceRoots", self.client.fork_thread.await_args.args[1])
+        self.assertNotIn("environments", self.client.start_turn.await_args.kwargs["overrides"])
 
     async def test_unsupported_protocol_never_starts_provider(self):
         self.verify.side_effect = SideQuestionError(503, "Update Codex")
@@ -171,6 +198,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("OPENAI_API_KEY", options["env_factory"]())
         self.assertNotIn("AGENTSDOCK_TOKEN", options["env_factory"]())
         self.assertNotIn(selected["api_key"], str(options["app_server_args"]))
+        self.assertEqual(options["protected_env_keys"], (ENV_KEY,))
         params = self.client.fork_thread.await_args.args[1]
         self.prepare_catalog.assert_awaited_once()
         self.assertEqual(params["config"]["model_catalog_json"], str(Path(options["cwd"]) / "models.json"))
@@ -179,7 +207,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(params["config"]["model_providers"][PROVIDER_ID]["requires_openai_auth"])
         self.assertEqual(params["config"]["model_reasoning_summary"], "none")
         overrides = self.client.start_turn.await_args.kwargs["overrides"]
-        self.assertEqual(overrides["environments"], [])
+        self.assertNotIn("environments", overrides)
         self.assertNotIn("effort", overrides)
         self.assertIsNone(overrides["collaborationMode"]["settings"]["reasoning_effort"])
         await chat.close()
@@ -265,14 +293,23 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             await task
         self.client.close.assert_awaited_once()
 
-    async def test_unconfirmed_integrations_fail_before_thread_start(self):
-        for invalid in (None, {}, {"config": None}, {"config": {"mcp_servers": []}}):
-            with self.subTest(invalid=invalid):
-                self.client.request.return_value = invalid
-                with self.assertRaises(SideQuestionError):
-                    await self.answer()
-        self.client.fork_thread.assert_not_awaited()
-        self.client.start_turn.assert_not_awaited()
+    async def test_approval_callback_only_accepts_exact_active_side_thread(self):
+        callback = AsyncMock(return_value={"decision": "accept"})
+        chat = adapter.NativeCodexSideChat("parent-thread", executable="synthetic-codex",
+            model=None, env={}, server_request_handler=callback)
+        async def notifications():
+            handler = self.factory.call_args.kwargs["server_request_handler"]
+            method = "item/commandExecution/requestApproval"
+            self.assertEqual(await handler(1, method, {"threadId": "parent-thread"}), {"decision": "decline"})
+            self.assertEqual(await handler(2, method, {"threadId": "temporary-thread"}), {"decision": "accept"})
+            self.turn.next_notification.side_effect = [completed()]
+            return message()
+        self.turn.next_notification.side_effect = notifications
+        self.assertEqual(await chat.ask("Read a file"), "Answer")
+        callback.assert_awaited_once_with(2, "item/commandExecution/requestApproval", {"threadId": "temporary-thread"})
+        self.assertEqual(await chat._handle_server_request(3, "item/commandExecution/requestApproval",
+            {"threadId": "temporary-thread"}), {"decision": "decline"})
+        await chat.close()
 
     async def test_final_answer_ignores_commentary_and_duplicate_completion(self):
         self.turn.next_notification.side_effect = [

@@ -52559,6 +52559,7 @@ async def cancel_codex_interactions(
             (interaction_id, pending)
             for interaction_id, pending in CODEX_PENDING_INTERACTIONS.items()
             if session_id is None or pending.get("session_id") == session_id
+            if resolution != "turn_stopped" or not pending.get("side_chat")
         ]
     affected: set[str] = set()
     for interaction_id, pending in pending_items:
@@ -52590,14 +52591,26 @@ async def handle_codex_server_request(
     request_id: Any,
     method: str,
     params: dict[str, Any],
+    *,
+    side_session_id: str | None = None,
+    side_owner_is_current: Any = None,
 ) -> dict[str, Any]:
     """Bridge one app-server prompt to the owning AgentsDock chat, fail closed."""
     thread_id = str(params.get("threadId") or "")
-    session_id = codex_session_id_for_thread(thread_id)
+    session_id = side_session_id or codex_session_id_for_thread(thread_id)
+
+    def request_is_owned() -> bool:
+        if side_session_id is not None:
+            # A side fork belongs to its private client, never to the main
+            # thread registry. Recheck that exact owner under the lifecycle lock.
+            return bool(callable(side_owner_is_current) and side_owner_is_current())
+        return bool(codex_session_id_for_thread(thread_id) == session_id
+                    and codex_request_is_interactive(session_id, thread_id))
+
     if (
         method not in CODEX_INTERACTION_METHODS
         or not session_id
-        or not codex_request_is_interactive(session_id, thread_id)
+        or not request_is_owned()
     ):
         return await decline_server_request(request_id, method, params)
     pending: dict[str, Any] | None = None
@@ -52608,12 +52621,12 @@ async def handle_codex_server_request(
         if (
             session_id in DELETING_SESSIONS
             or session_id in DELETED_SESSION_TOMBSTONES
-            or codex_session_id_for_thread(thread_id) != session_id
-            or not codex_request_is_interactive(session_id, thread_id)
+            or not request_is_owned()
         ):
             pending = None
         else:
-            manager = existing_codex_app_server_manager_for_thread(thread_id)
+            manager = (None if side_session_id is not None else
+                       existing_codex_app_server_manager_for_thread(thread_id))
             generation = manager.generation if manager is not None else 0
             loop = asyncio.get_running_loop()
             future: asyncio.Future[dict[str, Any]] = loop.create_future()
@@ -52636,6 +52649,7 @@ async def handle_codex_server_request(
                 "generation": generation,
                 "session_id": session_id,
                 "thread_id": thread_id,
+                "side_chat": side_session_id is not None,
                 "turn_id": str(params.get("turnId") or "") or None,
                 "item_id": str(params.get("itemId") or "") or None,
                 "method": method,
@@ -79095,7 +79109,54 @@ async def create_native_side_chat(session_id: str):
             else:
                 from codex_side_question import NativeCodexSideChat
                 if self.codex is None:
-                    model = current.get("model")
+                    cwd = existing_cwd(str(current.get("cwd") or DEFAULT_CWD))
+                    model, effort, service_tier = codex_runtime_settings(current)
+                    approval_policy = current.get("codex_approval_policy")
+                    if approval_policy not in CODEX_APPROVAL_POLICIES:
+                        approval_policy = CODEX_DEFAULT_APPROVAL_POLICY
+                    reviewer = current.get("codex_approvals_reviewer")
+                    if reviewer not in CODEX_APPROVAL_REVIEWERS:
+                        reviewer = CODEX_DEFAULT_APPROVALS_REVIEWER
+                    fork_overrides = {
+                        "approvalPolicy": approval_policy,
+                        "approvalsReviewer": reviewer,
+                        "runtimeWorkspaceRoots": [cwd],
+                    }
+                    turn_overrides = dict(fork_overrides)
+                    permission_profile = str(current.get("codex_permission_profile")
+                                             or CODEX_DEFAULT_PERMISSION_PROFILE or "").strip()
+                    if permission_profile:
+                        fork_overrides["permissions"] = permission_profile
+                        turn_overrides["permissions"] = permission_profile
+                    else:
+                        sandbox = current.get("codex_sandbox_mode")
+                        if sandbox not in CODEX_SANDBOX_MODES:
+                            sandbox = CODEX_DEFAULT_SANDBOX_MODE
+                        fork_overrides["sandbox"] = sandbox
+                        turn_overrides["sandboxPolicy"] = {"type": CODEX_SANDBOX_POLICY_TYPES[sandbox]}
+                    config = flatten_codex_config_overrides(codex_effective_thread_config(current))
+                    reserved_prefix = f"mcp_servers.{CODEX_PROVIDER_MCP_NAME}"
+                    config = {key: value for key, value in config.items()
+                              if key != reserved_prefix and not key.startswith(reserved_prefix + ".")}
+                    fork_overrides["config"] = config
+                    if effort:
+                        turn_overrides["effort"] = effort
+                    if service_tier:
+                        fork_overrides["serviceTier"] = codex_app_server_service_tier(service_tier)
+                        turn_overrides["serviceTier"] = codex_app_server_service_tier(service_tier)
+
+                    async def side_server_request(request_id, method, params):
+                        def is_current():
+                            try:
+                                self.current()
+                            except side_questions.SideQuestionError:
+                                return False
+                            return bool(self.codex is not None and not self.codex.closed
+                                        and self.codex.thread_id
+                                        and str(params.get("threadId") or "") == self.codex.thread_id)
+                        return await handle_codex_server_request(request_id, method, params,
+                            side_session_id=session_id, side_owner_is_current=is_current)
+
                     provider_selection = CODEX_PROVIDER_STORE.for_session(current, include_key=True)
                     if provider_selection:
                         provider_selection["effort"] = codex_provider.runtime_effort(
@@ -79105,6 +79166,8 @@ async def create_native_side_chat(session_id: str):
                             provider_selection, CODEX_PROVIDER_STORE.cached_catalog(provider_selection))
                     self.codex = NativeCodexSideChat(parent_id, executable=CODEX_BIN,
                         model=model if isinstance(model, str) and model.strip() else None,
+                        cwd=cwd, fork_overrides=fork_overrides, turn_overrides=turn_overrides,
+                        server_request_handler=side_server_request,
                         env=side_questions.isolated_environment(runner_env()),
                         provider_selection=provider_selection)
                 result = {"answer": await self.codex.ask(question),

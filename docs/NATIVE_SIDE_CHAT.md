@@ -5,8 +5,14 @@ desktop timeline. No main turn, queue item, goal mutation, or provider-history
 import is created by a side question.
 
 - Codex: `thread/fork` with `ephemeral: true`, reusing that fork for follow-ups.
-  Its dedicated app-server process declines approvals and has no environment
-  access. The source thread is never resumed, interrupted or modified.
+  Its dedicated app-server process uses the parent's workspace and selected
+  permissions. Like native Codex Side chat, it can read/search files, run
+  non-mutating checks and use configured tools. Inherited tasks and approvals
+  are reference context; mutations require a new explicit request in Side chat.
+  Subagents remain unavailable. Native approval requests use the existing
+  approval UI and belong only to the ephemeral child. The main run's internal
+  AgentsDock helper transport and credentials are not inherited. The source
+  thread is never resumed, interrupted or modified.
 - Claude: native `side_question` control (the `/btw` operation) on the exact
   chat-owned SDK connection. Only connection acquisition is actor-serialized;
   waiting for a side answer never occupies the main-turn actor. Cancellation
@@ -21,6 +27,9 @@ follow-up, `after_request_id`. The server deduplicates receipts and verifies
 the predecessor before asking the provider. Client-authored history is refused.
 Claude receives its native maximum of twenty server-owned side exchanges;
 Codex retains its own ephemeral transcript. No parent text budget is applied.
+Codex captures the main context on its first question; Clear starts a new fork
+with the latest main context. Its workspace tools can inspect current files
+even when the inherited conversation predates those files.
 
 `DELETE /api/sessions/{session}/side-questions/{request}` cancels one request.
 `DELETE /api/sessions/{session}/side-chats/{side_chat}` closes the side chat.

@@ -61,7 +61,7 @@ def namespace():
         "QUEUED_TURNS": {}, "RUN_NOW_TURNS": {}, "ACTIVE": {}, "CURRENT_TURNS": {},
         "STEERING_SESSIONS": set(), "STEERING_WAIT_TASKS": {}, "BUSY_SESSIONS": set(),
         "DEFAULT_BACKEND": "claude", "BACKEND_CLAUDE": "claude", "BACKEND_CODEX": "codex",
-        "CODEX_TRANSPORT_APP_SERVER": "app_server", "CLAUDE_TRANSPORT_SDK": "sdk",
+        "CODEX_TRANSPORT_APP_SERVER": "app_server", "CLAUDE_TRANSPORT_AGENT_SDK": "agent-sdk",
         "reject_promoted_queue_mutation": Mock(), "managed_server_update_blocker": lambda: None,
         "managed_server_update_admission_blocker": lambda: None,
         "provider_cross_chat_delivery_pair_is_live": lambda record: True,

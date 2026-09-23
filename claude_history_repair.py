@@ -504,8 +504,10 @@ class _MailboxWakeInputs(_AsyncDeliveryInputs):
             provider_ids = {row.get("provider_session_id") for row in owners
                             if row.get("provider_session_id") not in (None, "")}
             start_time, end_time = _timestamp(start.get("ts")), _timestamp(end.get("ts"))
+            # The exact generated input remains internal when its run is
+            # stopped or fails. Completion is needed to bound ownership, not
+            # to prove success; assistant replay keeps its separate checks.
             if (wake is None or provider_ids != {self.provider_id}
-                    or end.get("exit_code") != 0 or end.get("stopped") is True
                     or start_time is None or end_time is None or start_time > end_time
                     or type(start.get("seq")) is not int or type(end.get("seq")) is not int
                     or start["seq"] >= end["seq"]

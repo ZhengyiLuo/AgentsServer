@@ -186,13 +186,26 @@ class MailboxWakeRepairTests(unittest.TestCase):
                 self.assertEqual(self.native["text"], "收到并回复了。")
                 self.assertEqual(self.imported["text"], "✅ 收到并回复了。")
 
+    def test_stopped_or_failed_wake_repairs_input_without_hiding_assistant_output(self):
+        for terminal in ({"stopped": True, "exit_code": None}, {"stopped": False, "exit_code": 1}):
+            for oversized in (False, True):
+                with self.subTest(terminal=terminal, oversized=oversized):
+                    self.setUp()
+                    self.rows[3].update(terminal)
+                    self.input["provider_history_sanitized"] = True
+                    self.prepare(oversized=oversized)
+                    self.assertTrue(self.cache.is_hidden("chat-one", self.input))
+                    self.assertIsNone(self.cache.project_event("chat-one", self.imported))
+                    self.assertIsNone(self.cache.project_event("chat-one", self.native))
+                    self.assertFalse(self.cache.is_hidden("chat-one", self.rows[-3]))
+
     def test_wake_requires_exact_hash_unique_owned_occurrence_and_nonhuman_input(self):
         mutations = [lambda: self.rows[0].update(provider_input_sha256="0" * 64),
                      lambda: self.rows[0].pop("provider_generated"),
                      lambda: self.rows[0].update(mailbox_wake_through_seq=True),
                      lambda: self.rows[0].update(mailbox_wake_id="not-a-claim"),
                      lambda: self.rows[2].update(provider_session_id="other-provider"),
-                     lambda: self.rows[3].update(stopped=True),
+                     lambda: self.rows.remove(self.rows[3]),
                      lambda: self.rows[0].update(ts="2026-09-10T12:00:01.322Z"),
                      lambda: self.input.pop("provider_origin"),
                      lambda: self.input.update(provider_user_authored=True),
@@ -287,6 +300,22 @@ class MailboxWakeRepairTests(unittest.TestCase):
                 self.assertTrue(result[0]["metadata_only"])
                 self.assertEqual(result[1], before[1])
                 self.assertEqual(before[0]["text"], self.prompt)
+
+    def test_first_import_of_stopped_or_failed_wake_keeps_human_quotation(self):
+        for terminal in ({"stopped": True, "exit_code": None}, {"stopped": False, "exit_code": 1}):
+            for human in (False, True):
+                with self.subTest(terminal=terminal, human=human):
+                    self.setUp()
+                    self.rows[3].update(terminal)
+                    if human:
+                        self.source_rows[0]["clientUserMessageId"] = "genuine-human"
+                    before, result = self.forward()
+                    if human:
+                        self.assertEqual(result, before)
+                    else:
+                        self.assertEqual(result[0]["provider_history_repair"], "source_proven_import")
+                        self.assertEqual(result[0]["text"], "")
+                        self.assertEqual(result[1], before[1])
 
     def test_first_import_keeps_human_ambiguous_unowned_or_out_of_interval_input(self):
         for mutate in (lambda: self.source_rows[0].update(clientUserMessageId="genuine-human"),

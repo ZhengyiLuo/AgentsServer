@@ -51,6 +51,14 @@ Tailscale. Keep access tokens private and do not expose the agent port directly
 to the public internet. See the [setup guide](https://agentsdock.net/setup.html)
 for detailed instructions.
 
+### Memory at launch
+
+New agent turns require **2 GiB (2048 MiB) of available server RAM** by default;
+scheduled jobs require **4 GiB (4096 MiB)**. This is a launch check, not total RAM or a
+guarantee that every workload will fit. Low-memory errors show the available
+amount, required minimum, and recovery advice. See [memory settings](docs/MEMORY_ADMISSION.md)
+for operator overrides.
+
 ## Multiple servers on one machine
 
 Add a separate server without replacing your original/default server:

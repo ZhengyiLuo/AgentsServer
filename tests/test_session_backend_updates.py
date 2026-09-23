@@ -322,7 +322,11 @@ class SessionBackendUpdateFenceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_low_memory_send_reports_effective_minimum_and_releases_reservation(self) -> None:
         self.session["title"] = "Existing chat"
-        for available, minimum in ((480, 512), (567, 1024), (567, 2048)):
+        for available, minimum, label in (
+            (480, 512, "512 MiB"), (567, 1024, "1 GiB (1024 MiB)"),
+            (567, 1536, "1536 MiB"), (567, 2048, "2 GiB (2048 MiB)"),
+            (2047, 2048, "2 GiB (2048 MiB)"),
+        ):
             with (
                 self.subTest(available=available, minimum=minimum),
                 patch.object(agent_server, "MIN_START_AVAILABLE_MEM_MB", minimum),
@@ -342,7 +346,7 @@ class SessionBackendUpdateFenceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(raised.exception.status_code, 503)
                 self.assertEqual(raised.exception.detail,
                     f"agent launch deferred: low available memory on the server: {available} MiB available; "
-                    f"at least {minimum} MiB required to start an agent turn. "
+                    f"at least {label} required to start an agent turn. "
                     "Close unused applications or stop other agent runs on the server, then retry.")
                 run.assert_not_called()
                 append.assert_not_awaited()
@@ -351,12 +355,12 @@ class SessionBackendUpdateFenceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(self.session_id, agent_server.CURRENT_TURNS)
                 self.assertNotIn(self.session_id, agent_server.SESSION_TURN_TASKS)
 
-    async def test_reported_567_mib_send_reaches_provider_admission(self) -> None:
+    async def test_2048_mib_send_reaches_provider_admission(self) -> None:
         self.session["title"] = "Existing chat"
         with (
-            patch.object(agent_server, "MIN_START_AVAILABLE_MEM_MB", 512),
+            patch.object(agent_server, "MIN_START_AVAILABLE_MEM_MB", 2048),
             patch.object(agent_server, "MAX_ACTIVE_AGENT_RUNS", 0),
-            patch.object(agent_server, "host_pressure_snapshot", return_value={"available_mem_mb": 567}),
+            patch.object(agent_server, "host_pressure_snapshot", return_value={"available_mem_mb": 2048}),
             patch.object(agent_server, "managed_server_update_blocker", return_value=None),
             patch.object(agent_server, "managed_server_update_admission_blocker", return_value=None),
             patch.object(agent_server, "ensure_runtime_available", AsyncMock()),

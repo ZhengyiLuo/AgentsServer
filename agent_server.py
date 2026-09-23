@@ -969,9 +969,7 @@ JOB_RUNTIME_UNAVAILABLE_MAX_DEFERS = 3
 # No server-wide chat-run ceiling by default. Operators can explicitly set a
 # positive cap; launch memory and managed-update guards remain independent.
 MAX_ACTIVE_AGENT_RUNS = int(agentsdock_setting("MAX_ACTIVE_AGENT_RUNS", "0"))
-# A launch reserve, not a provider's RAM requirement. Values are MiB despite
-# the legacy _MB suffix. Keep a guard while allowing modest low-RAM hosts.
-MIN_START_AVAILABLE_MEM_MB = int(agentsdock_setting("MIN_START_AVAILABLE_MEM_MB", "512"))
+MIN_START_AVAILABLE_MEM_MB = int(agentsdock_setting("MIN_START_AVAILABLE_MEM_MB", "2048"))
 HOST_MONITOR_INTERVAL_SECONDS = float(agentsdock_setting("HOST_MONITOR_INTERVAL_SECONDS", "15"))
 HOST_HEALTH_MAX_BYTES = int(agentsdock_setting("HOST_HEALTH_MAX_BYTES", str(20 * 1024 * 1024)))
 IDLE_WARN_SECONDS = int(agentsdock_setting("IDLE_WARN_SECONDS", "1800"))
@@ -51365,9 +51363,12 @@ def host_pressure_snapshot() -> dict[str, Any]:
 
 
 def low_available_memory_message(available_mb: int, minimum_mb: int, *, action: str) -> str:
+    minimum = f"{minimum_mb} MiB"
+    if minimum_mb >= 1024 and minimum_mb % 1024 == 0:
+        minimum = f"{minimum_mb // 1024} GiB ({minimum_mb} MiB)"
     return (
         f"low available memory on the server: {available_mb} MiB available; "
-        f"at least {minimum_mb} MiB required to {action}. "
+        f"at least {minimum} required to {action}. "
         "Close unused applications or stop other agent runs on the server, then retry."
     )
 

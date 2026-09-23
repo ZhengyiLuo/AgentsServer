@@ -53,8 +53,8 @@ for detailed instructions.
 
 ### Memory at launch
 
-New agent turns require **512 MiB of available server RAM** by default; scheduled
-jobs retain a **4096 MiB** reserve. This is a launch check, not total RAM or a
+New agent turns require **2 GiB (2048 MiB) of available server RAM** by default;
+scheduled jobs require **4 GiB (4096 MiB)**. This is a launch check, not total RAM or a
 guarantee that every workload will fit. Low-memory errors show the available
 amount, required minimum, and recovery advice. See [memory settings](docs/MEMORY_ADMISSION.md)
 for operator overrides.

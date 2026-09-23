@@ -9,7 +9,7 @@ establish an out-of-memory crash or memory leak.
 
 | Setting | Default | Purpose |
 | --- | ---: | --- |
-| `AGENTSDOCK_MIN_START_AVAILABLE_MEM_MB` | 512 | Minimum available memory before a new agent turn, including queued turns and goal resumes that use normal admission. |
+| `AGENTSDOCK_MIN_START_AVAILABLE_MEM_MB` | 2048 | Minimum available memory before a new agent turn, including queued turns and goal resumes that use normal admission. |
 | `AGENTSDOCK_JOB_MIN_AVAILABLE_MEM_MB` | 4096 | Additional reserve before launching a scheduled job. |
 
 Both values are in **MiB** (1024 × 1024 bytes); the existing `_MB` environment
@@ -33,23 +33,22 @@ the global turn guard and their additional job guard; the first blocker is
 reported. Their 4096 MiB default remains conservative because unattended work
 can wait instead of competing with interactive work.
 
-## Why 512 MiB
+## Clearer errors, unchanged limits
 
-The previous 2048 MiB default prevented otherwise usable low-RAM hosts from
-starting a turn. A 1024 MiB floor would still reject the reported **567 MiB**
-case. The new 512 MiB default admits that case while retaining a nonzero guard.
-This is a less restrictive policy choice, **not proof that every provider,
-project or concurrency level can run safely with 512 MiB available**. Operators
-can retain a higher floor for their workloads.
+The interactive default remains **2 GiB (2048 MiB)**; the scheduled-job
+default remains **4 GiB (4096 MiB)**. Only the error message changes. A host
+with 567 MiB available still fails the default interactive check. These
+thresholds are admission policy, not a guarantee that every workload will fit.
 
 When the guard blocks, the existing HTTP 503 detail now says, for example:
 
 ```text
-agent launch deferred: low available memory on the server: 480 MiB available; at least 512 MiB required to start an agent turn. Close unused applications or stop other agent runs on the server, then retry.
+agent launch deferred: low available memory on the server: 567 MiB available; at least 2 GiB (2048 MiB) required to start an agent turn. Close unused applications or stop other agent runs on the server, then retry.
 ```
 
 The minimum comes from the effective configuration, not a hardcoded message.
-For example, an operator retaining 2048 MiB will see **2048 MiB required**.
+For example, an operator setting 1024 MiB will see **1 GiB (1024 MiB) required**.
+Whole-GiB thresholds also show the exact MiB value; other thresholds stay in MiB.
 Scheduled-job memory messages similarly show their effective job minimum.
 Free memory on the server, let other work finish, or use a host with more RAM
 if this happens repeatedly; merely refreshing the client does not free RAM.
@@ -61,12 +60,10 @@ memory readings: below/at/above the floor, the 567 MiB report, canonical/legacy
 overrides, explicit opt-out, missing readings, scheduled jobs and independent
 concurrency/maintenance guards. These are policy and error-message tests, not
 provider load benchmarks. No live host is deliberately placed under memory
-pressure, and end-to-end provider reliability on a constrained 512 MiB reserve
-remains unverified. No existing service needs restarting to run these tests.
+pressure. No existing service needs restarting to run these tests.
 
-Local verification passed 371 focused tests across admission, session/backend
-lifecycle, scheduled jobs, server update/restart, host hardening and Codex goal
-resume suites. The real send entrypoint was exercised with a mocked provider:
-567 MiB reaches admission, while low-memory rejections retain HTTP 503, include
-the effective minimum and recovery advice, and release the turn reservation.
-This was isolated local verification, not a full CI or constrained-host load run.
+The real send entrypoint is exercised with a mocked provider: below-floor
+rejections retain HTTP 503, include the effective minimum and recovery advice,
+and release the turn reservation. At 2048 MiB the default memory check allows
+admission. This does not establish a minimum hardware specification or replace
+constrained-host load testing.

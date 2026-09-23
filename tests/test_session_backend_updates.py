@@ -320,6 +320,58 @@ class SessionBackendUpdateFenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["session"]["backend_locked"])
         run_claude.assert_awaited_once()
 
+    async def test_low_memory_send_reports_effective_minimum_and_releases_reservation(self) -> None:
+        self.session["title"] = "Existing chat"
+        for available, minimum in ((480, 512), (567, 1024), (567, 2048)):
+            with (
+                self.subTest(available=available, minimum=minimum),
+                patch.object(agent_server, "MIN_START_AVAILABLE_MEM_MB", minimum),
+                patch.object(agent_server, "MAX_ACTIVE_AGENT_RUNS", 0),
+                patch.object(agent_server, "host_pressure_snapshot", return_value={"available_mem_mb": available}),
+                patch.object(agent_server, "managed_server_update_blocker", return_value=None),
+                patch.object(agent_server, "managed_server_update_admission_blocker", return_value=None),
+                patch.object(agent_server, "ensure_runtime_available", AsyncMock()),
+                patch.object(agent_server, "run_claude", AsyncMock()) as run,
+                patch.object(agent_server, "append_event", AsyncMock()) as append,
+                patch.object(agent_server.STORE, "mark_backend_started", AsyncMock()) as mark,
+            ):
+                # Keep the real send entrypoint and admission check. No provider
+                # or listener starts; the same HTTPException becomes the 503 body.
+                with self.assertRaises(agent_server.TransientAdmissionWait) as raised:
+                    await agent_server.post_turn(self.session_id, agent_server.TurnRequest(prompt="Start"))
+                self.assertEqual(raised.exception.status_code, 503)
+                self.assertEqual(raised.exception.detail,
+                    f"agent launch deferred: low available memory on the server: {available} MiB available; "
+                    f"at least {minimum} MiB required to start an agent turn. "
+                    "Close unused applications or stop other agent runs on the server, then retry.")
+                run.assert_not_called()
+                append.assert_not_awaited()
+                mark.assert_not_awaited()
+                self.assertNotIn(self.session_id, agent_server.BUSY_SESSIONS)
+                self.assertNotIn(self.session_id, agent_server.CURRENT_TURNS)
+                self.assertNotIn(self.session_id, agent_server.SESSION_TURN_TASKS)
+
+    async def test_reported_567_mib_send_reaches_provider_admission(self) -> None:
+        self.session["title"] = "Existing chat"
+        with (
+            patch.object(agent_server, "MIN_START_AVAILABLE_MEM_MB", 512),
+            patch.object(agent_server, "MAX_ACTIVE_AGENT_RUNS", 0),
+            patch.object(agent_server, "host_pressure_snapshot", return_value={"available_mem_mb": 567}),
+            patch.object(agent_server, "managed_server_update_blocker", return_value=None),
+            patch.object(agent_server, "managed_server_update_admission_blocker", return_value=None),
+            patch.object(agent_server, "ensure_runtime_available", AsyncMock()),
+            patch.object(agent_server.STORE, "mark_backend_started", AsyncMock(return_value=self.session)) as mark,
+            patch.object(agent_server.STORE, "update", AsyncMock(return_value=self.session)),
+            patch.object(agent_server, "build_turn_provider_prompt", return_value="provider prompt"),
+            patch.object(agent_server, "append_event", AsyncMock(return_value={"type": "turn_started", "seq": 1})),
+            patch.object(agent_server, "run_claude", AsyncMock()) as run,
+        ):
+            result = await agent_server.post_turn(self.session_id, agent_server.TurnRequest(prompt="Start"))
+            await asyncio.sleep(0)
+            self.assertEqual(result["session"]["id"], self.session_id)
+            mark.assert_awaited_once()
+            run.assert_awaited_once()
+
     async def test_queued_turn_start_is_durable_before_provider_task_creation(
         self,
     ) -> None:

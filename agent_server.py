@@ -969,7 +969,9 @@ JOB_RUNTIME_UNAVAILABLE_MAX_DEFERS = 3
 # No server-wide chat-run ceiling by default. Operators can explicitly set a
 # positive cap; launch memory and managed-update guards remain independent.
 MAX_ACTIVE_AGENT_RUNS = int(agentsdock_setting("MAX_ACTIVE_AGENT_RUNS", "0"))
-MIN_START_AVAILABLE_MEM_MB = int(agentsdock_setting("MIN_START_AVAILABLE_MEM_MB", "2048"))
+# A launch reserve, not a provider's RAM requirement. Values are MiB despite
+# the legacy _MB suffix. Keep a guard while allowing modest low-RAM hosts.
+MIN_START_AVAILABLE_MEM_MB = int(agentsdock_setting("MIN_START_AVAILABLE_MEM_MB", "512"))
 HOST_MONITOR_INTERVAL_SECONDS = float(agentsdock_setting("HOST_MONITOR_INTERVAL_SECONDS", "15"))
 HOST_HEALTH_MAX_BYTES = int(agentsdock_setting("HOST_HEALTH_MAX_BYTES", str(20 * 1024 * 1024)))
 IDLE_WARN_SECONDS = int(agentsdock_setting("IDLE_WARN_SECONDS", "1800"))
@@ -51362,6 +51364,14 @@ def host_pressure_snapshot() -> dict[str, Any]:
     }
 
 
+def low_available_memory_message(available_mb: int, minimum_mb: int, *, action: str) -> str:
+    return (
+        f"low available memory on the server: {available_mb} MiB available; "
+        f"at least {minimum_mb} MiB required to {action}. "
+        "Close unused applications or stop other agent runs on the server, then retry."
+    )
+
+
 async def scheduled_job_blocker(
     session_id: str,
     *,
@@ -51405,7 +51415,9 @@ async def scheduled_job_blocker(
         and JOB_MIN_AVAILABLE_MEM_MB > 0
         and available_mem_mb < JOB_MIN_AVAILABLE_MEM_MB
     ):
-        return f"low available memory ({available_mem_mb} MB)"
+        return low_available_memory_message(
+            available_mem_mb, JOB_MIN_AVAILABLE_MEM_MB, action="start a scheduled job",
+        )
 
     return None
 
@@ -51427,7 +51439,9 @@ async def turn_start_blocker(*, ignore_session_id: str | None = None) -> str | N
         and MIN_START_AVAILABLE_MEM_MB > 0
         and available_mem_mb < MIN_START_AVAILABLE_MEM_MB
     ):
-        return f"low available memory ({available_mem_mb} MB)"
+        return low_available_memory_message(
+            available_mem_mb, MIN_START_AVAILABLE_MEM_MB, action="start an agent turn",
+        )
 
     return None
 

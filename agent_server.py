@@ -46977,7 +46977,10 @@ def parse_codex_history_events(
     items: deque[dict[str, str]] = deque(
         maxlen=normalized_history_import_limit(limit)
     )
+    from codex_history_repair import CodexCompactionSummaryTracker
+    compaction = CodexCompactionSummaryTracker()
     for event in events:
+        compaction.discard_summary(items, event)
         append_codex_history_event(
             items,
             event,
@@ -47961,10 +47964,13 @@ def parse_provider_history_delta(
     cursor_offset = start
     last_item_digest = previous_last_item_digest
     source_context = source_text_context if source_text_context is not None else {}
+    last_append_state = None
     blocked_on_unseen_message = False
     tracker = ClaudeInterruptionTracker(interruption_context) if backend == BACKEND_CLAUDE else None
     from claude_goals import ClaudeGoalHistoryNormalizer
     goal_history = ClaudeGoalHistoryNormalizer() if backend == BACKEND_CLAUDE else None
+    from codex_history_repair import CodexCompactionSummaryTracker
+    compaction = CodexCompactionSummaryTracker() if backend == BACKEND_CODEX else None
     if goal_history is not None:
         goal_history.seed(path, start)
     for event, record_end in bounded_jsonl_records_range(
@@ -47977,6 +47983,14 @@ def parse_provider_history_delta(
             # Exhaust the fixed range so its final fstat validation still
             # runs, but never advance across an unconsumed provider message.
             continue
+        if compaction is not None:
+            if compaction.discard_summary(items, event) and last_append_state is not None:
+                last_item_digest, prior_phase, prior_source = last_append_state
+                source_context.clear()
+                source_context.update(prior_source)
+                if codex_phase_context is not None:
+                    codex_phase_context.clear()
+                    codex_phase_context.update(prior_phase)
         item = None
         prior_context = tracker.export_context() if tracker is not None else None
         if tracker is not None and event is None:
@@ -48040,6 +48054,7 @@ def parse_provider_history_delta(
             if tracker is not None:
                 tracker = ClaudeInterruptionTracker(prior_context)
             continue
+        last_append_state = (last_item_digest, dict(codex_phase_context or {}), dict(source_context))
         items.append(item)
         source_context.clear()
         if source_sha256:

@@ -36,6 +36,97 @@ _NATIVE_LEADING_DECORATION_RE = re.compile(
 )
 NATIVE_PROOF_LINE_BYTES = 4 * 1024 * 1024
 NATIVE_PROOF_SECONDS = 30.0
+_COMPACTION_PREFIX = (
+    "Another language model started to solve this problem and produced a summary of its thinking process. "
+    "You also have access to the state of the tools that were used by that language model. "
+    "Use this to build on the work that has already been done and avoid duplicating work. "
+    "Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:\n"
+)
+
+
+class CodexCompactionSummaryTracker:
+    """Match one native compaction response, never classify assistant wording.
+
+    Some endpoints persist the compactor's response as an ordinary assistant
+    item. Only its immediately following usage receipt and typed replacement
+    history can prove that item belongs to the compaction, not the conversation.
+    """
+    def __init__(self, provider_id: str | None = None):
+        self.provider_id = provider_id
+        self.pending = None
+
+    def observe(self, record: dict) -> dict | None:
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            self.pending = None
+            return None
+        kind = record.get("type")
+        if kind == "response_item":
+            self.pending = None
+            origin = codex_public_item_origin(record, self.provider_id or "")
+            metadata = payload.get("internal_chat_message_metadata_passthrough")
+            content = payload.get("content")
+            if (origin and origin["kind"] == "assistant" and payload.get("phase") == "final_answer"
+                and isinstance(metadata, dict) and metadata.get("content_item_kinds") == ["unknown"]
+                and isinstance(content, list) and len(content) == 1 and isinstance(content[0], dict)
+                and content[0].get("type") == "output_text" and isinstance(content[0].get("text"), str)
+                and 0 < len(content[0]["text"]) <= NATIVE_PROOF_LINE_BYTES):
+                self.pending = {"origin": origin, "text": content[0]["text"], "response_id": None}
+            return None
+        pending = self.pending
+        if pending is None:
+            return None
+        if kind == "event_msg" and payload.get("type") == "token_count":
+            return None
+        if kind == "token_usage_record":
+            response = payload.get("response_id")
+            thread = payload.get("thread_id")
+            if (pending["response_id"] is None and isinstance(thread, str) and _PROVIDER_ID.fullmatch(thread)
+                and (self.provider_id is None or thread == self.provider_id)
+                and payload.get("turn_id") == pending["origin"]["turn_id"]
+                and isinstance(response, str) and 0 < len(response) <= 4096):
+                pending["response_id"] = response
+                pending["thread_id"] = thread
+                return None
+        self.pending = None
+        if kind != "compacted" or pending["response_id"] is None:
+            return None
+        latest = payload.get("latest_token_usage_record")
+        replacement = payload.get("replacement_history")
+        if not isinstance(latest, dict) or not isinstance(replacement, list) or not replacement:
+            return None
+        summary = replacement[-1]
+        if not isinstance(summary, dict):
+            return None
+        metadata = summary.get("internal_chat_message_metadata_passthrough")
+        text = _COMPACTION_PREFIX + pending["text"]
+        start, end = _delivery_timestamp(pending["origin"]["timestamp"]), _delivery_timestamp(record.get("timestamp"))
+        if (payload.get("compaction_response_id") != pending["response_id"]
+            or latest.get("response_id") != pending["response_id"] or latest.get("thread_id") != pending["thread_id"]
+            or latest.get("turn_id") != pending["origin"]["turn_id"]
+            or start is None or end is None or end < start or payload.get("message") != text
+            or summary.get("type") != "message" or summary.get("role") != "user"
+            or not isinstance(metadata, dict) or metadata.get("turn_id") != pending["origin"]["turn_id"]
+            or metadata.get("content_item_kinds") != ["compaction.summary"]
+            or summary.get("content") != [{"type": "input_text", "text": text}]):
+            return None
+        return {**pending["origin"], "kind": "compaction_summary", "source_text_sha256": _text_key(pending["text"])}
+
+    def discard_summary(self, items, record: dict | None) -> bool:
+        """Use the existing parse pass; incomplete ranges keep their last item."""
+        if record is None:
+            self.pending = None
+            return False
+        proof = self.observe(record)
+        if proof is None or not items:
+            return False
+        item = items[-1]
+        origin = item.get("provider_origin")
+        if (item.get("kind") == "assistant" and isinstance(origin, dict)
+            and all(origin.get(key) == proof.get(key) for key in ("event_id", "turn_id", "timestamp"))):
+            items.pop()
+            return True
+        return False
 
 
 class CodexNativeHistoryProofUnavailable(ValueError):
@@ -774,6 +865,8 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
                       if target[1] in eligible}
     digest, verified, canonical, occurrences = hashlib.sha256(), set(), {}, {}
     assistant_native_keys = {}
+    compactions, candidate_assistants = {}, set()
+    compaction_tracker = CodexCompactionSummaryTracker(thread)
     delivery_bodies, delivery_source_ids = {}, {}
     allowed_header_owners, header_parents = {thread}, {}
     context_turn = None
@@ -802,6 +895,14 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
         for expected in wanted.get(offset, ()):
             if hmac.compare_digest(digest.hexdigest(), expected):
                 verified.add((offset, expected))
+        compaction = compaction_tracker.observe(record)
+        if compaction is not None:
+            identity = (compaction["event_id"], compaction["turn_id"], compaction["timestamp"])
+            if identity in candidate_assistants:
+                compactions[identity] = (offset, compaction)
+                retained += 1
+                if retained > MAX_KEYS:
+                    raise _Unproven()
         if not isinstance(payload, dict):
             continue
         if record.get("type") == "turn_context" or record.get("type") == "event_msg" and payload.get("type") == "task_started":
@@ -836,6 +937,8 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
             cleaned = _native_assistant_text(item["text"])
             if cleaned:
                 assistant_native_keys[key] = _text_key(cleaned)
+            if origin:
+                candidate_assistants.add((origin["event_id"], origin["turn_id"], origin["timestamp"]))
         if origin:
             ids = canonical.setdefault(key, {})
             retained += origin["event_id"] not in ids
@@ -866,6 +969,18 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
             continue
         key = next(iter(matches))
         source_ids, owned_runs = canonical.get(key, {}), owners.get((thread, key[0]), set())
+        # Compaction owns a particular source item and timestamp. Another
+        # genuine answer with the same body in this turn is a distinct item.
+        timestamp_origins = [origin for origin in source_ids.values() if origin["timestamp"] == timestamp]
+        compaction_matches = [compactions[identity] for origin in timestamp_origins
+            if len(timestamp_origins) == 1
+            and (identity := (origin["event_id"], origin["turn_id"], origin["timestamp"])) in compactions
+            and compactions[identity][0] <= end]
+        if kind == "assistant" and source_hash is None and len(compaction_matches) == 1:
+            proofs[target] = compaction_matches[0][1]
+            if len(proofs) > MAX_TARGETS:
+                raise _Unproven()
+            continue
         if len(source_ids) != 1 or source_hash is not None:
             # Truncated source hashes need a separately retained native full-body
             # hash. Until one exists, the bounded preview cannot prove equality.
@@ -964,6 +1079,9 @@ class CodexNativeHistoryRepairCache(CodexGoalHistoryRepairCache):
         origin = proof.targets.get(target) if target else None
         if origin is None:
             return None
+        if origin.get("kind") == "compaction_summary":
+            return {**event, "text": "", "metadata_only": True,
+                    "provider_history_repair": "source_proven_compaction", "provider_origin": origin}
         if origin.get("kind") in ("subagent_notification", "turn_aborted", "provider_notice"):
             return {**event, "prompt": "", "metadata_only": True,
                     "provider_runtime_context": origin["kind"], "provider_origin": origin,

@@ -45914,10 +45914,16 @@ def contained_jsonl_path(path: Path, root: Path) -> Path | None:
         return None
 
 
-def bounded_jsonl_paths(root: Path) -> Iterator[Path]:
+def bounded_jsonl_paths(
+    root: Path,
+    *,
+    excluded_directory_names: frozenset[str] = frozenset(),
+) -> Iterator[Path]:
     try:
         resolved_root = root.expanduser().resolve(strict=True)
     except (OSError, RuntimeError):
+        return
+    if resolved_root.name in excluded_directory_names:
         return
     scanned = 0
     pending = [resolved_root]
@@ -45939,7 +45945,8 @@ def bounded_jsonl_paths(root: Path) -> Iterator[Path]:
                     return
                 try:
                     if entry.is_dir(follow_symlinks=False):
-                        pending.append(Path(entry.path))
+                        if entry.name not in excluded_directory_names:
+                            pending.append(Path(entry.path))
                     elif (
                         entry.name.endswith(".jsonl")
                         and entry.is_file(follow_symlinks=False)
@@ -47872,8 +47879,37 @@ def schedule_generated_session_title(session_id: str, event: dict) -> None:
 
 
 def local_session_label(value: Any, fallback: str) -> str:
-    clean = compact_import_text(str(value or "")).strip()
-    return (clean or fallback)[:MAX_LOCAL_SESSION_LABEL_CHARS]
+    # Labels are display metadata, not raw transcript text. Keep tab/LF/CR,
+    # replace other whitespace controls with word breaks, and drop unsafe
+    # C0/DEL characters (including ANSI ESC) from both title and fallback.
+    for candidate in (value, fallback):
+        text = re.sub(
+            r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]",
+            lambda match: " " if match[0].isspace() else "",
+            str(candidate or ""),
+        )
+        clean = compact_import_text(text).strip()
+        if clean:
+            return clean[:MAX_LOCAL_SESSION_LABEL_CHARS]
+    # The Codex index probe uses an empty fallback to mean "no title" so a
+    # transcript preview can win. Actual candidate fallbacks must be nonempty.
+    return "Local chat" if fallback else ""
+
+
+def claude_transcript_is_subagent(path: Path) -> bool:
+    # Older Claude versions also stored sidechains beside main transcripts.
+    # Inspect provider metadata, never the user's title or message text.
+    for region in bounded_claude_transcript_regions(path):
+        for raw_line in region.splitlines():
+            if not raw_line or len(raw_line) > CLAUDE_TRANSCRIPT_CWD_LINE_BYTES:
+                continue
+            try:
+                event = json.loads(raw_line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if isinstance(event, dict) and event.get("isSidechain") is True:
+                return True
+    return False
 
 
 def local_claude_session_candidates(known_provider_ids: set[str]) -> list[dict[str, Any]]:
@@ -47881,9 +47917,13 @@ def local_claude_session_candidates(known_provider_ids: set[str]) -> list[dict[s
         return []
     candidates: list[dict[str, Any]] = []
     newest_paths: dict[str, tuple[float, Path]] = {}
-    for path in bounded_jsonl_paths(CLAUDE_PROJECTS_ROOT):
+    for path in bounded_jsonl_paths(
+        CLAUDE_PROJECTS_ROOT, excluded_directory_names=frozenset({"subagents"}),
+    ):
         provider_id = provider_session_identifier(path.stem)
         if not provider_id or provider_id in known_provider_ids:
+            continue
+        if claude_transcript_is_subagent(path):
             continue
         with suppress(OSError):
             mtime = path.stat().st_mtime
@@ -47912,7 +47952,24 @@ def local_claude_session_candidates(known_provider_ids: set[str]) -> list[dict[s
 CODEX_TRANSCRIPT_SCAN_LINES = 200
 
 
-def codex_transcript_meta(path: Path) -> tuple[str | None, str | None]:
+def codex_session_meta_is_subagent(payload: dict[str, Any]) -> bool:
+    # Parent identity denotes a child, whereas forked_from_id alone can be an
+    # ordinary user-created fork and must remain resumable in the picker.
+    if any(isinstance(payload.get(key), str) and payload[key].strip()
+           for key in ("parent_thread_id", "parentThreadId")):
+        return True
+    for key in ("source", "thread_source", "threadSource"):
+        source = payload.get(key)
+        if isinstance(source, dict) and any(name in source for name in ("subagent", "subAgent")):
+            return True
+        if isinstance(source, str) and source.replace("_", "").lower().startswith("subagent"):
+            return True
+    return False
+
+
+def codex_transcript_meta(
+    path: Path, *, exclude_subagents: bool = False,
+) -> tuple[str | None, str | None]:
     """Return (session_id, cwd) from a Codex transcript's session_meta record."""
     with suppress(OSError, ValueError):
         for index, event in enumerate(bounded_jsonl_events(path)):
@@ -47921,6 +47978,8 @@ def codex_transcript_meta(path: Path) -> tuple[str | None, str | None]:
             if event.get("type") != "session_meta":
                 continue
             payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            if exclude_subagents and codex_session_meta_is_subagent(payload):
+                return None, None
             session_id = provider_session_identifier(
                 payload.get("id") or payload.get("session_id")
             )
@@ -47982,8 +48041,12 @@ def local_codex_session_candidates(known_provider_ids: set[str]) -> list[dict[st
     thread_names = codex_session_index_thread_names()
     candidates: list[dict[str, Any]] = []
     newest_paths: dict[str, tuple[float, Path, str | None]] = {}
-    for path in bounded_jsonl_paths(CODEX_SESSIONS_ROOT):
-        provider_id, cwd = codex_transcript_meta(path)
+    # Native archive moves rollouts out of sessions/ into archived_sessions/.
+    # Also prune that directory if an operator configured a broader scan root.
+    for path in bounded_jsonl_paths(
+        CODEX_SESSIONS_ROOT, excluded_directory_names=frozenset({"archived_sessions"}),
+    ):
+        provider_id, cwd = codex_transcript_meta(path, exclude_subagents=True)
         if not provider_id or provider_id in known_provider_ids:
             continue
         with suppress(OSError):
@@ -85191,7 +85254,7 @@ async def create_session(req: CreateSessionRequest) -> dict[str, Any]:
 async def get_local_sessions(
     limit: int = Query(default=200, ge=1, le=MAX_LOCAL_SESSION_LIST_ITEMS),
 ) -> dict[str, Any]:
-    """List local Claude/Codex chat history not yet imported into AgentsDock."""
+    """List unimported main Claude/Codex conversations, excluding native archives."""
 
     async with STORE._lock:
         known_provider_keys = {

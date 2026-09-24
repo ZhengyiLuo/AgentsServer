@@ -795,6 +795,64 @@ sys.exit(7)
         self.assertIn("unsupported stream-json", error["message"])
         self.assertNotIn(sensitive_unknown_payload, json.dumps(error))
 
+    async def test_invalid_outer_tool_id_uses_valid_nested_id(self) -> None:
+        nested_call_id = "Shell_0_mailbox-wake"
+        events = await self._run_script(_event_script([
+            _init_event(),
+            {
+                "type": "tool_call",
+                "subtype": "started",
+                "call_id": "",
+                "tool_call": {
+                    "shellToolCall": {
+                        "args": {
+                            "command": "agentsdock-chats inbox",
+                            "toolCallId": nested_call_id,
+                        },
+                    },
+                },
+                "session_id": "cursor-sess-test",
+            },
+            {
+                "type": "tool_call",
+                "subtype": "completed",
+                "call_id": " invalid-leading-space",
+                "tool_call": {
+                    "shellToolCall": {
+                        "args": {
+                            "command": "agentsdock-chats inbox",
+                            "toolCallId": nested_call_id,
+                        },
+                        "result": {
+                            "success": {
+                                "exitCode": 0,
+                                "stdout": "{}",
+                                "stderr": "",
+                            },
+                        },
+                    },
+                },
+                "session_id": "cursor-sess-test",
+            },
+            _result_event("mail checked"),
+        ]))
+
+        tool_started = next(
+            event for event in events if event["type"] == "tool_started"
+        )
+        tool_finished = next(
+            event for event in events if event["type"] == "tool_finished"
+        )
+        terminal = next(
+            event for event in events if event["type"] == "turn_finished"
+        )
+
+        self.assertEqual(tool_started["tool"]["id"], nested_call_id)
+        self.assertEqual(tool_finished["tool_id"], nested_call_id)
+        self.assertFalse(terminal["is_error"])
+        self.assertEqual(terminal["exit_code"], 0)
+        self.assertFalse(any(event["type"] == "raw_event" for event in events))
+
     async def test_malformed_stream_and_stderr_cannot_leak_prompt_material(
         self,
     ) -> None:

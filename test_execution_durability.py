@@ -81,7 +81,7 @@ class DurabilityTests(unittest.TestCase):
         stdlib.write_text("stdlib bytes")
         executable = prefix / "bin/python3.13"
         executable.write_text("#!/bin/sh\nexit 0\n")
-        executable.chmod(0o755)
+        executable.chmod(0o775)
         (self.runtime / ".venv/bin").mkdir(parents=True)
         (self.runtime / ".venv/bin/python").symlink_to(executable)
         seen = []
@@ -112,6 +112,48 @@ class DurabilityTests(unittest.TestCase):
         value["phase"] = "quiescing"
         with self.assertRaisesRegex(RuntimeError, "precede native quiescing"):
             durability.flush_activation(self.base, value)
+
+    def test_activation_flushes_group_writable_uv_used_by_candidate_and_old_release(self):
+        prefix = self.base / "cpython-3.13.12-linux-x86_64-gnu"
+        (prefix / "bin").mkdir(parents=True)
+        (prefix / "lib/python3.13").mkdir(parents=True)
+        (prefix / "BUILD").write_text("20260921")
+        stdlib = prefix / "lib/python3.13/stdlib.py"
+        stdlib.write_text("retained standard library\n")
+        executable = prefix / "bin/python3.13"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        (prefix / "bin/python3").symlink_to("python3.13")
+        (prefix / "lib/python3.13/stdlib-link.py").symlink_to("stdlib.py")
+        for path in [prefix, *prefix.rglob("*")]:
+            if not path.is_symlink():
+                path.chmod(0o775 if path.is_dir() else 0o664)
+        old = self.base / "old"
+        old.mkdir(mode=0o700)
+        (old / "VERSION").write_text("1.0.7-beta.2\n")
+        for release in (self.runtime, old):
+            (release / ".venv/bin").mkdir(parents=True)
+            (release / ".venv/bin/python").symlink_to(executable)
+
+        for executable_mode in (0o755, 0o775):
+            with self.subTest(executable_mode=oct(executable_mode)):
+                executable.chmod(executable_mode)
+                identities = {path: durability._identity(path.lstat())
+                              for path in [prefix, *prefix.rglob("*")]}
+                candidate = durability.activation._release_identity(self.runtime, self.runtime)
+                retained = durability.activation._release_identity(old, old)
+                value = {"phase": "prepared", "candidate_release": candidate,
+                         "old_release": retained,
+                         "execution": {"old_worker_release": copy.deepcopy(retained)}}
+                seen = []
+                actual = durability._file_barrier
+                def record(fd):
+                    seen.append(os.fstat(fd).st_ino)
+                    actual(fd)
+                with patch.object(durability, "_file_barrier", side_effect=record):
+                    durability.flush_activation(self.base, value)
+                self.assertEqual(seen.count(stdlib.stat().st_ino), 2)
+                self.assertEqual(identities, {path: durability._identity(path.lstat())
+                                              for path in identities})
 
     def test_installer_flush_failure_precedes_native_mutation(self):
         source = (Path(__file__).parent / "install.sh").read_text()

@@ -280,6 +280,25 @@ preparation.write_prepared(candidate=pathlib.Path(sys.argv[2]),root=pathlib.Path
         with self.assertRaisesRegex(RuntimeError, "runtime changed"):
             self.validate()
 
+    def test_owned_group_writable_python_is_recorded_without_changing_permissions(self):
+        interpreter = self.base / "python3"
+        interpreter.write_bytes(b"#!/bin/sh\nexit 0\n")
+        interpreter.chmod(0o775)
+        python = self.candidate / ".venv/bin/python"
+        python.unlink()
+        python.symlink_to(interpreter)
+        before = interpreter.stat()
+        receipt = self.write()
+        self.assertEqual(self.validate(), receipt)
+        self.assertEqual(interpreter.stat(), before)
+        self.assertEqual(receipt["runtime_inventory"][".venv/bin/python"]["content"]["mode"], 0o775)
+        interpreter.chmod(0o755)
+        with self.assertRaisesRegex(RuntimeError, "runtime changed"):
+            self.validate()
+        interpreter.chmod(0o777)
+        with self.assertRaises(PermissionError):
+            self.write()
+
     def test_receipt_outside_private_install_directory_is_rejected(self):
         for output in (self.base / "outside.json", self.candidate / "receipt.json"):
             with self.subTest(output=output):

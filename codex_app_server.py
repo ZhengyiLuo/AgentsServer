@@ -1760,7 +1760,11 @@ class CodexAppServerClient:
                     isinstance(exc, CodexAppServerDisconnected)
                     and exc.request_sent
                 )
-                if ambiguous:
+                # Ephemeral forks disappear with their owning process. After
+                # explicit close there can be no late child left to delete;
+                # durable forks still require their usual ambiguity cleanup.
+                closing_ephemeral = payload.get("ephemeral") is True and self._closing
+                if ambiguous and not closing_ephemeral:
                     cleanup = asyncio.create_task(
                         self._delete_late_fork_child(late_children)
                     )

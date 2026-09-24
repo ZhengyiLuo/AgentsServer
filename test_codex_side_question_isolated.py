@@ -111,6 +111,9 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             callback = self.factory.call_args.kwargs.get("before_start")
             if callback:
                 await callback()
+            started = self.factory.call_args.kwargs.get("on_process_started")
+            if started:
+                started(12345, 12345)
         self.client.start.side_effect = start
         self.enterContext(patch.object(adapter, "CodexAppServerClient", self.factory))
         self.enterContext(patch.object(adapter, "_verify_protocol", self.verify))
@@ -264,28 +267,67 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.fork_thread.await_args.args[1]["path"], "/synthetic/parent.jsonl")
         self.assertEqual(self.client.start_turn.await_args.args[1], [{"type": "text", "text": "question"}])
 
-    async def test_cancel_during_fork_joins_acceptance_before_owned_cleanup(self):
+    async def test_cancel_during_stalled_fork_closes_owned_process_without_waiting_for_reply(self):
         entered, release = asyncio.Event(), asyncio.Event()
         order = []
         async def fork(*args):
             entered.set()
             await release.wait()
-            order.append("forked")
-            return "temporary-thread"
+            raise adapter.CodexAppServerError("fork connection closed")
         async def close():
             order.append("closed")
+            release.set()
         self.client.fork_thread.side_effect = fork
         self.client.close.side_effect = close
         task = asyncio.create_task(self.answer())
         await entered.wait()
         task.cancel()
-        await asyncio.sleep(0)
-        self.assertFalse(task.done())
+        done, _ = await asyncio.wait({task}, timeout=0.2)
+        release.set()  # Always release the fixture if the regression fails.
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertIn(task, done, "Stop waited for a fork response instead of closing its private process")
+        self.assertEqual(order, ["closed"])
+        self.client.start_turn.assert_not_awaited()
+
+    async def test_cancel_during_stalled_initialize_closes_spawned_process(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def start():
+            started = self.factory.call_args.kwargs.get("on_process_started")
+            if started:
+                started(12345, 12345)
+            entered.set()
+            await release.wait()
+            raise adapter.CodexAppServerError("initialization connection closed")
+        self.client.start.side_effect = start
+        self.client.close.side_effect = lambda: release.set()
+        task = asyncio.create_task(self.answer())
+        await entered.wait()
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=0.2)
         release.set()
         with self.assertRaises(asyncio.CancelledError):
             await task
-        self.assertEqual(order, ["forked", "closed"])
+        self.assertIn(task, done)
+        self.client.close.assert_awaited_once()
+        self.client.fork_thread.assert_not_awaited()
+
+    async def test_fork_reply_racing_stop_cannot_restart_transport_for_metadata(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def fork(*args):
+            entered.set()
+            await release.wait()
+            return "temporary-thread"
+        self.client.fork_thread.side_effect = fork
+        self.client.close.side_effect = lambda: release.set()
+        task = asyncio.create_task(self.answer())
+        await entered.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.client.read_thread.assert_not_awaited()
         self.client.start_turn.assert_not_awaited()
+        self.client.close.assert_awaited_once()
 
     async def test_explicit_close_cancels_current_ask_and_reaps_once(self):
         entered = asyncio.Event()
@@ -376,6 +418,9 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             entered.set()
             await release.wait()
             order.append("started")
+            started = self.factory.call_args.kwargs.get("on_process_started")
+            if started:
+                started(12345, 12345)
         async def close():
             order.append("closed")
         self.client.start.side_effect = start

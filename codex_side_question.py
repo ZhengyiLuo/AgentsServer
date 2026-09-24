@@ -172,6 +172,7 @@ class NativeCodexSideChat:
         self._temporary: tempfile.TemporaryDirectory | None = None
         self._opening: asyncio.Task | None = None
         self._cleaning: asyncio.Task | None = None
+        self._process_started = asyncio.Event()
         self._active: asyncio.Task | None = None
         self._lock = asyncio.Lock()
         self._closed = False
@@ -225,6 +226,7 @@ class NativeCodexSideChat:
             sensitive_values=self.sensitive_values,
             protected_env_keys=self.protected_env_keys,
             server_request_handler=self._handle_server_request,
+            on_process_started=lambda _pid, _group: self._process_started.set(),
             **client_options,
         )
         await self._client.start()
@@ -248,6 +250,10 @@ class NativeCodexSideChat:
         # Native ephemeral forks cannot carry a goal. In particular, do not set
         # deferGoalContinuation: Codex rejects it when ephemeral is true.
         self.thread_id = await self._client.fork_thread(self.parent_thread_id, params)
+        if self._closed:
+            # A fork reply can race Stop. Do not let the following read lazily
+            # restart a private transport that cleanup has already closed.
+            raise SideQuestionError(409, "Side chat was closed; open a new side chat")
         if self.thread_id == self.parent_thread_id:
             raise SideQuestionError(503, "Codex did not create a separate side chat")
         metadata = await self._client.read_thread(self.thread_id, include_turns=False)
@@ -312,15 +318,31 @@ class NativeCodexSideChat:
             active.cancel()
         if self._cleaning is None:
             async def cleanup():
-                if self._opening is not None:
-                    with suppress(BaseException):
-                        await self._opening
+                client_closed = False
                 try:
-                    if self._client is not None:
+                    if self._opening is not None and not self._opening.done():
+                        # Keep ownership while subprocess creation is in flight.
+                        # Once its handle exists, Stop can close this private
+                        # process without waiting for initialize/fork replies.
+                        started = asyncio.create_task(self._process_started.wait())
+                        try:
+                            await asyncio.wait({self._opening, started}, return_when=asyncio.FIRST_COMPLETED)
+                        finally:
+                            started.cancel()
+                            await asyncio.gather(started, return_exceptions=True)
+                    if self._process_started.is_set() and self._client is not None:
                         await self._client.close()
+                        client_closed = True
+                    if self._opening is not None:
+                        with suppress(BaseException):
+                            await self._opening
                 finally:
-                    if self._temporary is not None:
-                        self._temporary.cleanup()
+                    try:
+                        if self._client is not None and not client_closed:
+                            await self._client.close()
+                    finally:
+                        if self._temporary is not None:
+                            self._temporary.cleanup()
             self._cleaning = asyncio.create_task(cleanup())
         cancelled = False
         while not self._cleaning.done():

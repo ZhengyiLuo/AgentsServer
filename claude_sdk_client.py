@@ -3372,7 +3372,6 @@ class ClaudeSDKSupervisorManager:
         history: list[dict[str, str]] | None = None,
         options: Any,
         configuration_key: str,
-        timeout_seconds: float = 150.0,
         expected_provider_id: str | None = None,
     ) -> dict[str, Any]:
         """Lease native parent context without occupying its main-turn actor.
@@ -3418,7 +3417,6 @@ class ClaudeSDKSupervisorManager:
             side_task = asyncio.create_task(
                 ask_native_side_question(
                     lease.client, question, history=history,
-                    timeout_seconds=timeout_seconds,
                 ),
                 name=f"claude-sdk-side-question:{clean_chat_id}",
             )

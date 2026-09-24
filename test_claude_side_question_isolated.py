@@ -160,13 +160,37 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client._query.pending_control_responses, {})
         self.assertEqual(len(client.frames), 2)
 
-    async def test_timeout_cancels_native_side_request_only(self):
+    async def test_long_native_request_completes_and_followup_retains_context(self):
         client = NativeClient()
-        with self.assertRaises(side.SideQuestionError) as caught:
-            await side.ask_native_side_question(client, "Timeout", timeout_seconds=0.01)
-        self.assertEqual(caught.exception.status_code, 504)
-        self.assertEqual([frame["type"] for frame in client.frames], ["control_request", "control_cancel_request"])
+        loop = asyncio.get_running_loop()
+        clock = loop.time
+        elapsed = 0
+        with patch.object(loop, "slow_callback_duration", 1000), \
+                patch.object(loop, "time", side_effect=lambda: clock() + elapsed):
+            task = asyncio.create_task(side.ask_native_side_question(client, "Think carefully"))
+            self.addAsyncCleanup(self._cancel_task, task)
+            request = await client.next_request()
+            elapsed = 151
+            await asyncio.sleep(0.01)
+            self.assertFalse(task.done())
+            self.assertFalse(client.cancelled.is_set())
+            client.respond(request["request_id"], answer("Long answer"))
+            self.assertEqual((await task)["answer"], "Long answer")
+            history = [{"question": "Think carefully", "response": "Long answer"}]
+            followup = asyncio.create_task(side.ask_native_side_question(client, "Explain that", history=history))
+            self.addAsyncCleanup(self._cancel_task, followup)
+            request = await client.next_request(1)
+            self.assertEqual(request["request"]["history"], history)
+            client.respond(request["request_id"], answer("Followup answer"))
+            self.assertEqual((await followup)["answer"], "Followup answer")
         self.assertEqual(client._query.pending_control_responses, {})
+        client.interrupt.assert_not_called()
+        client.disconnect.assert_not_called()
+
+    async def _cancel_task(self, task):
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     async def test_nonresponsive_cancel_is_bounded_and_does_not_disconnect_main(self):
         client = NativeClient()

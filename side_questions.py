@@ -29,7 +29,6 @@ MAX_REQUEST_BYTES = 512 * 1024
 MAX_CONTEXT_CHARS = 60000
 MAX_LOG_BYTES = 4 * 1024 * 1024
 MAX_OUTPUT_BYTES = 1024 * 1024
-REQUEST_TIMEOUT_SECONDS = 150
 RECEIPT_TTL_SECONDS = 600
 IDENTIFIER = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 SYSTEM_PROMPT = (
@@ -215,7 +214,7 @@ async def terminate_isolated_process(proc, *, force_group: bool = False):
 
 
 async def run_isolated_command(command, *, prompt: str, cwd: str, env: dict,
-                               timeout: float = REQUEST_TIMEOUT_SECONDS) -> str:
+                               timeout: float | None = None) -> str:
     """Own only this fresh process group, including cancellation during spawn."""
     spawn = asyncio.create_task(asyncio.create_subprocess_exec(
         *command, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
@@ -456,9 +455,10 @@ class SideQuestions:
                           if self.native_factory is not None else
                           self.answer(session_id, question, history=history_messages(frozen_history))
                           if frozen_history else self.answer(session_id, question))
-                return await asyncio.wait_for(answer, REQUEST_TIMEOUT_SECONDS)
-            except asyncio.TimeoutError:
-                raise SideQuestionError(504, "Side question timed out") from None
+                # A live side answer may be thinking, using tools or waiting
+                # for approval. Only explicit cancellation or provider failure
+                # ends it; elapsed time does not close its native conversation.
+                return await answer
             finally:
                 receipt.expires_at = time.monotonic() + RECEIPT_TTL_SECONDS
 

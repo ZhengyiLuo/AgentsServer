@@ -58,17 +58,43 @@ class ClaudeSDKSideQuestionTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(client.connected)
             self.assertEqual(client.options["resume"], "existing-provider-session")
             self.assertEqual(question, "Why?")
-            self.assertEqual(kwargs, {"history": history, "timeout_seconds": 4})
+            self.assertEqual(kwargs, {"history": history})
             self.assertEqual(self.manager._pins, {"chat": 1})
             return answer
 
         with patch("claude_side_question.ask_native_side_question", native):
-            self.assertEqual(await self.ask(history=history, timeout_seconds=4,
+            self.assertEqual(await self.ask(history=history,
                 expected_provider_id="existing-provider-session"), answer)
         client = self.factory.clients[0]
         self.assertEqual([call[0] for call in client.calls], ["connect", "receive_messages"])
         self.assertFalse(self.manager._supervisors["chat"].is_active)
         self.assertEqual(self.manager._pins, {})
+
+    async def test_native_answer_outlives_old_deadline_without_stopping_parent(self) -> None:
+        from test_claude_side_question_isolated import NativeClient, answer
+
+        main = await self.start_main()
+        client = self.factory.clients[0]
+        native = NativeClient()
+        client._query = native._query
+        original_calls = list(client.calls)
+        loop = asyncio.get_running_loop()
+        clock = loop.time
+        elapsed = 0
+        with patch.object(loop, "slow_callback_duration", 1000), \
+                patch.object(loop, "time", side_effect=lambda: clock() + elapsed):
+            side = self.ask()
+            request = await native.next_request()
+            elapsed = 151
+            await asyncio.sleep(0.01)
+            self.assertFalse(side.done())
+            self.assertFalse(native.cancelled.is_set())
+            self.assertFalse(main.done)
+            native.respond(request["request_id"], answer("Long native answer"))
+            self.assertEqual((await side)["answer"], "Long native answer")
+        self.assertEqual(self.manager._pins, {})
+        self.assertEqual(client.calls, original_calls)
+        self.assertFalse(client.disconnected)
 
     async def test_pending_side_answer_does_not_block_main_start_messages_or_stop(self) -> None:
         started = asyncio.Event()

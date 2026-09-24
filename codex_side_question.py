@@ -220,7 +220,7 @@ class NativeCodexSideChat:
         args = config_args(config)
         self._client = CodexAppServerClient(
             self.executable, cwd=self.cwd or temporary, env_factory=lambda: self.env,
-            app_server_args=args, request_timeout=20, lifecycle_timeout=30,
+            app_server_args=args,
             process_stream_limit=MAX_OUTPUT_BYTES, notification_queue_limit=512,
             sensitive_values=self.sensitive_values,
             protected_env_keys=self.protected_env_keys,

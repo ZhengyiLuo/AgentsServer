@@ -288,6 +288,40 @@ class NativeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         return self.runtime.submit(owner, session_id, request_id, question,
             side_chat_id=side_chat_id, after_request_id=after_request_id, **kwargs)
 
+    async def test_long_native_answer_keeps_context_for_followup(self):
+        await self.submit().task
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def waiting(*args, **kwargs):
+            started.set()
+            await release.wait()
+            return {"answer": "Long answer completed"}
+
+        handle = self.handles[0]
+        handle.ask.side_effect = waiting
+        loop = asyncio.get_running_loop()
+        clock = loop.time
+        elapsed = 0
+        with patch.object(loop, "slow_callback_duration", 1000), \
+                patch.object(loop, "time", side_effect=lambda: clock() + elapsed):
+            active = self.submit("long", "Think carefully", after_request_id="first")
+            await started.wait()
+            # Advance the actual loop deadlines beyond the former 150-second
+            # cap. The provider remains active until it chooses to answer.
+            elapsed = 151
+            await asyncio.sleep(0.01)
+            self.assertFalse(active.task.done())
+            handle.close.assert_not_awaited()
+            self.assertIs(self.submit("long", "Think carefully", after_request_id="first"), active)
+            release.set()
+            self.assertEqual((await active.task)["answer"], "Long answer completed")
+            handle.ask.side_effect = None
+            await self.submit("followup", "Explain that", after_request_id="long").task
+            self.factory.assert_awaited_once_with("chat")
+            self.assertEqual(handle.ask.await_args.kwargs["history"][-1], {
+                "question": "Think carefully", "response": "Long answer completed"})
+            handle.close.assert_not_awaited()
+
     async def test_native_dedup_cursor_and_server_owned_history(self):
         first = self.submit()
         self.assertIs(self.submit(), first)
@@ -351,9 +385,17 @@ class NativeRuntimeTests(unittest.IsolatedAsyncioTestCase):
             started.set()
             await asyncio.Event().wait()
         self.handles[0].ask.side_effect = waiting
-        active = self.submit("active", after_request_id="first")
-        await started.wait()
-        await self.runtime.cancel("owner", "chat", "active")
+        loop = asyncio.get_running_loop()
+        clock = loop.time
+        elapsed = 0
+        with patch.object(loop, "slow_callback_duration", 1000), \
+                patch.object(loop, "time", side_effect=lambda: clock() + elapsed):
+            active = self.submit("active", after_request_id="first")
+            await started.wait()
+            elapsed = 151
+            await asyncio.sleep(0.01)
+            self.assertFalse(active.task.done())
+            await self.runtime.cancel("owner", "chat", "active")
         self.assertTrue(active.task.cancelled())
         self.handles[0].close.assert_awaited_once()
         late = self.submit("late", after_request_id="first")
@@ -618,6 +660,39 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(output, '{"result":"ok"}')
         self.assertEqual(proc.stdout.read.await_count, 3)
         self.assertEqual(proc.stderr.read.await_count, 2)
+
+    async def test_legacy_answer_process_has_no_default_elapsed_time_cutoff(self):
+        started, release = asyncio.Event(), asyncio.Event()
+        proc = fake_process([], [b""])
+
+        async def read(_):
+            started.set()
+            await release.wait()
+            proc.stdout.read = AsyncMock(return_value=b"")
+            return b"Long answer"
+
+        proc.stdout.read = read
+        loop = asyncio.get_running_loop()
+        clock = loop.time
+        elapsed = 0
+        with patch.object(side.asyncio, "create_subprocess_exec", AsyncMock(return_value=proc)), \
+                patch.object(loop, "slow_callback_duration", 1000), \
+                patch.object(loop, "time", side_effect=lambda: clock() + elapsed):
+            task = asyncio.create_task(side.run_isolated_command(
+                ["fake"], prompt="q", cwd="/synthetic", env={}))
+            self.addAsyncCleanup(self._cancel_task, task)
+            await started.wait()
+            elapsed = 151
+            await asyncio.sleep(0.01)
+            self.assertFalse(task.done())
+            self.killpg.assert_not_called()
+            release.set()
+            self.assertEqual(await task, "Long answer")
+
+    async def _cancel_task(self, task):
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     async def test_output_limit_is_enforced_across_chunks(self):
         proc = fake_process([b'1234', b'5678', b''], [b''])

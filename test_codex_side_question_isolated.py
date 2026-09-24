@@ -181,6 +181,17 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("runtimeWorkspaceRoots", self.client.fork_thread.await_args.args[1])
         self.assertNotIn("environments", self.client.start_turn.await_args.kwargs["overrides"])
 
+    async def test_side_chat_uses_normal_codex_transport_deadlines(self):
+        from codex_app_server import CodexAppServerClient
+
+        await self.answer()
+        # Instantiate the shared transport from the actual adapter arguments;
+        # side chat must not impose a shorter startup/fork/turn-ack deadline.
+        transport = CodexAppServerClient(*self.factory.call_args.args, **self.factory.call_args.kwargs)
+        ordinary = CodexAppServerClient("synthetic-codex", cwd="/synthetic", env_factory=dict)
+        self.assertEqual(transport.request_timeout, ordinary.request_timeout)
+        self.assertEqual(transport.lifecycle_timeout, ordinary.lifecycle_timeout)
+
     async def test_unsupported_protocol_never_starts_provider(self):
         self.verify.side_effect = SideQuestionError(503, "Update Codex")
         with self.assertRaises(SideQuestionError):

@@ -1,12 +1,12 @@
 # Contributing to AgentsServer
 
-This repository contains the deployable server. Client changes belong in
-[AgentsDock](https://github.com/ZhengyiLuo/AgentsDock).
+This directory contains the maintained server in the AgentsDock repository.
+Desktop client changes belong in `../electron/`; mobile changes in `../mobile-react/`.
 
 ## Development and tests
 
 Use Python 3.13, matching the release and pull-request workflows. Deployable
-modules live at the repository root; Python tests live in `tests/`.
+modules live at the `server/` root; Python tests live in `tests/`.
 
 ```bash
 uv sync --locked --python 3.13

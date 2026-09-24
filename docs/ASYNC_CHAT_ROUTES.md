@@ -5,7 +5,9 @@ same-server permission pair. Stored route members have a shared `pair_id` and
 each other's `paired_route_id`. Later ordinary runs receive fresh snapshots of
 their live pair routes. Agents discover them on demand with Chats `list`;
 pair permission does not add per-turn prose or copy source history into a
-recipient message.
+recipient message. A fresh, explicit user reference can separately carry bounded
+[user-delegation provenance](CHAT_MAILBOX.md#explicit-user-delegation) through
+the mailbox; permanent pair membership alone cannot.
 
 Credentials remain bound to the server, source chat, and active logical run.
 The send path intersects its issued route snapshot with the live pair and

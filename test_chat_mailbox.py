@@ -27,8 +27,8 @@ class ChatMailboxTests(unittest.TestCase):
             target_session_id TEXT, action TEXT, body TEXT, authorization_kind TEXT,
             authorization_pair_id TEXT, status TEXT, target_run_id TEXT,
             target_body TEXT, message_revision INTEGER DEFAULT 0, created_at TEXT,
-            delivery_mode TEXT, reply_to_message_id TEXT, lifecycle_status TEXT DEFAULT '', updated_at TEXT,
-            source_user_instruction TEXT DEFAULT '')""")
+            source_user_instruction TEXT DEFAULT '', source_user_delegation_action TEXT DEFAULT '',
+            delivery_mode TEXT, reply_to_message_id TEXT, lifecycle_status TEXT DEFAULT '', updated_at TEXT)""")
         mailbox.initialize(self.connection)
 
     def transaction(self):

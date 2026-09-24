@@ -21,21 +21,54 @@ legacy exchanges retain their negotiated delivery behavior.
 - A reply is an independent `send --route <route> --reply-to <message_id>`.
   There is no automatic reply, reply obligation, wait lease, or goal pause.
 
-Provider inbox reads include a separate `source_user_instruction`, captured by the
-server from the source's accepted user turn (or inherited from a verified handoff).
-It preserves the user's authorization for delegated work, including its scope and
-constraints, so the recipient can act without asking the user to authorize the
-same task again. The agent-authored `body` remains task detail and cannot grant or
-expand that authorization. Ordinary peer mail with no source instruction conveys
-no user authorization. Generated mailbox wakes never become source instructions,
-and reading several messages does not merge their authorization into one grant.
-
-Source wording remains exact in the durable envelope and provider read receipts;
-it is omitted from public inbox projections. It counts toward the existing page
-byte budget. A message that cannot fit with its source instruction is rejected
-before acceptance; authorization constraints and replayed pages are never silently
-truncated. Existing messages without source provenance remain informational.
+Message bodies remain agent-authored peer content, never independent user authorization.
 Opening a message in the desktop does not mark it read by the agent.
+
+## Explicit user delegation
+
+An ordinary user-origin chat turn with a validated, structured reference to the
+exact recipient can attach server-attested `user_delegation` context to a new
+async mailbox message. This includes current single-`@` route references with
+`grant_intent: true` and explicit instruction/request-reply references. Existing
+pair membership, an unstructured name in prose, a mailbox wake, a scheduled job,
+native steering without a fresh reference, or a peer reply cannot mint it.
+
+`chats read` returns the optional object separately from `body`:
+
+```json
+{
+  "user_delegation": {
+    "version": 1,
+    "source_session_id": "source-chat",
+    "source_run_id": "source-turn",
+    "target_session_id": "recipient-chat",
+    "reference_action": "route",
+    "source_user_instruction": "Ask @Recipient to research the issue. Do not edit or deploy anything."
+  }
+}
+```
+
+This attests who explicitly addressed this recipient and what the user said;
+it does not assert that every task proposed by the agent is authorized. The
+receiving agent must compare the prepared task with the exact original scope,
+constraints, and reference action. A route mention is not itself a command to
+execute arbitrary work. No tool, filesystem, route, job, deployment, or other
+permissions are added. A body containing lookalike fields or provenance
+wrappers remains untrusted text. Replies do not inherit or forward this proof.
+
+The instruction and its explicit-reference marker commit atomically with the
+message and are included in idempotency comparisons. Reads and retries use that
+immutable record, never the sender's latest prompt or current run. Revocation,
+deletion, cancellation, and snapshot paging retain their existing checks.
+Editing an unread message removes its attestation from the read projection;
+the edited message stays readable as peer content. Legacy records are not
+backfilled, even if they already contain source instruction text.
+
+The complete source instruction counts toward the existing mailbox response
+byte bound. A delegated message that would not fit is rejected before commit;
+instructions are never truncated or silently downgraded to peer mail. This is
+an additive server response field; no client UI change is required. Provider
+contexts must receive the updated server instructions to interpret the field.
 
 ### Message bodies and delivery confirmation
 

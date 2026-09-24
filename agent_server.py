@@ -52065,6 +52065,17 @@ def host_pressure_snapshot() -> dict[str, Any]:
     }
 
 
+def low_available_memory_message(available_mb: int, minimum_mb: int, *, action: str) -> str:
+    minimum = f"{minimum_mb} MiB"
+    if minimum_mb >= 1024 and minimum_mb % 1024 == 0:
+        minimum = f"{minimum_mb // 1024} GiB ({minimum_mb} MiB)"
+    return (
+        f"low available memory on the server: {available_mb} MiB available; "
+        f"at least {minimum} required to {action}. "
+        "Close unused applications or stop other agent runs on the server, then retry."
+    )
+
+
 async def scheduled_job_blocker(
     session_id: str,
     *,
@@ -52108,7 +52119,9 @@ async def scheduled_job_blocker(
         and JOB_MIN_AVAILABLE_MEM_MB > 0
         and available_mem_mb < JOB_MIN_AVAILABLE_MEM_MB
     ):
-        return f"low available memory ({available_mem_mb} MB)"
+        return low_available_memory_message(
+            available_mem_mb, JOB_MIN_AVAILABLE_MEM_MB, action="start a scheduled job",
+        )
 
     return None
 
@@ -52130,7 +52143,9 @@ async def turn_start_blocker(*, ignore_session_id: str | None = None) -> str | N
         and MIN_START_AVAILABLE_MEM_MB > 0
         and available_mem_mb < MIN_START_AVAILABLE_MEM_MB
     ):
-        return f"low available memory ({available_mem_mb} MB)"
+        return low_available_memory_message(
+            available_mem_mb, MIN_START_AVAILABLE_MEM_MB, action="start an agent turn",
+        )
 
     return None
 

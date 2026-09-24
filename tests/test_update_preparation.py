@@ -134,6 +134,25 @@ class PendingPreparationTests(unittest.TestCase):
         stage_process.assert_called_once()
         self.assertEqual(json.loads(self.status_path.read_text())["phase"], "pending")
 
+    def test_named_update_retains_legacy_activation_without_staging_default_gateway(self):
+        source = self.root / "named-source"
+        source.mkdir()
+        (source / "install.sh").write_text("#!/bin/bash\n# --instance)\n")
+        (source / "server_instances.py").write_text("INSTANCE_PROTOCOL = 1\n")
+        (source / "execution_preparation.py").write_text("# split-capable release\n")
+        with patch.dict(os.environ, {"AGENTS_SERVER_INSTANCE": "work"}), \
+                patch.object(update_runner, "download_npm_archive", return_value=b"synthetic") as download, \
+                patch.object(update_runner, "safe_extract", return_value=source), \
+                patch.object(preparation, "run_preparer") as preparer:
+            self.run_preparation()
+        download.assert_called_once()
+        preparer.assert_not_called()
+        status = json.loads(self.status_path.read_text())
+        self.assertEqual(status["_prepared_update"]["mode"], "legacy")
+        self.assertEqual(status["phase"], "pending")
+        self.assertFalse((self.root / "execution-layout.json").exists())
+        self.assertFalse(self.fixture.receipt.exists())
+
     def test_process_lease_prevents_duplicate_preparation(self):
         program = "from pathlib import Path; import sys; from update_preparation import preparation_lease; " \
             "ctx=preparation_lease(Path(sys.argv[1])); ctx.__enter__(); print('ready',flush=True); sys.stdin.read()"

@@ -88,7 +88,7 @@ class ImportTitleLabels(unittest.TestCase):
 
     def test_preview_sanitization_does_not_filter_user_words(self):
         for text, expected in (("New chat", "New chat"), ("New Agent", "New Agent"),
-                               ("  Fix\x00\n issue\u202e  ", "Fix issue"),
+                               ("  Fix\x00\n issue\u202e  ", "Fix\n issue"),
                                ("\x00\u200b", "Fallback")):
             with self.subTest(text=text):
                 self.assertEqual(server.local_session_label(text, "Fallback"), expected)

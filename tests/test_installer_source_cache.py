@@ -35,7 +35,7 @@ class InstallerSourceCacheTests(unittest.TestCase):
         copy_start = installer.index('for name in "${RELEASE_FILES[@]}"; do', end)
         copy_end = installer.index('echo "[2/7]', copy_start)
         self.script = (
-            "set -euo pipefail\n"
+            "set -euo pipefail\nACTIVATE_PREPARED=\nRECOVER_ONLY=false\nPREPARE_ONLY=false\n"
             f"SOURCE_DIR={shlex.quote(str(self.source))}\n"
             f"STAGE_DIR={shlex.quote(str(self.stage))}\n"
             + validation + installer[copy_start:copy_end]

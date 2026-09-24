@@ -113,7 +113,6 @@ def _message(row: sqlite3.Row) -> dict:
         "source_session_id": row["source_session_id"], "target_session_id": row["target_session_id"],
         "conversation_id": row["pair_id"],
         "body": row["target_body"] if edited else row["original_body"],
-        "source_user_instruction": row["source_user_instruction"] or "",
         "created_at": row["created_at"], "stored_at": row["stored_at"],
         "in_reply_to_message_id": row["in_reply_to_message_id"],
         "read_id": row["read_id"], "read_at": row["read_at"],

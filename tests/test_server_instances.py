@@ -915,6 +915,22 @@ systemctl() { printf '%s\\n' "$*"; }
         self.assertNotIn("zenithbot-agent", result.stdout)
         self.assertNotIn(" agents-server.service", result.stdout)
 
+    def test_explicit_named_split_install_is_rejected_before_mutation(self):
+        self.configured(self.default, 7850)
+        before = self.snapshot(self.default)
+        env = {**instances.clean_environment(self.work), "HOME": str(self.home),
+               "PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin"}
+        result = subprocess.run([
+            "/bin/bash", str(ROOT / "install.sh"), "--instance", "work",
+            "--port", "17851", "--execution-mode", "split", "--non-interactive",
+        ], env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("require --execution-mode legacy", result.stderr)
+        self.assertEqual(self.snapshot(self.default), before)
+        self.assertFalse(self.work.runtime.exists())
+        self.assertFalse(self.work.config.exists())
+        self.assertFalse(self.work.state.exists())
+
     def test_complete_named_installer_with_fake_services_preserves_default(self):
         self.check_complete_named_install()
 

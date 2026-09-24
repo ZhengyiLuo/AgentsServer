@@ -48043,7 +48043,8 @@ def local_session_label(value: Any, fallback: str) -> str:
         )
         clean = compact_import_text("".join(
             character for character in text
-            if character.isspace() or unicodedata.category(character) not in {"Cc", "Cf", "Cs"}
+            if character.isspace() or character in "\u200c\u200d"
+            or unicodedata.category(character) not in {"Cc", "Cf", "Cs"}
         )).strip()
         if clean:
             return clean[:MAX_LOCAL_SESSION_LABEL_CHARS]
@@ -90753,8 +90754,7 @@ def public_chat_mailbox_message(
         "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
         "message_revision": int(row.get("message_revision") or 0),
         "message_edited_by_user": bool(row.get("message_edited_by_user")),
-        **({"source_user_instruction": str(row["user_delegation"].get("source_user_instruction") or ""),
-            "user_delegation": dict(row["user_delegation"])}
+        **({"user_delegation": dict(row["user_delegation"])}
            if include_source_instruction and isinstance(row.get("user_delegation"), dict) else {}),
     }
 

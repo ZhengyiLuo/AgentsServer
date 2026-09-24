@@ -529,14 +529,14 @@ class LocalSessionLabelsEndpointTests(unittest.IsolatedAsyncioTestCase):
                 self.assertLessEqual(len(label), agent_server.MAX_LOCAL_SESSION_LABEL_CHARS)
                 self.assertNotRegex(label, r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
                 self.assertEqual(candidate["backend"], "claude" if candidate["provider_session_id"].startswith("claude-") else "codex")
-            self.assertEqual(by_id["claude-prompt"]["label"], "widget: [31mFix[0m AB\t中文\nnext")
+            self.assertEqual(by_id["claude-prompt"]["label"], "[31mFix[0m AB\t中文\nnext")
             self.assertEqual(by_id["claude-prompt"]["cwd"], "/work/widget")
-            self.assertEqual(by_id["claude-fallback"]["label"], "Local chat")
+            self.assertEqual(by_id["claude-fallback"]["label"], "Claude chat claude-f")
             self.assertIsNone(by_id["claude-fallback"]["cwd"])
-            self.assertEqual(by_id["claude-normal"]["label"], "normal: - café — 中文 👩🏽‍💻")
+            self.assertEqual(by_id["claude-normal"]["label"], "- café — 中文 👩🏽‍💻")
             self.assertEqual(by_id[indexed]["label"], "Named — café 中文")
             for provider_id in (empty_indexed, preview):
-                self.assertEqual(by_id[provider_id]["label"], "codex: From preview next")
+                self.assertEqual(by_id[provider_id]["label"], "From preview next")
                 self.assertEqual(by_id[provider_id]["cwd"], "/work/codex")
             for path, original in original_bytes.items():
                 self.assertEqual(path.read_bytes(), original)

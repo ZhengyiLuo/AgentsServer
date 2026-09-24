@@ -82,7 +82,7 @@ class ServerUpdateEnsureTests(unittest.IsolatedAsyncioTestCase):
             "managed_server_force_update_is_pending": lambda status: False,
             "server_update_is_active": lambda status: True,
             "server_update_status_age_seconds": lambda status: 0,
-            "tmux_capability": lambda: {"available": True},
+            "tmux_capability": lambda: {"available": True}, "TMUX_INSTANCE_ARGS": (),
             "ensure_managed_update_tmux_isolated": lambda: None,
             "prepare_provider_background_work_snapshot": AsyncMock(return_value={}),
             "server_update_active_session_ids_locked": lambda: ["busy-chat"],

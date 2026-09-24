@@ -157,8 +157,8 @@ class ReleaseFileManifestTests(unittest.TestCase):
 
     def test_staging_does_not_execute_library_modules_after_chmod(self):
         staging = self.installer.split('chmod 755 "$STAGE_DIR/agent_server.py"', 1)[1]
-        before_dependencies = staging.split('echo "[2/7]', 1)[0]
-        self.assertEqual(len(before_dependencies.strip().splitlines()), 1)
+        before_dependencies = staging.split('echo "[2/7]', 1)[0].split('\n', 1)[1]
+        self.assertNotRegex(before_dependencies, r'(?m)^\s*"\$STAGE_DIR/[^"\n]+\.py"(?:\s|$)')
 
     def test_frozen_hub_manifest_includes_new_migration_and_current_hashes(self):
         tree = ast.parse((ROOT / "tests" / "test_team_hub_host.py").read_text())

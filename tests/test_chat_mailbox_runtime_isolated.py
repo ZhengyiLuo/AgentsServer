@@ -496,7 +496,7 @@ class ChatMailboxRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.delegate(instruction)
         receipt = await self.send()
         first = await self.read()
-        self.assertEqual(first["messages"][0]["source_user_instruction"], instruction)
+        self.assertEqual(first["messages"][0]["user_delegation"]["source_user_instruction"], instruction)
         self.assertEqual(first["messages"][0]["body"], "Exact synthetic peer message.")
         self.assertEqual(first["messages"][0]["message_id"], receipt["message_id"])
         self.assertNotIn("source_user_instruction", self.ns["public_chat_mailbox_message"](first["messages"][0]))

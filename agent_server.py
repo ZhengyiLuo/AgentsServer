@@ -77,6 +77,7 @@ import chat_mailbox
 import workspace_git
 import codex_auth
 import codex_provider
+import server_instances
 
 from codex_app_server import (
     CodexAppServerDisconnected,
@@ -260,6 +261,8 @@ def canonical_server_display_name(
     return normalized
 
 
+# Fail before reading another instance's config or resolving/migrating state.
+server_instances.validate_runtime_environment(os.environ, Path.home())
 CONFIG_ENV_FILE = (
     Path(
         os.environ.get("AGENTS_SERVER_CONFIG_DIR")
@@ -368,6 +371,15 @@ def resolve_state_dir() -> Path:
 
 
 STATE_DIR = resolve_state_dir()
+SERVER_INSTANCE_NAME = server_instances.instance_name(os.environ.get("AGENTS_SERVER_INSTANCE", "default"))
+TMUX_INSTANCE_ARGS = () if SERVER_INSTANCE_NAME == "default" else ("-L", f"agents-server-{SERVER_INSTANCE_NAME}")
+# Claim state before identity/database initialization in the supported CLI.
+# Imports remain usable by helpers/tests; ASGI startup also claims state.
+SERVER_STATE_PROCESS_LOCK = (
+    server_instances.acquire_state_lock(STATE_DIR)
+    if __name__ == "__main__" and not {"-h", "--help"}.intersection(sys.argv[1:])
+    else None
+)
 SERVER_ROOT = Path(__file__).resolve().parent
 SERVER_VERSION_FILE = SERVER_ROOT / "VERSION"
 try:
@@ -27413,13 +27425,14 @@ def tmux_capability(*, use_cache: bool = False) -> dict[str, Any]:
 
 def terminal_session_name(session_id: str) -> str:
     clean = re.sub(r"[^A-Za-z0-9_]", "_", session_id).strip("_") or "session"
-    return f"zd_{clean[:80]}"
+    prefix = "zd_" if SERVER_INSTANCE_NAME == "default" else f"zdi_{SERVER_INSTANCE_NAME}_"
+    return f"{prefix}{clean[:80]}"
 
 
 def run_tmux(args: list[str], *, check: bool = True, timeout: float = TMUX_COMMAND_TIMEOUT_SECONDS) -> subprocess.CompletedProcess[str]:
     try:
         result = subprocess.run(
-            [tmux_bin(), *args],
+            [tmux_bin(), *TMUX_INSTANCE_ARGS, *args],
             text=True,
             capture_output=True,
             timeout=timeout,
@@ -27441,7 +27454,7 @@ def tmux_session_exists(name: str) -> bool:
     return run_tmux(["has-session", "-t", name], check=False).returncode == 0
 
 
-AGENTS_SERVER_SYSTEMD_UNIT = "agents-server.service"
+AGENTS_SERVER_SYSTEMD_UNIT = server_instances.service_name(SERVER_INSTANCE_NAME) + ".service"
 
 
 def process_cgroup_paths(pid: int) -> tuple[str, ...]:
@@ -27675,7 +27688,7 @@ def server_restart_tmux_cgroup_state() -> dict[str, Any]:
     )).hexdigest()
     state["_tmux_server_probe_revision"] = probe_fingerprint
     if probe.returncode != 0:
-        socket_path = Path("/tmp") / f"tmux-{os.getuid()}" / "default"
+        socket_path = Path(os.environ.get("TMUX_TMPDIR", "/tmp")) / f"tmux-{os.getuid()}" / (TMUX_INSTANCE_ARGS[-1] if TMUX_INSTANCE_ARGS else "default")
         try:
             socket_present = stat.S_ISSOCK(socket_path.lstat().st_mode)
         except OSError:
@@ -27750,6 +27763,7 @@ def bootstrap_isolated_tmux_server() -> bool:
                 "--collect",
                 f"--unit={unit}",
                 tmux,
+                *TMUX_INSTANCE_ARGS,
                 "new-session",
                 "-d",
                 "-s",
@@ -28091,7 +28105,7 @@ def spawn_terminal_client(
     try:
         set_pty_dimensions(slave_fd, columns, rows)
         process = subprocess.Popen(
-            [tmux_bin(), "attach-session", "-t", name],
+            [tmux_bin(), *TMUX_INSTANCE_ARGS, "attach-session", "-t", name],
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
@@ -48083,17 +48097,15 @@ def local_session_candidates(
     limit: int,
     known_provider_keys: set[tuple[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Enumerate local Claude/Codex sessions not already imported into AgentsDock."""
+    """Enumerate sessions not already used by this or another local instance."""
 
     if known_provider_keys is None:
         known_provider_keys = {
-            (
-                str(sess.get("backend") or DEFAULT_BACKEND).strip().lower(),
-                str(pid),
-            )
+            key
             for sess in STORE.sessions.values()
-            if (pid := session_provider_id(sess))
+            for key in server_instances.provider_session_keys(sess, DEFAULT_BACKEND)
         }
+    known_provider_keys = known_provider_keys | other_local_instance_provider_keys()
     claude_known = {
         provider_id
         for backend, provider_id in known_provider_keys
@@ -48110,6 +48122,33 @@ def local_session_candidates(
     ]
     candidates.sort(key=lambda c: c["updated_at"], reverse=True)
     return candidates[:max(1, min(limit, MAX_LOCAL_SESSION_LIST_ITEMS))]
+
+
+def other_local_instance_provider_keys() -> set[tuple[str, str]]:
+    try:
+        return server_instances.other_instance_provider_keys(STATE_DIR)
+    except (OSError, ValueError) as exc:
+        logger.warning("local import ownership check failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Cannot verify chats already used by other local server instances. Check their configuration/session indexes and retry.",
+        ) from exc
+
+
+@contextmanager
+def local_history_import_guard():
+    guard = server_instances.history_import_lock()
+    try:
+        guard.__enter__()
+    except (OSError, ValueError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Local history import is busy or unavailable. Retry when the other import has finished.",
+        ) from exc
+    try:
+        yield
+    finally:
+        guard.__exit__(None, None, None)
 
 
 def standalone_provider_session(sess: dict[str, Any]) -> dict[str, Any]:
@@ -73677,7 +73716,7 @@ def macos_launchd_owns_current_process() -> bool | None:
             [
                 "/bin/launchctl",
                 "print",
-                f"gui/{os.getuid()}/com.agentsdock.server",
+                f"gui/{os.getuid()}/{server_instances.launchd_label(SERVER_INSTANCE_NAME)}",
             ],
             stdin=subprocess.DEVNULL,
             text=True,
@@ -75722,16 +75761,22 @@ async def reconcile_server_update_status_after_startup() -> dict[str, Any]:
 
 def server_update_runner_environment() -> dict[str, str]:
     """Preserve Linux's user-service bus when the detached tmux server is stale."""
+    result = {
+        "AGENTS_SERVER_INSTANCE": SERVER_INSTANCE_NAME,
+        "AGENTS_SERVER_CONFIG_DIR": str(CONFIG_ENV_FILE.parent),
+        "AGENTSDOCK_STATE_DIR": str(STATE_DIR),
+        "AGENTS_SERVER_INSTALL_DIR": str(os.environ.get("AGENTS_SERVER_INSTALL_DIR") or ""),
+    }
     if not sys.platform.startswith("linux"):
-        return {}
+        return result
     runtime_dir = str(os.environ.get("XDG_RUNTIME_DIR") or "").strip()
     if not runtime_dir:
         candidate = Path("/run/user") / str(os.getuid())
         if candidate.is_dir():
             runtime_dir = str(candidate)
     if not runtime_dir:
-        return {}
-    result = {"XDG_RUNTIME_DIR": runtime_dir}
+        return result
+    result["XDG_RUNTIME_DIR"] = runtime_dir
     bus_address = str(os.environ.get("DBUS_SESSION_BUS_ADDRESS") or "").strip()
     if not bus_address and (Path(runtime_dir) / "bus").exists():
         bus_address = f"unix:path={Path(runtime_dir) / 'bus'}"
@@ -76976,6 +77021,9 @@ async def lifespan(app: FastAPI):
                     STATE_DIR / "admin" / "execution-maintenance.json", SERVER_INSTANCE_ID,
                 )
                 EXECUTION_MAINTENANCE.hold_for_startup(operation)
+    global SERVER_STATE_PROCESS_LOCK
+    if SERVER_STATE_PROCESS_LOCK is None:
+        SERVER_STATE_PROCESS_LOCK = server_instances.acquire_state_lock(STATE_DIR)
     SERVER_SHUTTING_DOWN = False
     await STORE.load()
     # Prime the managed-service ownership proof once, off the loop, so the
@@ -84783,7 +84831,7 @@ async def _start_server_update(
             if auth_token_file is not None:
                 atomic_update_json(auth_token_file, {"token": AGENT_TOKEN})
             runner_shell_command = (
-                f"{shlex.quote(tmux_bin())} set-option -w remain-on-exit off "
+                f"{shlex.join([tmux_bin(), *TMUX_INSTANCE_ARGS])} set-option -w remain-on-exit off "
                 f">/dev/null 2>&1 && exec {shlex.join(command)}"
             )
             launch_task = asyncio.create_task(
@@ -85305,6 +85353,20 @@ async def complete_working_directory(
 
 @app.post("/api/sessions")
 async def create_session(req: CreateSessionRequest) -> dict[str, Any]:
+    provider_keys = server_instances.provider_session_keys(req.model_dump(), DEFAULT_BACKEND)
+    if provider_keys:
+        with local_history_import_guard():
+            foreign_keys = await asyncio.to_thread(other_local_instance_provider_keys)
+            if provider_keys & foreign_keys:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This provider conversation is already used by another local AgentsServer instance. Open it there instead.",
+                )
+            return await create_session_with_history(req)
+    return await create_session_with_history(req)
+
+
+async def create_session_with_history(req: CreateSessionRequest) -> dict[str, Any]:
     sess = await STORE.create(req)
     provider_id = session_provider_id(sess)
     should_import = bool(provider_id) if req.import_history is None else req.import_history
@@ -85317,16 +85379,13 @@ async def create_session(req: CreateSessionRequest) -> dict[str, Any]:
 async def get_local_sessions(
     limit: int = Query(default=200, ge=1, le=MAX_LOCAL_SESSION_LIST_ITEMS),
 ) -> dict[str, Any]:
-    """List unimported main Claude/Codex conversations, excluding native archives."""
+    """List main conversations unused by any installed same-user local instance."""
 
     async with STORE._lock:
         known_provider_keys = {
-            (
-                str(session.get("backend") or DEFAULT_BACKEND).strip().lower(),
-                str(provider_id),
-            )
+            key
             for session in STORE.sessions.values()
-            if (provider_id := session_provider_id(session))
+            for key in server_instances.provider_session_keys(session, DEFAULT_BACKEND)
         }
     sessions = await asyncio.to_thread(
         local_session_candidates,
@@ -85385,15 +85444,20 @@ async def bulk_import_sessions(req: BulkImportSessionsRequest) -> dict[str, Any]
             status_code=400,
             detail=f"at most {MAX_BULK_IMPORT_ITEMS} items are allowed per bulk import",
         )
+    with local_history_import_guard():
+        foreign_keys = await asyncio.to_thread(other_local_instance_provider_keys)
+        return await bulk_import_sessions_guarded(req, foreign_keys)
+
+
+async def bulk_import_sessions_guarded(
+    req: BulkImportSessionsRequest, foreign_keys: set[tuple[str, str]],
+) -> dict[str, Any]:
     async with LOCAL_SESSION_IMPORT_LOCK:
         async with STORE._lock:
             known_provider_keys = {
-                (
-                    str(session.get("backend") or DEFAULT_BACKEND).strip().lower(),
-                    str(provider_id),
-                )
+                key
                 for session in STORE.sessions.values()
-                if (provider_id := session_provider_id(session))
+                for key in server_instances.provider_session_keys(session, DEFAULT_BACKEND)
             }
         available = await asyncio.to_thread(
             local_session_candidates,
@@ -85417,12 +85481,13 @@ async def bulk_import_sessions(req: BulkImportSessionsRequest) -> dict[str, Any]
                 ))
                 continue
             requested_keys.add(key)
-            if key in known_provider_keys:
+            if key in known_provider_keys or key in foreign_keys:
                 results.append(bulk_import_result(
                     item,
                     ok=False,
                     code="already_imported",
-                    error="This local session is already present in AgentsDock.",
+                    error=("This local session is already used by another local AgentsServer instance."
+                           if key in foreign_keys else "This local session is already present in AgentsDock."),
                 ))
                 continue
             candidate = candidate_by_key.get(key)

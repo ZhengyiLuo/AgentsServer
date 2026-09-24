@@ -84,6 +84,10 @@ else
   STATE_ROOT="$HOME/.agentsdock"
 fi
 SERVICE_NAME="agents-server"
+INSTANCE_NAME="${AGENTS_SERVER_INSTANCE:-default}"
+INSTANCE_EXPLICIT="false"
+LABEL="com.agentsdock.server"
+INSTANCE_LOG_DIR="$HOME/Library/Logs/AgentsServer"
 LEGACY_SERVICE_NAME="zenithbot-agent"
 # AgentsServer's cooperative shutdown has 18 independently bounded cleanup
 # phases in addition to uvicorn's graceful window.  Five seconds was shorter
@@ -141,7 +145,7 @@ SYSTEMD_MANAGED_STOP_ATTEMPTS=50
 SYSTEMD_MANAGED_STOP_DELAY=0.1
 SYSTEMD_MANAGED_KILL_ATTEMPTS=20
 
-if [[ -t 1 ]] && [[ "${TERM:-}" != "dumb" ]] && [[ -z "${NO_COLOR:-}" ]]; then
+if [[ -t 1 ]] && [[ "${TERM:-}" != "dumb" ]] && [[ -z "${NO_COLOR+x}" ]]; then
   COLOR_GREEN=$'\033[32m'
   COLOR_RED=$'\033[31m'
   COLOR_YELLOW=$'\033[33m'
@@ -162,13 +166,16 @@ usage() {
   cat <<'USAGE'
 Usage: ./install.sh [--port PORT] [--bind ADDRESS] [--release-version VERSION] [--team-hub-host|--reactivate-team-hub-host|--no-team-hub-host] [--team-hub-tailscale-serve-url URL] [--team-hub-direct-ip-url URL] [--non-interactive] [--allow-port-fallback|--no-port-fallback]
 
+--instance NAME updates a named instance (use ./instances.sh new to create one
+with an automatically selected name/port). No arguments retain default setup.
+
 Installs or updates AgentsServer for the current user. Releases and Python
 runtimes are versioned, the previous healthy release is retained for rollback,
 and existing chat state and generated tokens are preserved. No sudo privileges
 are required.
 
---non-interactive skips the optional tmux install prompt on macOS instead of
-asking; use it for unattended/SSH-driven runs.
+--non-interactive skips optional prompts (including clipboard copy); use it for
+unattended/SSH-driven runs.
 
 --fresh-install-only refuses an existing installation, state, configuration or
 service. The npm fresh-install command uses it; existing servers update through
@@ -214,7 +221,8 @@ never silently reactivates preserved state. Without an explicit host option, an
 existing host/disabled setting is preserved; new installs default to disabled.
 
 --show-token prints the current access token for an already-installed
-AgentsServer and exits immediately; it makes no other changes.
+AgentsServer without reinstalling or restarting. Interactive terminals offer
+optional clipboard copy; redirected output remains just the raw token.
 USAGE
 }
 
@@ -222,6 +230,7 @@ SHOW_TOKEN="false"
 
 while (($#)); do
   case "$1" in
+    --instance) INSTANCE_NAME="${2:?--instance requires a name}"; INSTANCE_EXPLICIT="true"; shift 2 ;;
     --port) PORT="${2:-}"; PORT_EXPLICIT="true"; shift 2 ;;
     --bind) BIND_ADDRESS="${2:-}"; BIND_EXPLICIT="true"; shift 2 ;;
     --release-version) RELEASE_VERSION="${2:-}"; shift 2 ;;
@@ -339,6 +348,41 @@ while (($#)); do
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+if [[ ! "$INSTANCE_NAME" =~ ^[a-z][a-z0-9-]{0,31}$ ]]; then
+  echo "Invalid instance name." >&2
+  exit 2
+fi
+if [[ "$INSTANCE_NAME" != "default" || ( "$INSTANCE_EXPLICIT" == "true" && "${AGENTS_SERVER_INSTANCE:-default}" != "default" ) ]]; then
+  INSTANCE_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  instance_bindings="$(bash "$INSTANCE_SCRIPT_DIR/instances.sh" _bindings "$INSTANCE_NAME")" || exit 2
+  eval "$instance_bindings"
+  # Never inherit the default instance's token, Hub designation or history.
+  unset AGENTSDOCK_AGENT_TOKEN ZENITHDOCK_AGENT_TOKEN ZENITHBOT_AGENT_TOKEN
+  export AGENTS_SERVER_INSTANCE="$INSTANCE_NAME"
+  export AGENTS_SERVER_INSTALL_DIR="$INSTALL_ROOT" AGENTS_SERVER_CONFIG_DIR="$CONFIG_ROOT" AGENTSDOCK_STATE_DIR="$STATE_ROOT"
+  [[ -n "${AGENTSDOCK_SERVER_NAME:-}" ]] || export AGENTSDOCK_SERVER_NAME="$INSTANCE_NAME"
+  PORT_FALLBACK="false"
+fi
+# Named services keep their independently named legacy unit. The split service
+# protocol currently reserves the default gateway labels; never take them over.
+if [[ "$INSTANCE_NAME" != "default" ]]; then
+  if [[ "$EXECUTION_MODE_EXPLICIT" == "true" && "$EXECUTION_MODE" != "legacy" ]]; then
+    echo "Named instances currently require --execution-mode legacy; no services were changed." >&2
+    exit 2
+  fi
+  if [[ -e "$INSTALL_ROOT/execution-layout.json" || -L "$INSTALL_ROOT/execution-layout.json" ]]; then
+    echo "A named instance cannot use the default split service layout." >&2
+    exit 2
+  fi
+  EXECUTION_MODE="legacy"
+  EXECUTION_MODE_EXPLICIT="true"
+fi
+export AGENTS_SERVER_INSTANCE="$INSTANCE_NAME"
+if [[ "$INSTANCE_NAME" != "default" && ! -f "$CONFIG_ROOT/env" && "$PORT_EXPLICIT" != "true" && "$SHOW_TOKEN" != "true" ]]; then
+  echo "A new named instance needs --port; use ./instances.sh new for automatic allocation." >&2
+  exit 2
+fi
 
 if [[ "$PORT_FALLBACK" == "auto" ]]; then
   if [[ "$PORT_EXPLICIT" == "true" ]]; then
@@ -1278,7 +1322,7 @@ canonical_team_hub_direct_ipv4_url() {
 
 LEGACY_ENV_FILE=""
 LEGACY_SERVICE_CONTENTS=""
-if [[ -e "$LEGACY_SERVICE_FILE" || -L "$LEGACY_SERVICE_FILE" ]]; then
+if [[ "$INSTANCE_NAME" == "default" && ( -e "$LEGACY_SERVICE_FILE" || -L "$LEGACY_SERVICE_FILE" ) ]]; then
   if ! LEGACY_SERVICE_CONTENTS="$(read_owned_config_file "$LEGACY_SERVICE_FILE")"; then
     echo "$LEGACY_SERVICE_FILE is not a safe regular legacy service file." >&2
     exit 1
@@ -1295,7 +1339,7 @@ if [[ -e "$LEGACY_SERVICE_FILE" || -L "$LEGACY_SERVICE_FILE" ]]; then
     exit 1
   fi
 fi
-if [[ -z "$LEGACY_ENV_FILE" \
+if [[ "$INSTANCE_NAME" == "default" && -z "$LEGACY_ENV_FILE" \
   && ( -e "$HOME/Zenithbot/.env" || -L "$HOME/Zenithbot/.env" ) ]]; then
   LEGACY_ENV_FILE="$HOME/Zenithbot/.env"
 fi
@@ -1334,9 +1378,55 @@ find_existing_token() {
   return 1
 }
 
+interactive_token_output() {
+  [[ "$NON_INTERACTIVE" != "true" && -t 0 && -t 1 && -z "$EXPECTED_SERVER_IDENTITY" ]]
+}
+
+print_token_for_copy() {
+  local access_token="$1"
+  local copy_reply=""
+  local clipboard_command=()
+  printf '\nAccess token (%s):\n%s\n\n' "$INSTANCE_NAME" "$access_token"
+  # A remote clipboard is not the user's local clipboard. Do not emit OSC 52
+  # sequences or attempt to modify a remote desktop's clipboard over SSH.
+  if [[ -n "${SSH_CONNECTION:-}${SSH_CLIENT:-}${SSH_TTY:-}" ]]; then
+    printf '%s\n' 'Clipboard copy is unavailable over SSH; copy the token line above manually.'
+    return 0
+  fi
+  if [[ "$(uname -s)" == "Darwin" ]] && command -v pbcopy >/dev/null 2>&1; then
+    clipboard_command=(pbcopy)
+  elif [[ -n "${WAYLAND_DISPLAY:-}" ]] && command -v wl-copy >/dev/null 2>&1; then
+    clipboard_command=(wl-copy)
+  elif [[ -n "${DISPLAY:-}" ]] && command -v xclip >/dev/null 2>&1; then
+    clipboard_command=(xclip -selection clipboard)
+  elif [[ -n "${DISPLAY:-}" ]] && command -v xsel >/dev/null 2>&1; then
+    clipboard_command=(xsel --clipboard --input)
+  fi
+  if ((${#clipboard_command[@]} == 0)); then
+    printf '%s\n' 'Clipboard copy is unavailable here; copy the token line above manually.'
+    return 0
+  fi
+  read -r -p "Copy token to this machine's clipboard? [y/N] " copy_reply || return 0
+  case "$copy_reply" in
+    y|Y|[yY][eE][sS]) ;;
+    *) return 0 ;;
+  esac
+  # Pass the credential via stdin, never an external process's argv. Optional
+  # clipboard failures must not turn a successful installation into a failure.
+  if printf '%s' "$access_token" | "${clipboard_command[@]}" >/dev/null 2>&1; then
+    printf '%s\n' 'Copied to your clipboard.'
+  else
+    printf '%s\n' 'Could not copy to the clipboard; copy the token line above manually.'
+  fi
+}
+
 if [[ "$SHOW_TOKEN" == "true" ]]; then
   if TOKEN_TO_SHOW="$(find_existing_token)"; then
-    printf '%s\n' "$TOKEN_TO_SHOW"
+    if interactive_token_output; then
+      print_token_for_copy "$TOKEN_TO_SHOW"
+    else
+      printf '%s\n' "$TOKEN_TO_SHOW"
+    fi
     exit 0
   fi
   echo "No AgentsServer access token found at $ENV_FILE. Run install.sh first." >&2
@@ -1345,7 +1435,7 @@ fi
 
 OS_NAME="$(uname -s)"
 SYSTEMD_SERVICE_FILE="$HOME/.config/systemd/user/$SERVICE_NAME.service"
-LABEL="com.agentsdock.server"
+LABEL="${LABEL:-com.agentsdock.server}"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 
 validate_legacy_macos_update_roots() {
@@ -1749,7 +1839,7 @@ if [[ "$TEAM_HUB_MODE" == "host" && "$TEAM_HUB_OPERATION_PENDING" != "true" \
   fi
 fi
 
-RELEASE_FILES=(activation_transaction.py execution_activation.py execution_legacy_runner.py execution_preparation.py update_preparation.py update_handoff.py update_recovery.py execution_update_status.py execution_uninstall.py execution_recovery.py execution_recovery_status.py execution_http.py execution_durability.py execution_control.py execution_install.py execution_maintenance.py execution_manage.py execution_ownership.py execution_service.py execution_transport.py agent_server.py workspace_git.py team_hub_host.py secure_peer_runtime.py team_mail_runtime.py team_mail_websocket.py team_mail_grants.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py chat_mailbox.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py provider_commands.py claude_sdk_client.py claude_goals.py claude_background_reconciliation.py codex_app_server.py codex_auth.py codex_provider.py side_questions.py title_generation.py codex_side_question.py claude_side_question.py cursor_agent_client.py opencode_agent_client.py cursor_process_guard.py claude_history_repair.py claude_history_provenance.py codex_history_repair.py public_chat_shares.py public_chat_transcript.py public_chat_share_routes.py interactive_chat_shares.py interactive_chat_share_routes.py interactive_chat_share_web.py interactive_chat_projection.py interactive_chat_runtime.py interactive_chat_native.py shared_chat_videos.py shared_chat_video_stream.py interactive_chat_controls.py install.sh uninstall.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem LICENSE NOTICE)
+RELEASE_FILES=(activation_transaction.py execution_activation.py execution_legacy_runner.py execution_preparation.py update_preparation.py update_handoff.py update_recovery.py execution_update_status.py execution_uninstall.py execution_recovery.py execution_recovery_status.py execution_http.py execution_durability.py execution_control.py execution_install.py execution_maintenance.py execution_manage.py execution_ownership.py execution_service.py execution_transport.py agent_server.py workspace_git.py team_hub_host.py secure_peer_runtime.py team_mail_runtime.py team_mail_websocket.py team_mail_grants.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py chat_mailbox.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py provider_commands.py claude_sdk_client.py claude_goals.py claude_background_reconciliation.py codex_app_server.py codex_auth.py codex_provider.py side_questions.py title_generation.py codex_side_question.py claude_side_question.py cursor_agent_client.py opencode_agent_client.py cursor_process_guard.py claude_history_repair.py claude_history_provenance.py codex_history_repair.py public_chat_shares.py public_chat_transcript.py public_chat_share_routes.py interactive_chat_shares.py interactive_chat_share_routes.py interactive_chat_share_web.py interactive_chat_projection.py interactive_chat_runtime.py interactive_chat_native.py shared_chat_videos.py shared_chat_video_stream.py interactive_chat_controls.py install.sh uninstall.sh instances.sh server_instances.py update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem LICENSE NOTICE)
 RELEASE_DIRECTORIES=(agentsdock_team_hub)
 TEAM_HUB_RELEASE_FILES=(
   __init__.py
@@ -1801,12 +1891,11 @@ for name in "${RELEASE_DIRECTORIES[@]}"; do
     echo "$name is missing beside install.sh or is not a real directory." >&2
     exit 1
   fi
+  # Local Python runs create bytecode caches. Never copy those (staging uses
+  # the explicit manifest below), but still reject links/special files anywhere,
+  # including inside a cache directory.
   if find "$SOURCE_DIR/$name" \( -type l -o \( ! -type d ! -type f \) \) -print -quit | grep -q .; then
-    echo "$name contains unsafe linked or special entries and cannot be installed." >&2
-    exit 1
-  fi
-  if [[ -z "$ACTIVATE_PREPARED" && "$RECOVER_ONLY" != "true" ]] && find "$SOURCE_DIR/$name" \( -type f \( -name '*.pyc' -o -name '*.pyo' \) -o -type d -name '__pycache__' \) -print -quit | grep -q .; then
-    echo "$name contains linked or generated entries and cannot be installed." >&2
+    echo "$name contains linked or special entries and cannot be installed." >&2
     exit 1
   fi
 done
@@ -1820,13 +1909,13 @@ done
 # bound by the receipt or owned recovery journal before activation; raw source
 # archives continue to require the exact clean allowlist.
 if [[ -z "$ACTIVATE_PREPARED" && "$RECOVER_ONLY" != "true" ]]; then
-TEAM_HUB_RELEASE_FILE_COUNT="$(find "$SOURCE_DIR/agentsdock_team_hub" -type f | wc -l)"
+TEAM_HUB_RELEASE_FILE_COUNT="$(find "$SOURCE_DIR/agentsdock_team_hub" -type d -name '__pycache__' -prune -o -type f ! -name '*.pyc' ! -name '*.pyo' -print | wc -l)"
 TEAM_HUB_RELEASE_FILE_COUNT="${TEAM_HUB_RELEASE_FILE_COUNT//[[:space:]]/}"
 if [[ "$TEAM_HUB_RELEASE_FILE_COUNT" != "${#TEAM_HUB_RELEASE_FILES[@]}" ]]; then
   echo "agentsdock_team_hub contains unexpected release files." >&2
   exit 1
 fi
-TEAM_HUB_RELEASE_DIRECTORY_COUNT="$(find "$SOURCE_DIR/agentsdock_team_hub" -type d | wc -l)"
+TEAM_HUB_RELEASE_DIRECTORY_COUNT="$(find "$SOURCE_DIR/agentsdock_team_hub" -type d -name '__pycache__' -prune -o -type d -print | wc -l)"
 TEAM_HUB_RELEASE_DIRECTORY_COUNT="${TEAM_HUB_RELEASE_DIRECTORY_COUNT//[[:space:]]/}"
 if [[ "$TEAM_HUB_RELEASE_DIRECTORY_COUNT" != "2" ]]; then
   echo "agentsdock_team_hub contains unexpected release directories." >&2
@@ -2459,7 +2548,7 @@ backup_runtime_configuration() {
     current_snapshot="${current_snapshot#*|}"
     PRIOR_SERVICE_ENABLED="${current_snapshot%%|*}"
   fi
-  if [[ "$OS_NAME" == "Linux" ]]; then
+  if [[ "$OS_NAME" == "Linux" && "${INSTANCE_NAME:-default}" == "default" ]]; then
     local legacy_exists="false"
     local legacy_snapshot=""
     if [[ -e "$LEGACY_SERVICE_FILE" || -L "$LEGACY_SERVICE_FILE" ]]; then
@@ -3496,6 +3585,7 @@ sync_release_dependencies() (
       --project "$STAGE_DIR" \
       --python '>=3.10' \
       --no-dev \
+      --quiet \
       --frozen
 )
 
@@ -3570,8 +3660,9 @@ validate_staged_release_runtime() (
     "$STAGE_DIR/shared_chat_video_stream.py" \
     "$STAGE_DIR/interactive_chat_controls.py" \
     "$STAGE_DIR/update_runner.py"
+  "$STAGE_DIR/.venv/bin/python" -m py_compile "$STAGE_DIR/server_instances.py"
   "$STAGE_DIR/.venv/bin/python" -m compileall -q "$STAGE_DIR/agentsdock_team_hub"
-  PYTHONPATH="$STAGE_DIR" "$STAGE_DIR/.venv/bin/python" -c 'import execution_activation, execution_preparation, update_preparation, update_handoff, update_recovery, execution_update_status, execution_uninstall, execution_recovery, execution_recovery_status, execution_http, execution_durability, execution_control, execution_install, execution_maintenance, execution_manage, execution_ownership, execution_service, execution_transport; import workspace_git; import codex_auth, codex_provider, side_questions, title_generation, codex_side_question, claude_side_question, agentsdock_team_hub, cursor_agent_client, opencode_agent_client, cursor_process_guard, secure_peer_delivery, secure_peer_runtime, team_mail_runtime, team_mail_websocket, team_mail_grants, team_hub_host, agentsdock_mail, agentsdock_team, claude_history_repair, claude_history_provenance, claude_goals, claude_background_reconciliation, codex_history_repair, public_chat_shares, public_chat_transcript, public_chat_share_routes, interactive_chat_shares, interactive_chat_share_routes, interactive_chat_share_web, interactive_chat_projection, interactive_chat_runtime, interactive_chat_native, shared_chat_videos, shared_chat_video_stream, interactive_chat_controls, chat_mailbox, provider_commands; from agentsdock_team_hub import secure_peer, secure_peer_hub' >/dev/null
+  PYTHONPATH="$STAGE_DIR" "$STAGE_DIR/.venv/bin/python" -c 'import execution_activation, execution_preparation, update_preparation, update_handoff, update_recovery, execution_update_status, execution_uninstall, execution_recovery, execution_recovery_status, execution_http, execution_durability, execution_control, execution_install, execution_maintenance, execution_manage, execution_ownership, execution_service, execution_transport; import workspace_git, server_instances; import codex_auth, codex_provider, side_questions, title_generation, codex_side_question, claude_side_question, agentsdock_team_hub, cursor_agent_client, opencode_agent_client, cursor_process_guard, secure_peer_delivery, secure_peer_runtime, team_mail_runtime, team_mail_websocket, team_mail_grants, team_hub_host, agentsdock_mail, agentsdock_team, claude_history_repair, claude_history_provenance, claude_goals, claude_background_reconciliation, codex_history_repair, public_chat_shares, public_chat_transcript, public_chat_share_routes, interactive_chat_shares, interactive_chat_share_routes, interactive_chat_share_web, interactive_chat_projection, interactive_chat_runtime, interactive_chat_native, shared_chat_videos, shared_chat_video_stream, interactive_chat_controls, chat_mailbox, provider_commands; from agentsdock_team_hub import secure_peer, secure_peer_hub' >/dev/null
 )
 
 abort_unclaimed_team_hub_reactivation() {
@@ -3899,6 +3990,7 @@ for name in "${TEAM_HUB_RELEASE_FILES[@]}"; do
     "$STAGE_DIR/agentsdock_team_hub/$name"
 done
 chmod 755 "$STAGE_DIR/agent_server.py" "$STAGE_DIR/agentsdock_jobs.py" "$STAGE_DIR/agentsdock_chats.py" "$STAGE_DIR/agentsdock_emergency.py" "$STAGE_DIR/agentsdock_publish.py" "$STAGE_DIR/agentsdock_mail.py" "$STAGE_DIR/agentsdock_team.py" "$STAGE_DIR/install.sh" "$STAGE_DIR/uninstall.sh" "$STAGE_DIR/update_runner.py"
+chmod 755 "$STAGE_DIR/instances.sh"
 
 if [[ "$PREPARE_ONLY" == "true" ]]; then
   source_inventory="$(mktemp "$INSTALL_ROOT/.prepared-inventory.XXXXXXXX")" || exit 1
@@ -3923,7 +4015,9 @@ with output.open("w") as stream:
 PYINVENTORY
 fi
 
-echo "[2/7] Resolving the release dependencies with uv"
+echo "[2/7] Preparing private Python dependencies for instance $INSTANCE_NAME"
+echo "      Reusing uv's package cache where available; errors will still be shown."
+echo "      This does not reinstall Claude Code, Codex, or tmux."
 if run_timed_stage \
   "dependency resolution" \
   "$DEPENDENCY_SYNC_TIMEOUT_SECONDS" \
@@ -3999,7 +4093,7 @@ write_runtime_env() {
     local filter_status=0
     preserved_contents="$(read_owned_config_file "$PRESERVE_SOURCE")" || return 1
     if printf '%s\n' "$preserved_contents" \
-      | grep -Ev '^(AGENTSDOCK_(STATE_DIR|AGENT_CWD|AGENT_BIND|AGENT_PORT|AGENT_TOKEN|SERVER_NAME|TEAM_HUB_MODE|TEAM_HUB_TRANSPORT|TEAM_HUB_URL|TEAM_HUB_DIRECT_IP_URL|TEAM_HUB_REACTIVATION_HUB_ID|TEAM_HUB_REACTIVATION_OPERATION_ID|TEAM_HUB_REACTIVATION_SNAPSHOT|TEAM_HUB_UPDATE_HUB_ID|TEAM_HUB_UPDATE_OPERATION_ID|TEAM_HUB_UPDATE_SNAPSHOT)|AGENTS_SERVER_(STATE_DIR|INSTALL_DIR)|ZENITHBOT_AGENT_(DIR|CWD|BIND|PORT|TOKEN)|ZENITHDOCK_AGENT_TOKEN|PATH)=' \
+      | grep -Ev '^(AGENTSDOCK_(STATE_DIR|AGENT_CWD|AGENT_BIND|AGENT_PORT|AGENT_TOKEN|SERVER_NAME|TEAM_HUB_MODE|TEAM_HUB_TRANSPORT|TEAM_HUB_URL|TEAM_HUB_DIRECT_IP_URL|TEAM_HUB_REACTIVATION_HUB_ID|TEAM_HUB_REACTIVATION_OPERATION_ID|TEAM_HUB_REACTIVATION_SNAPSHOT|TEAM_HUB_UPDATE_HUB_ID|TEAM_HUB_UPDATE_OPERATION_ID|TEAM_HUB_UPDATE_SNAPSHOT)|AGENTS_SERVER_(STATE_DIR|INSTALL_DIR|CONFIG_DIR|INSTANCE)|ZENITHBOT_AGENT_(DIR|CWD|BIND|PORT|TOKEN)|ZENITHDOCK_AGENT_TOKEN|PATH)=' \
       > "$env_temp"; then
       :
     else
@@ -4025,6 +4119,8 @@ AGENTSDOCK_TEAM_HUB_TRANSPORT=$TEAM_HUB_TRANSPORT
 AGENTSDOCK_TEAM_HUB_URL=$TEAM_HUB_URL
 AGENTSDOCK_TEAM_HUB_DIRECT_IP_URL=$TEAM_HUB_DIRECT_IP_URL
 AGENTS_SERVER_INSTALL_DIR=$INSTALL_ROOT
+AGENTS_SERVER_CONFIG_DIR=$CONFIG_ROOT
+AGENTS_SERVER_INSTANCE=${INSTANCE_NAME:-default}
 PATH=$SERVER_PATH
 EOF
   if ! replace_activation_config env "$env_temp" 600; then
@@ -4182,21 +4278,23 @@ restart_service() {
     return
   fi
   if [[ "$OS_NAME" == "Linux" ]]; then
-    local legacy_exists="false"
-    local legacy_snapshot=""
-    [[ -f "$LEGACY_SERVICE_FILE" && ! -L "$LEGACY_SERVICE_FILE" ]] \
-      && legacy_exists="true"
-    if [[ "$PRIOR_LEGACY_SERVICE_STATE" == "absent" ]]; then
-      legacy_snapshot="$(systemd_unit_snapshot \
-        "$LEGACY_SERVICE_NAME.service" "$legacy_exists")" || return 1
-      [[ "${legacy_snapshot%%|*}" == "absent" ]] || return 1
-    else
-      systemctl --user disable --now "$LEGACY_SERVICE_NAME.service" \
-        >/dev/null || return 1
-      legacy_snapshot="$(systemd_unit_snapshot \
-        "$LEGACY_SERVICE_NAME.service" "$legacy_exists")" || return 1
-      [[ "${legacy_snapshot%%|*}" == "stopped" \
-        && "${legacy_snapshot#*|}" == "false|"* ]] || return 1
+    if [[ "${INSTANCE_NAME:-default}" == "default" ]]; then
+      local legacy_exists="false"
+      local legacy_snapshot=""
+      [[ -f "$LEGACY_SERVICE_FILE" && ! -L "$LEGACY_SERVICE_FILE" ]] \
+        && legacy_exists="true"
+      if [[ "$PRIOR_LEGACY_SERVICE_STATE" == "absent" ]]; then
+        legacy_snapshot="$(systemd_unit_snapshot \
+          "$LEGACY_SERVICE_NAME.service" "$legacy_exists")" || return 1
+        [[ "${legacy_snapshot%%|*}" == "absent" ]] || return 1
+      else
+        systemctl --user disable --now "$LEGACY_SERVICE_NAME.service" \
+          >/dev/null || return 1
+        legacy_snapshot="$(systemd_unit_snapshot \
+          "$LEGACY_SERVICE_NAME.service" "$legacy_exists")" || return 1
+        [[ "${legacy_snapshot%%|*}" == "stopped" \
+          && "${legacy_snapshot#*|}" == "false|"* ]] || return 1
+      fi
     fi
     systemctl --user daemon-reload || return
     systemctl --user enable "$SERVICE_NAME.service" >/dev/null || return
@@ -4528,19 +4626,21 @@ restore_prior_service_state() {
         [[ "$PRIOR_SERVICE_STATE" == "absent" ]] || return 1
       }
     fi
-    if [[ "$PRIOR_LEGACY_SERVICE_ENABLED" == "true" ]]; then
-      systemctl --user enable "$LEGACY_SERVICE_NAME.service" >/dev/null || return 1
-    elif [[ "$PRIOR_LEGACY_SERVICE_STATE" == "absent" ]]; then
-      systemctl --user disable "$LEGACY_SERVICE_NAME.service" >/dev/null 2>&1 || true
-    else
-      systemctl --user disable "$LEGACY_SERVICE_NAME.service" >/dev/null || return 1
-    fi
-    if [[ "$PRIOR_LEGACY_SERVICE_STATE" == "running" ]]; then
-      systemctl --user start "$LEGACY_SERVICE_NAME.service" || return 1
-    else
-      systemctl --user stop "$LEGACY_SERVICE_NAME.service" >/dev/null 2>&1 || {
-        [[ "$PRIOR_LEGACY_SERVICE_STATE" == "absent" ]] || return 1
-      }
+    if [[ "${INSTANCE_NAME:-default}" == "default" ]]; then
+      if [[ "$PRIOR_LEGACY_SERVICE_ENABLED" == "true" ]]; then
+        systemctl --user enable "$LEGACY_SERVICE_NAME.service" >/dev/null || return 1
+      elif [[ "$PRIOR_LEGACY_SERVICE_STATE" == "absent" ]]; then
+        systemctl --user disable "$LEGACY_SERVICE_NAME.service" >/dev/null 2>&1 || true
+      else
+        systemctl --user disable "$LEGACY_SERVICE_NAME.service" >/dev/null || return 1
+      fi
+      if [[ "$PRIOR_LEGACY_SERVICE_STATE" == "running" ]]; then
+        systemctl --user start "$LEGACY_SERVICE_NAME.service" || return 1
+      else
+        systemctl --user stop "$LEGACY_SERVICE_NAME.service" >/dev/null 2>&1 || {
+          [[ "$PRIOR_LEGACY_SERVICE_STATE" == "absent" ]] || return 1
+        }
+      fi
     fi
     local current_exists="false"
     local legacy_exists="false"
@@ -4556,7 +4656,7 @@ restore_prior_service_state() {
         && "${observed_snapshot#*|}" == "$PRIOR_SERVICE_ENABLED|"* ]] \
         || return 1
     fi
-    if [[ "$PRIOR_LEGACY_SERVICE_STATE" != "running" ]]; then
+    if [[ "${INSTANCE_NAME:-default}" == "default" && "$PRIOR_LEGACY_SERVICE_STATE" != "running" ]]; then
       observed_snapshot="$(systemd_unit_snapshot \
         "$LEGACY_SERVICE_NAME.service" "$legacy_exists")" || return 1
       [[ "${observed_snapshot%%|*}" == "$PRIOR_LEGACY_SERVICE_STATE" \
@@ -4723,7 +4823,7 @@ write_service_files() {
   if [[ "$OS_NAME" == "Linux" ]]; then
     USER_SERVICE_DIR="$HOME/.config/systemd/user"
     mkdir -p "$USER_SERVICE_DIR"
-    service_temp="$USER_SERVICE_DIR/.agents-server.service.activation-$ACTIVATION_TRANSACTION_ID-service.source"
+    service_temp="$USER_SERVICE_DIR/.$SERVICE_NAME.service.activation-$ACTIVATION_TRANSACTION_ID-service.source"
     (umask 077; set -o noclobber; : > "$service_temp") 2>/dev/null || return 1
     chmod 600 "$service_temp" || return 1
     cat > "$service_temp" <<EOF
@@ -4757,8 +4857,9 @@ EOF
     SERVICE_KIND="systemd-user"
   elif [[ "$OS_NAME" == "Darwin" ]]; then
     LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
-    mkdir -p "$LAUNCH_AGENTS" "$HOME/Library/Logs/AgentsServer"
-    service_temp="$LAUNCH_AGENTS/.com.agentsdock.server.plist.activation-$ACTIVATION_TRANSACTION_ID-service.source"
+    local instance_log_dir="${INSTANCE_LOG_DIR:-$HOME/Library/Logs/AgentsServer}"
+    mkdir -p "$LAUNCH_AGENTS" "$instance_log_dir"
+    service_temp="$LAUNCH_AGENTS/.$LABEL.plist.activation-$ACTIVATION_TRANSACTION_ID-service.source"
     (umask 077; set -o noclobber; : > "$service_temp") 2>/dev/null || return 1
     chmod 600 "$service_temp" || return 1
     local launchd_server_name_entry=""
@@ -4791,11 +4892,13 @@ $launchd_server_name_entry
     <key>AGENTSDOCK_TEAM_HUB_URL</key><string>$TEAM_HUB_URL</string>
     <key>AGENTSDOCK_TEAM_HUB_DIRECT_IP_URL</key><string>$TEAM_HUB_DIRECT_IP_URL</string>
     <key>AGENTS_SERVER_INSTALL_DIR</key><string>$INSTALL_ROOT</string>
+    <key>AGENTS_SERVER_CONFIG_DIR</key><string>$CONFIG_ROOT</string>
+    <key>AGENTS_SERVER_INSTANCE</key><string>${INSTANCE_NAME:-default}</string>
     <key>PATH</key><string>$SERVER_PATH</string>
   </dict>
   <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>$HOME/Library/Logs/AgentsServer/server.log</string>
-  <key>StandardErrorPath</key><string>$HOME/Library/Logs/AgentsServer/server-error.log</string>
+  <key>StandardOutPath</key><string>$instance_log_dir/server.log</string>
+  <key>StandardErrorPath</key><string>$instance_log_dir/server-error.log</string>
 </dict></plist>
 EOF
     if ! replace_activation_config service "$service_temp" 600; then
@@ -4929,7 +5032,8 @@ service_manager_owns_listener() {
     services=("$LABEL")
     [[ "$EXECUTION_MODE" != "split" ]] || services+=("com.agentsdock.gateway")
   else
-    services=("$SERVICE_NAME" "${LEGACY_SERVICE_NAME:-}")
+    services=("$SERVICE_NAME")
+    [[ "${INSTANCE_NAME:-default}" != "default" ]] || services+=("${LEGACY_SERVICE_NAME:-}")
     [[ "$EXECUTION_MODE" != "split" ]] || services+=("agents-server-gateway")
   fi
   for service in "${services[@]}"; do
@@ -4969,7 +5073,8 @@ pinned_managed_http_get() {
     services=("$LABEL")
     [[ "$EXECUTION_MODE" != "split" ]] || services+=("com.agentsdock.gateway")
   else
-    services=("$SERVICE_NAME" "${LEGACY_SERVICE_NAME:-}")
+    services=("$SERVICE_NAME")
+    [[ "${INSTANCE_NAME:-default}" != "default" ]] || services+=("${LEGACY_SERVICE_NAME:-}")
     [[ "$EXECUTION_MODE" != "split" ]] || services+=("agents-server-gateway")
   fi
   for service in "${services[@]}"; do
@@ -7014,35 +7119,124 @@ if [[ "$CLAUDE_READY" == "false" && "$CODEX_READY" == "false" ]]; then
   echo "      Sign in to at least one before starting a chat."
 fi
 
-TAILSCALE_IP=""
-if command -v tailscale >/dev/null 2>&1; then
-  TAILSCALE_IP="$(tailscale ip -4 2>/dev/null | head -n 1 || true)"
-fi
-SERVER_URL="$(health_origin "$PORT")"
-if [[ "$BIND_ADDRESS" == "0.0.0.0" && -n "$TAILSCALE_IP" ]]; then
-  SERVER_URL="http://$TAILSCALE_IP:$PORT"
-fi
+setup_network_summary() {
+  TAILSCALE_IP=""
+  TAILSCALE_STATUS="unknown"
+  TAILSCALE_BIND_MATCH="false"
+  SERVER_LOCAL_ONLY="false"
+  NETWORK_URLS=""
+  SERVER_URL="$(health_origin "$PORT")"
+  local network_bindings=""
+  # The shipped helper emits only fixed keys and shell-quoted validated values.
+  # Optional network diagnostics must not fail an already healthy installation.
+  if network_bindings="$("$CURRENT_LINK/.venv/bin/python" \
+      "$CURRENT_LINK/server_instances.py" _setup-network \
+      --bind "$BIND_ADDRESS" --port "$PORT" 2>/dev/null)" \
+      && [[ -n "$network_bindings" ]]; then
+    eval "$network_bindings"
+  fi
+}
+
+print_tailscale_summary() {
+  case "$TAILSCALE_STATUS" in
+    connected)
+      if [[ "$TAILSCALE_BIND_MATCH" == "true" ]]; then
+        echo "  $CHECK_MARK Tailscale already connected: http://$TAILSCALE_IP:$PORT (tailnet access rules still apply)"
+      elif [[ "$SERVER_LOCAL_ONLY" == "true" ]]; then
+        echo "  $DOT_MARK Tailscale already connected; this server is bound to localhost only, so phones cannot connect directly."
+        echo "    For phone access, choose a reachable server bind: https://github.com/ZhengyiLuo/AgentsServer"
+      else
+        echo "  $DOT_MARK Tailscale already connected; its IPv4 address is not available on this server's configured bind."
+        echo "    For tailnet access, review the server bind: https://github.com/ZhengyiLuo/AgentsServer"
+      fi
+      ;;
+    disconnected)
+      echo "  $DOT_MARK Tailscale already installed but not connected; no installation or configuration changes made."
+      echo "    To connect from other networks, open Tailscale and sign in/connect."
+      ;;
+    not-installed)
+      echo "  $DOT_MARK optional: Tailscale was not found; use your LAN address on the same network, or see https://tailscale.com/download"
+      ;;
+    unavailable)
+      echo "  $DOT_MARK Tailscale already installed; connection status could not be checked. No setup changes made."
+      echo "    Open Tailscale to check the connection, or try: tailscale status"
+      ;;
+    *)
+      echo "  $DOT_MARK Tailscale connection status could not be checked; no installation or configuration changes made."
+      echo "    If you use Tailscale, check its app or try: tailscale status"
+      ;;
+  esac
+}
+
+print_setup_checklist() {
+  local network_ready="false"
+  [[ "$TAILSCALE_STATUS" != "connected" || "$TAILSCALE_BIND_MATCH" != "true" ]] || network_ready="true"
+  if [[ -z "$TMUX_WARNING" && "$network_ready" == "true" \
+    && ( "$CLAUDE_READY" == "true" || "$CODEX_READY" == "true" ) ]]; then
+    echo "  ${COLOR_GREEN}${COLOR_BOLD}You are all set${COLOR_RESET}"
+    echo "  $CHECK_MARK tmux available"
+    print_tailscale_summary
+    return
+  fi
+
+  echo "  ${COLOR_BOLD}You already have${COLOR_RESET}"
+  echo "  $CHECK_MARK AgentsServer running"
+  if [[ -z "$TMUX_WARNING" ]]; then
+    echo "  $CHECK_MARK tmux available"
+  fi
+  if [[ "$network_ready" == "true" ]]; then
+    print_tailscale_summary
+  elif [[ "$TAILSCALE_STATUS" == "connected" || "$TAILSCALE_STATUS" == "disconnected" || "$TAILSCALE_STATUS" == "unavailable" ]]; then
+    echo "  $CHECK_MARK Tailscale installed"
+  fi
+
+  if [[ "$CLAUDE_READY" == "false" && "$CODEX_READY" == "false" ]]; then
+    echo
+    echo "  ${COLOR_BOLD}To start chats${COLOR_RESET}"
+    echo "  $DOT_MARK Choose one agent CLI and sign in:"
+    echo "    Claude Code: npm install -g @anthropic-ai/claude-code, then run: claude"
+    echo "    Codex: npm install -g @openai/codex, then run: codex login"
+  fi
+  if [[ -n "$TMUX_WARNING" || "$network_ready" != "true" ]]; then
+    echo
+    echo "  ${COLOR_BOLD}Optional next steps${COLOR_RESET}"
+    echo "  You can skip these unless you need the features below."
+    if [[ -n "$TMUX_WARNING" ]]; then
+      echo "  $DOT_MARK For persistent terminals, pane inspection and in-app updates, install tmux:"
+      if [[ "$OS_NAME" == "Darwin" ]]; then
+        echo "    With Homebrew: brew install tmux"
+      else
+        echo "    Use your package manager, for example: sudo apt install tmux"
+      fi
+    fi
+    if [[ "$network_ready" != "true" ]]; then
+      print_tailscale_summary
+    fi
+  fi
+}
+
+setup_network_summary
 
 echo "[7/7] AgentsServer $RELEASE_VERSION is ready"
+if [[ "$PRIOR_SERVICE_STATE" == "absent" && "$PRIOR_LEGACY_SERVICE_STATE" == "absent" && -z "$EXPECTED_SERVER_IDENTITY" ]]; then
+  printf '\n%s%s\n%s\n%s%s\n' \
+    "$COLOR_GREEN" '================================' \
+    'Your new service is up!' \
+    '================================' "$COLOR_RESET"
+fi
 echo
 echo "  ${COLOR_BOLD}Server URL${COLOR_RESET}    $SERVER_URL"
+if [[ -n "$NETWORK_URLS" ]]; then
+  echo "  Other local/network addresses (reachability depends on network/firewall):"
+  while IFS= read -r network_url; do
+    [[ -z "$network_url" ]] || echo "    $network_url"
+  done <<< "$NETWORK_URLS"
+fi
 echo
-echo "  ${COLOR_BOLD}Next steps${COLOR_RESET}"
+print_setup_checklist
 if [[ "$PORT_AUTO_SELECTED" == "true" ]]; then
+  echo
   echo "  $DOT_MARK port $ORIGINAL_PORT was already in use, installed on $PORT instead (--port pins an exact port unless --allow-port-fallback is supplied)"
-fi
-if [[ "$CLAUDE_READY" == "false" && "$CODEX_READY" == "false" ]]; then
-  echo "  $CROSS_MARK install and sign in to Claude Code or Codex (see [6/7] above) before starting a chat"
-fi
-if [[ -n "$TMUX_WARNING" ]]; then
-  echo "  $CROSS_MARK tmux unavailable: persistent terminal, pane inspection, and in-app updates won't work - $TMUX_WARNING"
-else
-  echo "  $CHECK_MARK tmux available"
-fi
-if [[ -n "$TAILSCALE_IP" ]]; then
-  echo "  $CHECK_MARK reachable via Tailscale at $TAILSCALE_IP"
-else
-  echo "  $DOT_MARK optional: install and connect Tailscale to reach this server from another device or WiFi network: https://tailscale.com/download"
 fi
 if [[ "$TEAM_HUB_MODE" == "host" ]]; then
   echo
@@ -7072,4 +7266,7 @@ echo
 if [[ -z "$EXPECTED_SERVER_IDENTITY" ]]; then
   printf 'AGENTSDOCK_SETUP_RESULT={"server_url":"%s","access_token":"%s","service":"%s","tailscale_ip":"%s","server_version":"%s"}\n' \
     "$SERVER_URL" "$TOKEN" "$SERVICE_KIND" "$TAILSCALE_IP" "$RELEASE_VERSION"
+  if interactive_token_output; then
+    print_token_for_copy "$TOKEN"
+  fi
 fi

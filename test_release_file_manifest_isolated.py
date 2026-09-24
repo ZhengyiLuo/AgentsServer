@@ -21,6 +21,7 @@ NEW_MODULES = {
     "codex_provider.py",
     "side_questions.py", "codex_side_question.py", "claude_side_question.py",
     "title_generation.py",
+    "server_instances.py",
     "chat_mailbox.py",
     "claude_background_reconciliation.py",
     "claude_goals.py",

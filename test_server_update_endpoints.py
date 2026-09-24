@@ -1549,6 +1549,10 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                 environment = agent_server.server_update_runner_environment()
 
         self.assertEqual(environment, {
+            "AGENTS_SERVER_INSTANCE": "default",
+            "AGENTS_SERVER_CONFIG_DIR": str(agent_server.CONFIG_ENV_FILE.parent),
+            "AGENTSDOCK_STATE_DIR": str(agent_server.STATE_DIR),
+            "AGENTS_SERVER_INSTALL_DIR": "",
             "XDG_RUNTIME_DIR": str(runtime),
             "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime / 'bus'}",
         })

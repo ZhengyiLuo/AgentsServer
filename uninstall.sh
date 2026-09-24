@@ -1,6 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+UNINSTALL_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# Bare uninstall previews ALL instances and requires their exact names. Keep
+# legacy explicit --yes automation default-scoped; --all opts into bulk removal.
+if (($# == 0)); then
+  exec bash "$UNINSTALL_SCRIPT_DIR/instances.sh" remove --all
+fi
+for uninstall_option in "$@"; do
+  if [[ "$uninstall_option" == "--all" || "$uninstall_option" == "--instance" ]]; then
+    exec bash "$UNINSTALL_SCRIPT_DIR/instances.sh" remove "$@"
+  fi
+done
+INSTANCE_NAME="${AGENTS_SERVER_INSTANCE:-default}"
+MANAGED_REMOVAL="false"
+if [[ "$1" == "--managed-instance" ]]; then
+  MANAGED_REMOVAL="true"
+  INSTANCE_NAME="${2:?missing instance name}"
+  shift 2
+fi
+if [[ ! "$INSTANCE_NAME" =~ ^[a-z][a-z0-9-]{0,31}$ ]]; then
+  echo "Invalid instance name." >&2
+  exit 2
+fi
+
 INSTALL_ROOT="${AGENTS_SERVER_INSTALL_DIR:-$HOME/.local/share/agents-server}"
 CONFIG_ROOT="${AGENTS_SERVER_CONFIG_DIR:-$HOME/.config/agents-server}"
 LEGACY_STATE_ROOT="$HOME/.zenithbot-agent"
@@ -14,10 +37,29 @@ else
   STATE_ROOT="$HOME/.agentsdock"
 fi
 SERVICE_NAME="agents-server"
+LABEL="com.agentsdock.server"
+INSTANCE_LOG_DIR="$HOME/Library/Logs/AgentsServer"
+if [[ "$INSTANCE_NAME" != "default" ]]; then
+  instance_bindings="$(bash "$UNINSTALL_SCRIPT_DIR/instances.sh" _bindings "$INSTANCE_NAME")" || exit 2
+  eval "$instance_bindings"
+fi
 OS_NAME="$(uname -s)"
 
 ASSUME_YES="false"
 PURGE_STATE="false"
+MANAGED_RELEASE_NAME="false"
+UNINSTALL_RED=""
+UNINSTALL_GREEN=""
+UNINSTALL_RESET=""
+if [[ -t 1 && "${TERM:-}" != "dumb" && -z "${NO_COLOR+x}" ]]; then
+  UNINSTALL_RED=$'\033[31m'
+  UNINSTALL_GREEN=$'\033[32m'
+  UNINSTALL_RESET=$'\033[0m'
+fi
+
+uninstall_status() {
+  printf '%s%s%s\n' "$1" "$2" "$UNINSTALL_RESET"
+}
 
 normalize_managed_path() {
   local label="$1"
@@ -97,6 +139,12 @@ usage() {
   cat <<USAGE
 Usage: ./uninstall.sh [--yes] [--purge-state]
 
+With no arguments: show all current-user instances and confirm their exact names.
+  --instance NAME   Remove only NAME (preview + confirmation).
+  --all             Remove all instances (preview + confirmation).
+  --all --exclude default   Keep the original/default server untouched.
+Legacy --yes without --all remains default-scoped for compatibility.
+
 Stops and removes the AgentsServer user service, versioned release runtime,
 and generated configuration (including the access token). Chat history, jobs,
 files, secure-peer credentials, and terminals under $STATE_ROOT are preserved
@@ -117,10 +165,20 @@ while (($#)); do
   case "$1" in
     --yes) ASSUME_YES="true"; shift ;;
     --purge-state) PURGE_STATE="true"; shift ;;
+    --managed-release-name) MANAGED_RELEASE_NAME="true"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+# This flag only controls progress text. The manager separately archives state
+# after a successful service removal, using the user's affirmative choice.
+if [[ "$MANAGED_RELEASE_NAME" == "true" \
+  && ( "$MANAGED_REMOVAL" != "true" || "$INSTANCE_NAME" == "default" \
+    || "$ASSUME_YES" != "true" || "$PURGE_STATE" == "true" ) ]]; then
+  echo "--managed-release-name is only for a confirmed named-instance manager removal." >&2
+  exit 2
+fi
 
 # The split lifecycle validates its installed layout, obtains an exact idle
 # execution hold, and owns the shared lock through both native service stops
@@ -243,14 +301,15 @@ else
   echo "Aborted; nothing was changed." >&2
   exit 1
 fi
+echo
 
 case "$OS_NAME" in
   Darwin)
-    LABEL="com.agentsdock.server"
+    LABEL="${LABEL:-com.agentsdock.server}"
     PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
     SERVICE_TARGET="gui/$(id -u)/$LABEL"
     if launchctl print "$SERVICE_TARGET" >/dev/null 2>&1; then
-      echo "Stopping $LABEL"
+      uninstall_status "$UNINSTALL_RED" "Stopping $LABEL"
       if ! launchctl bootout "$SERVICE_TARGET" >/dev/null 2>&1 && \
         launchctl print "$SERVICE_TARGET" >/dev/null 2>&1; then
         echo "Could not stop $LABEL; no files were removed." >&2
@@ -270,12 +329,12 @@ case "$OS_NAME" in
       fi
     fi
     if [[ -f "$PLIST" ]]; then
-      echo "Removing $PLIST"
+      uninstall_status "$UNINSTALL_RED" "Removing $PLIST"
       rm -f "$PLIST"
     fi
-    LOG_DIR="$HOME/Library/Logs/AgentsServer"
+    LOG_DIR="$INSTANCE_LOG_DIR"
     if [[ -d "$LOG_DIR" ]]; then
-      echo "Removing $LOG_DIR"
+      uninstall_status "$UNINSTALL_RED" "Removing $LOG_DIR"
       rm -rf "$LOG_DIR"
     fi
     ;;
@@ -286,7 +345,7 @@ case "$OS_NAME" in
       exit 1
     fi
     if [[ -f "$SERVICE_FILE" ]] || systemctl --user is-active --quiet "$SERVICE_NAME.service"; then
-      echo "Stopping $SERVICE_NAME.service"
+      uninstall_status "$UNINSTALL_RED" "Stopping $SERVICE_NAME.service"
       if ! systemctl --user disable --now "$SERVICE_NAME.service" >/dev/null 2>&1 && \
         systemctl --user is-active --quiet "$SERVICE_NAME.service"; then
         echo "Could not stop $SERVICE_NAME.service; no files were removed." >&2
@@ -306,7 +365,7 @@ case "$OS_NAME" in
       fi
     fi
     if [[ -f "$SERVICE_FILE" ]]; then
-      echo "Removing $SERVICE_FILE"
+      uninstall_status "$UNINSTALL_RED" "Removing $SERVICE_FILE"
       rm -f "$SERVICE_FILE"
       systemctl --user daemon-reload || true
     fi
@@ -318,7 +377,7 @@ case "$OS_NAME" in
 esac
 
 if [[ -d "$INSTALL_ROOT" ]]; then
-  echo "Removing release runtime at $INSTALL_ROOT"
+  uninstall_status "$UNINSTALL_RED" "Removing release runtime at $INSTALL_ROOT"
   shopt -s dotglob nullglob
   for install_entry in "$INSTALL_ROOT"/*; do
     [[ "$install_entry" == "$INSTALL_LOCK_DIR" ]] || rm -rf -- "$install_entry"
@@ -327,20 +386,30 @@ if [[ -d "$INSTALL_ROOT" ]]; then
 fi
 
 if [[ -d "$CONFIG_ROOT" ]]; then
-  echo "Removing configuration at $CONFIG_ROOT"
+  uninstall_status "$UNINSTALL_RED" "Removing configuration at $CONFIG_ROOT"
   rm -rf "$CONFIG_ROOT"
 fi
 
 if [[ "$PURGE_STATE" == "true" ]]; then
   if [[ -e "$STATE_ROOT" || -L "$LEGACY_STATE_ROOT" ]]; then
-    [[ ! -L "$LEGACY_STATE_ROOT" ]] || rm -f "$LEGACY_STATE_ROOT"
+    if [[ "$INSTANCE_NAME" == "default" ]]; then
+      [[ ! -L "$LEGACY_STATE_ROOT" ]] || rm -f "$LEGACY_STATE_ROOT"
+    fi
     [[ ! -e "$STATE_ROOT" ]] || rm -rf "$STATE_ROOT"
-    echo "Deleted $STATE_ROOT"
+    uninstall_status "$UNINSTALL_RED" "Deleted $STATE_ROOT"
   fi
-elif [[ -e "$STATE_ROOT" ]]; then
-  echo "Preserved chat history, jobs, files, tokens, and secure-peer credentials at $STATE_ROOT."
-  echo "Re-running ./install.sh will pick ordinary AgentsServer state back up. Pass --purge-state to also delete it."
+elif [[ -e "$STATE_ROOT" && "$MANAGED_RELEASE_NAME" != "true" ]]; then
+  echo
+  uninstall_status "$UNINSTALL_GREEN" "Preserved chat history, jobs, files, tokens, and secure-peer credentials at $STATE_ROOT."
+  echo
+  if [[ "$INSTANCE_NAME" == "default" ]]; then
+    echo "Re-running ./install.sh will pick ordinary AgentsServer state back up. Pass --purge-state to also delete it."
+  else
+    echo "To reuse this named history, run ./install.sh --instance $INSTANCE_NAME --port PORT (choose an available port)."
+    echo "Do not use bare ./install.sh for this instance; it targets the default server. Pass --purge-state to also delete history."
+  fi
   if [[ -e "$STATE_ROOT/team-hub/team-hub.sqlite3" || -L "$STATE_ROOT/team-hub/team-hub.sqlite3" ]]; then
+    echo
     echo "Preserved Team Hub state is not auto-reactivated in this beta; use a signed managed recovery or support-assisted restoration."
   fi
 fi
@@ -354,6 +423,15 @@ if [[ -d "$INSTALL_ROOT" ]] && ! rmdir "$INSTALL_ROOT"; then
   exit 1
 fi
 
-echo "AgentsServer service, release runtime, and configuration removed."
-echo "Note: any persistent chat terminals (tmux sessions named zd_*) keep running"
-echo "independently and are not touched by this script. List them with: tmux ls"
+echo
+if [[ "$INSTANCE_NAME" == "default" ]]; then
+  echo "Note: any persistent chat terminals (tmux sessions named zd_*) keep running"
+  echo "independently and are not touched by this script. List them with: tmux ls"
+else
+  echo "Note: persistent chat terminals for $INSTANCE_NAME keep running independently and are not touched by this script."
+  echo "List only this instance's terminals with: tmux -L agents-server-$INSTANCE_NAME ls"
+fi
+if [[ "$MANAGED_REMOVAL" != "true" ]]; then
+  echo
+  uninstall_status "$UNINSTALL_GREEN" "Successful!"
+fi

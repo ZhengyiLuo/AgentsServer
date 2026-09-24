@@ -217,7 +217,10 @@ def run_preparation(*, status_path: Path, root: Path, public_key: Path, preparat
                 archive.write_bytes(data)
                 source = updates.safe_extract(archive, work / "extracted",
                     npm_manifest=manifest if manifest.get("schema") == 2 else None)
-                if not (source / "execution_preparation.py").is_file():
+                instance_arguments = updates.instance_installer_arguments(source)
+                if instance_arguments or not (source / "execution_preparation.py").is_file():
+                    # Named instances use their isolated legacy service, not the
+                    # default-only split gateway preparation/activation protocol.
                     # Older signed releases retain their established installer.
                     prepared = {"mode": "legacy", "preparation_id": preparation_id, "envelope": envelope}
                 else:

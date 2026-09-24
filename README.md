@@ -787,6 +787,8 @@ without losing chat state:
 | `AGENTSDOCK_CLAUDE_SDK_IDLE_TTL_SECONDS` | Idle per-chat SDK client retention | `300` |
 | `AGENTSDOCK_CLAUDE_SDK_MAX_LOADED_CHATS` | Maximum retained per-chat SDK clients | `4` |
 | `CODEX_BIN` | Codex executable name/path | `codex` |
+| `AGENTSDOCK_RUNTIME_CATALOG_TIMEOUT_SECONDS` | Per-command CLI version/help/model probe timeout | `6` |
+| `AGENTSDOCK_CLAUDE_AUTH_PROBE_TIMEOUT_SECONDS` | Separate timeout for `claude auth status --json` | `15` |
 | `AGENTSDOCK_RUNTIME_DIAGNOSTIC_TTL_SECONDS` | Cache lifetime for safe CLI version/auth probes | `60` |
 | `CLAUDE_PROJECTS_ROOT` | Claude history search root | `~/.claude/projects` |
 | `CODEX_SESSIONS_ROOT` | Codex history search root | `~/.codex/sessions` |
@@ -800,6 +802,17 @@ without losing chat state:
 | `AGENTSDOCK_HANDOFF_DIGEST_TIMEOUT_SECONDS` | Digest summarizer timeout | `180` |
 | `AGENTSDOCK_HANDOFF_DIGEST_CHARS` | Final digest character cap | `56000` |
 | `AGENTSDOCK_CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS` | Maximum time for each isolated Git worktree snapshot | `120` |
+
+Runtime catalog refreshes share a 25-second CLI/network-probe budget so they
+can finish before the desktop and mobile clients' 30-second request timeout.
+Provider health checks run concurrently so a slow provider cannot prevent the
+others from being checked.
+The Claude authentication timeout is independent of the six-second version,
+help, and model probes. A timeout does not establish that a user is signed out.
+If the refresh budget is exhausted, unfinished checks keep any prior diagnostic
+with its original timestamp; providers without a prior result are reported as
+unknown, not missing or unauthenticated. Model discovery uses its existing
+fallbacks, and incomplete checks are not added to the diagnostic cache.
 
 ### Codex subagent concurrency
 

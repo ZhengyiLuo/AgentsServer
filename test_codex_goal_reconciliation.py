@@ -125,6 +125,18 @@ class CodexGoalReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.resume_calls, 1)
         self.assertEqual(session["codex_goal"], native_goal)
 
+    async def test_new_manager_with_same_generation_reconciles_native_goal(self) -> None:
+        session = self.session()
+        agent_server.STORE.sessions["chat"] = session
+        old = GoalManager({"objective": "Old objective", "status": "paused"})
+        new = GoalManager(None)
+        self.assertEqual(old.generation, new.generation)
+        with patch.object(agent_server.STORE, "save", AsyncMock()):
+            await agent_server.reconcile_codex_thread_goal(old, "chat", "thread-old")
+            await agent_server.reconcile_codex_thread_goal(new, "chat", "thread-old")
+        new.get_thread_goal.assert_awaited_once()
+        self.assertIsNone(session.get("codex_goal"))
+
     async def test_missing_native_goal_clears_divergent_local_cache(self) -> None:
         session = self.session(
             codex_goal={"objective": "Ghost", "status": "paused"},

@@ -13761,6 +13761,14 @@ RUN_METADATA: dict[str, dict[str, Any]] = {}
 CODEX_APP_SERVER_MANAGER: CodexAppServerManager | None = None
 CODEX_APP_SERVER_MANAGER_LOCK = asyncio.Lock()
 CODEX_CUSTOM_APP_SERVER_MANAGERS: dict[str, CodexAppServerManager] = {}
+CODEX_RETIRED_APP_SERVER_MANAGERS: list[CodexAppServerManager] = []
+CODEX_SESSION_APP_SERVER_MANAGERS: dict[str, CodexAppServerManager] = {}
+CODEX_BINARY_IDENTITY: tuple[Any, ...] | None = None
+CODEX_BINARY_CHECKED_AT = 0.0
+CODEX_BINARY_PROBE_LOCK = asyncio.Lock()
+CODEX_MANAGER_DRAIN_TASK: asyncio.Task[Any] | None = None
+CODEX_MANAGER_DRAIN_REQUESTED = False
+CODEX_MANAGER_CLOSING = False
 CODEX_APP_SERVER_MANAGER_EPOCH = 0
 CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH: int | None = None
 CLAUDE_SDK_MANAGER: ClaudeSDKSupervisorManager | None = None
@@ -13779,7 +13787,7 @@ CODEX_THREAD_SESSION_INDEX: dict[str, str] = {}
 # session cache survives provider-process restarts. Remember which app-server
 # generation has been reconciled so a resumed thread is checked exactly once
 # per generation instead of trusting a stale local goal indefinitely.
-CODEX_GOAL_SYNC_GENERATIONS: dict[str, tuple[int, str]] = {}
+CODEX_GOAL_SYNC_GENERATIONS: dict[str, tuple[int, int, str]] = {}
 # Threads detached after a failed Stop remain fenced for the lifetime of the
 # provider process. Any late native goal continuation is interrupted instead
 # of being adopted as a new AgentsDock run.
@@ -52594,12 +52602,15 @@ async def handle_codex_server_request(
     *,
     side_session_id: str | None = None,
     side_owner_is_current: Any = None,
+    source_manager: CodexAppServerManager | None = None,
 ) -> dict[str, Any]:
     """Bridge one app-server prompt to the owning AgentsDock chat, fail closed."""
     thread_id = str(params.get("threadId") or "")
     session_id = side_session_id or codex_session_id_for_thread(thread_id)
 
     def request_is_owned() -> bool:
+        if source_manager is not None and not codex_manager_owns_notification(source_manager, {"params": params}):
+            return False
         if side_session_id is not None:
             # A side fork belongs to its private client, never to the main
             # thread registry. Recheck that exact owner under the lifecycle lock.
@@ -52625,7 +52636,7 @@ async def handle_codex_server_request(
         ):
             pending = None
         else:
-            manager = (None if side_session_id is not None else
+            manager = (None if side_session_id is not None else source_manager or
                        existing_codex_app_server_manager_for_thread(thread_id))
             generation = manager.generation if manager is not None else 0
             loop = asyncio.get_running_loop()
@@ -54061,7 +54072,7 @@ def ensure_provider_manager_factory_admission(*, codex: bool = False) -> None:
     """Reject even read-route lazy starts while provider teardown owns state."""
 
     blocker = managed_server_update_admission_blocker()
-    if blocker or (codex and CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH is not None):
+    if blocker or (codex and (CODEX_MANAGER_CLOSING or CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH is not None)):
         raise HTTPException(
             status_code=503,
             detail=blocker or "AgentsServer is finishing Codex provider cleanup",
@@ -54069,43 +54080,260 @@ def ensure_provider_manager_factory_admission(*, codex: bool = False) -> None:
 
 
 def codex_app_server_managers() -> tuple[CodexAppServerManager, ...]:
-    return tuple(manager for manager in (
-        CODEX_APP_SERVER_MANAGER, *CODEX_CUSTOM_APP_SERVER_MANAGERS.values(),
-    ) if manager is not None)
+    managers: list[CodexAppServerManager] = []
+    for manager in (CODEX_APP_SERVER_MANAGER, *CODEX_CUSTOM_APP_SERVER_MANAGERS.values(),
+                    *CODEX_RETIRED_APP_SERVER_MANAGERS):
+        if manager is not None and not any(manager is item for item in managers):
+            managers.append(manager)
+    return tuple(managers)
+
+
+def codex_manager_owns_notification(manager: CodexAppServerManager, notification: dict[str, Any]) -> bool:
+    """Pure source check: callbacks must not lease their long-lived reader."""
+    if not any(manager is item for item in codex_app_server_managers()):
+        return False
+    params = notification.get("params")
+    if not isinstance(params, dict):
+        return False
+    thread = params.get("thread") if isinstance(params.get("thread"), dict) else {}
+    thread_id = str(params.get("threadId") or thread.get("id") or "")
+    session_id = codex_session_id_for_thread(thread_id)
+    if session_id is None and thread:
+        _name, _path, parent = codex_subagent_thread_identity(thread)
+        session_id = codex_session_id_for_thread(parent) if parent else None
+    if session_id:
+        owner = CODEX_SESSION_APP_SERVER_MANAGERS.get(session_id)
+        if owner is not None:
+            return owner is manager
+        # An unsubscribed old native thread can still emit late events. Once
+        # its session lease is gone it may never mutate the replacement state.
+        return not any(manager is item for item in CODEX_RETIRED_APP_SERVER_MANAGERS)
+    return True  # Newly created native identities are not bound to a chat yet.
+
+
+def codex_binary_identity() -> tuple[Any, ...] | None:
+    """Probe the launcher and its version: npm wrappers can stay unchanged."""
+    try:
+        executable = shutil.which(CODEX_BIN, path=codex_app_server_env().get("PATH"))
+        if not executable:
+            return None
+        resolved = Path(executable).resolve()
+        stamp = resolved.stat()
+        result = runtime_command([executable, "--version"])
+        version = safe_runtime_version(result.stdout or result.stderr)
+        if result.returncode or not version:
+            return None
+        return (str(resolved), stamp.st_dev, stamp.st_ino, stamp.st_size,
+                stamp.st_mtime_ns, version)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def retain_codex_manager_caller(manager: CodexAppServerManager, session_id: str) -> None:
+    """Cover the gap between choosing a process and registering its request."""
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        return  # Read-only catalog helpers can run outside the event loop.
+    if task is None or task is CODEX_MANAGER_DRAIN_TASK:
+        return
+    users = getattr(manager, "_agentsdock_callers", None)
+    if not isinstance(users, weakref.WeakKeyDictionary):
+        users = manager._agentsdock_callers = weakref.WeakKeyDictionary()
+    if task not in users:
+        task.add_done_callback(lambda _task: schedule_codex_manager_drain())
+    users[task] = session_id
+
+
+def codex_manager_has_callers(manager: CodexAppServerManager, session_id: str | None = None) -> bool:
+    return any(not task.done() and (session_id is None or not owner or owner == session_id)
+               for task, owner in tuple(getattr(manager, "_agentsdock_callers", {}).items()))
+
+
+def codex_manager_has_callbacks(manager: CodexAppServerManager) -> bool:
+    tasks = [task for task in manager.client._callback_tasks if not task.done()]
+    for task in tasks:
+        if not getattr(task, "_agentsdock_drain_watched", False):
+            task._agentsdock_drain_watched = True
+            task.add_done_callback(lambda _task: schedule_codex_manager_drain())
+    return bool(tasks)
+
+
+def schedule_codex_manager_drain(_notification: Any = None) -> None:
+    global CODEX_MANAGER_DRAIN_TASK, CODEX_MANAGER_DRAIN_REQUESTED
+    if CODEX_MANAGER_CLOSING or not CODEX_RETIRED_APP_SERVER_MANAGERS:
+        return
+    if isinstance(_notification, dict) and _notification.get("method") not in {
+        "turn/completed", "thread/closed", "thread/goal/updated", "thread/status/changed",
+    }:
+        return
+    CODEX_MANAGER_DRAIN_REQUESTED = True
+    if CODEX_MANAGER_DRAIN_TASK is None or CODEX_MANAGER_DRAIN_TASK.done():
+        CODEX_MANAGER_DRAIN_TASK = asyncio.create_task(drain_retired_codex_managers())
+
+
+async def refresh_codex_app_server_binary(*, force: bool = False) -> None:
+    """Change admission, never interrupt a process that still owns work."""
+    global CODEX_BINARY_IDENTITY, CODEX_BINARY_CHECKED_AT, CODEX_APP_SERVER_MANAGER
+    if CODEX_TRANSPORT == CODEX_TRANSPORT_EXEC or CODEX_AUTH_LOCK.locked() or CODEX_MANAGER_CLOSING:
+        return
+    async with CODEX_BINARY_PROBE_LOCK:
+        if not force and time.monotonic() - CODEX_BINARY_CHECKED_AT < 30.0:
+            return
+        identity = await asyncio.to_thread(codex_binary_identity)
+        CODEX_BINARY_CHECKED_AT = time.monotonic()
+        if identity is None:
+            return  # A failed/mid-install probe must not disturb working clients.
+        async with CODEX_GOALS_CONFIG_LOCK:
+            async with CODEX_APP_SERVER_MANAGER_LOCK:
+                if CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH is not None or CODEX_AUTH_LOCK.locked() or CODEX_MANAGER_CLOSING:
+                    return
+                previous = CODEX_BINARY_IDENTITY
+                CODEX_BINARY_IDENTITY = identity
+                for revision, manager in ((None, CODEX_APP_SERVER_MANAGER), *tuple(CODEX_CUSTOM_APP_SERVER_MANAGERS.items())):
+                    launched = getattr(manager, "_agentsdock_binary_identity", None) or previous
+                    if manager is not None and launched is not None and launched != identity:
+                        CODEX_RETIRED_APP_SERVER_MANAGERS.append(manager)
+                        if revision is None:
+                            CODEX_APP_SERVER_MANAGER = None
+                        else:
+                            CODEX_CUSTOM_APP_SERVER_MANAGERS.pop(revision, None)
+    schedule_codex_manager_drain()
+
+
+def codex_manager_session_busy(manager: CodexAppServerManager, session_id: str) -> bool:
+    session = STORE.sessions.get(session_id) or {}
+    return bool(
+        session_id in BUSY_SESSIONS or ACTIVE.get(session_id) is not None
+        or session_id in SERVER_MAINTENANCE_SESSIONS
+        or codex_manager_has_callers(manager, session_id)
+        or codex_manager_has_callbacks(manager)
+        or any(session_registry_has_live_tasks(registry, session_id) for registry in (
+            SESSION_TURN_TASKS, CODEX_NATIVE_ACTION_TASKS, CODEX_INTERACTION_HANDLER_TASKS))
+        or any(item.get("session_id") == session_id for item in CODEX_PENDING_INTERACTIONS.values())
+        or (isinstance(session.get("codex_goal"), dict)
+            and session["codex_goal"].get("status") == "active")
+        or codex_session_has_live_subagents(session_id)
+    )
+
+
+async def drain_retired_codex_managers() -> None:
+    """Event-driven, bounded idle cleanup; failed proof retains the old owner."""
+    global CODEX_MANAGER_DRAIN_REQUESTED
+    while CODEX_MANAGER_DRAIN_REQUESTED:
+        CODEX_MANAGER_DRAIN_REQUESTED = False
+        if CODEX_AUTH_LOCK.locked() or CODEX_GOALS_RECONFIGURING or CODEX_MANAGER_CLOSING:
+            return
+        if CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH is not None:
+            return
+        for manager in tuple(CODEX_RETIRED_APP_SERVER_MANAGERS):
+            for session_id, owner in tuple(CODEX_SESSION_APP_SERVER_MANAGERS.items()):
+                if owner is not manager or codex_manager_session_busy(manager, session_id):
+                    continue
+                lock = session_lifecycle_lock(session_id)
+                if lock.locked():
+                    continue  # Never invert the session -> manager lock order.
+                async with lock:
+                    if codex_manager_session_busy(manager, session_id):
+                        continue
+                    SERVER_MAINTENANCE_SESSIONS.add(session_id)
+                    try:
+                        threads = [thread for thread in tuple(manager.client._loaded_threads)
+                                   if codex_session_id_for_thread(thread) == session_id]
+                        for thread in threads:
+                            if (thread in CODEX_APP_SERVER_PINNED_THREADS
+                                    or thread in CODEX_INTERACTIVE_CONTROL_THREADS
+                                    or manager.active_turn(thread) is not None):
+                                break
+                            try:
+                                goal = await asyncio.wait_for(manager.get_thread_goal(thread), timeout=3.0)
+                            except CodexAppServerRequestError as exc:
+                                if exc.code not in {-32600, -32601}:
+                                    raise
+                                goal = None
+                            if isinstance(goal, dict) and goal.get("status") == "active":
+                                break
+                            try:
+                                terminals = await asyncio.wait_for(manager.list_background_terminals(thread), timeout=3.0)
+                            except CodexAppServerRequestError as exc:
+                                if exc.code not in {-32600, -32601}:
+                                    raise
+                                terminals = []
+                            if terminals or not await evict_codex_app_server_thread(manager, thread, reinsert_on_failure=True):
+                                break
+                        else:
+                            if (CODEX_SESSION_APP_SERVER_MANAGERS.get(session_id) is manager
+                                    and not codex_manager_has_callers(manager, session_id)
+                                    and not codex_manager_has_callbacks(manager)):
+                                CODEX_SESSION_APP_SERVER_MANAGERS.pop(session_id, None)
+                                CODEX_GOAL_SYNC_GENERATIONS.pop(session_id, None)
+                    except Exception:
+                        logger.debug("Codex CLI refresh retained an unverified idle owner", exc_info=True)
+                    finally:
+                        SERVER_MAINTENANCE_SESSIONS.discard(session_id)
+            client = manager.client
+            if (any(owner is manager for owner in CODEX_SESSION_APP_SERVER_MANAGERS.values())
+                    or codex_manager_has_callers(manager) or client._loaded_threads
+                    or client._pending or client._server_request_tasks or codex_manager_has_callbacks(manager)
+                    or any(not turn._completed for turn in client._turns_by_thread.values())):
+                continue
+            # Keep the exact object registered until close has settled;
+            # shutdown can still discover and close it on cancellation.
+            await manager.close()
+            CODEX_RETIRED_APP_SERVER_MANAGERS.remove(manager)
 
 
 def existing_codex_app_server_manager(sess: dict[str, Any] | None = None) -> CodexAppServerManager | None:
+    revision = None
     if sess is not None and codex_provider.session_choice(sess.get("codex_provider")) == "custom":
         revision = sess.get("codex_provider_revision")
-        if revision:
-            return CODEX_CUSTOM_APP_SERVER_MANAGERS.get(revision)
-        try:
-            selected = CODEX_PROVIDER_STORE.for_session(sess)
-            return CODEX_CUSTOM_APP_SERVER_MANAGERS.get(selected["credential_id"])
-        except HTTPException:
-            return None
-    return CODEX_APP_SERVER_MANAGER
+        if not revision:
+            try:
+                revision = CODEX_PROVIDER_STORE.for_session(sess)["credential_id"]
+            except HTTPException:
+                return None
+    session_id = str((sess or {}).get("id") or "")
+    owner = CODEX_SESSION_APP_SERVER_MANAGERS.get(session_id)
+    if not (owner is not None and any(owner is item for item in codex_app_server_managers())
+            and getattr(owner, "_agentsdock_provider_revision", None) == revision):
+        thread_id = str(session_provider_id(sess) or "") if sess else ""
+        owner = next((item for item in codex_app_server_managers()
+                      if thread_id and item.is_thread_loaded(thread_id)
+                      and getattr(item, "_agentsdock_provider_revision", None) == revision), None)
+    manager = owner or (CODEX_CUSTOM_APP_SERVER_MANAGERS.get(revision) if revision else CODEX_APP_SERVER_MANAGER)
+    return manager
 
 
 def existing_codex_app_server_manager_for_thread(thread_id: str) -> CodexAppServerManager | None:
     session_id = codex_session_id_for_thread(thread_id)
     if session_id and session_id in STORE.sessions:
         return existing_codex_app_server_manager(STORE.sessions[session_id])
+    manager = next((item for item in codex_app_server_managers() if item.is_thread_loaded(thread_id)), None)
+    if manager is not None:
+        return manager
     selected = CODEX_PROVIDER_STORE.for_thread(thread_id)
-    if selected:
-        return CODEX_CUSTOM_APP_SERVER_MANAGERS.get(selected["credential_id"])
-    return next((manager for manager in codex_app_server_managers()
-        if manager.is_thread_loaded(thread_id)), None)
+    return CODEX_CUSTOM_APP_SERVER_MANAGERS.get(selected["credential_id"]) if selected else None
 
 
 async def codex_app_server_manager_for_thread(thread_id: str) -> CodexAppServerManager:
     session_id = codex_session_id_for_thread(thread_id)
     if session_id and session_id in STORE.sessions:
         return await codex_app_server_manager(STORE.sessions[session_id])
+    owner = existing_codex_app_server_manager_for_thread(thread_id)
+    if owner is not None:
+        retain_codex_manager_caller(owner, "")
+        return owner
     selected = CODEX_PROVIDER_STORE.for_thread(thread_id)
     return await codex_app_server_manager({"codex_provider": "custom",
         "codex_provider_revision": selected["credential_id"],
         "codex_provider_binding": codex_provider.binding(selected)} if selected else None)
+
+
+async def prepare_codex_app_server_process(manager: CodexAppServerManager, selected: dict | None) -> None:
+    manager._agentsdock_binary_identity = await asyncio.to_thread(codex_binary_identity)
+    if selected:
+        await codex_provider.prepare_native_catalog(
+            CODEX_BIN, codex_app_server_env(), CODEX_PROVIDER_STORE.root / "native-models.json")
 
 
 async def codex_app_server_manager(sess: dict[str, Any] | None = None) -> CodexAppServerManager:
@@ -54113,15 +54341,26 @@ async def codex_app_server_manager(sess: dict[str, Any] | None = None) -> CodexA
     global CODEX_APP_SERVER_MANAGER
     global CODEX_APP_SERVER_MANAGER_EPOCH
     ensure_provider_manager_factory_admission(codex=True)
+    await refresh_codex_app_server_binary()
     selected = CODEX_PROVIDER_STORE.for_session(sess, include_key=True) if sess is not None else None
     revision = selected["credential_id"] if selected else None
+    session_id = str((sess or {}).get("id") or "")
     # Goal enablement is a process launch flag. Manager lookup therefore takes
     # the same barrier as configuration replacement, including the fast path;
     # no caller can retain/create the old generation halfway through a toggle.
     async with CODEX_GOALS_CONFIG_LOCK:
         ensure_provider_manager_factory_admission(codex=True)
-        manager = CODEX_CUSTOM_APP_SERVER_MANAGERS.get(revision) if revision else CODEX_APP_SERVER_MANAGER
+        manager = existing_codex_app_server_manager(sess) if sess is not None else None
+        if manager is not None and (not any(manager is item for item in codex_app_server_managers())
+                                   or getattr(manager, "_agentsdock_provider_revision", None) != revision):
+            CODEX_SESSION_APP_SERVER_MANAGERS.pop(session_id, None)
+            manager = None
+        manager = manager or (CODEX_CUSTOM_APP_SERVER_MANAGERS.get(revision) if revision else CODEX_APP_SERVER_MANAGER)
         if manager is not None:
+            if session_id:
+                CODEX_SESSION_APP_SERVER_MANAGERS[session_id] = manager
+            retain_codex_manager_caller(manager, session_id)
+            schedule_codex_manager_drain()
             return manager
         async with CODEX_APP_SERVER_MANAGER_LOCK:
             ensure_provider_manager_factory_admission(codex=True)
@@ -54139,16 +54378,16 @@ async def codex_app_server_manager(sess: dict[str, Any] | None = None) -> CodexA
                             "model_catalog_json": str(CODEX_PROVIDER_STORE.root / "native-models.json"),
                         }) if selected else ())
                     ),
-                    before_start=(lambda: codex_provider.prepare_native_catalog(
-                        CODEX_BIN, codex_app_server_env(), CODEX_PROVIDER_STORE.root / "native-models.json",
-                    )) if selected else None,
+                    before_start=lambda: prepare_codex_app_server_process(manager, selected),
                     request_timeout=CODEX_APP_SERVER_TIMEOUT_SECONDS,
                     lifecycle_timeout=CODEX_APP_SERVER_LIFECYCLE_TIMEOUT_SECONDS,
                     process_stream_limit=CODEX_APP_SERVER_JSONL_LIMIT_BYTES,
                     notification_queue_limit=(
                         CODEX_APP_SERVER_NOTIFICATION_QUEUE_LIMIT
                     ),
-                    server_request_handler=handle_codex_server_request,
+                    server_request_handler=lambda request_id, method, params: handle_codex_server_request(
+                        request_id, method, params, source_manager=manager),
+                    notification_guard=lambda notification: codex_manager_owns_notification(manager, notification),
                     initialize_params={
                         "clientInfo": {
                             "name": "agents_server",
@@ -54169,11 +54408,17 @@ async def codex_app_server_manager(sess: dict[str, Any] | None = None) -> CodexA
                 if selected:
                     manager.client._authentication_submitted = True
                 manager.add_notification_handler(cache_codex_approval_item)
+                manager.add_notification_handler(schedule_codex_manager_drain)
+                manager._agentsdock_binary_identity = CODEX_BINARY_IDENTITY
+                manager._agentsdock_provider_revision = revision
                 CODEX_APP_SERVER_MANAGER_EPOCH += 1
                 if revision:
                     CODEX_CUSTOM_APP_SERVER_MANAGERS[revision] = manager
                 else:
                     CODEX_APP_SERVER_MANAGER = manager
+            if session_id:
+                CODEX_SESSION_APP_SERVER_MANAGERS[session_id] = manager
+            retain_codex_manager_caller(manager, session_id)
             return manager
 
 
@@ -54633,68 +54878,85 @@ async def interrupt_claude_sdk_run_bounded(
 
 
 async def close_codex_app_server_manager() -> None:
-    global CODEX_APP_SERVER_MANAGER
-    global CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH
-    await cancel_codex_interactions(resolution="server_closed")
-    await cancel_codex_native_actions()
-    async with CODEX_APP_SERVER_MANAGER_LOCK:
-        if CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH is not None:
-            raise RuntimeError("Codex provider cleanup is already in progress")
-        managers = codex_app_server_managers()
-        cleanup_epoch = CODEX_APP_SERVER_MANAGER_EPOCH
-        CODEX_APP_SERVER_MANAGER = None
-        CODEX_CUSTOM_APP_SERVER_MANAGERS.clear()
-        CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH = cleanup_epoch
-    async with CODEX_APP_SERVER_THREAD_LRU_LOCK:
-        for event in CODEX_APP_SERVER_EVICTING_THREADS.values():
-            event.set()
-        CODEX_APP_SERVER_EVICTING_THREADS.clear()
-        CODEX_APP_SERVER_THREAD_LRU.clear()
-        CODEX_APP_SERVER_PINNED_THREADS.clear()
-        CODEX_APP_SERVER_THREAD_PIN_COUNTS.clear()
-        CODEX_APP_SERVER_INVALIDATED_THREADS.clear()
-    if managers:
-        await asyncio.gather(*(manager.close() for manager in managers))
-    shutdown_tasks = [
-        task
-        for registry in (
-            SESSION_TURN_TASKS,
-            CODEX_INTERACTION_HANDLER_TASKS,
-            CLAUDE_INTERACTION_HANDLER_TASKS,
-        )
-        for tasks in tuple(registry.values())
-        for task in tuple(tasks)
-        if not task.done()
-    ]
-    if shutdown_tasks:
-        _done, pending = await asyncio.wait(
-            shutdown_tasks,
-            timeout=max(0.01, CODEX_SESSION_CLEANUP_TIMEOUT_SECONDS),
-        )
-        for task in pending:
-            task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-    # Closing the provider releases ordinary turns, whose finalizers may touch
-    # or unpin their thread after the initial shutdown clear. Clear a second
-    # time so a future manager generation cannot inherit stale LRU state.
-    async with CODEX_APP_SERVER_THREAD_LRU_LOCK:
-        for event in CODEX_APP_SERVER_EVICTING_THREADS.values():
-            event.set()
-        CODEX_APP_SERVER_EVICTING_THREADS.clear()
-        CODEX_APP_SERVER_THREAD_LRU.clear()
-        CODEX_APP_SERVER_PINNED_THREADS.clear()
-        CODEX_APP_SERVER_THREAD_PIN_COUNTS.clear()
-        CODEX_APP_SERVER_INVALIDATED_THREADS.clear()
-    CODEX_APPROVAL_ITEM_CACHE.clear()
-    CODEX_INTERACTIVE_CONTROL_THREADS.clear()
-    CODEX_INTERACTIVE_CONTROL_THREAD_COUNTS.clear()
-    CODEX_PERMISSION_PROFILES_CACHE.clear()
-    CODEX_QUARANTINED_GOAL_THREADS.clear()
-    await reset_codex_ephemeral_runtime_metadata()
-    async with CODEX_APP_SERVER_MANAGER_LOCK:
-        if CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH == cleanup_epoch:
-            CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH = None
+    global CODEX_MANAGER_CLOSING
+    if CODEX_MANAGER_CLOSING:
+        raise RuntimeError("Codex provider cleanup is already in progress")
+    CODEX_MANAGER_CLOSING = True
+    try:
+        global CODEX_APP_SERVER_MANAGER
+        global CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH
+        global CODEX_MANAGER_DRAIN_TASK, CODEX_MANAGER_DRAIN_REQUESTED
+        CODEX_MANAGER_DRAIN_REQUESTED = False
+        drain_task = CODEX_MANAGER_DRAIN_TASK
+        CODEX_MANAGER_DRAIN_TASK = None
+        if drain_task is not None and not drain_task.done():
+            drain_task.cancel()
+            await asyncio.gather(drain_task, return_exceptions=True)
+        await cancel_codex_interactions(resolution="server_closed")
+        await cancel_codex_native_actions()
+        async with CODEX_APP_SERVER_MANAGER_LOCK:
+            if CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH is not None:
+                raise RuntimeError("Codex provider cleanup is already in progress")
+            managers = codex_app_server_managers()
+            cleanup_epoch = CODEX_APP_SERVER_MANAGER_EPOCH
+            CODEX_APP_SERVER_MANAGER = None
+            CODEX_CUSTOM_APP_SERVER_MANAGERS.clear()
+            CODEX_RETIRED_APP_SERVER_MANAGERS.clear()
+            CODEX_SESSION_APP_SERVER_MANAGERS.clear()
+            CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH = cleanup_epoch
+        async with CODEX_APP_SERVER_THREAD_LRU_LOCK:
+            for event in CODEX_APP_SERVER_EVICTING_THREADS.values():
+                event.set()
+            CODEX_APP_SERVER_EVICTING_THREADS.clear()
+            CODEX_APP_SERVER_THREAD_LRU.clear()
+            CODEX_APP_SERVER_PINNED_THREADS.clear()
+            CODEX_APP_SERVER_THREAD_PIN_COUNTS.clear()
+            CODEX_APP_SERVER_INVALIDATED_THREADS.clear()
+        if managers:
+            await asyncio.gather(*(manager.close() for manager in managers))
+        shutdown_tasks = [
+            task
+            for registry in (
+                SESSION_TURN_TASKS,
+                CODEX_INTERACTION_HANDLER_TASKS,
+                CLAUDE_INTERACTION_HANDLER_TASKS,
+            )
+            for tasks in tuple(registry.values())
+            for task in tuple(tasks)
+            if not task.done()
+        ]
+        if shutdown_tasks:
+            _done, pending = await asyncio.wait(
+                shutdown_tasks,
+                timeout=max(0.01, CODEX_SESSION_CLEANUP_TIMEOUT_SECONDS),
+            )
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        # Closing the provider releases ordinary turns, whose finalizers may touch
+        # or unpin their thread after the initial shutdown clear. Clear a second
+        # time so a future manager generation cannot inherit stale LRU state.
+        async with CODEX_APP_SERVER_THREAD_LRU_LOCK:
+            for event in CODEX_APP_SERVER_EVICTING_THREADS.values():
+                event.set()
+            CODEX_APP_SERVER_EVICTING_THREADS.clear()
+            CODEX_APP_SERVER_THREAD_LRU.clear()
+            CODEX_APP_SERVER_PINNED_THREADS.clear()
+            CODEX_APP_SERVER_THREAD_PIN_COUNTS.clear()
+            CODEX_APP_SERVER_INVALIDATED_THREADS.clear()
+        CODEX_APPROVAL_ITEM_CACHE.clear()
+        CODEX_INTERACTIVE_CONTROL_THREADS.clear()
+        CODEX_INTERACTIVE_CONTROL_THREAD_COUNTS.clear()
+        CODEX_PERMISSION_PROFILES_CACHE.clear()
+        CODEX_QUARANTINED_GOAL_THREADS.clear()
+        await reset_codex_ephemeral_runtime_metadata()
+        async with CODEX_APP_SERVER_MANAGER_LOCK:
+            if CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH == cleanup_epoch:
+                CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH = None
+
+    finally:
+        CODEX_MANAGER_CLOSING = False
 
 
 def codex_control_http_error(exc: Exception) -> HTTPException:
@@ -58090,7 +58352,7 @@ async def reconcile_codex_thread_goal(
 
     generation_value = getattr(manager, "generation", 0)
     generation = generation_value if isinstance(generation_value, int) else 0
-    sync_key = (generation, thread_id)
+    sync_key = (id(manager), generation, thread_id)
     session = STORE.sessions.get(session_id) or {}
     if (
         expected_goal is None
@@ -82190,7 +82452,10 @@ async def host_diagnostics(limit: int = 40) -> dict[str, Any]:
 
 @app.get("/api/runtime/catalog")
 async def runtime_catalog(refresh: bool = False) -> dict[str, Any]:
-    return await asyncio.to_thread(discover_runtime_catalog, force_runtime_probe=refresh)
+    catalog = await asyncio.to_thread(discover_runtime_catalog, force_runtime_probe=refresh)
+    if refresh:
+        await refresh_codex_app_server_binary(force=True)
+    return catalog
 
 
 @app.get("/api/sessions/{session_id}/terminal")
@@ -90271,7 +90536,7 @@ async def pause_active_codex_goal_for_stop(
     )
     generation_value = getattr(manager, "generation", 0)
     generation = generation_value if isinstance(generation_value, int) else 0
-    CODEX_GOAL_SYNC_GENERATIONS[session_id] = (generation, thread_id)
+    CODEX_GOAL_SYNC_GENERATIONS[session_id] = (id(manager), generation, thread_id)
     return True, True, None
 
 

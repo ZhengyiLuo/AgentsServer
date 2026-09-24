@@ -562,6 +562,7 @@ class CodexAppServerClient:
         process_factory: ProcessFactory | None = None,
         before_start: Callable[[], Awaitable[Any]] | None = None,
         server_request_handler: ServerRequestHandler | None = None,
+        notification_guard: Callable[[dict[str, Any]], bool] | None = None,
         initialize_params: dict[str, Any] | None = None,
         on_process_started: ProcessLifecycleHook | None = None,
         on_process_exited: ProcessLifecycleHook | None = None,
@@ -599,6 +600,7 @@ class CodexAppServerClient:
         # arbitrary/recycled PIDs, so never derive a signal target from them.
         self._owns_spawned_process_groups = process_factory is None and os.name == "posix"
         self._server_request_handler = server_request_handler or decline_server_request
+        self._notification_guard = notification_guard
         self._initialize_params = initialize_params or {
             "clientInfo": {
                 "name": "agents_server",
@@ -1457,7 +1459,14 @@ class CodexAppServerClient:
                 "at": time.time(),
             })
 
-        for handler in tuple(self._notification_handlers):
+        handlers = tuple(self._notification_handlers)
+        try:
+            allowed = self._notification_guard is None or self._notification_guard(notification)
+        except Exception:
+            allowed = False
+        if not allowed:
+            handlers = ()
+        for handler in handlers:
             owner = (handler, thread_id or "")
             previous = self._callback_tails.get(owner)
             if previous is None:
@@ -1530,6 +1539,8 @@ class CodexAppServerClient:
                 # notification already received for the same handler.
                 pass
         try:
+            if self._notification_guard is not None and not self._notification_guard(notification):
+                return
             result = handler(notification)
         except Exception:
             return
@@ -2696,6 +2707,7 @@ class CodexAppServerManager:
         process_factory: ProcessFactory | None = None,
         before_start: Callable[[], Awaitable[Any]] | None = None,
         server_request_handler: ServerRequestHandler | None = None,
+        notification_guard: Callable[[dict[str, Any]], bool] | None = None,
         initialize_params: dict[str, Any] | None = None,
         on_process_started: ProcessLifecycleHook | None = None,
         on_process_exited: ProcessLifecycleHook | None = None,
@@ -2715,6 +2727,7 @@ class CodexAppServerManager:
             process_factory=process_factory,
             before_start=before_start,
             server_request_handler=server_request_handler,
+            notification_guard=notification_guard,
             initialize_params=initialize_params,
             on_process_started=on_process_started,
             on_process_exited=on_process_exited,

@@ -140,6 +140,16 @@ class PendingPreparationTests(unittest.TestCase):
         (source / "install.sh").write_text("#!/bin/bash\n# --instance)\n")
         (source / "server_instances.py").write_text("INSTANCE_PROTOCOL = 1\n")
         (source / "execution_preparation.py").write_text("# split-capable release\n")
+        content = b"synthetic"
+        self.manifest["archive"].update(sha256=hashlib.sha256(content).hexdigest(), size=len(content))
+        self.manifest["npm"]["integrity"] = "sha512-" + base64.b64encode(hashlib.sha512(content).digest()).decode()
+        document = json.dumps(self.manifest).encode()
+        status = json.loads(self.status_path.read_text())
+        status["_npm_release"] = {
+            "manifest_base64": base64.b64encode(document).decode(),
+            "signature_base64": base64.b64encode(self.private.sign(document)).decode(),
+        }
+        update_runner.atomic_json(self.status_path, status)
         with patch.dict(os.environ, {"AGENTS_SERVER_INSTANCE": "work"}), \
                 patch.object(update_runner, "download_npm_archive", return_value=b"synthetic") as download, \
                 patch.object(update_runner, "safe_extract", return_value=source), \

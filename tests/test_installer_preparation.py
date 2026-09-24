@@ -31,7 +31,7 @@ class InstallerPreparationTests(unittest.TestCase):
         (self.source/'agent_server.py').write_text('API_CONTRACT_VERSION = 28\n')
         # The actual branch copies these mandatory executable helpers.
         for name in ('agentsdock_jobs.py','agentsdock_chats.py','agentsdock_emergency.py','agentsdock_publish.py',
-                     'agentsdock_mail.py','agentsdock_team.py','install.sh','uninstall.sh','update_runner.py'):
+                     'agentsdock_mail.py','agentsdock_team.py','install.sh','uninstall.sh','instances.sh','update_runner.py'):
             self.names.append(name); (self.source/name).write_text('# fixture\n')
         (self.source/"agentsdock_team_hub").mkdir()
         (self.source/"agentsdock_team_hub/__init__.py").write_text("# package fixture\n")
@@ -43,7 +43,7 @@ class InstallerPreparationTests(unittest.TestCase):
         self.block = code[code.index('# Recovery never restages'):code.index('\nPRESERVE_SOURCE=""',code.index('# Recovery never restages'))]
 
     def script(self, *, activate=False, recover=False):
-        variables = dict(INSTALL_ROOT=str(self.root), RELEASES_ROOT=str(self.root/'releases'),
+        variables = dict(INSTANCE_NAME="default", INSTALL_ROOT=str(self.root), RELEASES_ROOT=str(self.root/'releases'),
             RELEASE_VERSION='2.0.0', REQUESTED_RELEASE_VERSION='2.0.0', EXPECTED_API_CONTRACT='28',
             STAGE_DIR=str(self.root/'releases/.staging-2.0.0-test'), STAGE_DIR_DEVICE='', STAGE_DIR_INODE='',
             CANDIDATE_RUNTIME_ROOT='', SOURCE_DIR=str(self.source), CONFIG_ROOT=str(self.config),
@@ -73,14 +73,14 @@ migrate_legacy_state() {{ printf '%s\\n' "$STAGE_DIR" > {shlex.quote(str(self.ba
         return subprocess.run(['/bin/bash','-c',self.script(**kwargs)], capture_output=True,text=True,
                               env={**os.environ,'PYTHONDONTWRITEBYTECODE':'1'}, timeout=30)
 
-    def test_prepared_runtime_generated_cache_requires_receipt_path_and_keeps_symlinks_rejected(self):
+    def test_source_cache_is_ignored_in_all_modes_and_symlinks_remain_rejected(self):
         code=(ROOT/'install.sh').read_text()
         block=code[code.index('for name in "${RELEASE_FILES[@]}"; do'):code.index('\ncurrent_release_binding()')]
         cache=self.source/'agentsdock_team_hub/__pycache__';cache.mkdir();(cache/'cli.cpython.pyc').write_bytes(b'generated cache')
         prefix='set -eu\nSOURCE_DIR='+shlex.quote(str(self.source))+'\nRELEASE_FILES=(VERSION)\nRELEASE_DIRECTORIES=(agentsdock_team_hub)\nTEAM_HUB_RELEASE_FILES=(__init__.py migrations/001.sql)\n'
         def check(prepared,recover=False):
             return subprocess.run(['/bin/bash','-c',prefix+'ACTIVATE_PREPARED='+shlex.quote(str(self.receipt) if prepared else '')+'\nRECOVER_ONLY='+('true' if recover else 'false')+'\n'+block],capture_output=True,text=True)
-        self.assertNotEqual(check(False).returncode,0)
+        self.assertEqual(check(False).returncode,0)
         self.assertEqual(check(True).returncode,0)
         self.assertEqual(check(False,True).returncode,0)
         (cache/'link').symlink_to(self.source/'VERSION')

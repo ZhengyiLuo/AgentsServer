@@ -23,6 +23,7 @@ NEW_MODULES = {
     "title_generation.py",
     "chat_mailbox.py",
     "claude_background_reconciliation.py",
+    "claude_model_catalog.py",
     "claude_goals.py",
     "team_mail_runtime.py", "team_mail_websocket.py",
     "team_mail_grants.py",
@@ -140,6 +141,13 @@ class ReleaseFileManifestTests(unittest.TestCase):
                 self.assertIn(f'"$STAGE_DIR/{name}"', self.installer)
                 self.assertIn(f"'$REMOTE_SERVER_DIR/{name}'", self.deployer)
                 self.assertIn(name.removesuffix(".py"), self.installer.split("PYTHONPATH=\"$STAGE_DIR\"")[-1])
+
+    def test_claude_native_catalog_is_import_smoked_before_activation(self):
+        module = "claude_model_catalog"
+        installer_smoke = self.installer.split('PYTHONPATH="$STAGE_DIR"')[-1]
+        deploy_smoke = self.deployer.split("PYTHONPATH='$REMOTE_SERVER_DIR'")[-1]
+        self.assertRegex(installer_smoke, rf"\bimport [^'\n;]*\b{module}\b")
+        self.assertRegex(deploy_smoke, rf"\bimport [^'\n;]*\b{module}\b")
 
     def test_frozen_hub_manifest_includes_new_migration_and_current_hashes(self):
         tree = ast.parse((ROOT / "test_team_hub_host.py").read_text())

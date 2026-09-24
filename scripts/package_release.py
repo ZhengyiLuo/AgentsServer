@@ -35,6 +35,8 @@ FILES = (
     "execution_service.py",
     "execution_transport.py",
     "agent_server.py",
+    "local_session_ownership.py",
+    "cursor_history.py",
     "workspace_git.py",
     "team_hub_host.py",
     "secure_peer_runtime.py",

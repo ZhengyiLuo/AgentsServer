@@ -78,6 +78,8 @@ import workspace_git
 import codex_auth
 import codex_provider
 import server_instances
+import local_session_ownership
+import cursor_history
 
 from codex_app_server import (
     CodexAppServerDisconnected,
@@ -6324,7 +6326,7 @@ PROVIDER_SESSION_IDENTIFIER_RE = re.compile(
 
 class BulkImportSessionItem(BaseModel):
     provider_session_id: str = Field(min_length=1, max_length=256)
-    backend: Literal["claude", "codex"]
+    backend: Literal["claude", "codex", "cursor"]
     cwd: str | None = Field(default=None, max_length=MAX_WORKSPACE_PATH_CHARS)
     title: str | None = Field(default=None, max_length=MAX_LOCAL_SESSION_LABEL_CHARS)
 
@@ -10530,11 +10532,34 @@ class SessionStore:
         ensure_codex_thread_not_pending_fork_cleanup(codex_thread_id)
         if backend == BACKEND_CODEX:
             CODEX_PROVIDER_STORE.require_thread(codex_thread_id, CODEX_PROVIDER_STORE.for_session(runtime))
+        resume_placeholder = f"Resumed {backend.title()} {str(active_provider_id)[:8]}"
+        # Older clients explicitly send this generated resume label. Recognize
+        # it only at creation; PATCH renames (even identical wording) stay manual.
+        # A staged import already chose a native title or preview. Preserve it
+        # even if its literal text happens to match an AgentsDock placeholder.
+        automatic_title = not req.title or (not initializing_import and (
+            req.title == "New chat" or (
+                bool(active_provider_id) and req.title == resume_placeholder
+            )
+        ))
+        provider_title = None
+        if active_provider_id and automatic_title and not (
+            parent_id or initializing_fork or initializing_import
+        ):
+            try:
+                provider_title = await asyncio.wait_for(asyncio.to_thread(
+                    read_native_session_title,
+                    {"backend": backend, "session_id": active_provider_id,
+                     "cwd": req.cwd or DEFAULT_CWD},
+                ), timeout=1.0)
+            except Exception as exc:
+                # A missing/busy/changed native store must not prevent resume.
+                logger.debug("resume title lookup skipped error=%s", type(exc).__name__)
         sid = f"sess_{uuid.uuid4().hex[:16]}"
         ensure_dirs(sid)
         now = now_iso()
-        title = req.title or (
-            f"Resumed {backend.title()} {str(active_provider_id)[:8]}" if active_provider_id else "New chat"
+        title = provider_title or req.title or (
+            resume_placeholder if active_provider_id else "New chat"
         )
         archived = bool(req.archived)
         pinned = bool(req.pinned) and not archived
@@ -10545,10 +10570,10 @@ class SessionStore:
             # Clients send "New chat" explicitly for an unnamed creation.
             # Older persisted titles without provenance are left alone.
             "_title_source": (
-                "placeholder" if not req.title or req.title == "New chat" else "manual"
+                "provider" if provider_title else "placeholder" if automatic_title else "manual"
             ),
             "_title_auto_value": (
-                title if not req.title or req.title == "New chat" else None
+                title if automatic_title else None
             ),
             "folder": req.folder or "General",
             "cwd": session_cwd,
@@ -46882,7 +46907,7 @@ def parse_claude_history(
     )
 
 
-def strip_agentsdock_provider_context(text: str) -> str:
+def strip_agentsdock_provider_context(text: str, *, allow_jobless_legacy: bool = False) -> str:
     """Remove launch-only context from a Codex transcript user message."""
     if not text.startswith("[AgentsDock context]"):
         return text
@@ -46905,11 +46930,19 @@ def strip_agentsdock_provider_context(text: str) -> str:
         max(scheduled_start, 0),
     )
     if scheduled_start < 0 or snapshot_start < 0:
-        return text
-    scheduled_end = remainder.find("\n\n", snapshot_start)
-    if scheduled_end < 0:
-        return text
-    remainder = remainder[scheduled_end + 2:]
+        # Early codex-exec prompts predate the jobs snapshot. Enable this
+        # only for display previews, not reconciliation/durable history keys.
+        # A bare bracket label or an ordinary human quotation is insufficient.
+        if not (allow_jobless_legacy and base_index <= 64 * 1024 and text.startswith((
+            "[AgentsDock context]\nYou are responding through AgentsDock, backed by AgentsServer.\n",
+            "[AgentsDock context]\nYou are operating through AgentsDock, backed by AgentsServer.\n",
+        ))):
+            return text
+    else:
+        scheduled_end = remainder.find("\n\n", snapshot_start)
+        if scheduled_end < 0:
+            return text
+        remainder = remainder[scheduled_end + 2:]
     if remainder.startswith("\n[Per-chat system instructions]\n"):
         remainder = remainder[1:]
     if remainder.startswith("[Per-chat system instructions]\n"):
@@ -47675,12 +47708,90 @@ def native_session_title(value: Any) -> str | None:
     return clean
 
 
+def claude_transcript_title(path: Path, provider_id: str) -> str | None:
+    """Prefer an exact-session custom name over its latest AI-generated title.
+
+    Share the bounded reader between import discovery and existing sessions;
+    never perform another whole-project scan for each import candidate.
+    """
+    custom_title = ai_title = None
+    for region in bounded_claude_transcript_regions(path):
+        for line in region.splitlines():
+            if len(line) > CLAUDE_TRANSCRIPT_CWD_LINE_BYTES:
+                continue
+            try:
+                event = json.loads(line)
+            except (ValueError, UnicodeDecodeError, RecursionError):
+                continue
+            if not isinstance(event, dict) or event.get("sessionId") != provider_id:
+                continue
+            if event.get("isSidechain") is True:
+                continue
+            if event.get("type") == "custom-title":
+                custom_title = native_session_title(event.get("customTitle"))
+            elif event.get("type") == "ai-title":
+                ai_title = native_session_title(event.get("aiTitle"))
+    return custom_title or ai_title
+
+
+def cursor_native_session_title(provider_id: str, cwd: Any) -> str | None:
+    """Read only Cursor CLI's small metadata row, not its conversation blobs.
+
+    Verified against CLI 2026.09.18: config/chats/md5(absolute cwd)/id/store.db,
+    meta['0'] contains hex-encoded UTF-8 JSON with agentId and name. This is an
+    optional private-format adapter: identity/schema/path drift keeps fallback.
+    No recursive scanning, CLI invocation, deserialization of executable data,
+    database migration, or conversation-blob decryption is needed. No metadata
+    other than the sanitized name leaves this function.
+    """
+    provider_id = provider_session_identifier(provider_id)
+    cwd = normalized_local_session_cwd(cwd)
+    if not provider_id or not cwd:
+        return None
+    config = os.environ.get("CURSOR_CONFIG_DIR", "").strip()
+    xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    config_root = Path(config) if config else Path(xdg) / "cursor" if xdg else Path.home() / ".cursor"
+    if not config_root.is_absolute():
+        config_root = Path(cwd) / config_root
+    bucket = hashlib.md5(cwd.encode("utf-8"), usedforsecurity=False).hexdigest()
+    root = config_root / "chats"
+    workspace = root / bucket
+    directory = workspace / provider_id
+    database = directory / "store.db"
+    try:
+        if any(path.is_symlink() for path in (root, workspace, directory, database)):
+            return None
+        if not database.is_file():
+            return None
+        connection = sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.05)
+        try:
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("PRAGMA trusted_schema = OFF")
+            connection.set_progress_handler(lambda: 1, 10000)
+            row = connection.execute(
+                "SELECT substr(value, 1, 32769) FROM meta "
+                "WHERE key = '0' AND typeof(value) = 'text'",
+            ).fetchone()
+        finally:
+            connection.close()
+        if not row or len(row[0]) > 32768:
+            return None
+        metadata = json.loads(bytes.fromhex(row[0]))
+        if not isinstance(metadata, dict) or metadata.get("agentId") != provider_id:
+            return None
+        if metadata.get("subagentInfo") is not None:
+            return None
+        return cursor_history.native_title(metadata.get("name"))
+    except (OSError, ValueError, RecursionError, sqlite3.Error):
+        return None
+
+
 def read_native_session_title(sess: dict[str, Any]) -> str | None:
     """Read existing native metadata only; never launch a CLI or model request.
 
     Missing/changed provider formats intentionally leave the prompt fallback.
-    Cursor stream-json has no title event; its private serialized store is not
-    decoded here. Claude and Codex use the same roots as history discovery.
+    Claude and Codex use the same roots as history discovery. Cursor reads only
+    exact-workspace, exact-session naming metadata, never conversation blobs.
     """
     backend = str(sess.get("backend") or DEFAULT_BACKEND)
     provider_id = provider_session_identifier(session_provider_id(sess))
@@ -47690,26 +47801,11 @@ def read_native_session_title(sess: dict[str, Any]) -> str | None:
         candidates = claude_history_candidates(provider_id)
         if len(candidates) != 1:
             return None
-        custom_title = ai_title = None
-        for region in bounded_claude_transcript_regions(candidates[0]):
-            for line in region.splitlines():
-                if len(line) > CLAUDE_TRANSCRIPT_CWD_LINE_BYTES:
-                    continue
-                try:
-                    event = json.loads(line)
-                except (ValueError, UnicodeDecodeError):
-                    continue
-                if not isinstance(event, dict) or event.get("sessionId") != provider_id:
-                    continue
-                if event.get("isSidechain") is True:
-                    continue
-                if event.get("type") == "custom-title":
-                    custom_title = native_session_title(event.get("customTitle"))
-                elif event.get("type") == "ai-title":
-                    ai_title = native_session_title(event.get("aiTitle"))
-        return custom_title or ai_title
+        return claude_transcript_title(candidates[0], provider_id)
     if backend == BACKEND_CODEX:
         return native_session_title(codex_session_index_thread_names().get(provider_id))
+    if backend == BACKEND_CURSOR:
+        return cursor_native_session_title(provider_id, sess.get("cwd"))
     if backend == "opencode":
         # Current native storage. A schema change, missing store, or busy DB
         # fails closed. mode=ro must never create or migrate a provider DB.
@@ -47910,7 +48006,10 @@ def local_session_label(value: Any, fallback: str) -> str:
             lambda match: " " if match[0].isspace() else "",
             str(candidate or ""),
         )
-        clean = compact_import_text(text).strip()
+        clean = compact_import_text("".join(
+            character for character in text
+            if character.isspace() or unicodedata.category(character) not in {"Cc", "Cf", "Cs"}
+        )).strip()
         if clean:
             return clean[:MAX_LOCAL_SESSION_LABEL_CHARS]
     # The Codex index probe uses an empty fallback to mean "no title" so a
@@ -47918,18 +48017,23 @@ def local_session_label(value: Any, fallback: str) -> str:
     return "Local chat" if fallback else ""
 
 
+
 def claude_transcript_is_subagent(path: Path) -> bool:
     # Older Claude versions also stored sidechains beside main transcripts.
-    # Inspect provider metadata, never the user's title or message text.
+    # Inspect conversation records, not copied title/summary metadata or text.
     for region in bounded_claude_transcript_regions(path):
         for raw_line in region.splitlines():
             if not raw_line or len(raw_line) > CLAUDE_TRANSCRIPT_CWD_LINE_BYTES:
                 continue
             try:
                 event = json.loads(raw_line)
-            except (json.JSONDecodeError, UnicodeDecodeError):
+            except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
                 continue
-            if isinstance(event, dict) and event.get("isSidechain") is True:
+            if not isinstance(event, dict) or event.get("type") not in {"user", "assistant"}:
+                continue
+            if event.get("sessionId") not in (None, path.stem):
+                continue
+            if event.get("isSidechain") is True:
                 return True
     return False
 
@@ -47954,11 +48058,11 @@ def local_claude_session_candidates(known_provider_ids: set[str]) -> list[dict[s
                 newest_paths[provider_id] = (mtime, path)
     for provider_id, (mtime, path) in newest_paths.items():
         cwd = normalized_local_session_cwd(claude_transcript_cwd(path))
-        preview = claude_transcript_preview(path)
-        folder_display = Path(cwd).name if cwd else path.parent.name
-        fallback = folder_display or f"Claude chat {provider_id[:8]}"
+        fallback = f"Claude chat {provider_id[:8]}"
+        title = claude_transcript_title(path, provider_id)
+        preview = None if title else claude_transcript_preview(path)
         label = local_session_label(
-            f"{folder_display}: {preview}" if preview else fallback,
+            title or preview,
             fallback,
         )
         candidates.append({
@@ -48018,7 +48122,15 @@ def codex_transcript_preview(path: Path) -> str | None:
                 break
             item = codex_history_event_item(event)
             if item is not None and item.get("kind") == "user" and item.get("provider_runtime_context") not in ("subagent_notification", "turn_aborted", "provider_notice"):
-                return item["text"][:160]
+                preview = item["text"]
+                record = codex_history_user_record(event)
+                if record is not None and not codex_user_item_has_human_provenance(record[0]):
+                    original = record[1].lstrip()
+                    unwrapped = strip_agentsdock_provider_context(original, allow_jobless_legacy=True)
+                    if unwrapped != original:
+                        preview = strip_agentsdock_generated_user_text(unwrapped, provider_history=True)
+                if preview.strip():
+                    return preview[:160]
     return None
 
 
@@ -48046,12 +48158,12 @@ def codex_session_index_thread_names() -> dict[str, str]:
                     continue
                 try:
                     entry = json.loads(raw_line)
-                except (json.JSONDecodeError, UnicodeDecodeError):
+                except (ValueError, UnicodeDecodeError, RecursionError):
                     continue
                 if not isinstance(entry, dict):
                     continue
                 provider_id = provider_session_identifier(entry.get("id"))
-                thread_name = local_session_label(entry.get("thread_name"), "")
+                thread_name = native_session_title(entry.get("thread_name"))
                 if provider_id and thread_name:
                     names[provider_id] = thread_name
     return names
@@ -48079,10 +48191,7 @@ def local_codex_session_candidates(known_provider_ids: set[str]) -> list[dict[st
     for provider_id, (mtime, path, cwd) in newest_paths.items():
         label = thread_names.get(provider_id)
         if not label:
-            preview = codex_transcript_preview(path)
-            folder_display = Path(cwd).name if cwd else path.stem
-            fallback = folder_display or f"Codex chat {provider_id[:8]}"
-            label = f"{folder_display}: {preview}" if preview else fallback
+            label = codex_transcript_preview(path)
         candidates.append({
             "provider_session_id": provider_id,
             "backend": BACKEND_CODEX,
@@ -48093,9 +48202,149 @@ def local_codex_session_candidates(known_provider_ids: set[str]) -> list[dict[st
     return candidates
 
 
+CURSOR_IMPORT_TOOL_BINDING_RE = re.compile(
+    r"\n\n\[AgentsDock tool binding\]\n"
+    r"For this turn only, use MCP server `(?P<server>plugin-agentsdock-[0-9a-f]{24}-native)`, tool `run` "
+    r"\(Cursor tool `(?P=server)-run`\) for AgentsDock helpers\. "
+    r"This supersedes older helper commands and earlier tool bindings\. "
+    r"No shell fallback, credential lookup, or full-access permission is needed\. "
+    r"Only this top-level agent may call it\.\n\[End AgentsDock tool binding\]\Z"
+)
+
+
+def cursor_import_user_preview(text: str) -> str:
+    """Unwrap a recognized server launch envelope for a display label only.
+
+    Do not use a generic bracket-removal regex. A standalone current-prompt
+    marker needs a validated generated authority/tool-binding suffix. Preserve
+    incomplete envelopes, ordinary quotations and markers inside the real prompt.
+    This does not rewrite provider transcripts or persisted/imported history.
+    """
+    original = text
+    normalized = text.strip()
+    candidate = strip_all_legacy_agentsdock_provider_authority_suffixes(
+        normalized, allow_portable_authority_root=True,
+    )
+    generated = candidate != normalized
+    binding = CURSOR_IMPORT_TOOL_BINDING_RE.search(candidate)
+    if binding is not None:
+        candidate = candidate[:binding.start()]
+        generated = True
+    header = (
+        "[AgentsDock provider instructions]\n"
+        "You are operating through AgentsDock, backed by AgentsServer.\n"
+    )
+    footer = "\n[End AgentsDock provider instructions]\n\n"
+    if candidate.startswith(header):
+        boundary = candidate.find(footer, len(header), 64 * 1024)
+        if boundary < 0:
+            return original
+        policy = candidate[len(header):boundary]
+        if "- Keep the final answer concise;" not in policy:
+            return original
+        candidate = candidate[boundary + len(footer):]
+        generated = True
+    if not generated:
+        return original
+    memory = re.match(r"\[Fork memory context; chars=(\d{1,8})\]\n", candidate)
+    if memory is not None:
+        memory_end = memory.end() + int(memory.group(1))
+        memory_footer = "\n[End Fork memory context]\n\n"
+        if not candidate.startswith(memory_footer, memory_end):
+            return original
+        candidate = candidate[memory_end + len(memory_footer):]
+    marker = "[Current user prompt]\n"
+    if candidate == marker.rstrip():
+        return ""
+    if candidate.startswith(marker):
+        return candidate[len(marker):]
+    return original
+
+
+def cursor_history_event_item(event: dict[str, Any], *, for_preview: bool = False) -> dict[str, Any] | None:
+    """Project only Cursor CLI's public text export, never internal blobs/tools."""
+    role = event.get("role")
+    if role not in {"user", "assistant"}:
+        return None
+    message = event.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return None
+    parts = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "text" or not isinstance(block.get("text"), str):
+            continue
+        text = block["text"]
+        if role == "user":
+            # Cursor's native export wraps human prompts. Raw user-role tool
+            # results, image reinjections and system context are not user turns.
+            match = re.fullmatch(
+                r"(?:<timestamp>[^<>\r\n]{1,128}</timestamp>\s*)?<user_query>(.*)</user_query>\s*",
+                text, flags=re.DOTALL,
+            )
+            if match is None:
+                continue
+            text = cursor_import_user_preview(match[1]) if for_preview else match[1]
+            text = strip_agentsdock_generated_user_text(text, provider_history=True)
+        parts.append(text)
+    return normalized_history_item(role, "\n".join(parts), allow_user_boilerplate=True)
+
+
+def cursor_initial_history(provider_id: str, cwd: str, limit: int | None = None) -> tuple[Path | None, list[dict[str, Any]]]:
+    session = cursor_history.find_session(provider_id, cwd)
+    if session is None:
+        return None, []
+    snapshot, _continued = provider_history_source_snapshot(session.transcript, None)
+    items: deque[dict[str, Any]] = deque(maxlen=normalized_history_import_limit(limit))
+    for event in bounded_jsonl_events_range(
+        session.transcript, 0, snapshot["source_offset"], expected_stat=snapshot["expected_stat"],
+    ):
+        item = cursor_history_event_item(event)
+        if item is not None:
+            # The export has no immutable message IDs. Identical consecutive
+            # public messages can be legitimate; never deduplicate by text here.
+            items.append(item)
+    return session.transcript, list(items)
+
+
+def local_cursor_session_candidates(known_provider_ids: set[str]) -> list[dict[str, Any]]:
+    candidates: dict[str, dict[str, Any]] = {}
+    ambiguous: set[str] = set()
+    for session in cursor_history.local_sessions():
+        provider_id = session.provider_id
+        if provider_id in known_provider_ids or provider_id in ambiguous:
+            continue
+        title = cursor_history.native_title(session.title)
+        preview = None
+        try:
+            for index, event in enumerate(bounded_jsonl_events(session.transcript)):
+                if index >= 200:
+                    break
+                item = cursor_history_event_item(event, for_preview=True)
+                if item is not None and item["kind"] == "user":
+                    preview = " ".join(item["text"].split())[:160]
+                    break
+        except (OSError, ValueError, RecursionError):
+            continue
+        label = local_session_label(title or preview, f"Cursor chat {provider_id[:8]}")
+        # Do not choose arbitrarily if a copied ID exists in multiple workspaces.
+        if provider_id in candidates:
+            candidates.pop(provider_id)
+            ambiguous.add(provider_id)
+            continue
+        candidates[provider_id] = {
+            "provider_session_id": provider_id, "backend": BACKEND_CURSOR,
+            "label": label,
+            "updated_at": iso_from_timestamp(session.updated_at), "cwd": session.cwd,
+        }
+    return list(candidates.values())
+
+
 def local_session_candidates(
     limit: int,
     known_provider_keys: set[tuple[str, str]] | None = None,
+    *,
+    include_cursor: bool = False,
 ) -> list[dict[str, Any]]:
     """Enumerate sessions not already used by this or another local instance."""
 
@@ -48103,7 +48352,7 @@ def local_session_candidates(
         known_provider_keys = {
             key
             for sess in STORE.sessions.values()
-            for key in server_instances.provider_session_keys(sess, DEFAULT_BACKEND)
+            for key in local_session_ownership.provider_session_keys(sess, DEFAULT_BACKEND)
         }
     known_provider_keys = known_provider_keys | other_local_instance_provider_keys()
     claude_known = {
@@ -48120,13 +48369,17 @@ def local_session_candidates(
         *local_claude_session_candidates(claude_known),
         *local_codex_session_candidates(codex_known),
     ]
+    if include_cursor:
+        candidates.extend(local_cursor_session_candidates({
+            provider_id for backend, provider_id in known_provider_keys if backend == BACKEND_CURSOR
+        }))
     candidates.sort(key=lambda c: c["updated_at"], reverse=True)
     return candidates[:max(1, min(limit, MAX_LOCAL_SESSION_LIST_ITEMS))]
 
 
 def other_local_instance_provider_keys() -> set[tuple[str, str]]:
     try:
-        return server_instances.other_instance_provider_keys(STATE_DIR)
+        return local_session_ownership.other_instance_provider_keys(STATE_DIR)
     except (OSError, ValueError) as exc:
         logger.warning("local import ownership check failed: %s", exc)
         raise HTTPException(
@@ -48137,7 +48390,7 @@ def other_local_instance_provider_keys() -> set[tuple[str, str]]:
 
 @contextmanager
 def local_history_import_guard():
-    guard = server_instances.history_import_lock()
+    guard = local_session_ownership.history_import_lock()
     try:
         guard.__enter__()
     except (OSError, ValueError) as exc:
@@ -50001,6 +50254,22 @@ async def import_session_history(sess: dict[str, Any], *, force: bool = False, l
     backend = (sess.get("backend") or DEFAULT_BACKEND).lower()
     if not provider_id:
         return {"imported": 0, "source_path": None, "message": "No provider session ID set."}
+    if backend == BACKEND_CURSOR:
+        # Initial public-text snapshot only. The private native store, not these
+        # display messages, supplies resume context. Cursor exports are rewritable
+        # and lack stable event IDs; do not enable automatic history reconciliation
+        # or force replay through the append-only Claude/Codex cursor machinery.
+        if await asyncio.to_thread(lambda: any(
+            event.get("type") == "history_imported" for event in iter_session_events(session_id)
+        )):
+            return {"imported": 0, "source_path": None, "message": "Cursor initial history already imported."}
+        try:
+            source, items = await asyncio.to_thread(cursor_initial_history, provider_id, str(sess.get("cwd") or ""), limit)
+        except (OSError, ValueError, RecursionError):
+            return {"imported": 0, "source_path": None, "message": "Cursor local history is unavailable; native resume is unchanged."}
+        if source is None or not items:
+            return {"imported": 0, "source_path": None, "message": "No readable Cursor CLI history was found for this ID and workspace."}
+        return await append_imported_history(sess, source, items)
     if not force and any(event.get("type") == "history_imported" for event in read_events(session_id, limit=10000)):
         return {"imported": 0, "source_path": None, "message": "History already imported."}
 
@@ -80742,6 +81011,14 @@ async def health() -> dict[str, Any]:
                 "max_batch_items": MAX_BULK_IMPORT_ITEMS,
                 "max_list_items": MAX_LOCAL_SESSION_LIST_ITEMS,
             },
+            "local_session_import_cursor_v1": {
+                "available": True,
+                "required": False,
+                "message": "Cursor CLI discovery and native resume with an initial public-text history snapshot are available; request include_cursor=true.",
+                "action": None,
+                "version": 1,
+                "history_mode": "initial_text_snapshot",
+            },
             "session_fork_completed_prefix_v1": {
                 "available": True,
                 "version": 1,
@@ -85353,7 +85630,7 @@ async def complete_working_directory(
 
 @app.post("/api/sessions")
 async def create_session(req: CreateSessionRequest) -> dict[str, Any]:
-    provider_keys = server_instances.provider_session_keys(req.model_dump(), DEFAULT_BACKEND)
+    provider_keys = local_session_ownership.provider_session_keys(req.model_dump(), DEFAULT_BACKEND)
     if provider_keys:
         with local_history_import_guard():
             foreign_keys = await asyncio.to_thread(other_local_instance_provider_keys)
@@ -85378,6 +85655,7 @@ async def create_session_with_history(req: CreateSessionRequest) -> dict[str, An
 @app.get("/api/local-sessions")
 async def get_local_sessions(
     limit: int = Query(default=200, ge=1, le=MAX_LOCAL_SESSION_LIST_ITEMS),
+    include_cursor: bool = False,
 ) -> dict[str, Any]:
     """List main conversations unused by any installed same-user local instance."""
 
@@ -85385,13 +85663,10 @@ async def get_local_sessions(
         known_provider_keys = {
             key
             for session in STORE.sessions.values()
-            for key in server_instances.provider_session_keys(session, DEFAULT_BACKEND)
+            for key in local_session_ownership.provider_session_keys(session, DEFAULT_BACKEND)
         }
-    sessions = await asyncio.to_thread(
-        local_session_candidates,
-        limit,
-        known_provider_keys,
-    )
+    options = {"include_cursor": True} if include_cursor else {}
+    sessions = await asyncio.to_thread(local_session_candidates, limit, known_provider_keys, **options)
     return {"sessions": sessions}
 
 
@@ -85457,12 +85732,13 @@ async def bulk_import_sessions_guarded(
             known_provider_keys = {
                 key
                 for session in STORE.sessions.values()
-                for key in server_instances.provider_session_keys(session, DEFAULT_BACKEND)
+                for key in local_session_ownership.provider_session_keys(session, DEFAULT_BACKEND)
             }
         available = await asyncio.to_thread(
             local_session_candidates,
             MAX_LOCAL_SESSION_LIST_ITEMS,
             set(),
+            **({"include_cursor": True} if any(item.backend == BACKEND_CURSOR for item in req.items) else {}),
         )
         candidate_by_key = {
             (str(candidate["backend"]), str(candidate["provider_session_id"])): candidate
@@ -85512,24 +85788,29 @@ async def bulk_import_sessions_guarded(
 
             staged_session: dict[str, Any] | None = None
             try:
-                source_path, history_items = await asyncio.to_thread(
-                    provider_history,
-                    {
-                        "backend": item.backend,
-                        "session_id": item.provider_session_id,
-                        "claude_session_id": (
-                            item.provider_session_id
-                            if item.backend == BACKEND_CLAUDE
-                            else None
-                        ),
-                        "codex_thread_id": (
-                            item.provider_session_id
-                            if item.backend == BACKEND_CODEX
-                            else None
-                        ),
-                    },
-                    None,
-                )
+                if item.backend == BACKEND_CURSOR:
+                    source_path, history_items = await asyncio.to_thread(
+                        cursor_initial_history, item.provider_session_id, candidate_cwd or "",
+                    )
+                else:
+                    source_path, history_items = await asyncio.to_thread(
+                        provider_history,
+                        {
+                            "backend": item.backend,
+                            "session_id": item.provider_session_id,
+                            "claude_session_id": (
+                                item.provider_session_id
+                                if item.backend == BACKEND_CLAUDE
+                                else None
+                            ),
+                            "codex_thread_id": (
+                                item.provider_session_id
+                                if item.backend == BACKEND_CODEX
+                                else None
+                            ),
+                        },
+                        None,
+                    )
                 if source_path is None:
                     results.append(bulk_import_result(
                         item,

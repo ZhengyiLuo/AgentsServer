@@ -16,6 +16,8 @@ EXECUTION_MODULES = {
     "execution_manage.py", "execution_ownership.py", "execution_service.py", "execution_transport.py",
 }
 NEW_MODULES = {
+    "local_session_ownership.py",
+    "cursor_history.py",
     "workspace_git.py",
     "codex_auth.py",
     "codex_provider.py",
@@ -152,6 +154,11 @@ class ReleaseFileManifestTests(unittest.TestCase):
         )
         self.assertRegex(installer_smoke, rf"\bimport [^'\n;]*\b{module}\b")
         self.assertRegex(deploy_smoke, rf"\bimport [^'\n;]*\b{module}\b")
+
+    def test_staging_does_not_execute_library_modules_after_chmod(self):
+        staging = self.installer.split('chmod 755 "$STAGE_DIR/agent_server.py"', 1)[1]
+        before_dependencies = staging.split('echo "[2/7]', 1)[0]
+        self.assertEqual(len(before_dependencies.strip().splitlines()), 1)
 
     def test_frozen_hub_manifest_includes_new_migration_and_current_hashes(self):
         tree = ast.parse((ROOT / "test_team_hub_host.py").read_text())

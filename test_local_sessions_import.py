@@ -88,7 +88,7 @@ class LocalClaudeSessionCandidatesTests(unittest.TestCase):
             with patch.object(agent_server, "CLAUDE_PROJECTS_ROOT", root):
                 self.assertEqual(agent_server.local_claude_session_candidates(set()), [])
 
-    def test_reads_cwd_and_first_message_into_label(self) -> None:
+    def test_keeps_cwd_separate_from_first_message_label(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             projects_root = Path(temporary) / "claude-projects"
             transcript = projects_root / "-Users-georgia-code-widget" / "claude-abc123.jsonl"
@@ -102,8 +102,7 @@ class LocalClaudeSessionCandidatesTests(unittest.TestCase):
         self.assertEqual(candidate["provider_session_id"], "claude-abc123")
         self.assertEqual(candidate["backend"], agent_server.BACKEND_CLAUDE)
         self.assertEqual(candidate["cwd"], "/Users/georgia/code/widget")
-        self.assertIn("widget", candidate["label"])
-        self.assertIn("Fix the flaky test", candidate["label"])
+        self.assertEqual(candidate["label"], "Fix the flaky test")
 
     def test_dedups_against_already_imported_provider_ids(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -116,7 +115,7 @@ class LocalClaudeSessionCandidatesTests(unittest.TestCase):
 
         self.assertEqual(candidates, [])
 
-    def test_falls_back_to_folder_name_when_transcript_has_no_cwd(self) -> None:
+    def test_falls_back_to_identity_when_transcript_has_no_message(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             projects_root = Path(temporary) / "claude-projects"
             transcript = projects_root / "-unexpected-project-name" / "claude-xyz789.jsonl"
@@ -128,7 +127,7 @@ class LocalClaudeSessionCandidatesTests(unittest.TestCase):
         self.assertEqual(len(candidates), 1)
         candidate = candidates[0]
         self.assertIsNone(candidate["cwd"])
-        self.assertIn("-unexpected-project-name", candidate["label"])
+        self.assertEqual(candidate["label"], "Claude chat claude-x")
 
     def test_missing_projects_root_returns_empty(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -358,8 +357,7 @@ class LocalCodexSessionCandidatesTests(unittest.TestCase):
         self.assertEqual(candidate["provider_session_id"], "01a02d6d-76c4-7912-ac70-1ed02a436fe9")
         self.assertEqual(candidate["backend"], agent_server.BACKEND_CODEX)
         self.assertEqual(candidate["cwd"], "/private/tmp/codex-fun-fact")
-        self.assertIn("codex-fun-fact", candidate["label"])
-        self.assertIn("narwhals", candidate["label"])
+        self.assertEqual(candidate["label"], "Tell me one fun fact about narwhals.")
 
     def test_prefers_the_session_index_thread_name_when_one_exists(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

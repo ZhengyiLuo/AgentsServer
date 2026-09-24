@@ -66,7 +66,7 @@ class CodexHistoryDeferralTests(unittest.IsolatedAsyncioTestCase):
         self.store = SimpleNamespace(sessions={"chat": self.session}, _lock=asyncio.Lock(), save=AsyncMock())
         self.ns = self.functions
         self.ns.update(
-            STORE=self.store, logger=Mock(), BACKEND_CODEX="codex", BACKEND_CLAUDE="claude", DEFAULT_BACKEND="codex",
+            STORE=self.store, logger=Mock(), BACKEND_CODEX="codex", BACKEND_CLAUDE="claude", BACKEND_CURSOR="cursor", DEFAULT_BACKEND="codex",
             HISTORY_SYNC_CURSOR_VERSION=1, HISTORY_SYNC_CHECKPOINT_VERSION=1,
             MAX_WORKSPACE_PATH_CHARS=4096, MAX_LOCAL_TRANSCRIPT_BYTES=1 << 40,
             session_provider_id=lambda session: session.get("codex_thread_id"),

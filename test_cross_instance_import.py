@@ -1,13 +1,16 @@
 """Same-user import exclusion; synthetic homes only, never installed services."""
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import agent_server
-import server_instances as instances
+import httpx
+import local_session_ownership as instances
+from test_import_main_sessions import write_claude_transcript, write_codex_transcript
 
 
 class ImportFixtures:
@@ -33,6 +36,12 @@ class ImportFixtures:
         target.write_text(json.dumps(rows))
         return target
 
+    def register(self, instance, status):
+        self.registry.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.registry.file.write_text(json.dumps({
+            "version": 1, "instances": {instance.name: {"status": status}},
+        }))
+
     def keys(self):
         return instances.other_instance_provider_keys(self.current.state)
 
@@ -51,7 +60,7 @@ class CrossInstanceIndexTests(ImportFixtures, unittest.TestCase):
 
     def test_stopped_named_instance_and_archived_chat_still_count(self):
         self.index(self.other, {"local": {"backend": "codex", "codex_thread_id": "owned", "archived": True}})
-        with patch.object(instances, "service_status", side_effect=AssertionError("must not query services")):
+        with patch("subprocess.run", side_effect=AssertionError("must not query services")):
             self.assertEqual(self.keys(), {("codex", "owned")})
 
     def test_default_also_excludes_named_instances(self):
@@ -76,13 +85,11 @@ class CrossInstanceIndexTests(ImportFixtures, unittest.TestCase):
 
     def test_removed_instance_preserved_history_is_not_reserved(self):
         self.index(self.other, {"local": {"backend": "claude", "session_id": "old"}}, configured=False)
-        with self.registry.locked():
-            self.registry.save(self.other, "removed")
+        self.register(self.other, "removed")
         self.assertEqual(self.keys(), set())
 
     def test_registered_instance_without_index_is_empty(self):
-        with self.registry.locked():
-            self.registry.save(self.other, "installed")
+        self.register(self.other, "installed")
         self.assertEqual(self.keys(), set())
 
     def test_deletion_and_atomic_replacement_are_observed_without_restart(self):
@@ -194,6 +201,8 @@ class CrossInstanceImportEndpointTests(ImportFixtures, unittest.IsolatedAsyncioT
 
     async def test_manual_resume_cannot_bypass_filter_including_import_history_false(self):
         for backend, field in instances.PROVIDER_ID_FIELDS.items():
+            if field not in agent_server.CreateSessionRequest.model_fields:
+                continue  # Do not enable providers absent from this release.
             self.index(self.other, {"local": {"backend": backend, field: "owned"}})
             for supplied_field in (field, "provider_session_id", "session_id"):
                 with self.subTest(backend=backend, supplied_field=supplied_field):
@@ -247,6 +256,93 @@ class CrossInstanceImportEndpointTests(ImportFixtures, unittest.IsolatedAsyncioT
             await agent_server.create_session(req)
         self.assertEqual(error.exception.status_code, 503)
         self.create.assert_not_awaited()
+
+
+class ImportDiscoveryParityTests(ImportFixtures, unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        super().setUp()
+        self.projects = self.home / "claude-projects"
+        self.codex = self.home / "codex"
+        self.name_index = self.codex / "session_index.jsonl"
+        patch.object(agent_server, "STATE_DIR", self.current.state).start()
+        patch.object(agent_server, "CLAUDE_PROJECTS_ROOT", self.projects).start()
+        # Deliberately use a broad root: the native archive must still be pruned.
+        patch.object(agent_server, "CODEX_SESSIONS_ROOT", self.codex).start()
+        patch.object(agent_server, "CODEX_SESSION_INDEX_PATH", self.name_index).start()
+        patch.object(agent_server.STORE, "sessions", {}).start()
+        patch.object(agent_server, "AGENT_TOKEN", "synthetic-discovery-token").start()
+
+    def codex_chat(self, name, *, title=None, timestamp=100, metadata=None, archived=False):
+        directory = "archived_sessions" if archived else "sessions"
+        path = self.codex / directory / f"rollout-{name}.jsonl"
+        write_codex_transcript(path, session_id=name, cwd="/work/project",
+                               first_user_text="Repeated first prompt", metadata=metadata)
+        os.utime(path, (timestamp, timestamp))
+        if title:
+            with self.name_index.open("a") as stream:
+                stream.write(json.dumps({"id": name, "thread_name": title}) + "\n")
+        return path
+
+    async def test_real_http_picker_filters_before_limit_and_preserves_native_titles(self):
+        main = self.projects / "project" / "claude-main.jsonl"
+        write_claude_transcript(main, cwd="/work/project", first_user_text="First prompt")
+        with main.open("a") as stream:
+            stream.write(json.dumps({"type": "custom-title", "sessionId": "claude-main", "customTitle": "Claude native name"}) + "\n")
+        self.codex_chat("codex-main", title="Codex native name")
+        self.codex_chat("foreign", title="Other server's native name", timestamp=999)
+        self.codex_chat("parked", timestamp=999)
+        self.codex_chat("archived", title="Archived native name", timestamp=999, archived=True)
+        # Reproduces a picker flooded with >500 child transcripts. Naming a
+        # child does not promote it to a main chat, and excluded rows cannot
+        # consume the response limit.
+        for number in range(510):
+            self.codex_chat(f"child-{number}", title="Child name" if number == 0 else None,
+                            timestamp=999, metadata={"source": {"subagent": "review"}})
+        write_claude_transcript(self.projects / "project" / "claude-main" / "subagents" / "child.jsonl",
+                                cwd="/work/project", first_user_text="Child prompt")
+        self.index(self.default, {"foreign": {"backend": "codex", "codex_thread_id": "foreign", "archived": True}})
+        agent_server.STORE.sessions["current"] = {"backend": "claude", "claude_session_id": "unrelated", "codex_thread_id": "parked"}
+        originals = {path: path.read_bytes() for root in (self.projects, self.codex)
+                     for path in root.rglob("*.jsonl")}
+        foreign_original = (self.default.state / "sessions.json").read_bytes()
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=agent_server.app), base_url="http://test") as client:
+            response = await client.get("/api/local-sessions?limit=2", headers={"X-AgentsDock-Token": "synthetic-discovery-token"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual({(row["backend"], row["provider_session_id"], row["label"]) for row in response.json()["sessions"]}, {
+            ("claude", "claude-main", "Claude native name"),
+            ("codex", "codex-main", "Codex native name"),
+        })
+        for path, original in originals.items():
+            self.assertEqual(path.read_bytes(), original)
+        self.assertEqual((self.default.state / "sessions.json").read_bytes(), foreign_original)
+        self.assertFalse(self.registry.root.exists(), "Discovery must not register/change instances")
+
+    async def test_identical_labels_keep_distinct_main_ids_not_child_or_archive(self):
+        for name in ("first", "second"):
+            self.codex_chat(name, title="Same human title")
+        self.codex_chat("child", title="Same human title", metadata={"parent_thread_id": "first"})
+        self.codex_chat("archived", title="Same human title", archived=True)
+        rows = (await agent_server.get_local_sessions(limit=500))["sessions"]
+        self.assertEqual({row["provider_session_id"] for row in rows}, {"first", "second"})
+        self.assertEqual({row["label"] for row in rows}, {"Same human title"})
+
+    async def test_real_candidates_recheck_foreign_ownership_before_bulk_or_manual_resume(self):
+        self.codex_chat("native", title="Native title")
+        self.assertEqual(len((await agent_server.get_local_sessions(limit=10))["sessions"]), 1)
+        # Another instance imports it after the client has opened the picker.
+        self.index(self.other, {"owned": {"backend": "codex", "codex_thread_id": "native"}})
+        with patch.object(agent_server.STORE, "create", AsyncMock()) as create:
+            result = await agent_server.bulk_import_sessions(agent_server.BulkImportSessionsRequest(
+                items=[agent_server.BulkImportSessionItem(backend="codex", provider_session_id="native")],
+            ))
+            self.assertEqual(result["results"][0]["code"], "already_imported")
+            with self.assertRaises(agent_server.HTTPException) as error:
+                await agent_server.create_session(agent_server.CreateSessionRequest(
+                    backend="codex", provider_session_id="native", import_history=False,
+                ))
+            self.assertEqual(error.exception.status_code, 409)
+            create.assert_not_awaited()
+        self.assertFalse(self.current.state.exists())
 
 
 if __name__ == "__main__":

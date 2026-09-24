@@ -227,11 +227,19 @@ class NativeTitleOwnership(unittest.IsolatedAsyncioTestCase):
     async def test_custom_codex_uses_its_own_manager_cache(self):
         self.sess.update(backend="codex", codex_thread_id="provider-title",
                          codex_provider="custom", codex_provider_revision="custom-revision")
-        ordinary = SimpleNamespace(cached_thread_name=Mock(return_value="Wrong title"))
-        custom = SimpleNamespace(cached_thread_name=Mock(return_value="Custom title"))
+        ordinary = SimpleNamespace(
+            cached_thread_name=Mock(return_value="Wrong title"),
+            is_thread_loaded=Mock(return_value=False),
+        )
+        custom = SimpleNamespace(
+            cached_thread_name=Mock(return_value="Custom title"),
+            is_thread_loaded=Mock(return_value=True),
+            _agentsdock_provider_revision="custom-revision",
+        )
         with patch.object(server, "CODEX_APP_SERVER_MANAGER", ordinary), patch.object(
             server, "CODEX_CUSTOM_APP_SERVER_MANAGERS", {"custom-revision": custom},
         ), patch.object(server, "read_native_session_title") as reader:
+            self.assertIs(server.existing_codex_app_server_manager(self.sess), custom)
             await server.refresh_native_session_title("title-chat")
         self.assertEqual(self.sess["title"], "Custom title")
         custom.cached_thread_name.assert_called_once_with("provider-title")
@@ -255,8 +263,12 @@ class NativeTitleOwnership(unittest.IsolatedAsyncioTestCase):
 
     async def test_live_codex_metadata_needs_no_disk_or_provider_request(self):
         self.sess["backend"] = "codex"
-        manager = SimpleNamespace(cached_thread_name=Mock(return_value="Cached title"))
+        manager = SimpleNamespace(
+            cached_thread_name=Mock(return_value="Cached title"),
+            is_thread_loaded=Mock(return_value=True),
+        )
         with patch.object(server, "CODEX_APP_SERVER_MANAGER", manager), patch.object(server, "read_native_session_title") as reader:
+            self.assertIs(server.existing_codex_app_server_manager(self.sess), manager)
             await server.refresh_native_session_title("title-chat")
         self.assertEqual(self.sess["title"], "Cached title")
         manager.cached_thread_name.assert_called_once_with("provider-title")

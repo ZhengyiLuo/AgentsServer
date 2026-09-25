@@ -15,6 +15,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 
 import codex_auth
+import side_questions
 from codex_app_server import CodexAppServerClient, CodexAppServerRequestError, CodexAppServerTimeout
 import test_codex_subagents_admin_isolated as admin_fixture
 from test_codex_app_server import FakeProcessFactory, NO_RESPONSE, wait_until
@@ -56,7 +57,7 @@ class CodexAuthTests(unittest.IsolatedAsyncioTestCase):
             "SERVER_MAINTENANCE_SESSIONS": set(), "CODEX_NATIVE_ACTION_TASKS": {}, "CODEX_PENDING_INTERACTIONS": {},
             "CODEX_SUBAGENT_INDEX_LOCK": threading.RLock(), "CODEX_SUBAGENT_STATE": {},
             "codex_subagent_has_live_owner": lambda thread, state: state.get("live") is True,
-            "SIDE_QUESTIONS": SimpleNamespace(receipts={}), "codex_app_server_manager": AsyncMock(return_value=self.manager)})
+            "SIDE_QUESTIONS": side_questions.SideQuestions(), "codex_app_server_manager": AsyncMock(return_value=self.manager)})
         self.ns["codex_app_server_managers"] = lambda: (self.manager,)
         exec(OPERATION_CODE, self.ns)
         self.app = FastAPI()
@@ -213,6 +214,16 @@ class CodexAuthTests(unittest.IsolatedAsyncioTestCase):
         finally:
             waiting.cancel()
             await asyncio.gather(waiting, return_exceptions=True)
+        synced_waiting = asyncio.create_task(asyncio.Event().wait())
+        self.ns["SIDE_QUESTIONS"].synced = SimpleNamespace(tasks={("owner", "chat"): synced_waiting})
+        try:
+            with self.assertRaises(HTTPException):
+                async with self.ns["codex_auth_operation"](mutate=True):
+                    self.fail("synced side chat admitted an authentication mutation")
+            self.assertFalse(synced_waiting.done())
+        finally:
+            synced_waiting.cancel()
+            await asyncio.gather(synced_waiting, return_exceptions=True)
         self.manager.request.assert_not_awaited()
 
     async def test_admission_remains_reserved_until_login_settles_and_releases_on_cancellation(self):

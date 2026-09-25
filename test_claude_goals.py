@@ -1,8 +1,11 @@
 """Native goal attachment projection; no provider/server import or network."""
+import ast
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 from uuid import uuid4
 
 from claude_goals import ClaudeGoalProjection, ClaudeGoalHistoryNormalizer, is_claude_synthetic_no_response, MAX_GOAL_RECORD_BYTES
@@ -21,6 +24,42 @@ def record(*, met=False, sentinel=False, second=0, **fields):
 
 def encode(value):
     return json.dumps(value).encode() + b"\n"
+
+
+class ClaudeHistoryRootTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        tree = ast.parse(Path(__file__).with_name("agent_server.py").read_text())
+        assignment = next(node for node in tree.body if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "CLAUDE_PROJECTS_ROOT" for target in node.targets))
+        cls.expression = compile(ast.Expression(assignment.value), "<claude-projects-root>", "eval")
+
+    def root(self, environment):
+        return eval(self.expression, {"os": SimpleNamespace(environ=environment), "Path": Path})
+
+    def test_isolated_claude_config_home_locates_native_goal_transcript(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            private_home = Path(temporary) / "isolated-claude"
+            projects = private_home / "projects"
+            transcript = projects / "project" / f"{SESSION}.jsonl"
+            transcript.parent.mkdir(parents=True)
+            transcript.write_bytes(encode(record(sentinel=True)) + encode(record(met=True, second=1)))
+            resolved = self.root({"CLAUDE_CONFIG_DIR": str(private_home)})
+            self.assertEqual(resolved, projects)
+            projection = ClaudeGoalProjection(SESSION)
+            projection.refresh(next(resolved.rglob(f"{SESSION}.jsonl")))
+            self.assertTrue(projection.caught_up)
+            self.assertEqual(projection.goal["status"], "achieved")
+
+    def test_explicit_projects_root_overrides_config_home(self):
+        self.assertEqual(self.root({"CLAUDE_PROJECTS_ROOT": "/explicit/transcripts",
+            "CLAUDE_CONFIG_DIR": "/isolated/claude"}), Path("/explicit/transcripts"))
+
+    def test_default_home_and_empty_overrides_remain_compatible(self):
+        with patch.object(Path, "home", return_value=Path("/synthetic/home")):
+            self.assertEqual(self.root({}), Path("/synthetic/home/.claude/projects"))
+            self.assertEqual(self.root({"CLAUDE_CONFIG_DIR": "", "CLAUDE_PROJECTS_ROOT": ""}),
+                             Path("/synthetic/home/.claude/projects"))
 
 
 class ClaudeGoalProjectionTests(unittest.TestCase):

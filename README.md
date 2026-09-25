@@ -1400,6 +1400,7 @@ The server exposes JSON endpoints under `/api`.
 - `GET /api/sessions/{session_id}/processes`
 - `GET /api/sessions/{session_id}/tmux`
 - `GET /api/runtime/catalog`
+- `GET /api/runtime/usage?backend=codex&session_id=<chat>`
 - `GET /api/admin/update`
 - `GET /api/admin/codex/subagents`
 - `PUT /api/admin/codex/subagents`
@@ -1412,6 +1413,22 @@ Large clients should page history instead of loading every event at once.
 The subagents endpoint folds Claude local-agent lifecycle records into bounded
 `subagent_state` snapshots without returning provider prompts, raw events,
 tool-result output, commands, or output-file paths.
+
+### Provider account usage
+
+Authenticated native clients can read provider-reported allowance separately
+from a chat's context usage. Codex uses its existing app-server account read;
+subsequent reads use the observed snapshot, and `refresh=true` requests a fresh
+native snapshot. Native rate-limit events update it without polling. Custom
+endpoints and API-key accounts do not expose a ChatGPT allowance.
+
+Claude reports only windows observed through native Agent SDK rate-limit
+events. Missing percentages stay unknown; no model request is made to obtain
+usage. Responses include observation times, reset times when reported, and
+Codex credit balance when supplied. Credits have no inferred currency. Caches
+are scoped to the provider connection and invalidated when its account or
+generation changes. A `provider_usage_changed` socket notification tells the
+native client to reread; account data never becomes a transcript event.
 
 ### Native provider commands
 

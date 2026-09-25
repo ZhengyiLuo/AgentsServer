@@ -601,7 +601,7 @@ class ManagerGenerationTests(unittest.IsolatedAsyncioTestCase):
             nodes = [node for node in ast.parse(source.read_text()).body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
             created = []
             def factory(*args, **kwargs):
-                manager = SimpleNamespace(client=SimpleNamespace(), add_notification_handler=Mock(), close=AsyncMock(), options=kwargs)
+                manager = SimpleNamespace(client=SimpleNamespace(add_account_usage_handler=Mock()), add_notification_handler=Mock(), close=AsyncMock(), options=kwargs)
                 created.append(manager)
                 return manager
             normal_env = {"OPENAI_API_KEY": "normal-synthetic"}

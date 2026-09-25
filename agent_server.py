@@ -75,6 +75,7 @@ import chat_mailbox
 import workspace_git
 import codex_auth
 import codex_provider
+import provider_usage
 
 from codex_app_server import (
     CodexAppServerDisconnected,
@@ -391,7 +392,10 @@ PROVIDER_CHILDREN_FILE = SERVER_ADMIN_ROOT / "provider-children.json"
 PROVIDER_CHILD_PROC_ROOT = Path("/proc")
 SERVER_UPDATE_PUBLIC_KEY = SERVER_ROOT / "release-public-key.pem"
 SERVER_UPDATE_RUNNER = SERVER_ROOT / "update_runner.py"
-CLAUDE_PROJECTS_ROOT = Path(os.environ.get("CLAUDE_PROJECTS_ROOT", Path.home() / ".claude" / "projects"))
+CLAUDE_PROJECTS_ROOT = Path(
+    os.environ.get("CLAUDE_PROJECTS_ROOT")
+    or Path(os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")).expanduser() / "projects"
+).expanduser()
 CODEX_SESSIONS_ROOT = Path(
     os.environ.get("CODEX_SESSIONS_ROOT")
     or (
@@ -47392,6 +47396,7 @@ def codex_session_index_thread_names() -> dict[str, str]:
 def local_codex_session_candidates(known_provider_ids: set[str]) -> list[dict[str, Any]]:
     if not CODEX_SESSIONS_ROOT.exists():
         return []
+    known_provider_ids = known_provider_ids | SIDE_QUESTIONS.provider_thread_ids()
     thread_names = codex_session_index_thread_names()
     candidates: list[dict[str, Any]] = []
     newest_paths: dict[str, tuple[float, Path, str | None]] = {}
@@ -54336,6 +54341,43 @@ async def prepare_codex_app_server_process(manager: CodexAppServerManager, selec
             CODEX_BIN, codex_app_server_env(), CODEX_PROVIDER_STORE.root / "native-models.json")
 
 
+PROVIDER_USAGE = provider_usage.ProviderUsage()
+
+
+async def broadcast_provider_usage_changed(session_id: str, backend: str) -> None:
+    await broadcast_provider_runtime_changed(session_id, {
+        "type": "provider_usage_changed", "backend": backend, "ephemeral": True,
+    })
+
+
+async def broadcast_codex_usage_changed(manager: CodexAppServerManager) -> None:
+    for session_id, session in tuple(STORE.sessions.items()):
+        if (str(session.get("backend") or DEFAULT_BACKEND).lower() == BACKEND_CODEX
+                and codex_provider.session_choice(session.get("codex_provider")) != "custom"
+                and existing_codex_app_server_manager(session) is manager):
+            await broadcast_provider_usage_changed(session_id, BACKEND_CODEX)
+
+
+def project_codex_usage_notification(manager: CodexAppServerManager, notification: dict[str, Any]):
+    # This synchronous cache update happens before the following account RPC
+    # can resolve. Only a content-free invalidation goes to session sockets.
+    if getattr(manager, "_agentsdock_provider_revision", None):
+        return None
+    method = notification.get("method")
+    if method == "account/changed":
+        PROVIDER_USAGE.invalidate_codex(manager)
+    elif method != "account/rateLimits/updated" or not PROVIDER_USAGE.observe_codex(manager, notification):
+        return None
+    return broadcast_codex_usage_changed(manager)
+
+
+async def observe_claude_provider_usage(session_id: str, generation: str, message: Any) -> None:
+    if (CLAUDE_SDK_MANAGER is not None
+            and CLAUDE_SDK_MANAGER.usage_generation(session_id) == generation
+            and PROVIDER_USAGE.observe_claude(session_id, generation, message)):
+        await broadcast_provider_usage_changed(session_id, BACKEND_CLAUDE)
+
+
 async def codex_app_server_manager(sess: dict[str, Any] | None = None) -> CodexAppServerManager:
     """Keep normal Codex stable; custom credentials own immutable managers."""
     global CODEX_APP_SERVER_MANAGER
@@ -54405,6 +54447,8 @@ async def codex_app_server_manager(sess: dict[str, Any] | None = None) -> CodexA
                     protected_env_keys=(codex_provider.ENV_KEY,) if selected else (),
                 )
                 manager.add_notification_handler(project_codex_notification)
+                usage_handler = lambda notification, manager=manager: project_codex_usage_notification(manager, notification)
+                manager.client.add_account_usage_handler(usage_handler)
                 if selected:
                     manager.client._authentication_submitted = True
                 manager.add_notification_handler(cache_codex_approval_item)
@@ -54439,6 +54483,7 @@ async def claude_sdk_manager() -> ClaudeSDKSupervisorManager:
                 idle_ttl_seconds=CLAUDE_SDK_IDLE_TTL_SECONDS,
                 connect_timeout_seconds=CLAUDE_SDK_CONNECT_TIMEOUT_SECONDS,
                 control_timeout_seconds=CLAUDE_MCP_CONTROL_TIMEOUT_SECONDS,
+                usage_observer=observe_claude_provider_usage,
             )
             CLAUDE_SDK_MANAGER = manager
         return manager
@@ -73452,6 +73497,10 @@ async def close_managed_update_provider_managers() -> None:
 
     timeout_seconds = managed_update_provider_quiesce_timeout_seconds()
     tasks = {
+        "side-chats": asyncio.create_task(
+            SIDE_QUESTIONS.close(),
+            name="managed-update-close-side-chats",
+        ),
         "claude-sdk": asyncio.create_task(
             close_claude_sdk_manager(),
             name="managed-update-close-claude-sdk",
@@ -77905,6 +77954,7 @@ async def health() -> dict[str, Any]:
         ),
         "capabilities": {
             "subagent_limit_v1": {"version": 1, "backends": ["codex", "claude"]},
+            "provider_usage": {"available": bool(AGENT_TOKEN), "version": 1, "backends": ["codex", "claude"]},
             "side_questions": side_questions.capability(),
             "codex_auth_v1": codex_auth.capability(available=bool(AGENT_TOKEN) and CODEX_TRANSPORT != CODEX_TRANSPORT_EXEC),
             "codex_provider_v1": {"available": bool(AGENT_TOKEN) and CODEX_TRANSPORT != CODEX_TRANSPORT_EXEC, "wire_api": "responses", "per_chat": True, "per_chat_models": True, "model_discovery": True, "model_compatibility": True},
@@ -78814,6 +78864,7 @@ def active_provider_background_work_labels() -> list[str]:
 
     labels = sorted(set(
         active_codex_work_labels() + active_generated_title_work_labels()
+        + SIDE_QUESTIONS.active_work_labels()
     ))[:SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT]
     remaining = SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT - len(labels)
     manager = CLAUDE_SDK_MANAGER
@@ -78989,7 +79040,7 @@ def provider_background_work_labels_from_snapshot(
             }
             labels = [label for label in labels if label not in terminal_labels]
     labels = sorted(set(
-        labels + active_generated_title_work_labels()
+        labels + active_generated_title_work_labels() + SIDE_QUESTIONS.active_work_labels()
     ))[:SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT]
     remaining = SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT - len(labels)
     if remaining <= 0:
@@ -79197,16 +79248,15 @@ async def codex_auth_operation(*, mutate: bool, existing_only: bool = False):
                     raise
                 reserved = True
                 # Native goals may run between server-owned turns. Side chats
-                # own separate ephemeral processes using the same native login.
+                # own separate native processes using the same native login.
                 if any(
                     str(session.get("backend") or DEFAULT_BACKEND).lower() == BACKEND_CODEX
                     and isinstance(session.get("codex_goal"), dict)
                     and session["codex_goal"].get("status") == "active"
                     for session in STORE.sessions.values()
                 ) or any(
-                    receipt.task is not None and not receipt.task.done()
-                    and str((STORE.sessions.get(session_id) or {}).get("backend") or DEFAULT_BACKEND).lower() == BACKEND_CODEX
-                    for (_owner, session_id, _request_id), receipt in SIDE_QUESTIONS.receipts.items()
+                    str((STORE.sessions.get(session_id) or {}).get("backend") or DEFAULT_BACKEND).lower() == BACKEND_CODEX
+                    for session_id in SIDE_QUESTIONS.active_session_ids()
                 ):
                     raise HTTPException(409, codex_auth.BUSY_MESSAGE)
             manager = CODEX_APP_SERVER_MANAGER if existing_only else await codex_app_server_manager()
@@ -79307,11 +79357,11 @@ def public_chat_share_session_exists(session_id: str) -> bool:
     )
 
 
-async def create_native_side_chat(session_id: str):
-    """Bind a transient side conversation to the provider's actual parent.
+async def create_native_side_chat(session_id: str, *, persisted_state=None, persist_state=None, durable=False):
+    """Bind a side conversation to the provider's actual parent.
 
     No visible-message projection, main turn, queue or goal mutation belongs
-    here. Codex owns a native ephemeral fork; Claude uses native /btw control.
+    here. Codex owns a separate native fork; Claude uses native /btw control.
     """
     if SERVER_SHUTTING_DOWN:
         raise side_questions.SideQuestionError(503, "Server is shutting down")
@@ -79329,6 +79379,11 @@ async def create_native_side_chat(session_id: str):
         raise side_questions.SideQuestionError(409, "The native conversation has not started yet")
     custom_codex = backend == BACKEND_CODEX and codex_provider.session_choice(session.get("codex_provider")) == "custom"
     provider_revision = CODEX_PROVIDER_STORE.for_session(session)["credential_id"] if custom_codex else None
+    binding = {"backend": backend, "parent_id": parent_id, "provider_revision": provider_revision}
+    if persisted_state is not None and any(persisted_state.get(key) != value for key, value in binding.items()):
+        raise side_questions.SideQuestionError(410, "The main provider conversation changed; clear Side chat")
+    if durable and persist_state is not None and persisted_state is None:
+        await persist_state(binding)
 
     class NativeSideChat:
         codex = None
@@ -79426,12 +79481,16 @@ async def create_native_side_chat(session_id: str):
                         )
                         provider_selection["reasoning_summary"] = codex_provider.runtime_summary(
                             provider_selection, CODEX_PROVIDER_STORE.cached_catalog(provider_selection))
+                    async def save_codex_state(value):
+                        if persist_state is not None:
+                            await persist_state({**binding, "codex": value})
                     self.codex = NativeCodexSideChat(parent_id, executable=CODEX_BIN,
                         model=model if isinstance(model, str) and model.strip() else None,
                         cwd=cwd, fork_overrides=fork_overrides, turn_overrides=turn_overrides,
                         server_request_handler=side_server_request,
                         env=side_questions.isolated_environment(runner_env()),
-                        provider_selection=provider_selection)
+                        provider_selection=provider_selection, durable=durable,
+                        resume_state=(persisted_state or {}).get("codex"), persist_state=save_codex_state)
                 result = {"answer": await self.codex.ask(question),
                           "context_note": "Native Codex context from when Side chat started, including tool results. Clear Side chat to use the latest main context."}
             self.current()
@@ -79445,7 +79504,17 @@ async def create_native_side_chat(session_id: str):
     return NativeSideChat()
 
 
-SIDE_QUESTIONS = side_questions.SideQuestions(native_factory=create_native_side_chat)
+def require_side_question_admission():
+    # Reuse the main provider admission boundary only during actual process
+    # replacement. An ordinary update waiting for idle leaves side chats usable.
+    blocker = managed_server_update_admission_blocker()
+    if SERVER_SHUTTING_DOWN or blocker:
+        raise side_questions.SideQuestionError(503, blocker or "Server is shutting down")
+
+
+SIDE_QUESTIONS = side_questions.SideQuestions(native_factory=create_native_side_chat,
+    storage_path=STATE_DIR / "side_chats.sqlite3", notify=lambda session_id, event: HUB.broadcast(session_id, event),
+    admission_check=require_side_question_admission)
 app.include_router(side_questions.create_side_question_router(
     authorize=require_native_admin_control,
     session_exists=public_chat_share_session_exists,
@@ -82456,6 +82525,38 @@ async def runtime_catalog(refresh: bool = False) -> dict[str, Any]:
     if refresh:
         await refresh_codex_app_server_binary(force=True)
     return catalog
+
+
+@app.get("/api/runtime/usage")
+async def runtime_provider_usage(
+    request: Request, backend: str, session_id: str | None = None,
+    codex_provider: str | None = None, refresh: bool = False,
+) -> JSONResponse:
+    require_native_admin_control(request)
+    session = STORE.sessions.get(session_id) if session_id else None
+    if session_id and session is None:
+        raise HTTPException(404, "session not found")
+    if backend not in {BACKEND_CODEX, BACKEND_CLAUDE}:
+        result = provider_usage.unavailable(backend, "unsupported_provider")
+    elif session is not None and str(session.get("backend") or DEFAULT_BACKEND).lower() != backend:
+        result = provider_usage.unavailable(backend, "selection_changed")
+    elif backend == BACKEND_CODEX:
+        selected_provider = str((session or {}).get("codex_provider") or codex_provider or "default")
+        if selected_provider == "custom":
+            result = provider_usage.unavailable(backend, "custom_endpoint", account_kind="custom")
+        elif CODEX_TRANSPORT == CODEX_TRANSPORT_EXEC:
+            result = provider_usage.unavailable(backend, "unsupported_transport")
+        else:
+            try:
+                manager = await codex_app_server_manager(session)
+                result = await PROVIDER_USAGE.read_codex(manager, refresh=refresh)
+            except Exception:
+                result = provider_usage.unavailable(backend, "temporarily_unavailable")
+    else:
+        generation = (CLAUDE_SDK_MANAGER.usage_generation(session_id)
+                      if session_id and CLAUDE_SDK_MANAGER is not None else None)
+        result = PROVIDER_USAGE.read_claude(session_id or "", generation)
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/sessions/{session_id}/terminal")
@@ -85931,6 +86032,8 @@ async def delete_session(session_id: str) -> dict[str, Any]:
             # A previous delete can have committed before its request was
             # canceled. Retry any tracked bridge retirement on idempotent
             # deletion instead of returning while stale work remains alive.
+            await SIDE_QUESTIONS.close_session(session_id)
+            SIDE_QUESTIONS.delete_history(session_id)
             await cancel_claude_stop_fence_retry(
                 session_id,
                 clear_fence=True,
@@ -85989,6 +86092,7 @@ async def delete_session(session_id: str) -> dict[str, Any]:
                 for thread_id in (str(session_provider_id(session) or ""),)
                 if thread_id
             }
+            await SIDE_QUESTIONS.close_session(session_id)
             await cancel_codex_interactions(
                 session_id,
                 resolution="session_deleted",
@@ -86302,6 +86406,7 @@ async def delete_session(session_id: str) -> dict[str, Any]:
                     committed_deleted = await STORE.delete(session_id)
                     DELETED_SESSION_TOMBSTONES.add(session_id)
                     DELETING_SESSIONS.discard(session_id)
+                SIDE_QUESTIONS.delete_history(session_id)
                 if session_id in CLAUDE_STOP_FENCE_SESSIONS:
                     # No retry/attempt task remains after the bounded
                     # pre-delete join above. Clear synchronously after the

@@ -20,7 +20,8 @@ class Manager:
     def __init__(self, *_args, **options):
         self.options = options
         self.client = SimpleNamespace(_loaded_threads=set(), _pending={},
-            _server_request_tasks={}, _callback_tasks=set(), _turns_by_thread={})
+            _server_request_tasks={}, _callback_tasks=set(), _turns_by_thread={},
+            add_account_usage_handler=lambda handler: None)
         self.generation = 1
         self.ready = True
         self.handlers = []

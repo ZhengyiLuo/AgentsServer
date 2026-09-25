@@ -126,6 +126,51 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 "approvalPolicy": "on-request", "sandbox": "workspace-write"},
             turn_overrides={"approvalPolicy": "on-request", "sandboxPolicy": {"type": "workspaceWrite"}})
 
+    async def test_synced_chat_saves_native_fork_then_resumes_exact_child_after_restart(self):
+        self.client.read_thread.return_value = {"id": "temporary-thread", "ephemeral": False, "path": "/private/native-side.jsonl"}
+        self.client.clear_thread_goal = AsyncMock(return_value=False)
+        self.client.resume_thread = AsyncMock(return_value="temporary-thread")
+        saved = AsyncMock()
+        chat = adapter.NativeCodexSideChat("parent-thread", executable="synthetic-codex", model=None,
+            env={}, durable=True, persist_state=saved)
+        self.assertEqual(await chat.ask("question"), "Answer")
+        fork = self.client.fork_thread.await_args.args[1]
+        self.assertFalse(fork["ephemeral"])
+        self.assertTrue(fork["deferGoalContinuation"])
+        self.client.clear_thread_goal.assert_awaited_once_with("temporary-thread")
+        saved.assert_awaited_once_with({"thread_id": "temporary-thread", "path": "/private/native-side.jsonl"})
+        await chat.close()
+        self.turn.next_notification.side_effect = [message(), completed()]
+        resumed = adapter.NativeCodexSideChat("parent-thread", executable="synthetic-codex", model=None,
+            env={}, durable=True, resume_state=saved.await_args.args[0], persist_state=saved)
+        self.assertEqual(await resumed.ask("follow up"), "Answer")
+        self.client.fork_thread.assert_awaited_once()
+        thread, params = self.client.resume_thread.await_args.args
+        self.assertEqual(thread, "temporary-thread")
+        self.assertEqual(params["path"], "/private/native-side.jsonl")
+        self.assertTrue(params["deferGoalContinuation"])
+        self.assertNotIn("ephemeral", params)
+        self.assertEqual(self.client.start_turn.await_args.args[0], "temporary-thread")
+        await resumed.close()
+
+    async def test_synced_chat_never_starts_answer_before_native_binding_is_saved(self):
+        self.client.read_thread.return_value = {"id": "temporary-thread", "ephemeral": False, "path": "/private/native-side.jsonl"}
+        self.client.clear_thread_goal = AsyncMock(return_value=False)
+        chat = adapter.NativeCodexSideChat("parent-thread", executable="synthetic-codex", model=None,
+            env={}, durable=True, persist_state=AsyncMock(side_effect=OSError("disk full")))
+        with self.assertRaises(OSError):
+            await chat.ask("question")
+        self.client.start_turn.assert_not_awaited()
+        self.client.close.assert_awaited_once()
+
+    async def test_synced_chat_rejects_resuming_parent_as_side_context(self):
+        chat = adapter.NativeCodexSideChat("parent-thread", executable="synthetic-codex", model=None,
+            env={}, durable=True, resume_state={"thread_id": "parent-thread"})
+        with self.assertRaises(SideQuestionError):
+            await chat.ask("question")
+        self.client.start_turn.assert_not_awaited()
+        self.client.fork_thread.assert_not_awaited()
+
     async def test_forks_native_history_with_parent_workspace_and_permissions(self):
         self.assertEqual(await self.answer(), "Answer")
         args, options = self.factory.call_args

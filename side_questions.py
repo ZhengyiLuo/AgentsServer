@@ -1,22 +1,27 @@
-"""Transient side questions, receipts and native conversation ownership.
+"""Native side questions, durable side chats and request ownership.
 
 Nothing starts on import. This module has no access to the main turn, queue,
-goal, provider authority, provider history import, or persistence callbacks.
+goal, provider authority, or provider history import. Side-chat persistence
+is separate from the main conversation's event history.
 """
 from __future__ import annotations
 
 import asyncio
-from contextlib import suppress
+from contextlib import suppress, closing
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import signal
+import sqlite3
 import stat
 import tempfile
 import time
+import uuid
+from copy import deepcopy
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -52,7 +57,7 @@ class SideQuestionError(Exception):
 
 def capability():
     return {"available": True, "version": 2, "native_context": True, "backends": ["codex", "claude"],
-            "max_question_chars": MAX_QUESTION_CHARS}
+            "max_question_chars": MAX_QUESTION_CHARS, "sync": True}
 
 
 def validate_history(value) -> tuple[tuple[str, str], ...]:
@@ -340,12 +345,25 @@ NATIVE_IDLE_SECONDS = 30 * 60
 
 
 class SideQuestions:
-    def __init__(self, answer=None, *, native_factory=None):
+    def __init__(self, answer=None, *, native_factory=None, storage_path=None, notify=None, admission_check=None):
         self.answer = answer
         self.native_factory = native_factory
+        self.admission_check = admission_check
         self.receipts: dict[tuple[str, str, str], _Receipt] = {}
         self.conversations: dict[tuple[str, str, str], _NativeConversation] = {}
         self.cleanup_tasks: set[asyncio.Task] = set()
+        self.synced = (SyncedSideChats(storage_path, native_factory=native_factory, notify=notify, admission_check=admission_check)
+                       if storage_path is not None else None)
+
+    def active_session_ids(self):
+        sessions = {key[1] for key, receipt in self.receipts.items()
+                    if receipt.task is not None and not receipt.task.done()}
+        if self.synced is not None:
+            sessions.update(key[1] for key, task in self.synced.tasks.items() if not task.done())
+        return sessions
+
+    def active_work_labels(self):
+        return [f"Side chat in {session_id}" for session_id in sorted(self.active_session_ids())]
 
     async def _close_conversation(self, conversation):
         conversation.closed = True
@@ -433,6 +451,8 @@ class SideQuestions:
 
     def submit(self, owner: str, session_id: str, request_id: str, question: str, *, history: list[dict] | None = None,
                side_chat_id: str | None = None, after_request_id: str | None = None):
+        if self.admission_check is not None:
+            self.admission_check()
         frozen_history = validate_history([] if history is None else history)
         self._prune()
         key = (owner, session_id, request_id)
@@ -485,7 +505,27 @@ class SideQuestions:
             await asyncio.gather(receipt.task, return_exceptions=True)
         return status
 
+    async def close_session(self, session_id):
+        for key in tuple(self.receipts):
+            if key[1] == session_id:
+                await self.cancel(*key)
+        for key, conversation in tuple(self.conversations.items()):
+            if key[1] == session_id:
+                await self._close_conversation(conversation)
+                self.conversations.pop(key, None)
+        if self.synced is not None:
+            await self.synced.close_session(session_id)
+
+    def delete_history(self, session_id):
+        if self.synced is not None:
+            self.synced.delete_history(session_id)
+
+    def provider_thread_ids(self):
+        return self.synced.store.provider_thread_ids() if self.synced is not None else set()
+
     async def close(self):
+        if self.synced is not None:
+            await self.synced.close()
         tasks = [receipt.task for receipt in self.receipts.values()
                  if receipt.task is not None and not receipt.task.done()]
         for task in tasks:
@@ -495,6 +535,387 @@ class SideQuestions:
         await asyncio.gather(*(self._close_conversation(item) for item in self.conversations.values()), return_exceptions=True)
         self.conversations.clear()
         await asyncio.gather(*self.cleanup_tasks, return_exceptions=True)
+
+
+def side_chat_timestamp():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+class SideChatStore:
+    """Private, atomic side-chat state; never part of the main event log.
+
+    A request receipt is retained after Clear so a delayed/retried submission
+    cannot re-run a previously accepted tool-using request. Opening a database
+    after process restart marks unfinished answers interrupted, never resends.
+    """
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.database = None
+
+    def _db(self):
+        if self.database is None:
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            descriptor = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+            os.close(descriptor)
+            database = sqlite3.connect(self.path)
+            database.execute("CREATE TABLE IF NOT EXISTS chats (owner TEXT, session TEXT, document TEXT NOT NULL, PRIMARY KEY(owner, session))")
+            database.execute("CREATE TABLE IF NOT EXISTS receipts (owner TEXT, session TEXT, request TEXT, side_chat TEXT NOT NULL, question TEXT NOT NULL, PRIMARY KEY(owner, session, request))")
+            database.execute("CREATE TABLE IF NOT EXISTS provider_threads (thread TEXT PRIMARY KEY)")
+            with database:
+                if database.execute("PRAGMA user_version").fetchone()[0] == 0:
+                    # Early development databases stored receipt question
+                    # text. Only a digest is needed for duplicate detection.
+                    for owner, session, request, question in database.execute("SELECT owner, session, request, question FROM receipts").fetchall():
+                        database.execute("UPDATE receipts SET question=? WHERE owner=? AND session=? AND request=?",
+                            (hashlib.sha256(question.encode()).hexdigest(), owner, session, request))
+                    database.execute("PRAGMA user_version=1")
+                for owner, session, raw in database.execute("SELECT owner, session, document FROM chats").fetchall():
+                    document = json.loads(raw)
+                    thread = ((document.get("_provider_state") or {}).get("codex") or {}).get("thread_id")
+                    if isinstance(thread, str) and thread:
+                        database.execute("INSERT OR IGNORE INTO provider_threads VALUES(?)", (thread,))
+                    changed = False
+                    for exchange in document["exchanges"]:
+                        if exchange["status"] == "running":
+                            exchange.update(status="interrupted", error="side_question_interrupted", updated_at=side_chat_timestamp())
+                            document["last_request_id"] = exchange["request_id"]
+                            changed = True
+                    if changed:
+                        document["revision"] += 1
+                        database.execute("UPDATE chats SET document=? WHERE owner=? AND session=?",
+                                         (json.dumps(document), owner, session))
+            self.database = database
+        return self.database
+
+    def load(self, owner, session):
+        row = self._db().execute("SELECT document FROM chats WHERE owner=? AND session=?", (owner, session)).fetchone()
+        if row:
+            return json.loads(row[0])
+        document = {"session_id": session, "side_chat_id": uuid.uuid4().hex, "revision": 0,
+                    "exchanges": [], "last_request_id": None, "_provider_state": None}
+        self.save(owner, session, document)
+        return document
+
+    def save(self, owner, session, document, *, receipt=None):
+        database = self._db()
+        with database:
+            if receipt is not None:
+                database.execute("INSERT INTO receipts VALUES(?,?,?,?,?)",
+                                 (owner, session, receipt["request_id"], document["side_chat_id"],
+                                  hashlib.sha256(receipt["question"].encode()).hexdigest()))
+            provider_state = document.get("_provider_state") or {}
+            thread_id = (provider_state.get("codex") or {}).get("thread_id")
+            if isinstance(thread_id, str) and thread_id:
+                database.execute("INSERT OR IGNORE INTO provider_threads VALUES(?)", (thread_id,))
+            database.execute("INSERT OR REPLACE INTO chats VALUES(?,?,?)",
+                             (owner, session, json.dumps(document, ensure_ascii=False)))
+
+    def receipt(self, owner, session, request_id):
+        return self._db().execute("SELECT side_chat, question FROM receipts WHERE owner=? AND session=? AND request=?",
+                                  (owner, session, request_id)).fetchone()
+
+    def close(self):
+        if self.database is not None:
+            self.database.close()
+            self.database = None
+
+    def delete_session(self, session):
+        if self.database is None and not self.path.exists():
+            return
+        database = self._db()
+        with database:
+            database.execute("DELETE FROM chats WHERE session=?", (session,))
+            database.execute("DELETE FROM receipts WHERE session=?", (session,))
+
+    def provider_thread_ids(self):
+        # Local history discovery runs in a worker thread. Use a separate
+        # read-only connection instead of sharing the event-loop writer. The
+        # opaque registry survives Clear/deletion so old side forks never
+        # reappear as importable main chats.
+        if not self.path.exists():
+            return set()
+        with closing(sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True)) as database:
+            tables = {row[0] for row in database.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "provider_threads" in tables:
+                return {row[0] for row in database.execute("SELECT thread FROM provider_threads")}
+            if "chats" in tables:
+                threads = set()
+                for (raw,) in database.execute("SELECT document FROM chats"):
+                    state = json.loads(raw).get("_provider_state") or {}
+                    thread = (state.get("codex") or {}).get("thread_id")
+                    if isinstance(thread, str) and thread:
+                        threads.add(thread)
+                return threads
+            return set()
+
+
+class SyncedSideChats:
+    """Own detached requests and persisted native provider continuations.
+
+    The single server event loop serializes admission and state changes. The
+    SQLite commit precedes task creation, so accepted requests remain visible
+    after an app disconnect or an unexpected process exit.
+    """
+
+    def __init__(self, path, *, native_factory, notify=None, admission_check=None):
+        self.store = SideChatStore(path)
+        self.native_factory = native_factory
+        self.notify = notify
+        self.admission_check = admission_check
+        self.locks = {}
+        self.tasks = {}
+        self.handles = {}
+        self.timers = {}
+        self.cleanup_tasks = set()
+        self.pending_writes = {}
+        self.stopping = False
+
+    def _lock(self, key):
+        return self.locks.setdefault(key, asyncio.Lock())
+
+    def _load(self, key):
+        pending = self.pending_writes.get(key)
+        if pending is not None:
+            # A disk failure after an answer must not strand a permanently
+            # running receipt. The next client read retries only this write,
+            # never the provider request or its tools.
+            self.store.save(*key, pending)
+            self.pending_writes.pop(key, None)
+        return self.store.load(*key)
+
+    @staticmethod
+    def public(document):
+        return deepcopy({key: value for key, value in document.items() if not key.startswith("_")})
+
+    async def _changed(self, document):
+        if self.notify is not None:
+            # Notification is invalidation only. Loss of a socket never rolls
+            # back accepted work; reconnect always reads authoritative state.
+            with suppress(Exception):
+                await self.notify(document["session_id"], {
+                    "type": "side_chat_updated", "session_id": document["session_id"],
+                    "revision": document["revision"],
+                })
+
+    async def snapshot(self, owner, session):
+        async with self._lock((owner, session)):
+            return self.public(self._load((owner, session)))
+
+    async def submit(self, owner, session, request_id, question, side_chat_id, after_request_id=None):
+        key = (owner, session)
+        async with self._lock(key):
+            if self.stopping:
+                raise SideQuestionError(503, "Server is shutting down")
+            if self.admission_check is not None:
+                self.admission_check()
+            document = self._load(key)
+            previous = self.store.receipt(*key, request_id)
+            if previous is not None:
+                if previous != (side_chat_id, hashlib.sha256(question.encode()).hexdigest()) or document["side_chat_id"] != side_chat_id:
+                    raise SideQuestionError(409, "Request ID belongs to a different or cleared side chat")
+                return self.public(document)
+            if document["side_chat_id"] != side_chat_id:
+                raise SideQuestionError(409, "Side chat was cleared; refresh before sending")
+            if any(item["status"] == "running" for item in document["exchanges"]):
+                raise SideQuestionError(409, "A side question is already running in this conversation")
+            active = self.tasks.get(key)
+            if active is not None and not active.done():
+                raise SideQuestionError(409, "The previous side question is stopping; retry after it stops")
+            if document["last_request_id"] != after_request_id:
+                raise SideQuestionError(409, "Side chat changed; refresh before sending")
+            exchange = {"request_id": request_id, "question": question, "status": "running",
+                        "created_at": side_chat_timestamp(), "updated_at": side_chat_timestamp()}
+            document["exchanges"].append(exchange)
+            document["revision"] += 1
+            self.store.save(*key, document, receipt=exchange)
+            timer = self.timers.pop(key, None)
+            if timer is not None:
+                timer.cancel()
+            task = asyncio.create_task(self._answer(key, side_chat_id, request_id, question), name="synced-side-question")
+            self.tasks[key] = task
+            def done(completed):
+                if self.tasks.get(key) is completed:
+                    self.tasks.pop(key, None)
+                if not completed.cancelled():
+                    completed.exception()
+            task.add_done_callback(done)
+            snapshot = self.public(document)
+        await self._changed(document)
+        return snapshot
+
+    async def _provider_state(self, key, side_chat_id, value):
+        async with self._lock(key):
+            document = self._load(key)
+            if document["side_chat_id"] != side_chat_id:
+                raise SideQuestionError(409, "Side chat was cleared")
+            document["_provider_state"] = value
+            self.store.save(*key, document)
+
+    async def _answer(self, key, side_chat_id, request_id, question):
+        handle = None
+        failed = False
+        try:
+            document = self._load(key)
+            if document["side_chat_id"] != side_chat_id:
+                return
+            handle = self.handles.get(key)
+            if handle is None:
+                handle = await self.native_factory(key[1], persisted_state=document.get("_provider_state"),
+                    persist_state=lambda value: self._provider_state(key, side_chat_id, value), durable=True)
+                self.handles[key] = handle
+            history = [{"question": item["question"], "response": item["answer"]}
+                       for item in document["exchanges"] if item["status"] == "completed"][-20:]
+            result = await handle.ask(question, history=history)
+            await self._finish(key, side_chat_id, request_id, "completed", **result)
+        except asyncio.CancelledError:
+            failed = True
+            await self._finish(key, side_chat_id, request_id,
+                               "interrupted" if self.stopping else "cancelled",
+                               **({"error": "side_question_interrupted"} if self.stopping else {}))
+            raise
+        except Exception as exc:
+            failed = True
+            await self._finish(key, side_chat_id, request_id, "failed",
+                               error=f"side_question_http_{exc.status_code}" if isinstance(exc, SideQuestionError) else "side_question_failed")
+        finally:
+            if failed and handle is not None:
+                if self.handles.get(key) is handle:
+                    self.handles.pop(key, None)
+                cleanup = asyncio.create_task(handle.close(), name="synced-side-chat-close")
+                self.cleanup_tasks.add(cleanup)
+                try:
+                    # Stop, Clear and shutdown can race. Once a native process
+                    # is ours, repeated cancellation must still join its close.
+                    while not cleanup.done():
+                        try:
+                            await asyncio.shield(cleanup)
+                        except asyncio.CancelledError:
+                            continue
+                    cleanup.result()
+                finally:
+                    self.cleanup_tasks.discard(cleanup)
+            if self.tasks.get(key) is asyncio.current_task():
+                self.tasks.pop(key, None)
+                if not self.stopping:
+                    self.timers[key] = asyncio.get_running_loop().call_later(NATIVE_IDLE_SECONDS, self._expire, key)
+
+    async def _finish(self, key, side_chat_id, request_id, status, **result):
+        async with self._lock(key):
+            document = self._load(key)
+            if document["side_chat_id"] != side_chat_id:
+                return
+            exchange = next((item for item in document["exchanges"] if item["request_id"] == request_id), None)
+            if exchange is None or exchange["status"] != "running":
+                return
+            exchange.update(status=status, updated_at=side_chat_timestamp(), **result)
+            document["last_request_id"] = request_id
+            document["revision"] += 1
+            try:
+                self.store.save(*key, document)
+            except (OSError, sqlite3.Error):
+                self.pending_writes[key] = document
+        await self._changed(document)
+
+    def _expire(self, key):
+        self.timers.pop(key, None)
+        if key in self.tasks:
+            return
+        handle = self.handles.pop(key, None)
+        if handle is not None:
+            task = asyncio.create_task(handle.close(), name="synced-side-chat-idle-close")
+            self.cleanup_tasks.add(task)
+            task.add_done_callback(lambda done: (self.cleanup_tasks.discard(done), None if done.cancelled() else done.exception()))
+
+    async def cancel(self, owner, session, request_id):
+        key = (owner, session)
+        async with self._lock(key):
+            document = self._load(key)
+            exchange = next((item for item in document["exchanges"] if item["request_id"] == request_id), None)
+            if exchange is None:
+                # Stop can overtake submission in transit. Preserve an opaque
+                # receipt so the late POST cannot start provider/tool work.
+                if self.store.receipt(*key, request_id) is None:
+                    self.store.save(*key, document, receipt={"request_id": request_id, "question": ""})
+                return self.public(document)
+            if exchange["status"] != "running":
+                return self.public(document)
+            exchange.update(status="cancelled", updated_at=side_chat_timestamp())
+            document["last_request_id"] = request_id
+            document["revision"] += 1
+            try:
+                self.store.save(*key, document)
+            except (OSError, sqlite3.Error):
+                self.pending_writes[key] = document
+            task = self.tasks.get(key)
+            if task is not None:
+                task.cancel()
+        if task is not None:
+            await asyncio.shield(asyncio.gather(task, return_exceptions=True))
+        await self._changed(document)
+        return await self.snapshot(*key)
+
+    async def clear(self, owner, session, side_chat_id):
+        key = (owner, session)
+        async with self._lock(key):
+            document = self._load(key)
+            if document["side_chat_id"] != side_chat_id:
+                # A repeated Clear is harmless. A stale device cannot clear a
+                # new conversation it has not seen.
+                return self.public(document)
+            document.update(side_chat_id=uuid.uuid4().hex, exchanges=[], last_request_id=None, _provider_state=None)
+            document["revision"] += 1
+            try:
+                self.store.save(*key, document)
+            except (OSError, sqlite3.Error):
+                self.pending_writes[key] = document
+            task = self.tasks.get(key)
+            if task is not None:
+                task.cancel()
+            handle = self.handles.pop(key, None)
+        if task is not None:
+            await asyncio.shield(asyncio.gather(task, return_exceptions=True))
+        if handle is not None:
+            await handle.close()
+        await self._changed(document)
+        return await self.snapshot(*key)
+
+    async def close(self):
+        self.stopping = True
+        for timer in self.timers.values():
+            timer.cancel()
+        self.timers.clear()
+        tasks = list(self.tasks.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        handles, self.handles = list(self.handles.values()), {}
+        await asyncio.gather(*(handle.close() for handle in handles), return_exceptions=True)
+        await asyncio.gather(*self.cleanup_tasks, return_exceptions=True)
+        for key in tuple(self.pending_writes):
+            with suppress(OSError, sqlite3.Error):
+                self._load(key)
+        self.store.close()
+        # Managed-update retirement can be cancelled before process restart.
+        self.stopping = False
+
+    async def close_session(self, session):
+        tasks = [task for key, task in self.tasks.items() if key[1] == session]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for key, timer in tuple(self.timers.items()):
+            if key[1] == session:
+                timer.cancel()
+                self.timers.pop(key, None)
+        handles = [self.handles.pop(key) for key in tuple(self.handles) if key[1] == session]
+        await asyncio.gather(*(handle.close() for handle in handles))
+
+    def delete_history(self, session):
+        self.store.delete_session(session)
+        for key in tuple(self.pending_writes):
+            if key[1] == session:
+                self.pending_writes.pop(key, None)
 
 
 def create_side_question_router(*, authorize, session_exists, runtime: SideQuestions):
@@ -590,5 +1011,67 @@ def create_side_question_router(*, authorize, session_exists, runtime: SideQuest
         owner = guard(request, session_id, side_chat_id)
         await runtime.close_conversation(owner, session_id, side_chat_id)
         return JSONResponse({"side_chat_id": side_chat_id, "status": "closed"}, headers={"Cache-Control": "no-store"})
+
+    def synced_runtime():
+        if runtime.synced is None:
+            raise HTTPException(503, "Side chat storage is unavailable")
+        return runtime.synced
+
+    async def synced_response(operation, *, status_code=200):
+        try:
+            return JSONResponse(await operation, status_code=status_code, headers={"Cache-Control": "no-store"})
+        except SideQuestionError as exc:
+            raise HTTPException(exc.status_code, str(exc)) from None
+        except (OSError, sqlite3.Error):
+            raise HTTPException(503, "Side chat could not be saved; check server storage and retry") from None
+
+    @router.get("/api/sessions/{session_id}/side-chat")
+    async def get_synced(session_id: str, request: Request):
+        owner = guard(request, session_id)
+        return await synced_response(synced_runtime().snapshot(owner, session_id))
+
+    @router.post("/api/sessions/{session_id}/side-chat")
+    async def post_synced(session_id: str, request: Request):
+        owner = guard(request, session_id)
+        async def body():
+            data = bytearray()
+            async for chunk in request.stream():
+                if len(data) + len(chunk) > MAX_REQUEST_BYTES:
+                    raise HTTPException(413, "Side question request is too large")
+                data.extend(chunk)
+            return json.loads(data)
+        try:
+            value = await asyncio.wait_for(body(), 10)
+        except (ValueError, UnicodeError, RecursionError):
+            raise HTTPException(400, "Invalid side question request") from None
+        except asyncio.TimeoutError:
+            raise HTTPException(408, "Side question request was not received") from None
+        if (not isinstance(value, dict) or not {"request_id", "question", "side_chat_id"} <= set(value)
+                or set(value) - {"request_id", "question", "side_chat_id", "after_request_id"}):
+            raise HTTPException(400, "Invalid side question fields")
+        for field in ("request_id", "side_chat_id", "after_request_id"):
+            if field == "after_request_id" and value.get(field) is None:
+                continue
+            if not isinstance(value.get(field), str) or not IDENTIFIER.fullmatch(value[field]):
+                raise HTTPException(400, "Invalid side conversation ID")
+        question = value["question"]
+        if not isinstance(question, str) or not question.strip() or len(question) > MAX_QUESTION_CHARS:
+            raise HTTPException(400, "Question must contain 1 to 8000 characters")
+        try:
+            question.encode("utf-8")
+        except UnicodeEncodeError:
+            raise HTTPException(400, "Question must contain valid Unicode text") from None
+        return await synced_response(synced_runtime().submit(owner, session_id, value["request_id"], question,
+            value["side_chat_id"], value.get("after_request_id")), status_code=202)
+
+    @router.delete("/api/sessions/{session_id}/side-chat/requests/{request_id}")
+    async def cancel_synced(session_id: str, request_id: str, request: Request):
+        owner = guard(request, session_id, request_id)
+        return await synced_response(synced_runtime().cancel(owner, session_id, request_id))
+
+    @router.delete("/api/sessions/{session_id}/side-chat/{side_chat_id}")
+    async def clear_synced(session_id: str, side_chat_id: str, request: Request):
+        owner = guard(request, session_id, side_chat_id)
+        return await synced_response(synced_runtime().clear(owner, session_id, side_chat_id))
 
     return router

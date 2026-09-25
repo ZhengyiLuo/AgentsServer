@@ -30,6 +30,24 @@ class CompletedPrefixForkTests(unittest.IsolatedAsyncioTestCase):
         events = [{"type": "assistant_text", "text": "Previous history"}, {"type": "turn_finished", "imported": True}]
         self.assertEqual(server.completed_fork_events(events, active_run_id="live", through_sequence=None), events)
 
+    def test_metadata_only_import_does_not_replace_completed_native_boundary(self):
+        completed = self.events()[:3]
+        bookkeeping = [
+            {"seq": 4, "type": "history_imported", "run_id": "import_repair", "imported": True, "metadata_only": True},
+            {"seq": 5, "type": "turn_finished", "run_id": "import_repair", "imported": True, "metadata_only": True},
+        ]
+        running = {"seq": 6, "type": "turn_started", "run_id": "live"}
+        for backend in ("codex", "claude"):
+            with self.subTest(backend=backend):
+                events = [{**event, "backend": backend} for event in completed + bookkeeping + [running]]
+                self.assertEqual(
+                    server.completed_fork_events(events, active_run_id="live", through_sequence=6),
+                    events[:3],
+                )
+                self.assertEqual(
+                    server.completed_fork_events(events[3:], active_run_id="live", through_sequence=6), [],
+                )
+
     def test_claude_boundary_requires_this_completed_turn_not_older_matching_text(self):
         events = self.events()[:3]
         native = {
@@ -58,6 +76,34 @@ class CompletedPrefixForkTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await server.fork_session("parent", server.ForkSessionRequest()), {"ok": True})
         self.assertEqual(fork.await_args.kwargs["completed_snapshot"], self.events()[:3])
         self.assertEqual(active["parent"]["run_id"], "live")
+
+    async def test_running_codex_fork_uses_native_boundary_before_replay_and_stopped_turns(self):
+        parent = {"id": "parent", "backend": "codex", "cwd": "/tmp", "codex_thread_id": "parent-thread", "latest_event_seq": 10}
+        events = self.events()[:3] + [
+            {"seq": 4, "type": "turn_finished", "run_id": "mailbox", "exit_code": 0,
+             "purpose": "chat_mailbox_wake", "provider_thread_id": "parent-thread", "provider_turn_id": "mailbox-turn"},
+            {"seq": 5, "type": "history_imported", "run_id": "import_repair", "imported": True, "metadata_only": True},
+            {"seq": 6, "type": "turn_started", "run_id": "import_repair", "imported": True, "metadata_only": True, "prompt": ""},
+            {"seq": 7, "type": "turn_finished", "run_id": "import_repair", "imported": True, "metadata_only": True},
+            {"seq": 8, "type": "turn_started", "run_id": "stopped"},
+            {"seq": 9, "type": "turn_finished", "run_id": "stopped", "stopped": True,
+             "provider_thread_id": "parent-thread", "provider_turn_id": "stopped-turn"},
+            {"seq": 10, "type": "turn_started", "run_id": "live"},
+        ]
+        active = {"parent": {"run_id": "live", "provider_turn_id": "live-turn"}}
+        with patch.object(server.STORE, "sessions", {"parent": parent}), patch.object(server, "ACTIVE", active), patch.object(
+            server, "iter_session_events", return_value=iter(events),
+        ), patch.object(server, "fork_codex_thread", new_callable=AsyncMock, side_effect=RuntimeError("provider reached")) as fork, patch.object(
+            server.STORE, "create", new_callable=AsyncMock,
+        ) as create, patch.object(server.logger, "warning"):
+            with self.assertRaises(server.HTTPException) as raised:
+                await server.fork_session("parent", server.ForkSessionRequest())
+        # The provider fault stops this test immediately after the real endpoint
+        # selects its boundary. A synthetic terminal must never reject it first.
+        fork.assert_awaited_once_with("parent-thread", parent, last_turn_id="done-turn")
+        self.assertNotIn("no verifiable native snapshot", raised.exception.detail)
+        self.assertEqual(active, {"parent": {"run_id": "live", "provider_turn_id": "live-turn"}})
+        create.assert_not_awaited()
 
     async def test_codex_live_native_failure_never_becomes_memory_fork(self):
         parent = {"id": "parent", "backend": "codex", "cwd": "/tmp", "codex_thread_id": "parent-thread"}

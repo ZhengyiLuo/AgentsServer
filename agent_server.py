@@ -89946,6 +89946,10 @@ def completed_fork_events(
             and (event.get("exit_code") == 0 or event.get("imported") is True)
             and not event.get("stopped")
             and not event.get("is_error")
+            # Replay bookkeeping is not a newly completed provider turn. In
+            # particular, metadata-only repair batches carry no native turn
+            # identity and must not replace an already resumable boundary.
+            and not (event.get("imported") is True and event.get("metadata_only") is True)
             and event.get("purpose") not in FORK_INTERNAL_PURPOSES
         ):
             completed_length = len(prefix)

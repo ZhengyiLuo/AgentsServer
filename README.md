@@ -1414,6 +1414,20 @@ The subagents endpoint folds Claude local-agent lifecycle records into bounded
 `subagent_state` snapshots without returning provider prompts, raw events,
 tool-result output, commands, or output-file paths.
 
+### Synchronized side conversations
+
+Native authenticated clients with the `side_questions.sync` capability use
+`GET /api/sessions/{session_id}/side-chat` for saved history and `POST` on the
+same path to submit an answer request. Acceptance returns immediately; the server
+owns the answer even if the requesting app closes. Socket notifications invalidate
+history after changes, and reconnecting reads authoritative state without polling.
+
+`DELETE /api/sessions/{session_id}/side-chat/requests/{request_id}` stops that
+request. `DELETE /api/sessions/{session_id}/side-chat/{side_chat_id}` clears the
+side conversation. Devices using the same native server credential and main chat
+share the history. Side content never becomes main-chat transcript content.
+Existing transient side-question routes remain available to older clients.
+
 ### Provider account usage
 
 Authenticated native clients can read provider-reported allowance separately

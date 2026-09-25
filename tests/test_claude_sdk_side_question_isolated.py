@@ -71,7 +71,7 @@ class ClaudeSDKSideQuestionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.manager._pins, {})
 
     async def test_native_answer_outlives_old_deadline_without_stopping_parent(self) -> None:
-        from test_claude_side_question_isolated import NativeClient, answer
+        from tests.test_claude_side_question_isolated import NativeClient, answer
 
         main = await self.start_main()
         client = self.factory.clients[0]

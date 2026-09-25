@@ -29,7 +29,7 @@ def encode(value):
 class ClaudeHistoryRootTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        tree = ast.parse(Path(__file__).with_name("agent_server.py").read_text())
+        tree = ast.parse((Path(__file__).resolve().parents[1] / "agent_server.py").read_text())
         assignment = next(node for node in tree.body if isinstance(node, ast.Assign)
             and any(isinstance(target, ast.Name) and target.id == "CLAUDE_PROJECTS_ROOT" for target in node.targets))
         cls.expression = compile(ast.Expression(assignment.value), "<claude-projects-root>", "eval")

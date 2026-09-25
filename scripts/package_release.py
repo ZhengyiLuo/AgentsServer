@@ -52,6 +52,7 @@ FILES = (
     "agentsdock_mail.py",
     "agentsdock_team.py",
     "provider_commands.py",
+    "provider_usage.py",
     "claude_sdk_client.py",
     "claude_goals.py",
     "claude_background_reconciliation.py",

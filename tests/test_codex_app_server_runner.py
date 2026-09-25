@@ -179,6 +179,9 @@ class FakeManager:
     async def start(self) -> None:
         self.start_calls += 1
 
+    def is_thread_loaded(self, thread_id: str) -> bool:
+        return any(call[0] == thread_id for call in self.turn_calls)
+
     async def wait_for_notification_handler(
         self,
         handler: object,
@@ -6034,6 +6037,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             tempfile.TemporaryDirectory() as temporary,
             patch.object(agent_server, "HUB", hub),
             patch.object(agent_server, "websocket_authorized", return_value=True),
+            patch.object(agent_server, "CODEX_SESSIONS_ROOT", Path(temporary) / "native-sessions"),
             patch.object(
                 agent_server,
                 "events_path",

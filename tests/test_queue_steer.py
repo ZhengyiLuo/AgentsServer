@@ -5,6 +5,7 @@ import time
 import unittest
 from collections import OrderedDict, deque
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException
@@ -363,7 +364,9 @@ class StopTurnProviderReadinessTests(unittest.IsolatedAsyncioTestCase):
             await finish_descendant_cleanup.wait()
             return agent_server.empty_subagent_stop_result()
 
-        manager = object()
+        manager = SimpleNamespace(
+            is_thread_loaded=lambda thread_id: thread_id == "thread-root",
+        )
         append_durable_event = AsyncMock(return_value={})
         start_locked = AsyncMock(return_value={"run_id": "unexpected"})
         with (

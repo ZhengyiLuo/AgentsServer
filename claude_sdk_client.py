@@ -1348,6 +1348,7 @@ class ClaudeSDKSupervisor:
         ack_timeout_seconds: float = 60.0,
         query_delivery_timeout_seconds: float = 10.0,
         control_timeout_seconds: float = 15.0,
+        usage_observer: Callable[[str, str, Any], Awaitable[None]] | None = None,
     ) -> None:
         clean_chat_id = str(chat_id or "").strip()
         if not clean_chat_id:
@@ -1359,6 +1360,7 @@ class ClaudeSDKSupervisor:
         bind_permission_owner(self.options, self.ownership_token)
         self._client_factory = client_factory
         self._is_result_message = is_result_message
+        self._usage_observer = usage_observer
         if connect_timeout_seconds <= 0:
             raise ValueError("connect_timeout_seconds must be positive")
         self._connect_timeout_seconds = float(connect_timeout_seconds)
@@ -2692,6 +2694,14 @@ class ClaudeSDKSupervisor:
     async def _handle_received(self, command: _ReceivedMessage) -> None:
         if command.generation != self._generation:
             return
+        if _message_type(command.message) in {"ratelimitevent", "rate_limit_event"} and self._usage_observer is not None:
+            generation = self.control_generation
+            if generation is not None:
+                try:
+                    await self._usage_observer(self.chat_id, generation, command.message)
+                except Exception:
+                    logger.debug("Claude usage observer unavailable")
+            return
         pending = self._pending_goal_clear
         if pending is not None:
             local_run = _message_field(command.message, "local_command_run")
@@ -2924,6 +2934,7 @@ class ClaudeSDKSupervisorManager:
         ack_timeout_seconds: float = 60.0,
         query_delivery_timeout_seconds: float = 10.0,
         control_timeout_seconds: float = 15.0,
+        usage_observer: Callable[[str, str, Any], Awaitable[None]] | None = None,
     ) -> None:
         if max_clients < 1:
             raise ValueError("max_clients must be positive")
@@ -2931,6 +2942,7 @@ class ClaudeSDKSupervisorManager:
             raise ValueError("idle_ttl_seconds must be non-negative or None")
         self._client_factory = client_factory
         self._is_result_message = is_result_message
+        self._usage_observer = usage_observer
         self._max_clients = int(max_clients)
         self._idle_ttl_seconds = idle_ttl_seconds
         if connect_timeout_seconds <= 0:
@@ -3043,6 +3055,7 @@ class ClaudeSDKSupervisorManager:
                 ack_timeout_seconds=self._ack_timeout_seconds,
                 query_delivery_timeout_seconds=self._query_delivery_timeout_seconds,
                 control_timeout_seconds=self._control_timeout_seconds,
+                usage_observer=self._usage_observer,
             )
             self._supervisors[chat_id] = supervisor
         else:
@@ -3372,7 +3385,6 @@ class ClaudeSDKSupervisorManager:
         history: list[dict[str, str]] | None = None,
         options: Any,
         configuration_key: str,
-        timeout_seconds: float = 150.0,
         expected_provider_id: str | None = None,
     ) -> dict[str, Any]:
         """Lease native parent context without occupying its main-turn actor.
@@ -3418,7 +3430,6 @@ class ClaudeSDKSupervisorManager:
             side_task = asyncio.create_task(
                 ask_native_side_question(
                     lease.client, question, history=history,
-                    timeout_seconds=timeout_seconds,
                 ),
                 name=f"claude-sdk-side-question:{clean_chat_id}",
             )
@@ -3602,6 +3613,14 @@ class ClaudeSDKSupervisorManager:
             and supervisor.connected
             and not supervisor.closed
         )
+
+    def usage_generation(self, chat_id: str, *, run_id: str | None = None) -> str | None:
+        """Identify the existing native owner without connecting or issuing RPCs."""
+        supervisor = self._supervisors.get(str(chat_id))
+        if (supervisor is None or supervisor.closed or not supervisor.connected
+                or (run_id is not None and supervisor.active_run_id != run_id)):
+            return None
+        return supervisor.control_generation
 
     async def evict(
         self,

@@ -22,7 +22,6 @@ from typing import Any
 from side_questions import (
     MAX_OUTPUT_BYTES,
     MAX_QUESTION_CHARS,
-    REQUEST_TIMEOUT_SECONDS,
     SideQuestionError,
 )
 
@@ -128,7 +127,6 @@ async def ask_native_side_question(
     question: str,
     *,
     history: list[dict] | None = None,
-    timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
 ) -> dict:
     """Ask native /btw without acquiring the parent's main-turn authority.
 
@@ -138,8 +136,6 @@ async def ask_native_side_question(
     """
     request = _request(question, history)
     query = _native_query(client)
-    if timeout_seconds <= 0:
-        raise ValueError("timeout_seconds must be positive")
     request_id = f"agentsdock_side_{uuid.uuid4().hex}"
     event = asyncio.Event()
     query.pending_control_responses[request_id] = event
@@ -187,14 +183,11 @@ async def ask_native_side_question(
                 await cleanup
 
     try:
-        result = await asyncio.wait_for(asyncio.shield(receiving), timeout_seconds)
+        result = await asyncio.shield(receiving)
         return _answer(result)
     except asyncio.CancelledError:
         await cancel_and_settle()
         raise
-    except TimeoutError:
-        await cancel_and_settle()
-        raise SideQuestionError(504, "Claude native side question timed out") from None
     except SideQuestionError:
         raise
     except Exception:

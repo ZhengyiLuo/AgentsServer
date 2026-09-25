@@ -111,6 +111,9 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             callback = self.factory.call_args.kwargs.get("before_start")
             if callback:
                 await callback()
+            started = self.factory.call_args.kwargs.get("on_process_started")
+            if started:
+                started(12345, 12345)
         self.client.start.side_effect = start
         self.enterContext(patch.object(adapter, "CodexAppServerClient", self.factory))
         self.enterContext(patch.object(adapter, "_verify_protocol", self.verify))
@@ -122,6 +125,51 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             cwd="/synthetic/workspace", fork_overrides={"runtimeWorkspaceRoots": ["/synthetic/workspace"],
                 "approvalPolicy": "on-request", "sandbox": "workspace-write"},
             turn_overrides={"approvalPolicy": "on-request", "sandboxPolicy": {"type": "workspaceWrite"}})
+
+    async def test_synced_chat_saves_native_fork_then_resumes_exact_child_after_restart(self):
+        self.client.read_thread.return_value = {"id": "temporary-thread", "ephemeral": False, "path": "/private/native-side.jsonl"}
+        self.client.clear_thread_goal = AsyncMock(return_value=False)
+        self.client.resume_thread = AsyncMock(return_value="temporary-thread")
+        saved = AsyncMock()
+        chat = adapter.NativeCodexSideChat("parent-thread", executable="synthetic-codex", model=None,
+            env={}, durable=True, persist_state=saved)
+        self.assertEqual(await chat.ask("question"), "Answer")
+        fork = self.client.fork_thread.await_args.args[1]
+        self.assertFalse(fork["ephemeral"])
+        self.assertTrue(fork["deferGoalContinuation"])
+        self.client.clear_thread_goal.assert_awaited_once_with("temporary-thread")
+        saved.assert_awaited_once_with({"thread_id": "temporary-thread", "path": "/private/native-side.jsonl"})
+        await chat.close()
+        self.turn.next_notification.side_effect = [message(), completed()]
+        resumed = adapter.NativeCodexSideChat("parent-thread", executable="synthetic-codex", model=None,
+            env={}, durable=True, resume_state=saved.await_args.args[0], persist_state=saved)
+        self.assertEqual(await resumed.ask("follow up"), "Answer")
+        self.client.fork_thread.assert_awaited_once()
+        thread, params = self.client.resume_thread.await_args.args
+        self.assertEqual(thread, "temporary-thread")
+        self.assertEqual(params["path"], "/private/native-side.jsonl")
+        self.assertTrue(params["deferGoalContinuation"])
+        self.assertNotIn("ephemeral", params)
+        self.assertEqual(self.client.start_turn.await_args.args[0], "temporary-thread")
+        await resumed.close()
+
+    async def test_synced_chat_never_starts_answer_before_native_binding_is_saved(self):
+        self.client.read_thread.return_value = {"id": "temporary-thread", "ephemeral": False, "path": "/private/native-side.jsonl"}
+        self.client.clear_thread_goal = AsyncMock(return_value=False)
+        chat = adapter.NativeCodexSideChat("parent-thread", executable="synthetic-codex", model=None,
+            env={}, durable=True, persist_state=AsyncMock(side_effect=OSError("disk full")))
+        with self.assertRaises(OSError):
+            await chat.ask("question")
+        self.client.start_turn.assert_not_awaited()
+        self.client.close.assert_awaited_once()
+
+    async def test_synced_chat_rejects_resuming_parent_as_side_context(self):
+        chat = adapter.NativeCodexSideChat("parent-thread", executable="synthetic-codex", model=None,
+            env={}, durable=True, resume_state={"thread_id": "parent-thread"})
+        with self.assertRaises(SideQuestionError):
+            await chat.ask("question")
+        self.client.start_turn.assert_not_awaited()
+        self.client.fork_thread.assert_not_awaited()
 
     async def test_forks_native_history_with_parent_workspace_and_permissions(self):
         self.assertEqual(await self.answer(), "Answer")
@@ -180,6 +228,17 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.client.fork_thread.await_args.args[1]["ephemeral"])
         self.assertNotIn("runtimeWorkspaceRoots", self.client.fork_thread.await_args.args[1])
         self.assertNotIn("environments", self.client.start_turn.await_args.kwargs["overrides"])
+
+    async def test_side_chat_uses_normal_codex_transport_deadlines(self):
+        from codex_app_server import CodexAppServerClient
+
+        await self.answer()
+        # Instantiate the shared transport from the actual adapter arguments;
+        # side chat must not impose a shorter startup/fork/turn-ack deadline.
+        transport = CodexAppServerClient(*self.factory.call_args.args, **self.factory.call_args.kwargs)
+        ordinary = CodexAppServerClient("synthetic-codex", cwd="/synthetic", env_factory=dict)
+        self.assertEqual(transport.request_timeout, ordinary.request_timeout)
+        self.assertEqual(transport.lifecycle_timeout, ordinary.lifecycle_timeout)
 
     async def test_unsupported_protocol_never_starts_provider(self):
         self.verify.side_effect = SideQuestionError(503, "Update Codex")
@@ -253,28 +312,67 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.fork_thread.await_args.args[1]["path"], "/synthetic/parent.jsonl")
         self.assertEqual(self.client.start_turn.await_args.args[1], [{"type": "text", "text": "question"}])
 
-    async def test_cancel_during_fork_joins_acceptance_before_owned_cleanup(self):
+    async def test_cancel_during_stalled_fork_closes_owned_process_without_waiting_for_reply(self):
         entered, release = asyncio.Event(), asyncio.Event()
         order = []
         async def fork(*args):
             entered.set()
             await release.wait()
-            order.append("forked")
-            return "temporary-thread"
+            raise adapter.CodexAppServerError("fork connection closed")
         async def close():
             order.append("closed")
+            release.set()
         self.client.fork_thread.side_effect = fork
         self.client.close.side_effect = close
         task = asyncio.create_task(self.answer())
         await entered.wait()
         task.cancel()
-        await asyncio.sleep(0)
-        self.assertFalse(task.done())
+        done, _ = await asyncio.wait({task}, timeout=0.2)
+        release.set()  # Always release the fixture if the regression fails.
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertIn(task, done, "Stop waited for a fork response instead of closing its private process")
+        self.assertEqual(order, ["closed"])
+        self.client.start_turn.assert_not_awaited()
+
+    async def test_cancel_during_stalled_initialize_closes_spawned_process(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def start():
+            started = self.factory.call_args.kwargs.get("on_process_started")
+            if started:
+                started(12345, 12345)
+            entered.set()
+            await release.wait()
+            raise adapter.CodexAppServerError("initialization connection closed")
+        self.client.start.side_effect = start
+        self.client.close.side_effect = lambda: release.set()
+        task = asyncio.create_task(self.answer())
+        await entered.wait()
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=0.2)
         release.set()
         with self.assertRaises(asyncio.CancelledError):
             await task
-        self.assertEqual(order, ["forked", "closed"])
+        self.assertIn(task, done)
+        self.client.close.assert_awaited_once()
+        self.client.fork_thread.assert_not_awaited()
+
+    async def test_fork_reply_racing_stop_cannot_restart_transport_for_metadata(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def fork(*args):
+            entered.set()
+            await release.wait()
+            return "temporary-thread"
+        self.client.fork_thread.side_effect = fork
+        self.client.close.side_effect = lambda: release.set()
+        task = asyncio.create_task(self.answer())
+        await entered.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.client.read_thread.assert_not_awaited()
         self.client.start_turn.assert_not_awaited()
+        self.client.close.assert_awaited_once()
 
     async def test_explicit_close_cancels_current_ask_and_reaps_once(self):
         entered = asyncio.Event()
@@ -365,6 +463,9 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             entered.set()
             await release.wait()
             order.append("started")
+            started = self.factory.call_args.kwargs.get("on_process_started")
+            if started:
+                started(12345, 12345)
         async def close():
             order.append("closed")
         self.client.start.side_effect = start

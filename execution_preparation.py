@@ -67,8 +67,12 @@ def _file(path: Path, *, private: bool = False, dependency: bool = False,
         mode = stat.S_IMODE(before.st_mode)
         maximum = MAX_RECEIPT_BYTES if private else MAX_FILE_BYTES
         owners = {os.getuid(), 0} if external else {os.getuid()}
+        # Existing user-managed Python installations can inherit a group-write
+        # umask. Bind their bytes and mode in the receipt without chmodding a
+        # shared prerequisite. Private staging files retain their usual policy.
+        writable_mask = 0o002 if external and dependency and before.st_uid == os.getuid() else 0o022
         if (not stat.S_ISREG(before.st_mode) or before.st_uid not in owners
-                or (mode & 0o022 and not uv_lock) or mode & 0o7000 or (private and mode != 0o600)
+                or (mode & writable_mask and not uv_lock) or mode & 0o7000 or (private and mode != 0o600)
                 or (uv_lock and (before.st_size != 0 or before.st_nlink != 1))
                 or (not dependency and before.st_nlink != 1) or before.st_size > maximum):
             raise PermissionError("preparation file is unsafe or too large")
@@ -201,7 +205,7 @@ def _inventory_tree(candidate: Path, source: dict[str, dict]) -> dict[str, dict]
                                 or not re.fullmatch(r"python(?:[0-9]+(?:\.[0-9]+)*)?", resolved.name)
                                 or not os.access(resolved, os.X_OK)):
                             raise ValueError("external prepared dependency link is not an interpreter")
-                    target_info, _data = _file(resolved, dependency=True, external=True)
+                    target_info, _data = _file(resolved, dependency=True, external=candidate not in resolved.parents)
                     total += target_info["size"]
                 if _stable(info) != _stable(child.lstat()) or target != os.readlink(child):
                     raise RuntimeError("prepared dependency link changed")

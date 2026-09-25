@@ -107,9 +107,25 @@ class ChatMailboxMigrationTests(unittest.IsolatedAsyncioTestCase):
         self.ns["append_cross_chat_terminal_lifecycle"].assert_not_awaited()
         self.ns["schedule_next_queued_turn"].assert_not_called()
 
-    async def test_oversized_legacy_provenance_keeps_original_queue_recoverable(self):
+    async def test_oversized_unattested_legacy_provenance_stays_private_during_migration(self):
         source = "用户授权" * 20_000
         record = await self.envelope(source_user_instruction=source)
+        self.events([self.queue_event(record)])
+        proof = {record["id"]: {"target_session_id": "recipient"}}
+        recovered = self.ns["scan_queued_turns_from_events"]([("recipient", {})], mailbox_evidence=proof)
+        self.assertEqual(await self.ns["migrate_unstarted_chat_mailbox_backlog"]([record], proof, recovered), 1)
+        after = await self.ledger.get(record["id"])
+        self.assertEqual((after["status"], after["delivery_mode"]), ("stored", "mailbox"))
+        self.assertEqual(after["source_user_instruction"], source)
+        messages = (await self.ledger.mailbox_call("list_messages", "recipient", None, [PAIR]))["messages"]
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["body"], record["body"])
+        self.assertNotIn("user_delegation", messages[0])
+        self.assertNotIn("source_user_instruction", messages[0])
+
+    async def test_oversized_attested_provenance_keeps_original_queue_recoverable(self):
+        source = "用户授权" * 20_000
+        record = await self.envelope(source_user_instruction=source, source_user_delegation_action="route")
         self.events([self.queue_event(record)])
         proof = {record["id"]: {"target_session_id": "recipient"}}
         recovered = self.ns["scan_queued_turns_from_events"]([("recipient", {})], mailbox_evidence=proof)

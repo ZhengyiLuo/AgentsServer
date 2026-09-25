@@ -601,12 +601,17 @@ class ManagerGenerationTests(unittest.IsolatedAsyncioTestCase):
             nodes = [node for node in ast.parse(source.read_text()).body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
             created = []
             def factory(*args, **kwargs):
-                manager = SimpleNamespace(client=SimpleNamespace(), add_notification_handler=Mock(), close=AsyncMock(), options=kwargs)
+                manager = SimpleNamespace(client=SimpleNamespace(add_account_usage_handler=Mock()), add_notification_handler=Mock(), close=AsyncMock(), options=kwargs)
                 created.append(manager)
                 return manager
             normal_env = {"OPENAI_API_KEY": "normal-synthetic"}
             ns = {"asyncio": asyncio, "CODEX_PROVIDER_STORE": store, "codex_provider": provider,
                 "CODEX_APP_SERVER_MANAGER": None, "CODEX_CUSTOM_APP_SERVER_MANAGERS": {},
+                "CODEX_RETIRED_APP_SERVER_MANAGERS": [], "CODEX_SESSION_APP_SERVER_MANAGERS": {},
+                "CODEX_BINARY_IDENTITY": None,
+                "refresh_codex_app_server_binary": AsyncMock(),
+                "retain_codex_manager_caller": Mock(), "schedule_codex_manager_drain": Mock(),
+                "session_provider_id": lambda session: session.get("codex_thread_id"),
                 "CODEX_APP_SERVER_MANAGER_EPOCH": 0, "CODEX_GOALS_CONFIG_LOCK": asyncio.Lock(),
                 "CODEX_APP_SERVER_MANAGER_LOCK": asyncio.Lock(), "CODEX_GOALS_ENABLED": True,
                 "ensure_provider_manager_factory_admission": lambda **kwargs: None,

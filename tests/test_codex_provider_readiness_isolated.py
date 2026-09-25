@@ -2,6 +2,8 @@
 from __future__ import annotations
 import ast
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar, copy_context
 import json
 from pathlib import Path
 import re
@@ -15,7 +17,8 @@ import codex_provider
 
 SOURCE = (Path(__file__).resolve().parents[1] / "agent_server.py")
 NAMES = {"probe_runtime", "runtime_diagnostic_payload", "safe_runtime_version", "auth_failure_text",
-         "discover_runtime_catalog", "ensure_runtime_available"}
+         "discover_runtime_catalog", "discover_runtime_catalog_within_budget",
+         "discover_runtime_backend_catalog", "runtime_catalog_budget_expired", "ensure_runtime_available"}
 NODES = [node for node in ast.parse(SOURCE.read_text()).body
          if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in NAMES]
 assert {node.name for node in NODES} == NAMES
@@ -32,6 +35,10 @@ class CodexProviderReadinessTests(unittest.IsolatedAsyncioTestCase):
         self.ns = {"Any": object, "Path": Path, "re": re, "time": time, "json": json, "subprocess": subprocess,
             "asyncio": asyncio, "HTTPException": HTTPException, "codex_provider": codex_provider,
             "BACKEND_CODEX": "codex", "BACKEND_CLAUDE": "claude", "BACKEND_CURSOR": "cursor",
+            "BACKEND_OPENCODE": "opencode", "VALID_BACKENDS": {"claude", "codex", "cursor", "opencode"},
+            "ThreadPoolExecutor": ThreadPoolExecutor, "copy_context": copy_context,
+            "RUNTIME_CATALOG_DEADLINE": ContextVar("test_catalog_deadline", default=None),
+            "RUNTIME_CATALOG_BUDGET_SECONDS": 25.0, "CLAUDE_AUTH_PROBE_TIMEOUT_SECONDS": 15.0,
             "CODEX_PROVIDER_STORE": self.store, "CODEX_TRANSPORT": "app-server", "CODEX_TRANSPORT_EXEC": "exec",
             "runtime_display_name": lambda backend: backend, "runtime_action": lambda *args, **kwargs: None,
             "now_iso": lambda: "2026-09-17T00:00:00Z", "runtime_executable": lambda backend: backend,
@@ -40,7 +47,8 @@ class CodexProviderReadinessTests(unittest.IsolatedAsyncioTestCase):
             "runtime_diagnostic": Mock(return_value={"status": "unauthenticated", "installed": True}),
             "public_runtime_diagnostic": lambda value: value,
             "runtime_option": lambda value, label: {"value": value, "label": label},
-            "CURSOR_PERMISSION_MODES": [], "CURSOR_DEFAULT_PERMISSION_MODE": "default"}
+            "CURSOR_PERMISSION_MODES": [], "CURSOR_DEFAULT_PERMISSION_MODE": "default",
+            "OPENCODE_PERMISSION_MODES": [], "OPENCODE_DEFAULT_PERMISSION_MODE": "default"}
         exec(CODE, self.ns)
 
     def test_normal_codex_uses_its_login_despite_saved_or_broken_optional_provider(self):
@@ -75,8 +83,7 @@ class CodexProviderReadinessTests(unittest.IsolatedAsyncioTestCase):
 
     def test_catalog_adds_custom_metadata_without_replacing_normal_models_or_readiness(self):
         normal = {"models": [{"value": "ordinary-codex-model", "label": "Normal"}], "default_model": "ordinary-codex-model"}
-        self.ns.update({"refresh_runtime_diagnostics": lambda **kwargs: {"codex": {"status": "unauthenticated", "installed": True}},
-            "discover_codex_catalog": lambda: dict(normal), "parse_claude_help_catalog": lambda: {}})
+        self.ns.update({"discover_codex_catalog": lambda: dict(normal), "parse_claude_help_catalog": lambda: {}})
         result = self.ns["discover_runtime_catalog"]()["backends"]["codex"]
         self.assertEqual(result["models"], normal["models"])
         self.assertEqual(result["default_model"], normal["default_model"])

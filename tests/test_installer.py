@@ -759,6 +759,7 @@ exit 0
         self.assertIn('"$SCRIPT_DIR/agentsdock_publish.py"', source)
         self.assertIn('"$SCRIPT_DIR/agentsdock_team.py"', source)
         self.assertIn('"$SCRIPT_DIR/provider_commands.py"', source)
+        self.assertIn('"$SCRIPT_DIR/provider_usage.py"', source)
         self.assertIn('"$SCRIPT_DIR/claude_sdk_client.py"', source)
         self.assertIn('"$SCRIPT_DIR/codex_app_server.py"', source)
         self.assertIn('"$SCRIPT_DIR/cursor_agent_client.py"', source)
@@ -782,6 +783,7 @@ exit 0
         self.assertIn("'$REMOTE_SERVER_DIR/secure_peer_delivery.py'", source)
         self.assertIn("'$REMOTE_SERVER_DIR/agentsdock_team.py'", source)
         self.assertIn("'$REMOTE_SERVER_DIR/provider_commands.py'", source)
+        self.assertIn("'$REMOTE_SERVER_DIR/provider_usage.py'", source)
         self.assertIn("'$REMOTE_SERVER_DIR/agentsdock_team_hub'", source)
         self.assert_smoke_check_imports(
             source,
@@ -1431,6 +1433,8 @@ exit 0
         self.assertIn('"$STAGE_DIR/agentsdock_emergency.py"', installer_source)
         self.assertIn('"$STAGE_DIR/agentsdock_publish.py"', installer_source)
         self.assertIn('"$STAGE_DIR/provider_commands.py"', installer_source)
+        self.assertIn('"$STAGE_DIR/provider_usage.py"', installer_source)
+        self.assertIn("provider_usage.py", release_files)
         self.assertIn('"$STAGE_DIR/claude_sdk_client.py"', installer_source)
         self.assertIn('"$STAGE_DIR/codex_app_server.py"', installer_source)
         self.assertIn('"$STAGE_DIR/cursor_agent_client.py"', installer_source)
@@ -1513,6 +1517,7 @@ exit 0
                 f"agents-server-{version}/provider_commands.py",
                 members,
             )
+            self.assertIn(f"agents-server-{version}/provider_usage.py", members)
             self.assertIn(
                 f"agents-server-{version}/codex_app_server.py",
                 members,

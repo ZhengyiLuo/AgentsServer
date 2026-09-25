@@ -47,8 +47,11 @@ def flush_tree(root: Path, *, dependency_prefix: bool = False) -> dict[str, int]
     if not root.is_absolute() or root.resolve(strict=True) != root:
         raise ValueError("durability tree must have no linked ancestors")
     root_info = root.lstat()
+    # uv can retain a same-user runtime with 0775 directories and 0664 files.
+    # Flushing that admitted dependency must not change its permission policy.
+    writable_mask = 0o002 if dependency_prefix else 0o022
     if (not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != os.getuid()
-            or root_info.st_mode & 0o022):
+            or root_info.st_mode & writable_mask):
         raise PermissionError("durability tree root is unsafe")
     total = {"entries": 0, "bytes": 0}
     external: set[Path] = set()
@@ -70,7 +73,7 @@ def flush_tree(root: Path, *, dependency_prefix: bool = False) -> dict[str, int]
                 info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
                 if info.st_uid != os.getuid() or info.st_dev != root_info.st_dev:
                     raise PermissionError("durability member ownership or device changed")
-                if dependency_prefix and not stat.S_ISLNK(info.st_mode) and info.st_mode & 0o022:
+                if dependency_prefix and not stat.S_ISLNK(info.st_mode) and info.st_mode & 0o002:
                     raise PermissionError("standalone Python durability member is writable by others")
                 total["entries"] += 1
                 if total["entries"] > MAX_ENTRIES:
@@ -116,16 +119,17 @@ def flush_tree(root: Path, *, dependency_prefix: bool = False) -> dict[str, int]
     visit(root)
     for interpreter in sorted(external):
         info = interpreter.lstat()
+        prefix = interpreter.parent.parent
+        match = re.fullmatch(r"python([0-9]+\.[0-9]+)", interpreter.name)
+        standalone = re.fullmatch(r"cpython-[0-9]+\.[0-9]+\.[0-9]+(?:[a-z0-9.]*)?-(?:macos|linux)-[a-z0-9_]+-[a-z0-9_]+", prefix.name)
+        writable_mask = 0o002 if info.st_uid == os.getuid() else 0o022
         if (not stat.S_ISREG(info.st_mode) or info.st_uid not in {0, os.getuid()}
-                or info.st_mode & 0o022 or not info.st_mode & 0o111):
+                or info.st_mode & writable_mask or not info.st_mode & 0o111):
             raise PermissionError("external durability interpreter is unsafe")
         if info.st_uid == 0:
             # System interpreters are provisioned outside this updater. Never
             # traverse /usr or another OS-managed Python installation.
             continue
-        prefix = interpreter.parent.parent
-        match = re.fullmatch(r"python([0-9]+\.[0-9]+)", interpreter.name)
-        standalone = re.fullmatch(r"cpython-[0-9]+\.[0-9]+\.[0-9]+(?:[a-z0-9.]*)?-(?:macos|linux)-[a-z0-9_]+-[a-z0-9_]+", prefix.name)
         if standalone:
             if (interpreter.parent.name != "bin" or match is None
                     or not (prefix / "lib" / ("python" + match[1])).is_dir()

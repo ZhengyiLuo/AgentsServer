@@ -639,6 +639,103 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    async def test_closed_ephemeral_fork_skips_only_its_late_child_cleanup(self) -> None:
+        for ephemeral, closing in ((True, True), (False, True), (True, False), (False, False)):
+            with self.subTest(ephemeral=ephemeral, closing=closing):
+                client = self.make_client(FakeProcessFactory())
+                client._closing = closing
+                error = CodexAppServerDisconnected("lost fork reply", request_sent=True)
+                client.request = AsyncMock(side_effect=error)
+                client._delete_late_fork_child = AsyncMock(return_value=())
+                with self.assertRaises(CodexAppServerDisconnected) as caught:
+                    await client.fork_thread("parent", {"ephemeral": ephemeral})
+                self.assertIs(caught.exception, error)
+                if ephemeral and closing:
+                    client._delete_late_fork_child.assert_not_awaited()
+                else:
+                    client._delete_late_fork_child.assert_awaited_once()
+
+    async def test_side_chat_stop_closes_transport_with_lost_open_response(self) -> None:
+        import codex_side_question as side
+
+        for stalled_method in ("initialize", "thread/fork"):
+            with self.subTest(stalled_method=stalled_method):
+                factory = FakeProcessFactory()
+                entered = asyncio.Event()
+
+                def stall(_message):
+                    entered.set()
+                    return NO_RESPONSE
+
+                factory.process.responders[stalled_method] = stall
+                transports = []
+
+                def create_client(*args, **kwargs):
+                    client = CodexAppServerClient(*args, process_factory=factory, **kwargs)
+                    transports.append(client)
+                    return client
+
+                with patch.object(side, "_verify_protocol", AsyncMock()), \
+                        patch.object(side, "CodexAppServerClient", side_effect=create_client):
+                    chat = side.NativeCodexSideChat("parent", executable="fixture", model=None, env={})
+                    task = asyncio.create_task(chat.ask("Question"))
+                    await entered.wait()
+                    cleanup = AsyncMock(return_value=())
+                    transports[0]._delete_late_fork_child = cleanup
+                    task.cancel()
+                    done, _ = await asyncio.wait({task}, timeout=0.5)
+                    # Release even a regressed fixture without awaiting its
+                    # normal 300-second fork acknowledgment deadline.
+                    await transports[0].close()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+                    self.assertIn(task, done)
+                    self.assertIsNotNone(factory.process.returncode)
+                    self.assertIsNone(transports[0].process)
+                    self.assertEqual(len(factory.calls), 1)
+                    self.assertFalse(any(message.get("method") == "turn/start"
+                                         for message in factory.process.messages))
+                    cleanup.assert_not_awaited()
+
+    async def test_side_chat_stop_during_spawn_reaps_late_process_handle(self) -> None:
+        import codex_side_question as side
+
+        factory = FakeProcessFactory()
+        entered, release = asyncio.Event(), asyncio.Event()
+        factory.process.responders["initialize"] = lambda _: NO_RESPONSE
+        transports = []
+
+        async def delayed_spawn(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return await factory(*args, **kwargs)
+
+        def create_client(*args, **kwargs):
+            client = CodexAppServerClient(*args, process_factory=delayed_spawn, **kwargs)
+            transports.append(client)
+            return client
+
+        with patch.object(side, "_verify_protocol", AsyncMock()), \
+                patch.object(side, "CodexAppServerClient", side_effect=create_client):
+            chat = side.NativeCodexSideChat("parent", executable="fixture", model=None, env={})
+            task = asyncio.create_task(chat.ask("Question"))
+            await entered.wait()
+            task.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+            self.assertIsNone(transports[0].process)
+            release.set()
+            done, _ = await asyncio.wait({task}, timeout=0.5)
+            await transports[0].close()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertIn(task, done)
+            self.assertIsNotNone(factory.process.returncode)
+            self.assertIsNone(transports[0].process)
+            self.assertEqual(len(factory.calls), 1)
+            self.assertFalse(any(message.get("method") == "thread/fork"
+                                 for message in factory.process.messages))
+
     async def test_timed_out_fork_deletes_child_from_late_started_notification(
         self,
     ) -> None:

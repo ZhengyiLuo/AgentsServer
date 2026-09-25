@@ -10,7 +10,6 @@ from claude_sdk_client import (
     CLAUDE_NON_DURABLE_SCHEDULER_TOOLS,
     CLAUDE_PROVIDER_MCP_SERVER_NAME,
     CLAUDE_PROVIDER_MCP_TOOL_NAME,
-    CLAUDE_SDK_LITERAL_MESSAGE_PREFIX,
     CLAUDE_SDK_MCP_STATUS_SCAN_LIMIT,
     CLAUDE_SDK_MCP_STATUS_TRUNCATED_KEY,
     ClaudeSDKConfigurationConflict,
@@ -31,6 +30,7 @@ from claude_sdk_client import (
     reject_subagent_provider_tool_hook,
     reject_untracked_background_hook,
     _parse_claude_sdk_message,
+    _query_message_stream,
 )
 
 
@@ -853,14 +853,17 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual(await handle.wait_result(), result)
 
-    async def test_leading_slash_prompts_are_literalized_only_on_sdk_transport(self) -> None:
+    async def test_leading_slash_text_uses_native_metadata_without_rewriting_prompt(self) -> None:
         cases = (
             ("/team use research", True),
             (" \ufeff  /compact this explanation", True),
+            ("/hdd/projects/example.py\nPlease inspect this file.", True),
+            ("\n\t/目录/文件.txt  \n", True),
             ("What does /team mean?", False),
             ("https://example.test/team", False),
+            ("@README.md explain this file", False),
         )
-        for index, (prompt, literalized) in enumerate(cases):
+        for index, (prompt, verbatim) in enumerate(cases):
             with self.subTest(prompt=prompt):
                 handle = await self.manager.start_run(
                     "chat-1",
@@ -871,11 +874,13 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
                 )
                 client = self.factory.clients[0]
                 transmitted = client.calls[-1][1]
-                self.assertEqual(
-                    transmitted,
-                    f"{CLAUDE_SDK_LITERAL_MESSAGE_PREFIX}{prompt}"
-                    if literalized else prompt,
-                )
+                self.assertEqual(transmitted, prompt)
+                envelope = client.query_envelopes[-1][0]
+                self.assertEqual(envelope["message"]["content"], prompt)
+                if verbatim:
+                    self.assertIs(envelope["client_composed"], True)
+                else:
+                    self.assertNotIn("client_composed", envelope)
                 self.assertEqual(
                     client.query_envelopes[-1][0]["uuid"],
                     handle.correlation_id,
@@ -923,6 +928,9 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             ("query", "/review staged files", {}),
             self.factory.clients[0].calls,
+        )
+        self.assertNotIn(
+            "client_composed", self.factory.clients[0].query_envelopes[0][0],
         )
         self.assertEqual(
             await asyncio.wait_for(collect(handle), 1),
@@ -2363,6 +2371,71 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ClaudeSDKMCPControlTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pinned_sdk_serializes_per_message_verbatim_metadata(self) -> None:
+        from claude_agent_sdk import ClaudeSDKClient, Transport
+
+        class RecordingTransport(Transport):
+            def __init__(self) -> None:
+                self.frames: list[dict[str, Any]] = []
+                self.incoming: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+                self.ready = False
+
+            async def connect(self) -> None:
+                self.ready = True
+
+            async def write(self, data: str) -> None:
+                frame = json.loads(data)
+                self.frames.append(frame)
+                if frame["type"] == "control_request":
+                    await self.incoming.put({
+                        "type": "control_response",
+                        "response": {
+                            "subtype": "success",
+                            "request_id": frame["request_id"],
+                            "response": {},
+                        },
+                    })
+
+            async def read_messages(self) -> AsyncIterator[dict[str, Any]]:
+                while self.ready:
+                    yield await self.incoming.get()
+
+            async def close(self) -> None:
+                self.ready = False
+
+            def is_ready(self) -> bool:
+                return self.ready
+
+            async def end_input(self) -> None:
+                pass
+
+        transport = RecordingTransport()
+        client = ClaudeSDKClient(transport=transport)
+        await client.connect()
+        try:
+            for prompt, command, verbatim in (
+                (" \ufeff/hdd/project/source.py\nRead this.\n", None, True),
+                ("/review staged files", "review", False),
+                ("@README.md explain this file", None, False),
+            ):
+                with self.subTest(prompt=prompt):
+                    await client.query(
+                        _query_message_stream(prompt, "query-uuid", command),
+                        session_id="provider-session",
+                    )
+                    frame = transport.frames[-1]
+                    self.assertEqual(frame["message"], {
+                        "role": "user", "content": prompt,
+                    })
+                    self.assertEqual(frame["uuid"], "query-uuid")
+                    self.assertEqual(frame["session_id"], "provider-session")
+                    if verbatim:
+                        self.assertIs(frame["client_composed"], True)
+                    else:
+                        self.assertNotIn("client_composed", frame)
+        finally:
+            await client.disconnect()
+
     def test_pinned_sdk_exposes_native_mcp_controls(self) -> None:
         from claude_agent_sdk import ClaudeSDKClient
 

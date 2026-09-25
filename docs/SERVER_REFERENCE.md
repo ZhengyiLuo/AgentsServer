@@ -1507,8 +1507,10 @@ the selection against the session, backend, working directory, and current
 provider inventory immediately before execution. A valid Codex selection uses
 Codex's structured skill input, while a valid Claude selection invokes the
 provider-reported command through the SDK. Unknown or unselected leading-slash
-text remains an ordinary literal message, and normal approval policy is
-unchanged.
+text remains an ordinary literal message. Its content is sent unchanged;
+Claude receives a native per-message transport flag instead of an added
+instruction. Selected commands and ordinary `@file` input keep their native
+behavior, and normal approval policy is unchanged.
 
 Opaque IDs and revisions are scoped to the current AgentsServer process so
 native filesystem paths cannot be inferred from them. After a server restart,

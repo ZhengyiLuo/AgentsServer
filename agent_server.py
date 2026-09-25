@@ -35003,6 +35003,7 @@ def collect_semantic_timeline_events(
     internal_status_run_ids: set[str],
     event_limit: int,
     history_repair_window=None,
+    repair_seq_bounds: tuple[int, int] | None = None,
 ) -> list[dict[str, Any]]:
     if not selected:
         return []
@@ -35070,7 +35071,14 @@ def collect_semantic_timeline_events(
                         TIMELINE_IMPORTED_PROMPT_HIDDEN_FIELD: True,
                     }
                     page_repaired = True
+            before_projection = event
             event = project_legacy_imported_provider_event(event, session_id)
+            page_repaired = page_repaired or (
+                event is not before_projection
+                and event.get("provider_history_repair") in {
+                    "source_proven_import", "source_proven_assistant_replay", "source_proven_native_replay",
+                }
+            )
             hidden_imported_prompt = bool(
                 event.get(TIMELINE_IMPORTED_PROMPT_HIDDEN_FIELD)
             )
@@ -35237,12 +35245,16 @@ def collect_semantic_timeline_events(
                     else:
                         key = f"event:{event.get('id') or seq}"
 
+            if page_repaired and (
+                key in selected_by_key
+                or (repair_seq_bounds is not None and repair_seq_bounds[0] < seq <= repair_seq_bounds[1])
+            ) and event_files_belong_to_session(event, session_id):
+                # Same-ID empty records replace already-cached bogus bubbles.
+                # A repaired row can have lost its old semantic landmark.
+                # Retain its correction within this page's existing scan.
+                page_repairs.append(client_safe_event(event))
             if not key or key not in selected_by_key:
                 continue
-            if page_repaired:
-                # Same-ID empty records replace already-cached bogus bubbles.
-                # Simply omitting these rows leaves older desktop caches dirty.
-                page_repairs.append(client_safe_event(event))
             if hidden_imported_prompt:
                 # The event already updated logical-turn routing above. Its
                 # provider-only prompt is not part of the semantic response.
@@ -35694,6 +35706,12 @@ def read_semantic_timeline_page(
         fork_internal_run_ids=fork_internal_run_ids,
         internal_status_run_ids=internal_status_run_ids,
         history_repair_window=history_repair_window,
+        repair_seq_bounds=(
+            max(after, min((int(item.get("_semantic_original_start_seq") or 0)
+                            for item in selected), default=after + 1) - 1),
+            (boundary - 1 if boundary is not None else int(index.get("latest_seq") or 0))
+            if tail else max((int(item.get("end_seq") or 0) for item in selected), default=0),
+        ),
         event_limit=min(
             MAX_EVENT_RESPONSE_LIMIT,
             sum(

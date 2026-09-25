@@ -488,14 +488,21 @@ class ClaudeInterruptionRepairTests(unittest.TestCase):
         quoted = {**self.target, "provider_origin": {**self.target["provider_origin"], "event_id": self.raw(99)["uuid"]}, "seq": 55}
         self.assertIsNone(self.cache.project_event("chat-1", quoted))
 
-    def owned_followup_fixture(self, *, linked=True, same_uuid=True):
-        user = self.raw(1)
+    def owned_followup_fixture(self, *, linked=True, same_uuid=True,
+                               native_prompt="Real question", source_prompt=None,
+                               native_command=None):
+        source_prompt = native_prompt if source_prompt is None else source_prompt
+        user = self.raw(1, source_prompt)
         assistant = self.raw(2, type="assistant", parentUuid=user["uuid"] if linked else self.raw(99)["uuid"],
             message={"role": "assistant", "content": [{"type": "text", "text": "Owned answer"}]})
+        if native_command is not None:
+            assistant.update(type="system", subtype="local_command", commandRun=native_command,
+                             content="<local-command-stdout>Owned answer\n\n</local-command-stdout>")
+            assistant.pop("message")
         common = {"session_id": "chat-1", "backend": "claude", "run_id": "native-one",
                   "provider_session_id": self.PROVIDER, "ts": self.TIME}
         native = [
-            {**common, "type": "turn_started", "seq": 1, "prompt": "Real question"},
+            {**common, "type": "turn_started", "seq": 1, "prompt": native_prompt},
             {**common, "type": "assistant_text", "seq": 2, "phase": "commentary", "text": "Owned answer",
              "provider_message_id": assistant["uuid"] if same_uuid else self.raw(98)["uuid"]},
             {**common, "type": "turn_finished", "seq": 3, "exit_code": 0, "result_text": "Owned answer"},
@@ -504,7 +511,7 @@ class ClaudeInterruptionRepairTests(unittest.TestCase):
         def origin(row):
             return {"provider": "claude", "event_id": row["uuid"], "session_id": self.PROVIDER,
                     "timestamp": row["timestamp"]}
-        self.target.update(prompt="Real question", provider_origin=origin(user))
+        self.target.update(prompt=source_prompt.strip(), provider_origin=origin(user))
         imported = {**self.target, "type": "assistant_text", "seq": 18527,
                     "text": "Owned answer", "provider_origin": origin(assistant)}
         imported.pop("prompt")
@@ -535,6 +542,122 @@ class ClaudeInterruptionRepairTests(unittest.TestCase):
                 self.prepare()
                 self.assertFalse(self.cache.is_hidden("chat-1", self.target))
                 self.assertEqual(self.cache.project_event("chat-1", imported) is not None, same_uuid)
+
+    def test_legacy_slash_wrapper_replay_keeps_original_prompt_and_assistant_once(self):
+        for prompt in ("/hdd/work/file.py", "\ufeff \n/hdd/work/file.py\n  Keep **this** formatting.  \n"):
+            with self.subTest(prompt=prompt):
+                self.cache = repair.ClaudeMetadataRepairCache()
+                wrapped = repair.CLAUDE_SDK_LITERAL_MESSAGE_PREFIX + prompt
+                imported = self.owned_followup_fixture(native_prompt=prompt, source_prompt=wrapped)
+                before_events, before_source = self.events.read_bytes(), self.source.read_bytes()
+                self.assertTrue(self.prepare())
+                helpers = load_server_repair(self.cache)
+                projected = [helpers["project_provider_history_event_for_egress"](row, "chat-1")
+                             for row in self.rows]
+                self.assertEqual([row["prompt"] for row in projected
+                                  if row.get("type") == "turn_started" and row.get("prompt")], [prompt])
+                self.assertEqual([row["text"] for row in projected
+                                  if row.get("type") == "assistant_text" and row.get("text")], ["Owned answer"])
+                items = [{"kind": "user", "text": wrapped.strip(), "provider_origin": self.target["provider_origin"]},
+                         {"kind": "assistant", "text": imported["text"], "provider_origin": imported["provider_origin"]}]
+                result = repair.filter_native_claude_mailbox_wake_items(
+                    "chat-1", self.PROVIDER, self.events, items, source_path=self.source, root=self.root,
+                    sync_checkpoint=self.rows[3]["_history_sync_checkpoint"],
+                    normalize_user=self.normalize, normalize_full_user=self.normalize)
+                self.assertTrue(all(item.get("metadata_only") for item in result))
+                self.assertEqual(self.events.read_bytes(), before_events)
+                self.assertEqual(self.source.read_bytes(), before_source)
+
+    def test_legacy_slash_wrapper_repair_applies_to_existing_cached_history_pages(self):
+        prompt = "/hdd/work/file.py"
+        imported = self.owned_followup_fixture(native_prompt=prompt,
+            source_prompt=repair.CLAUDE_SDK_LITERAL_MESSAGE_PREFIX + prompt)
+        window = self.cache.prepare_window("chat-1", self.PROVIDER, self.events, self.root,
+            self.normalize, normalize_full_user=self.normalize, event_window_end=self.events.stat().st_size)
+        self.assertTrue(window.is_hidden(self.target))
+        self.assertTrue(window.project_event(imported)["metadata_only"])
+        self.assertFalse(window.is_hidden(self.rows[0]))
+
+    def test_legacy_slash_wrapper_without_original_ownership_is_not_deleted(self):
+        cases = [
+            {"linked": False}, {"same_uuid": False},
+            {"native_prompt": "A normal message"},
+            {"native_prompt": "/different/path"},
+            {"native_prompt": "Quoted:\n" + repair.CLAUDE_SDK_LITERAL_MESSAGE_PREFIX + "/hdd/work/file.py"},
+        ]
+        for changed in cases:
+            with self.subTest(changed=changed):
+                self.cache = repair.ClaudeMetadataRepairCache()
+                kwargs = {"native_prompt": "/hdd/work/file.py", **changed,
+                          "source_prompt": repair.CLAUDE_SDK_LITERAL_MESSAGE_PREFIX + "/hdd/work/file.py"}
+                self.owned_followup_fixture(**kwargs)
+                self.prepare()
+                self.assertFalse(self.cache.is_hidden("chat-1", self.target))
+
+    def test_user_pasted_literal_prefix_stays_exactly_as_submitted(self):
+        quoted = repair.CLAUDE_SDK_LITERAL_MESSAGE_PREFIX + "/hdd/work/file.py"
+        self.owned_followup_fixture(native_prompt=quoted)
+        self.prepare()
+        helpers = load_server_repair(self.cache)
+        original = self.rows[0]
+        self.assertEqual(helpers["project_provider_history_event_for_egress"](original, "chat-1"), original)
+        self.assertEqual(original["prompt"], quoted)
+        self.assertTrue(self.cache.is_hidden("chat-1", self.target), "Only its proven duplicate is hidden")
+
+    def test_owned_native_command_wrapper_is_not_reimported_as_a_user_message(self):
+        for name, args in (("context", ""), ("review", "staged files")):
+            with self.subTest(name=name):
+                self.cache = repair.ClaudeMetadataRepairCache()
+                prompt = "/" + name + (" " + args if args else "")
+                wrapped = (f"<command-name>/{name}</command-name>\n            "
+                           f"<command-message>{name}</command-message>\n            "
+                           f"<command-args>{args}</command-args>")
+                imported = self.owned_followup_fixture(native_prompt=prompt, source_prompt=wrapped,
+                    native_command={"command": name, "args": args})
+                before_events, before_source = self.events.read_bytes(), self.source.read_bytes()
+                self.assertTrue(self.prepare())
+                self.assertTrue(self.cache.is_hidden("chat-1", self.target))
+                window = self.cache.prepare_window("chat-1", self.PROVIDER, self.events, self.root,
+                    self.normalize, normalize_full_user=self.normalize, event_window_end=self.events.stat().st_size)
+                self.assertTrue(window.is_hidden(self.target))
+                items = [{"kind": "user", "text": wrapped, "provider_origin": self.target["provider_origin"]}]
+                filtered = repair.filter_native_claude_mailbox_wake_items(
+                    "chat-1", self.PROVIDER, self.events, items, source_path=self.source, root=self.root,
+                    sync_checkpoint=self.rows[3]["_history_sync_checkpoint"],
+                    normalize_user=self.normalize, normalize_full_user=self.normalize)
+                self.assertTrue(filtered[0].get("metadata_only"))
+                projected = load_server_repair(self.cache)["project_provider_history_event_for_egress"]
+                self.assertEqual(projected(self.rows[0], "chat-1")["prompt"], prompt)
+                self.assertEqual(projected(self.rows[1], "chat-1")["text"], "Owned answer")
+                self.assertEqual(self.events.read_bytes(), before_events)
+                self.assertEqual(self.source.read_bytes(), before_source)
+
+    def test_native_command_wrapper_requires_matching_output_uuid_and_command_metadata(self):
+        wrapped = ("<command-name>/context</command-name>\n"
+                   "<command-message>context</command-message>\n<command-args></command-args>")
+        for changed in (
+            {"linked": False}, {"same_uuid": False}, {"native_command": {}},
+            {"native_command": {"command": "context", "args": "other"}},
+            {"native_command": {"command": "cost", "args": ""}},
+            {"native_command": None}, {"native_prompt": "/different"},
+            {"native_prompt": "Quoted:\n" + wrapped},
+        ):
+            with self.subTest(changed=changed):
+                self.cache = repair.ClaudeMetadataRepairCache()
+                kwargs = {"native_prompt": "/context", "source_prompt": wrapped,
+                          "native_command": {"command": "context", "args": ""}, **changed}
+                self.owned_followup_fixture(**kwargs)
+                self.prepare()
+                self.assertFalse(self.cache.is_hidden("chat-1", self.target))
+
+    def test_user_pasted_native_command_xml_stays_as_submitted(self):
+        wrapped = ("<command-name>/context</command-name>\n"
+                   "<command-message>context</command-message>\n<command-args></command-args>")
+        self.owned_followup_fixture(native_prompt=wrapped)
+        self.prepare()
+        projected = load_server_repair(self.cache)["project_provider_history_event_for_egress"]
+        self.assertEqual(projected(self.rows[0], "chat-1")["prompt"], wrapped)
+        self.assertTrue(self.cache.is_hidden("chat-1", self.target), "Only its proven duplicate is hidden")
 
     def native_steer(self):
         common = {"session_id": "chat-1", "backend": "claude", "ts": self.TIME}

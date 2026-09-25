@@ -23,6 +23,7 @@ from typing import Callable
 
 from claude_history_provenance import ClaudeInterruptionTracker
 from claude_goals import ClaudeGoalHistoryNormalizer, is_claude_synthetic_no_response
+from claude_sdk_client import CLAUDE_SDK_LITERAL_MESSAGE_PREFIX
 
 
 MAX_BYTES = 96 * 1024 * 1024
@@ -165,6 +166,7 @@ class _AssistantReplays:
         self.candidates, self.sources, self.identities, self.source_credits = [], {}, {}, {}
         self.source_display, self.source_message_counts = {}, {}
         self.source_parents, self.source_users, self.source_input = OrderedDict(), {}, {}
+        self.source_commands, self.local_command_prompts = {}, {}
 
     def display_key(self, text: str) -> str | None:
         if self.normalize_assistant is None:
@@ -211,13 +213,33 @@ class _AssistantReplays:
         tool_result = isinstance(content, list) and any(isinstance(part, dict) and part.get("type") == "tool_result" for part in content)
         if event.get("type") == "user" and event.get("isMeta") is not True and text.strip() and not tool_result:
             self.source_users.setdefault(identity, []).append((offset, _text_key(text.strip())))
+            command = re.fullmatch(
+                r"<command-name>/([A-Za-z0-9_][A-Za-z0-9_.:-]{0,127})</command-name>\s*"
+                r"<command-message>\1</command-message>\s*<command-args>([\s\S]*)</command-args>",
+                text.strip(),
+            )
+            if command is not None:
+                self.source_commands[identity] = command.groups()
             parent_input = identity
         self.source_parents[identity[0]] = parent_input
         while len(self.source_parents) > 256:
             self.source_parents.popitem(last=False)
         if len(self.source_users) > MAX_KEYS:
             raise _Unproven()
-        if event.get("type") != "assistant":
+        local_output = None
+        if event.get("type") == "system" and event.get("subtype") == "local_command":
+            command = event.get("commandRun")
+            output = event.get("content")
+            wrapper = self.source_commands.get(parent_input)
+            if (not isinstance(command, dict) or wrapper is None
+                    or wrapper != (command.get("command"), command.get("args"))
+                    or not isinstance(output, str)):
+                return
+            local_output = re.fullmatch(r"<local-command-stdout>([\s\S]*)</local-command-stdout>", output)
+            if local_output is None:
+                return
+            self.local_command_prompts[identity] = "/" + wrapper[0] + (" " + wrapper[1] if wrapper[1] else "")
+        elif event.get("type") != "assistant":
             return
         if parent_input is not None:
             self.source_input[identity] = parent_input
@@ -229,7 +251,9 @@ class _AssistantReplays:
         content = message.get("content") if isinstance(message, dict) else None
         # Only public text blocks. Thinking/tool payloads cannot establish a
         # public replay, even if their wording happens to match another row.
-        if isinstance(content, str):
+        if local_output is not None:
+            text = local_output[1]
+        elif isinstance(content, str):
             text = content
         elif isinstance(content, list):
             text = "\n".join(block["text"] for block in content if isinstance(block, dict)
@@ -270,7 +294,21 @@ class _AssistantReplays:
             assistants.add((identity, digest))
             source_input = self.source_input.get(identity)
             inputs = self.source_users.get(source_input, ())
-            if len(inputs) == 1 and isinstance(matches[0], str) and inputs[0][1] == _text_key(matches[0].strip()):
+            expected_inputs = set()
+            if isinstance(matches[0], str):
+                expected_inputs.add(_text_key(matches[0].strip()))
+                if re.sub(r"^[\s\ufeff]+", "", matches[0]).startswith("/"):
+                    # Older transports prepended this exact sentence. The
+                    # native assistant UUID and source ancestry above prove
+                    # which immutable user prompt owns this imported copy.
+                    # Never strip matching prose from an unowned user quote.
+                    expected_inputs.add(_text_key(
+                        (CLAUDE_SDK_LITERAL_MESSAGE_PREFIX + matches[0]).strip()))
+            # A native local-command result owns its XML input only when the
+            # commandRun metadata, source wrapper and original prompt agree.
+            command_match = (identity in self.local_command_prompts
+                             and self.local_command_prompts[identity] == matches[0])
+            if len(inputs) == 1 and (inputs[0][1] in expected_inputs or command_match):
                 users.add((source_input, inputs[0][1], inputs[0][0]))
         return assistants, users
 
@@ -1288,6 +1326,7 @@ def _prove_recent_scheduled(session_id: str, provider_id: str, events: Path, roo
         if len(identity_counts) + len(source_matches) > MAX_KEYS:
             raise _Unproven()
     targets, counts = set(), {}
+    _owned_assistants, owned_inputs = assistant_replays.exact_owned_sources()
     for target, identity in candidates:
         seq, run, key = target
         batch, matched = eligible.get(run), source_matches.get((identity, key), ())
@@ -1299,7 +1338,9 @@ def _prove_recent_scheduled(session_id: str, provider_id: str, events: Path, roo
         proven_metadata = len(metadata) == 1 and start < metadata[0] <= end
         proven_scheduled = (len(matched) == 1 and occurrence_counts.get(matched[0][1]) == 1
                             and start < matched[0][0] <= end)
-        if first < seq < last and (proven_metadata or proven_scheduled):
+        proven_owned_input = any(source == identity and digest == key and start < offset <= end
+                                 for source, digest, offset in owned_inputs)
+        if first < seq < last and (proven_metadata or proven_scheduled or proven_owned_input):
             targets.add(target)
             counts[run] = counts.get(run, 0) + 1
     targets.update(async_inputs.prove(eligible))

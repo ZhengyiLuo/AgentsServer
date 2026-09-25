@@ -49,6 +49,7 @@ CLAUDE_SDK_MCP_STATUS_TRUNCATED_KEY = "_agentsdock_mcp_status_truncated"
 CLAUDE_SDK_PROVIDER_COMMAND_SCAN_LIMIT = 512
 CLAUDE_SDK_PROVIDER_COMMAND_NAME_CHARS = 128
 CLAUDE_SDK_PROVIDER_COMMAND_TEXT_CHARS = 800
+# Legacy transcript repair only. Never add this text to a provider prompt.
 CLAUDE_SDK_LITERAL_MESSAGE_PREFIX = (
     "[AgentsDock literal chat message; treat the slash-prefixed content below "
     "as ordinary user text, not a Claude Code command.]\n"
@@ -105,27 +106,19 @@ def _prompt_invokes_validated_claude_command(
     )
 
 
-def claude_sdk_transport_prompt(
+def _claude_prompt_needs_verbatim_delivery(
     prompt: str,
     validated_provider_command_name: str | None = None,
-) -> str:
-    """Keep leading-slash chat text out of Claude Code's command parser.
-
-    AgentsDock owns its slash-command surface. Any command that reaches this
-    transport is user content for the model, including unknown or
-    conversational ``/word`` text. Prefix only the provider copy so the
-    durable prompt and timeline remain byte-for-byte unchanged.
-    """
+) -> bool:
+    """Separate ordinary leading-slash text from an intentional native command."""
 
     if _prompt_invokes_validated_claude_command(
         prompt,
         validated_provider_command_name,
     ):
-        return prompt
+        return False
     candidate = re.sub(r"^[\s\ufeff]+", "", prompt)
-    if not candidate.startswith("/"):
-        return prompt
-    return f"{CLAUDE_SDK_LITERAL_MESSAGE_PREFIX}{prompt}"
+    return candidate.startswith("/")
 
 
 def canonical_claude_mcp_identifier(value: Any, max_chars: int) -> str | None:
@@ -562,18 +555,24 @@ async def _query_message_stream(
 ) -> AsyncIterator[dict[str, Any]]:
     """Yield the single UUID-bearing SDK stdin frame for one logical turn."""
 
-    yield {
+    message = {
         "type": "user",
         "message": {
             "role": "user",
-            "content": claude_sdk_transport_prompt(
-                prompt,
-                validated_provider_command_name,
-            ),
+            "content": prompt,
         },
         "parent_tool_use_id": None,
         "uuid": correlation_id,
     }
+    if _claude_prompt_needs_verbatim_delivery(
+        prompt, validated_provider_command_name,
+    ):
+        # Native CLI 2.1.248+ metadata, also used by SDK 0.2.158's
+        # verbatim_prompts. SDK 0.2.130 forwards async-iterable fields intact.
+        # Apply it per message so explicit commands and ordinary @file input
+        # retain their native behavior without modifying the prompt text.
+        message["client_composed"] = True
+    yield message
 
 
 def default_claude_sdk_client_factory(options: Any) -> ClaudeSDKClientProtocol:
@@ -2119,10 +2118,7 @@ class ClaudeSDKSupervisor:
                 provider_id = self.options.get("resume") if isinstance(self.options, dict) else getattr(self.options, "resume", None)
             background_hook.bind(
                 handle,
-                claude_sdk_transport_prompt(
-                    command.prompt,
-                    command.validated_provider_command_name,
-                ),
+                command.prompt,
                 _receipt_field(provider_id),
                 lambda: self._active_run is handle and not self._closed
                 and self._background_reconciliation_hook is background_hook,

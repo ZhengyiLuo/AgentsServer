@@ -82,6 +82,49 @@ class HistoricalCronPageTests(unittest.TestCase):
         self.assertEqual(events["e2"]["prompt"], "Old scheduled input")
         self.assertEqual(events["e3"]["text"], "Old scheduled report")
 
+    def globally_repaired_tail(self):
+        # The original native turn remains visible; the later imported copy
+        # loses its landmark before semantic page selection takes place.
+        rows = [*self.events[6:9], *self.events[:3], self.events[5]]
+        rows = [{**event, "seq": seq, "id": f"e{seq}"} for seq, event in enumerate(rows, 1)]
+        self.path.write_bytes(b"".join((json.dumps(event) + "\n").encode() for event in rows))
+        self.ns["prepare_claude_history_metadata_repair"] = lambda *_args, **_kwargs: None
+
+        def project(event, _session):
+            if event["seq"] == 5:
+                return {**event, "prompt": "", "_agentsdock_imported_prompt_hidden": True,
+                        "provider_history_repair": "source_proven_import"}
+            if event["seq"] == 6:
+                return {**event, "text": "", "metadata_only": True,
+                        "provider_history_repair": "source_proven_assistant_replay"}
+            return event
+
+        self.ns["project_legacy_imported_provider_event"] = project
+        return rows
+
+    def test_global_repairs_survive_retired_landmarks_and_replace_cached_bubbles(self):
+        rows = self.globally_repaired_tail()
+        original = self.path.read_bytes()
+        result = self.ns["read_semantic_timeline_page"]("sender", limit=3, tail=True)
+        events = {event["id"]: event for event in result["events"]}
+        self.assertEqual(events["e5"]["prompt"], "")
+        self.assertEqual(events["e5"]["provider_history_repair"], "source_proven_import")
+        self.assertEqual(events["e6"]["text"], "")
+        self.assertEqual(events["e1"]["prompt"], "Current question")
+        self.assertEqual(events["e2"]["text"], "Current answer")
+        cached = {event["id"]: event for event in rows}
+        cached.update(events)
+        self.assertEqual(cached["e5"]["prompt"], "")
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_global_repair_tombstones_respect_older_page_boundary(self):
+        self.globally_repaired_tail()
+        result = self.ns["read_semantic_timeline_page"]("sender", limit=3, tail=True, semantic_before=4)
+        events = {event["id"]: event for event in result["events"]}
+        self.assertIn("e1", events)
+        self.assertNotIn("e5", events)
+        self.assertNotIn("e6", events)
+
 
 if __name__ == "__main__":
     unittest.main()

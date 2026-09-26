@@ -1747,6 +1747,7 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await turn.next_notification(timeout=1), started)
         self.assertEqual(await turn.next_notification(timeout=1), goal_updated)
         turn.adopt_turn_id("turn_initial")
+        self.assertEqual(turn.initial_turn_id, "turn_initial")
         completed = {
             "method": "turn/completed",
             "params": {
@@ -1772,6 +1773,7 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(manager.client.active_turn("thread_goal"), turn)
         self.assertFalse(turn._completed)
         self.assertEqual(turn.turn_id, "turn_continued")
+        self.assertEqual(turn.initial_turn_id, "turn_initial")
         # A delayed terminal packet from the previous turn cannot retire or
         # retarget the current native continuation.
         process.feed(completed)
@@ -1876,6 +1878,7 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(client.close)
         turn = await client.start_turn("parent", [], retain_thread_stream=True)
         self.assertEqual(turn.turn_id, "continued")
+        self.assertEqual(turn.initial_turn_id, "first")
         self.assertFalse(turn._completed)
         self.assertIs(client.active_turn("parent"), turn)
         self.assertEqual([((await turn.next_notification(timeout=1))["params"]["turn"]["id"])
@@ -2512,6 +2515,7 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
             accepted_event,
         )
         self.assertEqual(pending_turn.turn_id, "turn_late")
+        self.assertEqual(pending_turn.initial_turn_id, "turn_late")
         await pending_turn.close()
 
     async def test_default_server_request_handler_declines_without_wedging(self) -> None:

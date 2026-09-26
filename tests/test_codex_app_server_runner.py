@@ -3276,6 +3276,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_native_run_now_steers_runner_and_emits_queued_id(self) -> None:
         turn = FakeTurn()
+        turn.initial_turn_id = "turn-original-input"
         manager = FakeManager(turn)
         predecessor_run_id = "run_original"
         predecessor_route = {
@@ -3553,6 +3554,9 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             finished.await_args.args[1]["run_id"],
             run_now["run_id"],
         )
+        self.assertEqual(finished.await_args.args[1]["provider_initial_turn_id"], "turn-native")
+        stopped = [call.args[2] for call in events.await_args_list if call.args[1] == "turn_stopped"]
+        self.assertEqual(stopped[0]["provider_initial_turn_id"], "turn-original-input")
 
     async def test_consecutive_native_steers_rotate_to_only_latest_authority(
         self,

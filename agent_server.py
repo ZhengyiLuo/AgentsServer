@@ -24129,9 +24129,6 @@ async def _run_queued_turn_now_and_release(
                 await join_task_despite_caller_cancellation(settlement)
 
 
-CODEX_GOAL_STEER_CLIENT_CAPABILITY = "codex_goal_steer_v1"
-
-
 def codex_goal_followup_requires_native(
     session: dict[str, Any], active: dict[str, Any], current: dict[str, Any],
 ) -> bool:
@@ -24153,8 +24150,7 @@ def codex_goal_steer_selection_is_plain(selected: dict[str, Any]) -> bool:
     """User text/attachments may steer without changing runtime authority."""
     routes = selected.get("provider_cross_chat_route_snapshot")
     return (
-        CODEX_GOAL_STEER_CLIENT_CAPABILITY in (selected.get("client_capabilities") or [])
-        and str(selected.get("prompt") or "").strip().split(maxsplit=1)[:1] != ["/mail"]
+        str(selected.get("prompt") or "").strip().split(maxsplit=1)[:1] != ["/mail"]
         and selected.get("skill_selection") is None
         # Saved/ambient snapshots are automatic queue metadata and are never
         # applied by the owner-preserving goal lane. Explicit new @ grants
@@ -24360,22 +24356,22 @@ async def _run_queued_turn_now_once(
                     and not selected.get("cross_chat_obligation_ids")
                     and not selected.get("cross_chat_exchange_ids")
                     and selected.get("skill_selection") is None
-                    and interrupted_turn.get("skill_selection") is None
-                    and interrupted_turn.get("purpose")
-                    not in CROSS_CHAT_DELIVERY_PURPOSES
-                    and not interrupted_turn.get("chat_references")
-                    and not interrupted_turn.get("team_references")
-                    and not interrupted_turn.get("cross_chat_obligation_ids")
-                    and not interrupted_turn.get("cross_chat_exchange_ids")
-                    and not interrupted_turn.get("cross_chat_envelope_id")
-                    and not interrupted_turn.get("cross_chat_exchange_id")
-                    and not interrupted_turn.get("cross_chat_exchange_leg_id")
                     # Only ordinary logical-run replacement issues fresh
                     # authority. A goal steer keeps its exact owner and does
-                    # not apply automatic saved-route snapshots from the queue.
+                    # not replace the original turn's references or command.
                     and (
                         goal_followup or (
-                            provider_route_snapshot_allows_native_steer(
+                            interrupted_turn.get("skill_selection") is None
+                            and interrupted_turn.get("purpose")
+                            not in CROSS_CHAT_DELIVERY_PURPOSES
+                            and not interrupted_turn.get("chat_references")
+                            and not interrupted_turn.get("team_references")
+                            and not interrupted_turn.get("cross_chat_obligation_ids")
+                            and not interrupted_turn.get("cross_chat_exchange_ids")
+                            and not interrupted_turn.get("cross_chat_envelope_id")
+                            and not interrupted_turn.get("cross_chat_exchange_id")
+                            and not interrupted_turn.get("cross_chat_exchange_leg_id")
+                            and provider_route_snapshot_allows_native_steer(
                                 interrupted_turn.get("provider_cross_chat_route_snapshot")
                             )
                             and provider_route_snapshot_allows_native_steer(
@@ -24388,10 +24384,13 @@ async def _run_queued_turn_now_once(
                             active_turn.get("transport")
                             == CODEX_TRANSPORT_APP_SERVER
                             and selected_backend == BACKEND_CODEX
-                            and queued_codex_runtime_matches_active(
-                                session_id,
-                                selected,
-                                active_turn,
+                            # Native goal steering sends input to the running
+                            # turn. Picker changes apply to future turns; they
+                            # do not need to match its already pinned runtime.
+                            and (
+                                goal_followup or queued_codex_runtime_matches_active(
+                                    session_id, selected, active_turn,
+                                )
                             )
                         )
                         or (
@@ -24407,14 +24406,23 @@ async def _run_queued_turn_now_once(
                     )
                 )
                 if goal_followup and not native_steer:
+                    unsupported_input = not codex_goal_steer_selection_is_plain(selected)
                     raise HTTPException(
                         status_code=409,
                         detail=force_send_conflict_detail(
                             session_id, queued_id,
                             guard="active_goal_requires_native_steer",
-                            message="This follow-up cannot safely steer the active Codex goal. It remains queued; the goal was not paused.",
-                            action="Use a text or attachment follow-up with the current model settings once the goal turn is ready. New route grants or provider commands require separate work; the goal has not been paused.",
-                            retryable=True,
+                            message=(
+                                "This queued action adds chat access or invokes a provider command, which cannot be applied inside the running Codex turn."
+                                if unsupported_input else
+                                "Codex does not have a running goal turn ready to receive this message."
+                            ),
+                            action=(
+                                "It remains queued for a new turn. Text and file follow-ups can be sent now."
+                                if unsupported_input else
+                                "Your message remains queued. Retry Send now when Codex is running."
+                            ),
+                            retryable=not unsupported_input,
                             owner_queued_id=queued_id,
                         ),
                     )
@@ -56741,15 +56749,9 @@ async def send_codex_goal_steer(
             and str(active.get("codex_control_reservation_id") or "") == reservation_id
             and str(current.get("codex_control_reservation_id") or "") == reservation_id
             and codex_goal_steer_selection_is_plain(selected)
-            and current.get("skill_selection") is None
-            and not any(current.get(field) for field in (
-                "chat_references", "team_references", "secure_peer_route_snapshots",
-                "cross_chat_obligation_ids", "cross_chat_exchange_ids",
-                "cross_chat_envelope_id", "cross_chat_exchange_id", "cross_chat_exchange_leg_id",
-            ))
-            # Route snapshots are not consumed here: only user text/files are
-            # sent, under the exact existing authority, run and subscription.
-            and queued_codex_runtime_matches_active(session_id, selected, active)
+            # Only text/files are sent. The current turn's command, references,
+            # runtime and authority stay intact, regardless of picker changes
+            # or capability metadata on an older queued message.
         )
 
     async def validate_delivery_owner() -> None:
@@ -56757,7 +56759,7 @@ async def send_codex_goal_steer(
             allowed = delivery_owner_valid()
         if not allowed:
             raise NativeSteerHandoffError(
-                "The goal, native turn, settings, or control owner changed before delivery; the follow-up was not sent",
+                "The goal, native turn, or control owner changed before delivery; the follow-up was not sent",
                 safe_to_requeue=True,
             )
 
@@ -71285,7 +71287,7 @@ async def run_codex_app_server(
                 # ordinary logical-run replacement is unavailable.
                 "codex_goal_steer_queue": (
                     steer_queue
-                    if provider_command is None and not standalone_provider_context
+                    if not standalone_provider_context
                     else None
                 ),
                 "stdout_tail": deque(maxlen=LIVE_STDOUT_MAX_LINES),

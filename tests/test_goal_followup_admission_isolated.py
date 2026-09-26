@@ -265,12 +265,37 @@ class GoalFollowupAdmissionTests(unittest.IsolatedAsyncioTestCase):
                 self.active["transport"] = transport
                 await self.assert_rejected()
 
-    async def test_runtime_or_backend_change_cannot_pause_goal_via_fallback(self):
-        self.ns["queued_codex_runtime_matches_active"].return_value = False
-        await self.assert_rejected()
-        self.ns["queued_codex_runtime_matches_active"].return_value = True
+    async def test_backend_change_cannot_pause_goal_via_fallback(self):
         self.selected["backend"] = "claude"
         await self.assert_rejected()
+
+    async def test_goal_steer_uses_running_settings_not_next_turn_selection(self):
+        for ordinary in (False, True):
+            with self.subTest(ordinary=ordinary):
+                self.setUp()
+                lane = self.active["native_steer_queue"]
+                if ordinary:
+                    self.active.pop("codex_native_operation_kind")
+                    self.current.pop("purpose")
+                    self.active["native_steer_queue"] = None
+                    lane = self.active["codex_goal_steer_queue"] = asyncio.Queue()
+                self.active.update(provider_model="gpt-6-astra", provider_effort="xhigh", provider_service_tier="priority")
+                self.session.update(model="gpt-6-sol", effort="low")
+                self.selected.update(model="gpt-6-sol", effort="low")
+                self.ns["queued_codex_runtime_matches_active"].return_value = False
+                await self.assert_admitted_to_goal_lane(lane)
+                self.ns["queued_codex_runtime_matches_active"].assert_not_called()
+
+    async def test_non_goal_settings_change_still_requires_lifecycle_transition(self):
+        self.session.pop("codex_goal")
+        self.active.pop("codex_native_operation_kind")
+        self.current.pop("purpose")
+        self.ns["queued_codex_runtime_matches_active"].return_value = False
+        before = self.snapshot()
+        with self.assertRaises(self.ns["NonNativeForceSendRequiresLifecycleLock"]):
+            await self.ns["_run_queued_turn_now_once"]("chat", "q-followup", require_native=True)
+        self.assert_untouched(before)
+        self.ns["queued_codex_runtime_matches_active"].assert_called_once()
 
     async def test_authority_bearing_followups_stay_queued_without_stop(self):
         for field in (
@@ -284,18 +309,27 @@ class GoalFollowupAdmissionTests(unittest.IsolatedAsyncioTestCase):
                 await self.assert_rejected()
                 self.selected.pop(field)
 
-    async def test_current_authority_boundary_also_prevents_stop_fallback(self):
-        for field in (
-            "chat_references", "team_references", "cross_chat_obligation_ids",
-            "cross_chat_exchange_ids", "cross_chat_envelope_id",
-            "cross_chat_exchange_id", "cross_chat_exchange_leg_id",
-        ):
-            with self.subTest(field=field):
-                self.current[field] = [{"id": "scoped-reference"}]
-                await self.assert_rejected()
-                self.current.pop(field)
-        self.current["purpose"] = "local_delivery"
-        await self.assert_rejected()
+    async def test_goal_steer_keeps_original_references_commands_and_delivery_owner(self):
+        for ordinary in (False, True):
+            with self.subTest(ordinary=ordinary):
+                self.setUp()
+                lane = self.active["native_steer_queue"]
+                if ordinary:
+                    self.active.pop("codex_native_operation_kind")
+                    self.active["native_steer_queue"] = None
+                    lane = self.active["codex_goal_steer_queue"] = asyncio.Queue()
+                self.current.update(
+                    purpose="local_delivery", skill_selection={"name": "original-command"},
+                    chat_references=[{"session_id": "original-target"}],
+                    team_references=[{"id": "original-team"}],
+                    secure_peer_route_snapshots=[{"route_id": "original-route"}],
+                    cross_chat_obligation_ids=["original-obligation"],
+                    cross_chat_exchange_ids=["original-exchange"],
+                    cross_chat_envelope_id="original-envelope",
+                    cross_chat_exchange_id="original-exchange",
+                    cross_chat_exchange_leg_id="original-leg",
+                )
+                await self.assert_admitted_to_goal_lane(lane)
 
     async def test_resume_owner_protects_even_missing_or_stale_goal_cache(self):
         self.active.pop("native_steer_queue")
@@ -630,10 +664,24 @@ class GoalFollowupAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.session["codex_goal_time_budget_exhausted"] = True
         await self.assert_rejected()
 
-    async def test_old_client_or_mail_command_cannot_reuse_goal_authority(self):
-        self.selected["client_capabilities"] = []
-        await self.assert_rejected()
-        self.selected["client_capabilities"] = ["codex_goal_steer_v1"]
+    async def test_goal_steer_accepts_plain_input_without_client_capability(self):
+        for ordinary in (False, True):
+            for capabilities in (None, []):
+                with self.subTest(ordinary=ordinary, capabilities=capabilities):
+                    self.setUp()
+                    lane = self.active["native_steer_queue"]
+                    if ordinary:
+                        self.active.pop("codex_native_operation_kind")
+                        self.current.pop("purpose")
+                        self.active["native_steer_queue"] = None
+                        lane = self.active["codex_goal_steer_queue"] = asyncio.Queue()
+                    if capabilities is None:
+                        self.selected.pop("client_capabilities")
+                    else:
+                        self.selected["client_capabilities"] = capabilities
+                    await self.assert_admitted_to_goal_lane(lane)
+
+    async def test_mail_command_cannot_reuse_goal_authority(self):
         self.selected["prompt"] = "/mail server remote New message"
         await self.assert_rejected()
 

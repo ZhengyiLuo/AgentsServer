@@ -14,8 +14,7 @@ import unittest
 from unittest.mock import patch
 
 from public_chat_shares import (
-    MAX_MESSAGE_TEXT_BYTES,
-    MAX_SNAPSHOT_BYTES,
+    TARGET_SNAPSHOT_PAGE_BYTES,
     PublicChatShareStore,
     PublicChatShareUnavailable,
     PublicChatShareValidationError,
@@ -157,7 +156,7 @@ class PublicChatShareTests(unittest.TestCase):
         for page in range(latest["page_count"]):
             value = reopened.get_snapshot_page(share["token"], share_id=share["share_id"], page=page)
             self.assertLessEqual(len(value["snapshot"]["messages"]), 100)
-            self.assertLessEqual(len(json.dumps(value["snapshot"]).encode()), MAX_SNAPSHOT_BYTES)
+            self.assertLessEqual(len(json.dumps(value["snapshot"]).encode()), TARGET_SNAPSHOT_PAGE_BYTES)
             count += len(value["snapshot"]["messages"])
         self.assertEqual(count, 320)
         with self.assertRaises(PublicChatShareUnavailable):
@@ -295,20 +294,63 @@ class PublicChatShareTests(unittest.TestCase):
             with self.subTest(timestamp=value), self.assertRaises(PublicChatShareValidationError):
                 self.store.create_share("session", [{"role": "user", "text": "a", "timestamp": value}])
 
-    def test_message_and_snapshot_bounds_include_utf8_and_json_escaping(self):
+    def test_large_message_utf8_and_json_escaping_roundtrip_without_size_quota(self):
         for messages in (
-            [{"role": "user", "text": ""}] * (MAX_SNAPSHOT_BYTES // 20),
-            [{"role": "user", "text": "x" * (MAX_MESSAGE_TEXT_BYTES + 1)}],
-            [{"role": "user", "text": "😀" * (MAX_MESSAGE_TEXT_BYTES // 4 + 1)}],
-            [{"role": "user", "text": "x" * MAX_MESSAGE_TEXT_BYTES}] * 9,
-            [{"role": "user", "text": "\x01" * MAX_MESSAGE_TEXT_BYTES}] * 2,
+            [{"role": "user", "text": "x" * (3 * 1024 * 1024)}],
+            [{"role": "user", "text": "😀" * (700 * 1024)}],
+            [{"role": "user", "text": "\x01" * (400 * 1024)}],
+            [{"role": "user", "text": "x" * (300 * 1024)}] * 9,
         ):
-            with self.subTest(count=len(messages)), self.assertRaises(PublicChatShareValidationError):
-                self.store.create_share("session", messages)
-        near_max = self.store.create_share("session", [{"role": "user", "text": "&" * MAX_MESSAGE_TEXT_BYTES}] * 7)
-        snapshot = self.store.get_snapshot(near_max["token"])
-        self.assertLess(len(json.dumps(snapshot).encode()), MAX_SNAPSHOT_BYTES)
-        self.assertGreater(len(render_public_chat_html(snapshot)), MAX_SNAPSHOT_BYTES)
+            with self.subTest(count=len(messages), length=len(messages[0]["text"])):
+                share = self.store.create_share("session", messages)
+                snapshot = self.store.get_snapshot(share["token"])
+                self.assertEqual(snapshot["messages"], messages)
+                self.assertGreater(len(json.dumps(snapshot).encode()), 2 * 1024 * 1024)
+
+    def test_streamed_oversized_message_gets_its_own_complete_page(self):
+        long_text = "    Large genuine report with unicode 中文\n" * 90_000
+        messages = [{"role": "user", "text": "Before the long report"},
+                    {"role": "assistant", "text": long_text, "timestamp": self.clock},
+                    {"role": "user", "text": "After the long report"}]
+        self.assertGreater(len(long_text.encode()), TARGET_SNAPSHOT_PAGE_BYTES)
+        def emit(sink):
+            for message in messages:
+                sink(message)
+        share = self.store.create_streamed_share("chat-one", emit)
+        self.assertEqual(share["message_count"], 3)
+        reopened = PublicChatShareStore.open_existing(self.root, now=lambda: self.clock)
+        restored = []
+        for index, expected in enumerate(messages):
+            page = reopened.get_snapshot_page(share["token"], share_id=share["share_id"], page=index)
+            self.assertEqual((page["page"], page["page_count"], page["message_count"]), (index, 3, 3))
+            self.assertEqual(page["snapshot"]["messages"], [expected])
+            restored.extend(page["snapshot"]["messages"])
+        self.assertEqual(restored, messages)
+        self.store.revoke_share(share["share_id"], session_id="chat-one")
+        with self.assertRaises(PublicChatShareUnavailable):
+            reopened.get_snapshot_page(share["token"], page=1)
+
+    def test_large_first_streamed_message_and_later_invalid_message_roll_back(self):
+        long_text = "x" * (3 * 1024 * 1024)
+        def emit(sink):
+            sink({"role": "user", "text": long_text})
+            sink({"role": "assistant", "text": "Valid next page"})
+            sink({"role": "assistant", "text": long_text, "tool_output": "Private"})
+        with self.assertRaises(PublicChatShareValidationError):
+            self.store.create_streamed_share("chat-one", emit)
+        self.assertEqual(self.store.list_shares("chat-one"), [])
+        with self.store._connection() as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM public_chat_share_pages").fetchone()[0], 0)
+
+    def test_escaped_long_message_is_readable_past_old_render_limit(self):
+        text = "&" * (4 * 1024 * 1024) + "<script>never execute</script>"
+        share = self.store.create_streamed_share("chat-one", lambda sink: sink({"role": "user", "text": text}))
+        snapshot = self.store.get_snapshot(share["token"])
+        rendered = render_public_chat_html(snapshot)
+        self.assertGreater(len(rendered), 16 * 1024 * 1024)
+        self.assertEqual(rendered.count(b"&amp;"), 4 * 1024 * 1024)
+        self.assertIn(b"&lt;script&gt;never execute&lt;/script&gt;", rendered)
+        self.assertNotIn(b"<script>", rendered)
 
     def test_v1_upgrade_preserves_snapshots_revocations_and_rolls_back_failure(self):
         active = self.create()
@@ -335,7 +377,7 @@ class PublicChatShareTests(unittest.TestCase):
             with connect(write=write) as db:
                 class Interrupted:
                     def execute(self, sql, *args):
-                        if sql.startswith("ALTER TABLE public_chat_shares_v2"):
+                        if sql.startswith("ALTER TABLE public_chat_shares_expanded"):
                             raise sqlite3.OperationalError("database or disk is full")
                         return db.execute(sql, *args)
                 yield Interrupted()
@@ -361,6 +403,66 @@ class PublicChatShareTests(unittest.TestCase):
         with self.assertRaises(sqlite3.IntegrityError), old._connection(write=True) as db:
             db.execute("DELETE FROM public_chat_shares WHERE share_id=?", (active["share_id"],))
 
+    def test_existing_v3_size_constraints_migrate_atomically_without_version_gate(self):
+        def emit(sink):
+            for index in range(105):
+                sink({"role": "assistant", "text": f"Original paragraph {index}"})
+        active = self.store.create_streamed_share("legacy-chat", emit)
+        revoked = self.create()
+        self.store.revoke_share(revoked["share_id"], session_id=revoked["session_id"])
+        expected_pages = [self.store.get_snapshot_page(active["token"], page=index) for index in (0, 1)]
+        with self.store._connection() as db:
+            original_rows = {table: [tuple(row) for row in db.execute(f"SELECT * FROM {table}")]
+                             for table in ("public_chat_shares", "public_chat_share_pages", "public_chat_share_revocations")}
+            legacy_sql = "\n".join(db.iterdump()).replace("snapshot_json BLOB NOT NULL,",
+                "snapshot_json BLOB NOT NULL CHECK(length(snapshot_json) <= 2097152),")
+        self.assertEqual(legacy_sql.count("CHECK(length(snapshot_json) <= 2097152)"), 2)
+        legacy_root = Path(self.temporary.name) / "legacy-v3"
+        legacy_root.mkdir(mode=0o700)
+        legacy_path = legacy_root / "snapshots.sqlite3"
+        legacy_path.touch(mode=0o600)
+        with closing(sqlite3.connect(legacy_path)) as db, db:
+            db.executescript(legacy_sql)
+            db.execute("PRAGMA user_version=3")
+        before = legacy_path.read_bytes()
+        old = PublicChatShareStore.open_existing(legacy_root, now=lambda: self.clock)
+        self.assertEqual(old.get_snapshot_page(active["token"], page=1), expected_pages[1])
+        self.assertEqual(legacy_path.read_bytes(), before)
+        connect = old._connection
+        @contextmanager
+        def interrupted_connection(*, write=False):
+            with connect(write=write) as db:
+                class Interrupted:
+                    def execute(self, sql, *args):
+                        if sql.startswith("ALTER TABLE public_chat_share_pages_expanded"):
+                            raise sqlite3.OperationalError("Synthetic migration write failure")
+                        return db.execute(sql, *args)
+                yield Interrupted()
+        text = "Large migrated message 中文\n" * 100_000
+        with patch.object(old, "_connection", interrupted_connection):
+            with self.assertRaisesRegex(sqlite3.OperationalError, "Synthetic"):
+                old.create_streamed_share("new-chat", lambda sink: sink({"role": "user", "text": text}))
+        with old._connection() as db:
+            self.assertEqual("\n".join(db.iterdump()), legacy_sql)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 3)
+        self.assertEqual(old.get_snapshot_page(active["token"], page=1), expected_pages[1])
+        created = old.create_streamed_share("new-chat", lambda sink: sink({"role": "user", "text": text}))
+        self.assertEqual(old.get_snapshot(created["token"])["messages"], [{"role": "user", "text": text}])
+        for index in (0, 1):
+            self.assertEqual(old.get_snapshot_page(active["token"], page=index), expected_pages[index])
+        with self.assertRaises(PublicChatShareUnavailable):
+            old.get_snapshot(revoked["token"])
+        with old._connection() as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+            self.assertEqual(db.execute("SELECT count(*) FROM sqlite_master WHERE type='trigger'").fetchone()[0], 6)
+            for table, rows in original_rows.items():
+                current = [tuple(row) for row in db.execute(f"SELECT * FROM {table}")]
+                self.assertTrue(all(row in current for row in rows), table)
+            self.assertNotIn("CHECK(length(snapshot_json)", "\n".join(db.iterdump()))
+        with self.assertRaises(sqlite3.IntegrityError), old._connection(write=True) as db:
+            db.execute("DELETE FROM public_chat_share_pages WHERE share_id=?", (active["share_id"],))
+
     def test_html_escapes_plaintext_and_has_no_interactive_or_remote_content(self):
         literal = '<script>alert(1)</script>\n<img src="https://example.invalid/a" onerror="x()">\n[link](https://example.invalid/)\n```html\n<b>code</b>\n```\n  spaces\tand & < > "quotes"'
         result = self.store.create_share("session", [{"role": "user", "text": literal}], title="<iframe> & title")
@@ -385,12 +487,9 @@ class PublicChatShareTests(unittest.TestCase):
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertEqual(headers["Referrer-Policy"], "no-referrer")
 
-    def test_renderer_revalidates_snapshot_and_enforces_output_bound(self):
+    def test_renderer_revalidates_snapshot(self):
         result = self.create()
         snapshot = self.store.get_snapshot(result["token"])
-        with patch("public_chat_shares.MAX_RENDER_BYTES", 32):
-            with self.assertRaises(PublicChatShareValidationError):
-                render_public_chat_html(snapshot)
         snapshot["session_id"] = "private"
         with self.assertRaises(PublicChatShareValidationError):
             render_public_chat_html(snapshot)

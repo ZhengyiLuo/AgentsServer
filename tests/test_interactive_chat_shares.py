@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from interactive_chat_shares import InteractiveChatShareStore, Unavailable, Conflict, MAX_SHARE_UPLOAD_BYTES, token_hash
+from interactive_chat_shares import InteractiveChatShareStore, Unavailable, Conflict, token_hash
 
 
 class InteractiveShareStoreTests(unittest.TestCase):
@@ -141,6 +141,17 @@ class InteractiveShareStoreTests(unittest.TestCase):
             reopened.reserve_submission(self.share["id"], token, "request-one", "Prompt", [], operation="control:turn.stop")
         with self.assertRaisesRegex(Conflict, "different"):
             reopened.reserve_submission(self.share["id"], token, "request-one", "Changed", [])
+
+    def test_normal_uploads_have_no_separate_share_size_lifetime_or_count_cap(self):
+        token = self.redeem()
+        uploads = []
+        for index in range(9):
+            upload = self.store.reserve_upload(self.share["id"], token,
+                name=f"file-{index}.bin", media_type="application/octet-stream", byte_size=9 * 1024 * 1024)
+            self.store.complete_upload(self.share["id"], token, upload, f"file-{index}")
+            uploads.append(upload)
+        self.assertEqual(self.store.upload_refs(self.share["id"], token, uploads), [f"file-{index}" for index in range(9)])
+        self.store.reserve_upload(self.share["id"], token, name="empty.txt", media_type="text/plain", byte_size=0)
 
 
 if __name__ == "__main__":

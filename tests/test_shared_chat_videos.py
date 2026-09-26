@@ -6,7 +6,8 @@ import tempfile
 import unittest
 
 from shared_chat_videos import (SharedVideoUnavailable, normalize_shared_chat_videos,
-                              open_shared_chat_video, shared_chat_video_descriptor)
+                              open_shared_chat_video, shared_chat_video_descriptor,
+                              open_shared_chat_file, shared_chat_file_descriptor, normalize_shared_chat_files)
 
 
 class SharedVideoTests(unittest.TestCase):
@@ -124,6 +125,34 @@ class SharedVideoTests(unittest.TestCase):
                 [{**descriptor, "content_type": []}], [{**descriptor, "size": -1}],
                 [{**descriptor, "id": "https://foreign.example/video.mp4"}]):
             with self.subTest(value=value), self.assertRaises(ValueError): normalize_shared_chat_videos(value)
+
+    def test_general_attachments_keep_bytes_names_and_exact_chat_ownership(self):
+        self.video.unlink()
+        for name, mime, content in [("résumé.pdf", "application/pdf", b"synthetic pdf"),
+                ("note.txt", "text/plain", b"hello"), ("empty.txt", "text/plain", b""),
+                ("image.png", "image/png", b"synthetic image"),
+                ("page.html", "text/html", b"<script>example</script>")]:
+            with self.subTest(name=name):
+                path = self.folder / name
+                path.write_bytes(content)
+                self.meta.update(filename=name, path=str(path), content_type=mime, size=len(content))
+                self.save_meta()
+                descriptor = shared_chat_file_descriptor(self.root, "secret", "chat-one", self.identity)
+                self.assertEqual(normalize_shared_chat_files([descriptor]), [descriptor])
+                self.assertEqual(descriptor["filename"], name)
+                self.assertEqual(descriptor["content_type"], mime)
+                self.assertNotIn("path", descriptor)
+                opened = open_shared_chat_file(self.root, "secret", "chat-one", descriptor["id"])
+                try:
+                    self.assertEqual(os.read(opened["file_fd"], 1024), content)
+                finally:
+                    os.close(opened["file_fd"])
+                for secret, session in [("other", "chat-one"), ("secret", "other-chat")]:
+                    with self.assertRaises(SharedVideoUnavailable):
+                        open_shared_chat_file(self.root, secret, session, descriptor["id"])
+                with self.assertRaises(SharedVideoUnavailable):
+                    open_shared_chat_video(self.root, "secret", "chat-one", descriptor["id"])
+                path.unlink()
 
 
 if __name__ == "__main__":

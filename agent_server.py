@@ -181,7 +181,8 @@ from interactive_chat_share_routes import create_interactive_chat_share_router
 import side_questions
 import title_generation
 from shared_chat_videos import (SharedVideoUnavailable, shared_chat_video_descriptor,
-                               open_shared_chat_video)
+                               open_shared_chat_video, shared_chat_file_descriptor,
+                               open_shared_chat_file, VIDEO_TYPES)
 from interactive_chat_projection import IncrementalChatTranscript
 from interactive_chat_runtime import InteractiveChatLiveState
 from interactive_chat_native import shared_events, shared_native_value, shared_session
@@ -82910,7 +82911,7 @@ app.include_router(side_questions.create_side_question_router(
 ))
 
 
-def shared_chat_event_videos(session_id: str, event: dict[str, Any]) -> list[dict[str, Any]]:
+def shared_chat_event_attachments(session_id: str, event: dict[str, Any], *, videos: bool) -> list[dict[str, Any]]:
     """Issue media references only for published artifacts or sent attachments."""
     if (not is_client_visible_event(event) or not event_files_belong_to_session(event, session_id)
             or event.get("session_id") not in (None, "", session_id) or event.get("metadata_only") is True):
@@ -82930,25 +82931,45 @@ def shared_chat_event_videos(session_id: str, event: dict[str, Any]) -> list[dic
             return []
     else:
         return []
-    if len(file_ids) > 32:
-        raise ValueError("Shared chat attachment metadata is too large")
     output, seen = [], set()
     for file_id in file_ids:
         if not isinstance(file_id, str) or file_id in seen:
             continue
         seen.add(file_id)
         try:
-            output.append(shared_chat_video_descriptor(FILES_ROOT, AGENT_TOKEN, session_id, file_id,
-                                                       legacy_owner=legacy))
+            descriptor = shared_chat_video_descriptor if videos else shared_chat_file_descriptor
+            item = descriptor(FILES_ROOT, AGENT_TOKEN, session_id, file_id, legacy_owner=legacy)
+            if not videos and item["content_type"] in VIDEO_TYPES:
+                # Omit a duplicate only when this exact file can be published
+                # as a video. An extensionless video or empty media file must
+                # remain downloadable even when it cannot be embedded.
+                try:
+                    shared_chat_video_descriptor(FILES_ROOT, AGENT_TOKEN, session_id, file_id,
+                                                 legacy_owner=legacy)
+                except SharedVideoUnavailable:
+                    pass
+                else:
+                    continue
+            output.append(item)
         except SharedVideoUnavailable:
-            # Non-video and unavailable registry entries confer no capability.
+            # Unavailable registry entries confer no capability; the video
+            # projection also omits other attachment types.
             continue
     return output
+
+
+def shared_chat_event_videos(session_id: str, event: dict[str, Any]) -> list[dict[str, Any]]:
+    return shared_chat_event_attachments(session_id, event, videos=True)
+
+
+def shared_chat_event_files(session_id: str, event: dict[str, Any]) -> list[dict[str, Any]]:
+    return shared_chat_event_attachments(session_id, event, videos=False)
 
 
 def project_shared_chat_event_videos(session_id: str, event: dict[str, Any]) -> dict[str, Any]:
     clean = dict(event)
     clean.pop("shared_videos", None)
+    clean.pop("shared_files", None)
     videos = shared_chat_event_videos(session_id, event)
     if videos:
         clean["shared_videos"] = videos
@@ -82960,10 +82981,30 @@ def shared_chat_video_events(events: list[dict[str, Any]], session_id: str) -> l
     return shared_events([project_shared_chat_event_videos(session_id, event) for event in events], session_id)
 
 
+def shared_chat_attachment_events(events: list[dict[str, Any]], session_id: str) -> list[dict[str, Any]]:
+    projected = []
+    for event in events:
+        clean = project_shared_chat_event_videos(session_id, event)
+        files = shared_chat_event_files(session_id, event)
+        if files:
+            clean["shared_files"] = files
+        projected.append(clean)
+    return shared_events(projected, session_id)
+
+
 async def open_shared_chat_video_for_share(session_id: str, handle: str) -> dict[str, Any]:
+    return await open_shared_chat_attachment_for_share(session_id, handle, videos=True)
+
+
+async def open_shared_chat_file_for_share(session_id: str, handle: str) -> dict[str, Any]:
+    return await open_shared_chat_attachment_for_share(session_id, handle, videos=False)
+
+
+async def open_shared_chat_attachment_for_share(session_id: str, handle: str, *, videos: bool) -> dict[str, Any]:
     if not public_chat_share_session_exists(session_id):
-        raise HTTPException(404, "Shared video is unavailable")
-    task = asyncio.create_task(asyncio.to_thread(open_shared_chat_video, FILES_ROOT, AGENT_TOKEN, session_id, handle))
+        raise HTTPException(404, "Shared attachment is unavailable")
+    opener = open_shared_chat_video if videos else open_shared_chat_file
+    task = asyncio.create_task(asyncio.to_thread(opener, FILES_ROOT, AGENT_TOKEN, session_id, handle))
     try:
         return await asyncio.shield(task)
     except BaseException:
@@ -83075,13 +83116,13 @@ async def submit_interactive_chat_prompt(
 
 
 async def save_interactive_chat_upload(
-    session_id: str, share_id: str, filename: str, content_type: str, content: bytes,
+    session_id: str, share_id: str, filename: str, content_type: str, content: Any,
 ) -> str:
     if not interactive_chat_session_available(session_id):
         raise HTTPException(404, "Chat is unavailable")
     # Reuse the ordinary atomic, fsynced session-owned upload pipeline. Its
     # path-containing metadata never crosses the guest callback boundary.
-    file = UploadFile(file=io.BytesIO(content), filename=filename,
+    file = UploadFile(file=io.BytesIO(content) if isinstance(content, bytes) else content, filename=filename,
                       headers=Headers({"content-type": content_type}))
     try:
         result = await upload_file(session_id, file)
@@ -83096,7 +83137,7 @@ async def interactive_chat_native_page(session_id: str, **options: Any) -> dict[
     # Reuse the native semantic index. Unlike get_session(), opening a shared
     # page does not reconcile queues or start provider-history imports.
     page = await asyncio.to_thread(read_semantic_timeline_page, session_id, **options)
-    page["events"] = await asyncio.to_thread(shared_chat_video_events, page["events"], session_id)
+    page["events"] = await asyncio.to_thread(shared_chat_attachment_events, page["events"], session_id)
     return {**page, "has_more": bool(page.get("semantic_omitted_before")),
             "next_before": page.get("next_semantic_before"), "semantic_paging": True}
 
@@ -83289,11 +83330,11 @@ async def control_interactive_chat(session_id: str, action: str, payload: dict[s
         elif action == "timeline.trace":
             value = await asyncio.to_thread(read_indexed_run_trace, session_id, payload.get("run_id") or "",
                 anchor_seq=payload.get("anchor_seq"), after_seq=payload.get("after") or 0, limit=limit)
-            value["events"] = await asyncio.to_thread(shared_chat_video_events, value.get("events", []), session_id)
+            value["events"] = await asyncio.to_thread(shared_chat_attachment_events, value.get("events", []), session_id)
         elif action == "jobs.runs":
             value = await asyncio.to_thread(read_scheduled_job_runs, session_id, payload.get("id") or "",
                 before_seq=payload.get("before_seq"), timeline_group_id=payload.get("timeline_group_id"), limit=limit)
-            value["runs"] = await asyncio.to_thread(shared_chat_video_events, value.get("runs", []), session_id)
+            value["runs"] = await asyncio.to_thread(shared_chat_attachment_events, value.get("runs", []), session_id)
             value["supported"] = True
         else:
             async with INTERACTIVE_CHAT_CATALOG_LOCK:
@@ -83342,6 +83383,8 @@ app.include_router(create_interactive_chat_share_router(
     wait_for_change=INTERACTIVE_CHAT_LIVE.wait,
     chat_control=control_interactive_chat,
     open_video=open_shared_chat_video_for_share,
+    open_file=open_shared_chat_file_for_share,
+    max_upload_bytes=MAX_UPLOAD_BYTES,
 ))
 
 

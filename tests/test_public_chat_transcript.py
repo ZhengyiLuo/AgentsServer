@@ -1,4 +1,4 @@
-"""Pure bounded transcript projection tests; never import the live server."""
+"""Pure transcript projection tests; never import the live server."""
 from __future__ import annotations
 
 import hashlib
@@ -178,13 +178,61 @@ class PublicChatTranscriptTests(unittest.TestCase):
         with self.assertRaises(transcript.PublicTranscriptError):
             self.read()
 
-    def test_record_message_output_and_work_limits_fail_explicitly(self):
-        self.write_events({"type": "turn_started", "prompt": "中文"}, {"type": "assistant_text", "text": "answer"})
-        for constant, limit in (("MAX_LINE_BYTES", 8), ("MAX_SCAN_SECONDS", 0),
-                                ("MAX_TEXT_BYTES", 6), ("MAX_MESSAGE_BYTES", 5)):
-            with self.subTest(limit=constant), mock.patch.object(transcript, constant, limit):
-                with self.assertRaises(transcript.PublicTranscriptError):
-                    self.read()
+    def test_large_tool_records_stay_private_and_do_not_block_the_complete_share(self):
+        private_output = "Private tool output with unicode 中文\n" * 90_000
+        content = self.write_events(
+            {"type": "turn_started", "run_id": "one", "prompt": "Inspect the generated report"},
+            {"type": "tool_finished", "run_id": "one", "tool": "exec_command",
+             "output": private_output, "text": private_output},
+            {"type": "assistant_text", "run_id": "one", "text": "The report is ready."},
+        )
+        self.assertGreater(len(content.splitlines()[1]), 1024 * 1024)
+        projector = mock.Mock(side_effect=lambda event: event)
+        result = transcript.read_public_transcript(self.path, projector)
+        self.assertEqual(result["messages"], [
+            {"role": "user", "text": "Inspect the generated report"},
+            {"role": "assistant", "text": "The report is ready."},
+        ])
+        self.assertEqual(result["through_bytes"], len(content))
+        self.assertEqual(result["digest"], expected_digest(content, result["messages"]))
+        self.assertEqual([call.args[0]["type"] for call in projector.call_args_list],
+                         ["turn_started", "assistant_text"])
+        # Excluded bytes remain part of the reviewed snapshot proof.
+        self.path.write_bytes(content.replace(b"Private tool", b"Changed tool"))
+        self.assertNotEqual(self.read()["digest"], result["digest"])
+
+    def test_large_genuine_messages_are_preserved_exactly_in_preview_and_stream(self):
+        prompt = "  Quoted report with unicode 中文 and indentation\n" * 30_000
+        answer = "    Reviewed report\n\n" * 60_000
+        content = self.write_events(
+            {"type": "turn_started", "run_id": "one", "prompt": prompt},
+            {"type": "assistant_text", "run_id": "one", "text": answer},
+            {"type": "turn_finished", "run_id": "one", "result_text": answer},
+        )
+        self.assertGreater(len(prompt.encode()), 1024 * 1024)
+        self.assertGreater(len(answer.encode()), 1024 * 1024)
+        result = self.read()
+        self.assertEqual(result["messages"], [{"role": "user", "text": prompt},
+                                               {"role": "assistant", "text": answer}])
+        self.assertEqual(result["through_bytes"], len(content))
+        self.assertEqual(result["digest"], expected_digest(content, result["messages"]))
+        streamed = []
+        stream_result = self.read(message_sink=streamed.append)
+        self.assertEqual(streamed, result["messages"])
+        self.assertEqual(stream_result["digest"], result["digest"])
+
+    def test_large_incomplete_record_is_not_published_until_committed(self):
+        content = self.write_events({"type": "turn_started", "prompt": "Committed"})
+        tail = json.dumps({"type": "assistant_text", "text": "x" * (2 * 1024 * 1024)}).encode()
+        with self.path.open("ab") as stream:
+            stream.write(tail)
+        result = self.read()
+        self.assertEqual(result["through_bytes"], len(content))
+        with self.assertRaisesRegex(transcript.PublicTranscriptError, "preview it again"):
+            self.read(through_bytes=len(content) + len(tail))
+        with self.path.open("ab") as stream:
+            stream.write(b"\n")
+        self.assertEqual(self.read()["messages"][-1]["text"], "x" * (2 * 1024 * 1024))
 
     def test_invalid_boundaries_and_truncated_prefixes_are_rejected(self):
         content = self.write_events({"type": "turn_started", "prompt": "Public"})
@@ -213,11 +261,13 @@ class PublicChatTranscriptTests(unittest.TestCase):
             stream.write(b'{"type":"assistant_text","text":"Not part of the reviewed prefix"}\n')
         self.assertEqual(self.read(through_bytes=boundary), preview)
 
-    def test_actual_json_escaping_and_metadata_count_toward_output_budget(self):
-        self.write_events({"type": "turn_started", "prompt": "\x01" * 20})
-        with mock.patch.object(transcript, "MAX_TEXT_BYTES", 100):
-            with self.assertRaisesRegex(transcript.PublicTranscriptError, "2 MiB"):
-                self.read()
+    def test_json_escaping_does_not_impose_a_preview_size_quota(self):
+        prompt = "\x01" * (400 * 1024)
+        content = self.write_events({"type": "turn_started", "prompt": prompt})
+        self.assertGreater(len(content), 2 * 1024 * 1024)
+        result = self.read()
+        self.assertEqual(result["messages"], [{"role": "user", "text": prompt}])
+        self.assertEqual(result["digest"], expected_digest(content, result["messages"]))
 
     def test_streamed_share_has_no_whole_chat_two_mib_limit(self):
         count = 24

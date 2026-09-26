@@ -23,10 +23,10 @@ scheduled jobs for that chat. Prompts go to the existing chat's agent with its n
 the guest can ask that agent to use tools or return sensitive information. Review
 this trust boundary before confirming. Revoking a share cannot erase saved text
 or undo work already accepted by the agent. It does not delete or disable jobs
-already configured through the share. No general owner-file browsing or arbitrary
-attachment downloads are included. Videos explicitly attached to a sent message
-or published in the chat can be played; viewers can save those video bytes.
-Unsent guest uploads are not exposed as playable media.
+already configured through the share. Sent attachments and files published in
+the chat can be downloaded. Images and videos can be viewed in the conversation.
+This does not expose unrelated workspace files. Unsent guest uploads are not
+advertised to other viewers.
 
 ## Management and browser contract
 
@@ -84,12 +84,14 @@ revision, and a CSRF value. The viewer reuses AgentsDock's chat components rathe
 than creating a separate conversation UI. Native event IDs/order are retained;
 raw provider transcripts, authority data, and general file-reading capabilities
 are not added. Callback projections remove private authority/file fields and
-advertise only signed, path-free `shared_videos` descriptors on visible sent
-attachments and published video events. Paging uses the same projection.
+advertise signed, path-free `shared_videos` and `shared_files` descriptors on
+visible sent attachments and published file events. Paging uses the same projection.
 `/events` is same-origin SSE driven by relevant chat revision signals. Updates
 coalesce for one second. Twenty-second heartbeats recheck access but do not read
 the transcript; there is no event-log polling. Deletion, expiry, and revocation
 deny subsequent access; an idle stream closes on its next access check.
+Temporary snapshot or ledger failures end that stream without revoking the
+share. The browser's existing EventSource reconnect obtains the current state.
 
 Redemption requires the exact share-bound origin and access token. Subsequent
 POST requests require that origin, browser cookie and CSRF header. Revocation
@@ -140,24 +142,31 @@ the action under a new request ID: reopen and inspect the chat before deciding
 what to do next. If acceptance was confirmed but the following state refresh
 fails, the accepted action is still reported as accepted, not offered as a retry.
 
-Bounds are 64 KiB prompt text, four attachments per prompt, 8 MiB per upload,
-64 MiB total uploaded bytes per share, and 2 MiB projected JSON per state/read
-response. Native history uses explicitly bounded pages. Admission bounds are four upload reads, eight ledger workers/submissions,
-and 32 SSE connections. These are resource protections, not automatic processing
-or background jobs. No general attachment download or file viewer is exposed.
+Prompt text is limited to 64 KiB. Uploads use the native server's configured
+`MAX_UPLOAD_BYTES` limit and stream into a temporary file before entering the
+normal atomic upload pipeline. There is no separate shared-chat attachment-count,
+per-file-size, or lifetime upload quota. Native history retains its normal paging;
+shared state and history responses do not impose an additional transcript-size cap.
+Admission bounds are eight ledger workers/submissions and 32 SSE connections.
+These are resource protections, not automatic processing or background jobs.
 Video playback uses `GET`/`HEAD /interactive-chat/{id}/media/{handle}` with the
 same origin-bound, redeemed share cookie. The signed handle is bound to the
 exact chat, registered media identity and file revision, not a filesystem path.
 Native credentials are never sent to the browser. Known MP4, WebM, QuickTime
 and Ogg video types are served with single-byte-range support; the browser must
 support the video's codec. Players load on demand, not through an inbox poll.
+`GET`/`HEAD /interactive-chat/{id}/files/{handle}` downloads a sent attachment or
+published file with the same cookie authorization. It accepts both existing
+video handles and the new `shared_file_` handles. Downloads use attachment
+disposition; only raster images use the media route for inline previews, so an
+uploaded HTML document cannot execute at the chat's origin.
 Registry reads are no-follow and descriptor-relative; links, nonregular files,
 foreign chat ownership and changed registry copies are denied. Files are not
 copied again. Deletion, mutation or server authentication-key rotation can make
 old handles unavailable; refresh the Interactive share to obtain current media
-descriptors. Media egress rechecks revocation before headers and while consuming
-the response, without a background timer. Native file editors, reveal/download
-actions, dragging and unrelated file APIs remain unavailable in the web UI.
+descriptors. Media and download egress recheck revocation before headers and
+while consuming the response, without a background timer. Native file editors,
+reveal actions and unrelated file APIs remain unavailable in the web UI.
 
 An SSE admission slot belongs to the whole response lifecycle and is released
 on completion or disconnect, including a disconnect while sending headers before

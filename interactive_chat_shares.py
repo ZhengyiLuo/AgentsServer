@@ -23,8 +23,6 @@ Unavailable = PublicChatShareUnavailable
 ValidationError = PublicChatShareValidationError
 SHARE_ID = re.compile(r"interactive_[a-f0-9]{32}\Z")
 UPLOAD_ID = re.compile(r"upload_[a-f0-9]{32}\Z")
-MAX_UPLOAD_BYTES = 8 * 1024 * 1024
-MAX_SHARE_UPLOAD_BYTES = 64 * 1024 * 1024
 MAX_PROMPT_BYTES = 64 * 1024
 
 
@@ -163,21 +161,18 @@ class InteractiveChatShareStore(PublicChatShareStore):
             return {**self.metadata(row), "session_id": row["session_id"]}
 
     def reserve_upload(self, share_id, browser_token, *, name, media_type, byte_size):
-        if (not isinstance(name, str) or not 1 <= len(name) <= 160 or name in {".", ".."}
+        if (not isinstance(name, str) or not 1 <= len(name) <= 255 or name in {".", ".."}
                 or any(ord(c) < 32 or c in "/\\" for c in name)):
             raise ValidationError("Use a simple filename without directories")
-        _utf8_size(name, "Filename", 640)
+        _utf8_size(name, "Filename", 1024)
         if not isinstance(media_type, str) or re.fullmatch(r"[a-zA-Z0-9!#$&^_.+-]+/[a-zA-Z0-9!#$&^_.+-]+", media_type) is None:
             raise ValidationError("Invalid upload media type")
-        if type(byte_size) is not int or not 1 <= byte_size <= MAX_UPLOAD_BYTES:
-            raise ValidationError("Files must contain 1 byte to 8 MiB")
+        if type(byte_size) is not int or not 0 <= byte_size <= (1 << 53) - 1:
+            raise ValidationError("Invalid file size")
         upload_id = "upload_" + secrets.token_hex(16)
         with self._connection(write=True) as db:
             db.execute("BEGIN IMMEDIATE")
             self._authorized(db, share_id, browser_token)
-            used = db.execute("SELECT COALESCE(SUM(byte_size),0) FROM interactive_uploads WHERE share_id=?", (share_id,)).fetchone()[0]
-            if used + byte_size > MAX_SHARE_UPLOAD_BYTES:
-                raise ValidationError("This share has reached its 64 MiB upload storage bound")
             db.execute("INSERT INTO interactive_uploads VALUES(?,?,?,?,?,?,?)",
                 (upload_id, share_id, name, media_type, byte_size, None, self._now()))
         return upload_id
@@ -197,9 +192,9 @@ class InteractiveChatShareStore(PublicChatShareStore):
             db.execute("DELETE FROM interactive_uploads WHERE id=? AND share_id=? AND private_ref IS NULL", (upload_id, share_id))
 
     def upload_refs(self, share_id, browser_token, upload_ids):
-        if (not isinstance(upload_ids, list) or len(upload_ids) > 4 or len(set(str(i) for i in upload_ids)) != len(upload_ids)
+        if (not isinstance(upload_ids, list) or len(set(str(i) for i in upload_ids)) != len(upload_ids)
                 or any(not isinstance(i, str) or UPLOAD_ID.fullmatch(i) is None for i in upload_ids)):
-            raise ValidationError("Select at most four distinct uploads from this share")
+            raise ValidationError("Select distinct uploads from this share")
         with self._connection() as db:
             self._authorized(db, share_id, browser_token)
             refs = []

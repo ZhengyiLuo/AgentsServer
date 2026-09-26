@@ -18,6 +18,7 @@ from starlette.responses import Response, StreamingResponse
 
 
 VIDEO_CONTENT_TYPES = frozenset({"video/mp4", "video/webm", "video/quicktime", "video/ogg"})
+IMAGE_CONTENT_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/bmp"})
 VIDEO_CHUNK_BYTES = 64 * 1024
 REAUTHORIZE_INTERVAL_SECONDS = 1.0
 _RANGE = re.compile(r"bytes=([0-9]*)-([0-9]*)", re.IGNORECASE)
@@ -106,6 +107,9 @@ class SharedVideoResponse(StreamingResponse):
     at construction, before headers, and before/after every bounded read.
     """
 
+    content_types = VIDEO_CONTENT_TYPES
+    disposition = "inline"
+
     def __init__(self, fd, *, byte_size, content_type, filename, request,
                  reauthorize=None, extra_headers=None, admission=None, file_revision=None):
         self._fd = fd
@@ -113,7 +117,9 @@ class SharedVideoResponse(StreamingResponse):
         self._called = False
         try:
             if (type(fd) is not int or fd < 0 or type(byte_size) is not int
-                    or byte_size < 0 or content_type not in VIDEO_CONTENT_TYPES):
+                    or byte_size < 0 or not isinstance(content_type, str)
+                    or re.fullmatch(r"[a-zA-Z0-9!#$&^_.+-]+/[a-zA-Z0-9!#$&^_.+-]+", content_type) is None
+                    or (self.content_types is not None and content_type not in self.content_types)):
                 raise ValueError("Invalid shared video")
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode) or info.st_size != byte_size:
@@ -149,7 +155,7 @@ class SharedVideoResponse(StreamingResponse):
                     headers["content-range"] = f"bytes */{byte_size}"
                 else:
                     headers["content-type"] = content_type
-                    headers["content-disposition"] = "inline; filename*=UTF-8''" + quote(filename, safe="")
+                    headers["content-disposition"] = self.disposition + "; filename*=UTF-8''" + quote(filename, safe="")
                     if status == 206:
                         headers["content-range"] = f"bytes {self._start}-{self._start + self._length - 1}/{byte_size}"
             headers["content-length"] = str(self._length)
@@ -260,3 +266,16 @@ class SharedVideoResponse(StreamingResponse):
             self.close()
             if admitted:
                 self._admission.release()
+
+
+class SharedFileResponse(SharedVideoResponse):
+    """Download any registered attachment using the same descriptor lifecycle."""
+
+    content_types = None
+    disposition = "attachment"
+
+
+class SharedImageResponse(SharedVideoResponse):
+    """Only raster images are embedded at the shared chat's origin."""
+
+    content_types = IMAGE_CONTENT_TYPES

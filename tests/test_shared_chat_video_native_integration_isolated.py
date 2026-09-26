@@ -16,11 +16,14 @@ from unittest.mock import Mock, patch
 from fastapi import HTTPException
 
 from interactive_chat_native import shared_events
-from shared_chat_videos import SharedVideoUnavailable, open_shared_chat_video, shared_chat_video_descriptor
+from shared_chat_videos import (SharedVideoUnavailable, open_shared_chat_video, shared_chat_video_descriptor,
+    open_shared_chat_file, shared_chat_file_descriptor, VIDEO_TYPES)
 
 
 MEDIA_FUNCTIONS = frozenset({
     "shared_chat_event_videos", "project_shared_chat_event_videos", "shared_chat_video_events",
+    "shared_chat_event_attachments", "shared_chat_event_files", "shared_chat_attachment_events",
+    "open_shared_chat_file_for_share", "open_shared_chat_attachment_for_share",
     "open_shared_chat_video_for_share", "public_chat_share_session_exists",
     "file_record_belongs_to_session", "event_establishes_session_file_origin",
     "event_files_belong_to_session", "is_client_visible_event",
@@ -52,7 +55,9 @@ def install_media_glue(namespace, tree):
     assert len(constants) == 1
     namespace.update(asyncio=asyncio, os=os, re=re, HTTPException=HTTPException,
         shared_events=shared_events, SharedVideoUnavailable=SharedVideoUnavailable,
-        open_shared_chat_video=open_shared_chat_video, shared_chat_video_descriptor=shared_chat_video_descriptor)
+        open_shared_chat_video=open_shared_chat_video, shared_chat_video_descriptor=shared_chat_video_descriptor,
+        open_shared_chat_file=open_shared_chat_file, shared_chat_file_descriptor=shared_chat_file_descriptor,
+        VIDEO_TYPES=VIDEO_TYPES)
     future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
     exec(compile(ast.fix_missing_locations(ast.Module(body=[future, *constants, *nodes], type_ignores=[])),
                  "<isolated-native-video-adapters>", "exec"), namespace)
@@ -149,6 +154,61 @@ class SharedChatVideoNativeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(projected["shared_videos"]), 1)
         self.assertNotEqual(projected["shared_videos"][0]["id"], self.fake["id"])
         self.assertNotIn("file_ids", projected)
+
+    async def test_native_attachments_project_downloads_without_private_paths_or_duplicate_videos(self):
+        identity = "file_" + "e" * 16
+        folder = self.root / identity
+        folder.mkdir()
+        document = folder / "report.txt"
+        document.write_bytes(b"shared document")
+        (folder / "meta.json").write_text(json.dumps({"id": identity, "session_id": "chat-one",
+            "filename": document.name, "path": str(document), "size": document.stat().st_size,
+            "content_type": "text/plain"}))
+        event = self.event(file_ids=[self.own, identity], shared_files=[{"id": "untrusted"}])
+        projected = self.native["shared_chat_attachment_events"]([event], "chat-one")[0]
+        self.assertEqual(len(projected["shared_videos"]), 1)
+        self.assertEqual(len(projected["shared_files"]), 1)
+        descriptor = projected["shared_files"][0]
+        self.assertEqual(descriptor["filename"], "report.txt")
+        self.assertNotIn(str(self.root), json.dumps(projected))
+        self.assertNotIn("file_ids", projected)
+        opened = await self.native["open_shared_chat_file_for_share"]("chat-one", descriptor["id"])
+        try:
+            self.assertEqual(os.read(opened["file_fd"], 100), b"shared document")
+        finally:
+            os.close(opened["file_fd"])
+        for event in [self.event("file_uploaded", file_ids=[identity]),
+                self.event("assistant_text", shared_files=[descriptor]), self.event(file_ids=[self.other])]:
+            rows = self.native["shared_chat_attachment_events"]([event], "chat-one")
+            self.assertTrue(all("shared_files" not in row for row in rows))
+        artifact = self.event("artifact_created", artifact={"id": identity})
+        self.assertEqual(self.native["shared_chat_attachment_events"]([artifact], "chat-one")[0]["shared_files"], [descriptor])
+
+    async def test_unembeddable_video_remains_a_downloadable_attachment(self):
+        folder = self.root / self.own
+        original = folder / "clip.mp4"
+        for name, content in (("recording", b"owned extensionless recording"),
+                              ("recording.bin", b"owned recording with generic extension"),
+                              ("recording.mp4", b"")):
+            with self.subTest(name=name):
+                original.unlink(missing_ok=True)
+                path = folder / name
+                path.write_bytes(content)
+                meta = {"id": self.own, "filename": name, "path": str(path), "size": len(content),
+                        "content_type": "video/mp4", "session_id": "chat-one"}
+                (folder / "meta.json").write_text(json.dumps(meta))
+                event = self.event(file_ids=[self.own])
+                result = self.native["shared_chat_attachment_events"]([event], "chat-one")[0]
+                self.assertNotIn("shared_videos", result)
+                self.assertEqual(len(result["shared_files"]), 1)
+                descriptor = result["shared_files"][0]
+                self.assertEqual(descriptor["filename"], name)
+                opened = await self.native["open_shared_chat_file_for_share"]("chat-one", descriptor["id"])
+                try:
+                    self.assertEqual(os.read(opened["file_fd"], 100), content)
+                finally:
+                    os.close(opened["file_fd"])
+                path.unlink()
 
     async def test_exact_chat_signature_required_and_native_paths_are_not_downloads(self):
         handle = self.native["shared_chat_event_videos"]("chat-one", self.event())[0]["id"]

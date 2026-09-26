@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import re
 import threading
+import tempfile
 from urllib.parse import unquote
 import weakref
 
@@ -15,19 +16,19 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from interactive_chat_shares import (
     InteractiveChatShareStore, Unavailable, ValidationError, Conflict, SHARE_ID,
-    MAX_PROMPT_BYTES, MAX_UPLOAD_BYTES, csrf_token, _utf8_size,
+    MAX_PROMPT_BYTES, csrf_token, _utf8_size,
 )
 from public_chat_share_routes import chat_share_origin
 import interactive_chat_share_web as web
 from interactive_chat_controls import ChatControlError
-from shared_chat_video_stream import SharedVideoResponse
-from shared_chat_videos import VIDEO_ID, SharedVideoUnavailable
+from shared_chat_video_stream import SharedVideoResponse, SharedFileResponse, SharedImageResponse
+from shared_chat_videos import VIDEO_ID, SHARED_FILE_ID, SharedVideoUnavailable
 
 WARNING = (
     "Trusted full chat control: this person can read this chat, send or steer prompts, upload files, "
     "stop work, manage the queue and goals, change model/permission settings, respond to approvals, "
     "and create or run persistent scheduled jobs for this chat. "
-    "Attached and published videos are playable and can be saved by viewers. "
+    "Sent and published attachments can be downloaded; images and videos can be viewed. "
     "No general file browsing, terminal, other chats, or server administration are shared. "
     "The existing agent retains its normal tools and context, so they can ask it to use tools "
     "or return sensitive information. This is not a sandbox. Share the URL and reusable access token separately. "
@@ -46,12 +47,13 @@ HTTP_COOKIE = "AgentsDock-Chat"
 HEADERS = {
     "Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff",
     "X-Robots-Tag": "noindex, nofollow, noarchive", "Cross-Origin-Resource-Policy": "same-origin",
-    "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; media-src 'self'; font-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+    "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
 }
 
 
 def create_interactive_chat_share_router(*, storage_root, authorize, session_exists, public_base_url,
-    load_transcript, submit_prompt, save_upload, wait_for_change, chat_control=None, open_video=None):
+    load_transcript, submit_prompt, save_upload, wait_for_change, chat_control=None, open_video=None,
+    open_file=None, max_upload_bytes=25 * 1024 * 1024 * 1024):
     """Callbacks are scoped by the durable share ledger, not browser identities.
 
     A durable request ledger prevents repeated callback execution; ambiguous
@@ -66,7 +68,6 @@ def create_interactive_chat_share_router(*, storage_root, authorize, session_exi
     streams = 0
     active_workers = 0
     active_submissions = 0
-    active_uploads = 0
 
     class SharedChatStreamResponse(StreamingResponse):
         async def __call__(self, scope, receive, send):
@@ -227,11 +228,9 @@ def create_interactive_chat_share_router(*, storage_root, authorize, session_exi
                 messages.append(message)
             projected = {"revision": value["revision"], "busy": value["busy"], "messages": messages, "title": grant["title"]}
         try:
-            size = len(json.dumps(projected, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+            json.dumps(projected, ensure_ascii=False, allow_nan=False)
         except (ValueError, UnicodeError):
             raise HTTPException(503, "Shared conversation temporarily unavailable") from None
-        if size > 2 * 1024 * 1024:
-            raise HTTPException(503, "Shared conversation exceeds the safe display size")
         return projected
 
     @router.post("/api/admin/interactive-chat-shares/{session_id}")
@@ -313,25 +312,35 @@ def create_interactive_chat_share_router(*, storage_root, authorize, session_exi
         await auth(request, share_id)
         return result({**value, "csrf": csrf_token(token)})
 
-    @router.api_route("/interactive-chat/{share_id}/media/{handle}", methods=["GET", "HEAD"], include_in_schema=False)
-    async def video(share_id: str, handle: str, request: Request):
+    async def attachment_response(share_id, handle, request, *, download):
         grant, _ = await auth(request, share_id)
-        if open_video is None or len(handle) > 1024 or VIDEO_ID.fullmatch(handle) is None:
-            raise HTTPException(404, "Shared video is unavailable")
+        video = VIDEO_ID.fullmatch(handle) is not None
+        opener = open_video if video else open_file
+        if opener is None or len(handle) > 1024 or not (video or SHARED_FILE_ID.fullmatch(handle)):
+            raise HTTPException(404, "Shared attachment is unavailable")
         try:
-            opened = await open_video(grant["session_id"], handle)
+            opened = await opener(grant["session_id"], handle)
         except (SharedVideoUnavailable, OSError, ValueError):
-            raise HTTPException(404, "Shared video is unavailable") from None
+            raise HTTPException(404, "Shared attachment is unavailable") from None
         async def reauthorize():
             await auth(request, share_id)
         try:
             # Construction owns the descriptor even if its pinned revision
             # changed between resolution and response initialization.
-            return SharedVideoResponse(opened["file_fd"], byte_size=opened["size"],
+            response_class = SharedFileResponse if download else SharedVideoResponse if video else SharedImageResponse
+            return response_class(opened["file_fd"], byte_size=opened["size"],
                 content_type=opened["content_type"], filename=opened["filename"], request=request,
                 reauthorize=reauthorize, extra_headers=HEADERS, file_revision=opened.get("file_revision"))
         except (OSError, ValueError):
-            raise HTTPException(404, "Shared video is unavailable") from None
+            raise HTTPException(404, "Shared attachment is unavailable") from None
+
+    @router.api_route("/interactive-chat/{share_id}/media/{handle}", methods=["GET", "HEAD"], include_in_schema=False)
+    async def video(share_id: str, handle: str, request: Request):
+        return await attachment_response(share_id, handle, request, download=False)
+
+    @router.api_route("/interactive-chat/{share_id}/files/{handle}", methods=["GET", "HEAD"], include_in_schema=False)
+    async def download_file(share_id: str, handle: str, request: Request):
+        return await attachment_response(share_id, handle, request, download=True)
 
     @router.post("/interactive-chat/{share_id}/prompts", include_in_schema=False)
     async def prompt(share_id: str, request: Request):
@@ -389,42 +398,55 @@ def create_interactive_chat_share_router(*, storage_root, authorize, session_exi
 
     @router.post("/interactive-chat/{share_id}/uploads", include_in_schema=False)
     async def upload(share_id: str, request: Request):
-        nonlocal active_uploads
         await auth(request, share_id, write=True)
-        if active_uploads >= 4:
-            raise HTTPException(503, "Uploads are busy; retry shortly")
-        active_uploads += 1
         task = None
+        data = tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode="w+b")
         try:
             name = unquote(request.headers.get("x-chat-filename", ""))
             media_type = request.headers.get("content-type", "application/octet-stream").split(";")[0]
-            data = await body_bytes(request, MAX_UPLOAD_BYTES, timeout=30)
+            size = 0
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > max_upload_bytes:
+                    raise HTTPException(413, "File exceeds this server's upload size limit")
+                writing = asyncio.create_task(asyncio.to_thread(data.write, chunk))
+                try:
+                    await asyncio.shield(writing)
+                except asyncio.CancelledError:
+                    # Keep the temporary file owned until its disk write ends.
+                    while not writing.done():
+                        try:
+                            await asyncio.shield(writing)
+                        except asyncio.CancelledError:
+                            continue
+                    writing.result()
+                    raise
+            data.seek(0)
             async def commit_upload():
-                async with share_lock(share_id):
-                    grant, token = await auth(request, share_id, write=True)
-                    try:
-                        upload_id = await worker(lambda: store().reserve_upload(share_id, token, name=name, media_type=media_type, byte_size=len(data)))
-                    except ValidationError as exc:
-                        raise HTTPException(400, str(exc)) from None
-                    try:
-                        private_ref = await save_upload(grant["session_id"], share_id, name, media_type, data)
-                        await worker(lambda: store().complete_upload(share_id, token, upload_id, private_ref))
-                    except Exception:
-                        # A callback may already have durably written the file.
-                        # Keep its reservation charged when completion is unknown.
-                        raise HTTPException(503, "File upload could not be confirmed; its storage reservation is retained") from None
-                    return {"id": upload_id, "name": name, "media_type": media_type, "byte_size": len(data)}
+                try:
+                    async with share_lock(share_id):
+                        grant, token = await auth(request, share_id, write=True)
+                        try:
+                            upload_id = await worker(lambda: store().reserve_upload(share_id, token, name=name, media_type=media_type, byte_size=size))
+                        except ValidationError as exc:
+                            raise HTTPException(400, str(exc)) from None
+                        try:
+                            private_ref = await save_upload(grant["session_id"], share_id, name, media_type, data)
+                            await worker(lambda: store().complete_upload(share_id, token, upload_id, private_ref))
+                        except Exception:
+                            raise HTTPException(503, "File upload could not be confirmed; inspect this chat before uploading again") from None
+                        return {"id": upload_id, "name": name, "media_type": media_type, "byte_size": size}
+                finally:
+                    data.close()
             task = asyncio.create_task(commit_upload())
             def finished(_):
-                nonlocal active_uploads
-                active_uploads -= 1
                 if not task.cancelled():
                     task.exception()
             task.add_done_callback(finished)
             return result(await asyncio.shield(task), 201)
         finally:
             if task is None:
-                active_uploads -= 1
+                data.close()
 
     @router.get("/interactive-chat/{share_id}/controls", include_in_schema=False)
     async def controls(share_id: str, request: Request):
@@ -457,8 +479,7 @@ def create_interactive_chat_share_router(*, storage_root, authorize, session_exi
             grant, _ = await auth(request, share_id, write=True)
             try:
                 public_result = await chat_control(grant["session_id"], action, payload)
-                if len(json.dumps(public_result, ensure_ascii=False, allow_nan=False).encode("utf-8")) > 2 * 1024 * 1024:
-                    raise ValueError("Read result is too large")
+                json.dumps(public_result, ensure_ascii=False, allow_nan=False)
             except ChatControlError as exc:
                 raise HTTPException(403 if exc.code == "forbidden" else 400, "Invalid or unavailable chat read") from None
             except Exception:
@@ -480,8 +501,7 @@ def create_interactive_chat_share_router(*, storage_root, authorize, session_exi
                     if not isinstance(accepted, dict) or accepted.get("accepted") is not True:
                         raise ValueError("Invalid control receipt")
                     public_result = accepted.get("result")
-                    if len(json.dumps(public_result, ensure_ascii=False, allow_nan=False).encode("utf-8")) > 2 * 1024 * 1024:
-                        raise ValueError("Control result is too large")
+                    json.dumps(public_result, ensure_ascii=False, allow_nan=False)
                     receipt = {"accepted": True, "action": action, "request_id": request_id, "result": public_result}
                     await worker(lambda: store().accept_submission(share_id, request_id, receipt))
                 except ChatControlError as exc:
@@ -527,8 +547,14 @@ def create_interactive_chat_share_router(*, storage_root, authorize, session_exi
                     await auth(request, share_id)
                     revision = value["revision"]
                     yield "event: state\ndata: " + json.dumps(value, ensure_ascii=False) + "\n\n"
-            except (Unavailable, HTTPException):
+            except Unavailable:
                 yield "event: unavailable\ndata: {}\n\n"
+            except HTTPException as exc:
+                if exc.status_code in {401, 403, 404, 410}:
+                    yield "event: unavailable\ndata: {}\n\n"
+                # A failed snapshot or busy ledger does not revoke access.
+                # End the response so EventSource's existing reconnect path
+                # can obtain fresh state once the server is available again.
         return SharedChatStreamResponse(stream(), media_type="text/event-stream", headers={**HEADERS, "X-Accel-Buffering": "no"})
 
     return router

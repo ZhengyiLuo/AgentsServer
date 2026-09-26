@@ -115,20 +115,53 @@ class InteractiveChatProjectionTests(unittest.TestCase):
                 with self.assertRaises(PublicTranscriptError): reader.load()
                 with self.assertRaises(PublicTranscriptError): reader.load()
 
-    def test_limits_invalid_rows_and_unicode_are_explicit_errors(self):
-        cases = [
-            ("MAX_LOG_BYTES", 1, {"type": "turn_started", "prompt": "Text"}),
-            ("MAX_LINE_BYTES", 1, {"type": "turn_started", "prompt": "Text"}),
-            ("MAX_RECORDS", 0, {"type": "tool_started"}),
-            ("MAX_MESSAGES", 0, {"type": "turn_started", "prompt": "Text"}),
-            ("MAX_MESSAGE_BYTES", 1, {"type": "turn_started", "prompt": "Text"}),
-            ("MAX_TEXT_BYTES", 1, {"type": "turn_started", "prompt": "Text"}),
-        ]
-        for name, limit, event in cases:
-            with self.subTest(limit=name):
-                self.path.unlink(missing_ok=True); self.append(event)
-                with patch.object(projection, name, limit), self.assertRaises(PublicTranscriptError):
-                    projection.IncrementalChatTranscript(self.path, projector()).load()
+    def test_large_records_and_long_chat_keep_all_text_without_exposing_tool_payloads(self):
+        prompt = "  Large genuine quoted report 中文\n" * 40_000
+        self.assertGreater(len(prompt.encode()), 1024 * 1024)
+        self.append({"type": "turn_started", "prompt": prompt})
+        noise = json.dumps({"type": "tool_finished", "session_id": "chat", "run_id": "run",
+                            "tool": "exec_command", "output": "private" * 600_000}).encode() + b"\n"
+        small_tool = b'{"type":"tool_started","session_id":"chat","run_id":"run"}\n'
+        with self.path.open("ab") as stream:
+            for _ in range(17):
+                stream.write(noise)
+            for _ in range(100_001):
+                stream.write(small_tool)
+        self.assertGreater(self.path.stat().st_size, 64 * 1024 * 1024)
+        expected = [{"role": "user", "text": prompt}]
+        for index in range(1_004):
+            text = f"Report paragraph {index}: " + "public text " * 100
+            self.append({"type": "assistant_text", "text": text})
+            expected.append({"role": "assistant", "text": text})
+        seen = []
+        actual = projector()
+        reader = projection.IncrementalChatTranscript(self.path, lambda event: seen.append(event["type"]) or actual(event))
+        result = reader.load()
+        self.assertEqual(result["messages"], expected)
+        self.assertEqual(result["through_bytes"], self.path.stat().st_size)
+        self.assertEqual(seen, ["turn_started"] + ["assistant_text"] * 1_004)
+        self.append({"type": "assistant_text", "text": "Later live answer"})
+        expected.append({"role": "assistant", "text": "Later live answer"})
+        self.assertEqual(reader.load()["messages"], expected)
+        self.assertEqual(seen[-1], "assistant_text")
+        self.assertEqual(len(seen), 1_006)
+
+    def test_large_partial_tail_waits_for_commit_and_preserves_complete_message(self):
+        self.append({"type": "turn_started", "prompt": "Question"})
+        reader = projection.IncrementalChatTranscript(self.path, projector())
+        before = reader.load()
+        text = "Large response 中文\n" * 80_000
+        record = json.dumps({"type": "assistant_text", "run_id": "run", "text": text}).encode()
+        with self.path.open("ab") as stream:
+            stream.write(record)
+        self.assertEqual(reader.load(), before)
+        with self.path.open("ab") as stream:
+            stream.write(b"\n")
+        result = reader.load()
+        self.assertEqual(result["messages"][-1], {"role": "assistant", "text": text})
+        self.assertEqual(result["through_bytes"], self.path.stat().st_size)
+
+    def test_invalid_rows_and_unicode_are_explicit_errors(self):
         for body in (b"not-json\n", b"[]\n", b'{}\n', b'{"type":"turn_started","prompt":"\\ud800"}\n'):
             self.path.write_bytes(body)
             with self.assertRaises(PublicTranscriptError):

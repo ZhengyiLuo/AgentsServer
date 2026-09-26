@@ -1,4 +1,4 @@
-"""Incremental, bounded text-only chat projection; no server imports or timers."""
+"""Incremental text-only chat projection; no server imports or timers."""
 from __future__ import annotations
 
 import json
@@ -9,8 +9,7 @@ import threading
 from typing import Callable
 
 from public_chat_transcript import (
-    MAX_LINE_BYTES, MAX_LOG_BYTES, MAX_MESSAGE_BYTES, MAX_MESSAGES,
-    MAX_RECORDS, MAX_TEXT_BYTES, PublicTranscriptError,
+    PublicTranscriptError,
     _is_goal_followup, _public_timestamp,
 )
 
@@ -31,8 +30,6 @@ class IncrementalChatTranscript:
         self._stamp = None
         self._offset = 0
         self._revision = 0
-        self._records = 0
-        self._total_text = 0
         self._messages: list[dict] = []
         self._outputs: dict[str, list[str]] = {}
         self._failed = False
@@ -72,8 +69,6 @@ class IncrementalChatTranscript:
             if not stat.S_ISREG(initial.st_mode):
                 raise PublicTranscriptError("Chat history is unavailable")
             stamp = self._file_stamp(initial)
-            if initial.st_size > MAX_LOG_BYTES:
-                raise PublicTranscriptError("Chat exceeds the 64 MiB sharing limit")
             if self._stamp is not None:
                 if (stamp[:2] != self._stamp[:2] or stamp[2] < self._stamp[2]
                         or stamp[2] == self._stamp[2] and stamp[3:] != self._stamp[3:]):
@@ -82,15 +77,12 @@ class IncrementalChatTranscript:
                     return self._snapshot()
             stream.seek(self._offset)
             while self._offset < initial.st_size:
-                line = stream.readline(min(MAX_LINE_BYTES + 1, initial.st_size - self._offset))
-                if len(line) > MAX_LINE_BYTES:
-                    raise PublicTranscriptError("A chat record exceeds the sharing limit")
+                # Consume complete records through the captured file boundary.
+                # Large tool payloads are private, not a reason to reject a chat.
+                line = stream.readline(initial.st_size - self._offset)
                 if not line.endswith(b"\n"):
                     break  # Re-read this uncommitted tail only after it grows.
                 self._offset += len(line)
-                self._records += 1
-                if self._records > MAX_RECORDS:
-                    raise PublicTranscriptError("Chat exceeds the sharing record limit")
                 try:
                     raw = json.loads(line)
                 except (ValueError, UnicodeError, RecursionError) as exc:
@@ -130,20 +122,15 @@ class IncrementalChatTranscript:
         if not isinstance(text, str) or not text.strip():
             return
         try:
-            size = len(text.encode("utf-8"))
+            text.encode("utf-8")
         except UnicodeEncodeError as exc:
             raise PublicTranscriptError("Chat history contains invalid Unicode text") from exc
-        if size > MAX_MESSAGE_BYTES:
-            raise PublicTranscriptError("A message exceeds the 256 KiB sharing limit")
         normalized = " ".join(text.split())
         previous = self._outputs.setdefault(run, [])
         if kind == "turn_finished" and (normalized in previous or normalized == " ".join(previous)):
             return
         if kind == "assistant_text":
             previous.append(normalized)
-        self._total_text += size
-        if self._total_text > MAX_TEXT_BYTES or len(self._messages) >= MAX_MESSAGES:
-            raise PublicTranscriptError("Chat exceeds the 1,000-message / 2 MiB sharing limit")
         message = {"role": role, "text": text}
         timestamp = _public_timestamp(event.get("ts"))
         if timestamp is not None:

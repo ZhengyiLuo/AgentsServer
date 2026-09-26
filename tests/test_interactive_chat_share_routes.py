@@ -34,13 +34,15 @@ class InteractiveShareRouteTests(unittest.TestCase):
         self.wait = mock.AsyncMock(return_value=False)
         self.control = mock.AsyncMock(return_value={"accepted": True, "result": {"ok": True}})
         self.open_video = mock.AsyncMock()
+        self.open_file = mock.AsyncMock()
         def authorize(request):
             if request.headers.get("x-agentsdock-token") != "synthetic-native-admin" or request.headers.get("origin") or request.headers.get("cookie"):
                 raise HTTPException(403, "Native administration required")
         self.router = create_interactive_chat_share_router(storage_root=self.root, authorize=authorize,
             session_exists=lambda session: session in self.sessions, public_base_url=lambda: self.public_origin,
             load_transcript=self.load, submit_prompt=self.submit, save_upload=self.save, wait_for_change=self.wait,
-            chat_control=self.control, open_video=self.open_video)
+            chat_control=self.control, open_video=self.open_video, open_file=self.open_file,
+            max_upload_bytes=10 * 1024 * 1024)
         app = FastAPI()
         app.include_router(self.router)
         self.client = TestClient(app, base_url=self.origin, raise_server_exceptions=False)
@@ -73,6 +75,13 @@ class InteractiveShareRouteTests(unittest.TestCase):
         self.assertEqual(self.client.post(path + "/redeem", headers={"Origin": self.origin}, json={"invitation_token": share["access_token"]}).status_code, 200)
         self.assertEqual(self.client.get(path + "/state").json()["messages"], [])
         self.assertNotIn("session_id", self.client.get(path + "/state").text)
+
+    def test_shell_allows_local_attachment_previews_without_blob_scripts(self):
+        policy = self.client.get(self.create()["path"]).headers["content-security-policy"]
+        self.assertIn("img-src 'self' data: blob:", policy)
+        self.assertIn("media-src 'self' blob:", policy)
+        self.assertIn("script-src 'self';", policy)
+        self.assertNotIn("script-src 'self' blob:", policy)
 
     def video_fixture(self):
         path = self.root.parent / "synthetic.mp4"
@@ -129,6 +138,54 @@ class InteractiveShareRouteTests(unittest.TestCase):
         self.client.delete(self.admin + "/" + share["id"], headers=self.admin_headers)
         self.assertEqual(self.client.get(url).status_code, 404)
         self.assertEqual(self.open_video.await_count, accepted_calls)
+
+    def test_shared_attachments_download_images_preview_and_revocation(self):
+        file = self.root.parent / "shared-attachment"
+        handle = "shared_file_" + "a" * 16 + "." + "b" * 64
+        descriptors = []
+        current = {}
+        async def open_file(session_id, identity):
+            self.assertEqual((session_id, identity), ("chat-one", handle))
+            fd = os.open(file, os.O_RDONLY)
+            descriptors.append(fd)
+            return {"file_fd": fd, "filename": current["name"], "content_type": current["mime"], "size": file.stat().st_size}
+        self.open_file.side_effect = open_file
+        share = self.create()
+        download = share["path"] + "/files/" + handle
+        self.assertEqual(self.client.get(download).status_code, 404)
+        self.open_file.assert_not_awaited()
+        self.redeem(share)
+        for name, mime, content, preview in [("report.txt", "text/plain", b"report", False),
+                ("report.pdf", "application/pdf", b"synthetic pdf", False),
+                ("example.html", "text/html", b"<script>test</script>", False),
+                ("preview.png", "image/png", b"synthetic png", True),
+                ("empty.txt", "text/plain", b"", False)]:
+            with self.subTest(name=name):
+                current.update(name=name, mime=mime)
+                file.write_bytes(content)
+                response = self.client.get(download)
+                self.assertEqual((response.status_code, response.content), (200, content))
+                self.assertTrue(response.headers["content-disposition"].startswith("attachment;"))
+                self.assertEqual(response.headers["content-type"], mime)
+                self.assertEqual(self.client.head(download).content, b"")
+                response = self.client.get(share["path"] + "/media/" + handle)
+                self.assertEqual(response.status_code, 200 if preview else 404)
+                if preview:
+                    self.assertTrue(response.headers["content-disposition"].startswith("inline;"))
+        for descriptor in descriptors:
+            with self.assertRaises(OSError): os.fstat(descriptor)
+        calls = self.open_file.await_count
+        self.client.delete(self.admin + "/" + share["id"], headers=self.admin_headers)
+        self.assertEqual(self.client.get(download).status_code, 404)
+        self.assertEqual(self.open_file.await_count, calls)
+
+    def test_existing_video_handle_can_download_without_changing_inline_playback(self):
+        handle, data, _ = self.video_fixture()
+        share = self.create()
+        self.redeem(share)
+        response = self.client.get(share["path"] + "/files/" + handle)
+        self.assertEqual((response.status_code, response.content), (200, data))
+        self.assertTrue(response.headers["content-disposition"].startswith("attachment;"))
 
     def test_video_denied_after_open_during_revocation_and_session_removal(self):
         handle, _, handles = self.video_fixture()
@@ -426,6 +483,51 @@ class InteractiveShareRouteTests(unittest.TestCase):
         self.sessions.clear()
         self.assertEqual(self.client.get(path + "/state").status_code, 404)
 
+    def test_upload_spools_large_files_and_uses_native_configured_limit(self):
+        path, headers = self.redeem(self.create())
+        data = b"x" * (9 * 1024 * 1024)
+        async def save(session, share, name, mime, stream):
+            self.assertTrue(stream._rolled)
+            self.assertEqual(stream.read(), data)
+            return "private-large-file"
+        self.save.side_effect = save
+        headers = {**headers, "Content-Type": "application/octet-stream", "X-Chat-Filename": "data.bin"}
+        response = self.client.post(path + "/uploads", headers=headers, content=data)
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(response.json()["byte_size"], len(data))
+        self.assertTrue(self.save.await_args.args[-1].closed)
+        response = self.client.post(path + "/uploads", headers=headers, content=b"x" * (10 * 1024 * 1024 + 1))
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(self.save.await_count, 1)
+
+    def test_disconnected_upload_closes_its_temporary_file_without_committing(self):
+        share = self.create()
+        self.redeem(share)
+        cookie = next(cookie.value for cookie in self.client.cookies.jar if cookie.name == COOKIE)
+        async def stream():
+            yield b"partial upload"
+            raise ClientDisconnect()
+        request = SimpleNamespace(base_url=self.origin + "/", url=SimpleNamespace(query=""),
+            headers={"cookie": COOKIE + "=" + cookie, "origin": self.origin,
+                "x-chat-csrf": csrf_token(cookie), "x-chat-filename": "partial.txt", "content-type": "text/plain"},
+            stream=stream)
+        endpoint = next(route.endpoint for route in self.router.routes if route.path.endswith("/{share_id}/uploads"))
+        temporary = tempfile.SpooledTemporaryFile(max_size=16)
+        with mock.patch("interactive_chat_share_routes.tempfile.SpooledTemporaryFile", return_value=temporary):
+            with self.assertRaises(ClientDisconnect):
+                asyncio.run(endpoint(share["id"], request))
+        self.assertTrue(temporary.closed)
+        self.save.assert_not_awaited()
+
+    def test_large_native_state_is_not_rejected_by_separate_share_response_limit(self):
+        path, _ = self.redeem(self.create())
+        self.load.return_value = {"revision": "native-1", "session": {"id": "chat-one"}, "events": [
+            {"type": "assistant_text", "text": "x" * (2 * 1024 * 1024 + 1)}], "active": True}
+        response = self.client.get(path + "/state")
+        self.assertEqual(response.status_code, 200, response.text[:100])
+        self.assertTrue(response.json()["active"])
+        self.assertEqual(len(response.json()["events"][0]["text"]), 2 * 1024 * 1024 + 1)
+
     def test_stream_keepalive_does_not_load_transcript_and_revision_signal_does(self):
         share = self.create()
         path, _ = self.redeem(share)
@@ -469,6 +571,59 @@ class InteractiveShareRouteTests(unittest.TestCase):
         asyncio.run(disconnect())
         self.load.assert_not_awaited()
         self.wait.assert_not_awaited()
+
+    def test_stream_snapshot_failure_reconnects_to_fresh_running_state_without_revoking(self):
+        share = self.create()
+        self.redeem(share)
+        cookie = next(cookie.value for cookie in self.client.cookies.jar if cookie.name == COOKIE)
+        request = SimpleNamespace(base_url=self.origin + "/", url=SimpleNamespace(query=""),
+            headers={"cookie": COOKIE + "=" + cookie}, is_disconnected=mock.AsyncMock(return_value=False))
+        endpoint = next(route.endpoint for route in self.router.routes if route.path.endswith("/{share_id}/events"))
+        idle = {"revision": "revision-idle", "session": {"id": "chat-one"}, "events": [], "active": False}
+        running = {**idle, "revision": "revision-running", "active": True}
+        self.wait.return_value = True
+        async def exercise(fail_initially):
+            self.load.side_effect = ([RuntimeError("temporary snapshot failure"), running] if fail_initially
+                else [idle, RuntimeError("temporary snapshot failure"), running])
+            response = await endpoint(share["id"], request)
+            iterator = response.body_iterator
+            if not fail_initially:
+                self.assertIn('"active": false', await anext(iterator))
+            with mock.patch("interactive_chat_share_routes.asyncio.sleep", new=mock.AsyncMock()):
+                with self.assertRaises(StopAsyncIteration):
+                    await anext(iterator)
+            # EventSource reconnects after EOF. The replacement request gets
+            # authenticated current state, rather than a permanent denial.
+            restored = await endpoint(share["id"], request)
+            frame = await anext(restored.body_iterator)
+            self.assertTrue(frame.startswith("event: state\n"))
+            self.assertIn('"revision": "revision-running"', frame)
+            self.assertIn('"active": true', frame)
+            await restored.body_iterator.aclose()
+        for initial in (True, False):
+            with self.subTest(initial=initial):
+                asyncio.run(exercise(initial))
+
+    def test_stream_busy_auth_is_recoverable_but_revocation_is_terminal(self):
+        share = self.create()
+        self.redeem(share)
+        cookie = next(cookie.value for cookie in self.client.cookies.jar if cookie.name == COOKIE)
+        request = SimpleNamespace(base_url=self.origin + "/", url=SimpleNamespace(query=""),
+            headers={"cookie": COOKIE + "=" + cookie}, is_disconnected=mock.AsyncMock(return_value=False))
+        endpoint = next(route.endpoint for route in self.router.routes if route.path.endswith("/{share_id}/events"))
+        async def exercise():
+            response = await endpoint(share["id"], request)
+            iterator = response.body_iterator
+            self.assertIn("event: state", await anext(iterator))
+            with mock.patch.object(InteractiveChatShareStore, "authenticate", side_effect=HTTPException(503, "busy")):
+                with self.assertRaises(StopAsyncIteration):
+                    await anext(iterator)
+            restored = await endpoint(share["id"], request)
+            self.assertIn("event: state", await anext(restored.body_iterator))
+            InteractiveChatShareStore.open_existing(self.root).revoke_share(share["id"], session_id="chat-one")
+            self.assertEqual(await anext(restored.body_iterator), "event: unavailable\ndata: {}\n\n")
+            await restored.body_iterator.aclose()
+        asyncio.run(exercise())
 
     def test_upload_disconnect_joins_committed_save_and_retains_accounting(self):
         share = self.create()

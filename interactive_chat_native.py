@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import math
-from shared_chat_videos import normalize_shared_chat_videos
+from shared_chat_videos import normalize_shared_chat_videos, normalize_shared_chat_files
 
 PRIVATE_FIELDS = frozenset({
     "cwd", "path", "source_path", "root", "file", "files", "artifact", "artifacts",
@@ -57,10 +57,11 @@ def shared_events(events, session_id):
         if not isinstance(event, dict) or event.get("session_id") not in (None, "", session_id):
             raise ValueError("Shared chat event ownership is invalid")
         kind = str(event.get("type") or "")
-        # Only explicitly projected video descriptors cross the media boundary.
+        # Only explicitly projected attachment descriptors cross the media boundary.
         # Tool output is chat content, not direct filesystem access.
         videos = normalize_shared_chat_videos(event.get("shared_videos", []))
-        if kind.startswith(("file_", "artifact_", "workspace_", "terminal_")) and not (kind == "artifact_created" and len(videos) == 1):
+        files = normalize_shared_chat_files(event.get("shared_files", []))
+        if kind.startswith(("file_", "artifact_", "workspace_", "terminal_")) and not (kind == "artifact_created" and len(videos) + len(files) == 1):
             continue
         output.append(shared_native_value(event))
     return output

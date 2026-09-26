@@ -28,10 +28,9 @@ from typing import Any, Callable, Iterator
 from shared_chat_videos import normalize_shared_chat_videos
 
 
-MAX_MESSAGE_TEXT_BYTES = 256 * 1024
-MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024
-MAX_RENDER_BYTES = 16 * 1024 * 1024
-MAX_SNAPSHOT_PAGE_MESSAGES = 100
+# Pagination targets, not quotas: one complete message may exceed a page target.
+TARGET_SNAPSHOT_PAGE_BYTES = 2 * 1024 * 1024
+TARGET_SNAPSHOT_PAGE_MESSAGES = 100
 MAX_TITLE_CHARACTERS = 256
 MAX_LIST_LIMIT = 100
 MAX_UNIX_TIMESTAMP = 253402300799
@@ -41,7 +40,7 @@ SHARE_ID_PATTERN = re.compile(r"share_[a-f0-9]{32}\Z", re.ASCII)
 
 
 class PublicChatShareValidationError(ValueError):
-    """Input is not an already-projected, bounded public conversation."""
+    """Input is not an already-projected public conversation."""
 
 
 class PublicChatShareUnavailable(LookupError):
@@ -62,15 +61,15 @@ def _timestamp(value: Any, label: str) -> int | float:
     return value
 
 
-def _utf8_size(value: str, label: str, limit: int) -> int:
+def _utf8_size(value: str, label: str, limit: int | None = None) -> int:
     # Check character count first to avoid encoding a grossly oversized input.
-    if len(value) > limit:
+    if limit is not None and len(value) > limit:
         raise PublicChatShareValidationError(f"{label} is too large.")
     try:
         length = len(value.encode("utf-8"))
     except UnicodeEncodeError as exc:
         raise PublicChatShareValidationError(f"{label} must be valid UTF-8.") from exc
-    if length > limit:
+    if limit is not None and length > limit:
         raise PublicChatShareValidationError(f"{label} is too large.")
     return length
 
@@ -82,47 +81,39 @@ def _session_id(value: Any) -> str:
     return value
 
 
+def _projected_message(message: Any) -> dict[str, Any]:
+    if not isinstance(message, dict) or set(message) - {"role", "text", "timestamp", "videos"}:
+        raise PublicChatShareValidationError("Messages may contain only role, text, timestamp, and videos.")
+    role = message.get("role")
+    text = message.get("text")
+    if role not in ("user", "assistant") or not isinstance(text, str):
+        raise PublicChatShareValidationError("Each message needs a user/assistant role and text.")
+    _utf8_size(text, "message text")
+    item = {"role": role, "text": text}
+    if "videos" in message:
+        try:
+            videos = normalize_shared_chat_videos(message["videos"])
+        except ValueError as exc:
+            raise PublicChatShareValidationError("Invalid shared video metadata.") from exc
+        if videos:
+            item["videos"] = videos
+    if "timestamp" in message:
+        item["timestamp"] = _timestamp(message["timestamp"], "message timestamp")
+    return item
+
+
 def _snapshot(messages: Any, title: Any, created_at: Any) -> tuple[dict[str, Any], bytes]:
     if title is None:
         title = DEFAULT_TITLE
     if not isinstance(title, str) or not title.strip() or len(title) > MAX_TITLE_CHARACTERS:
         raise PublicChatShareValidationError("title must contain 1 to 256 characters.")
-    total_bytes = _utf8_size(title, "title", MAX_TITLE_CHARACTERS * 4)
+    _utf8_size(title, "title", MAX_TITLE_CHARACTERS * 4)
     _timestamp(created_at, "created_at")
     if not isinstance(messages, list) or not messages:
         raise PublicChatShareValidationError("messages must contain at least one item.")
-    serialized_bytes = len(json.dumps({"title": title, "created_at": created_at, "messages": []},
-        ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8"))
-    projected: list[dict[str, Any]] = []
-    for message in messages:
-        if not isinstance(message, dict) or set(message) - {"role", "text", "timestamp", "videos"}:
-            raise PublicChatShareValidationError("Messages may contain only role, text, timestamp, and videos.")
-        role = message.get("role")
-        text = message.get("text")
-        if role not in ("user", "assistant") or not isinstance(text, str):
-            raise PublicChatShareValidationError("Each message needs a user/assistant role and text.")
-        total_bytes += _utf8_size(text, "message text", MAX_MESSAGE_TEXT_BYTES)
-        if total_bytes > MAX_SNAPSHOT_BYTES:
-            raise PublicChatShareValidationError("Snapshot is too large.")
-        item = {"role": role, "text": text}
-        if "videos" in message:
-            try:
-                videos = normalize_shared_chat_videos(message["videos"])
-            except ValueError as exc:
-                raise PublicChatShareValidationError("Invalid shared video metadata.") from exc
-            if videos:
-                item["videos"] = videos
-        if "timestamp" in message:
-            item["timestamp"] = _timestamp(message["timestamp"], "message timestamp")
-        serialized_bytes += len(json.dumps(item, ensure_ascii=False, separators=(",", ":"),
-            allow_nan=False).encode("utf-8")) + bool(projected)
-        if serialized_bytes > MAX_SNAPSHOT_BYTES:
-            raise PublicChatShareValidationError("Snapshot is too large.")
-        projected.append(item)
+    projected = [_projected_message(message) for message in messages]
     snapshot = {"title": title, "created_at": created_at, "messages": projected}
     encoded = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
-    if len(encoded) > MAX_SNAPSHOT_BYTES:
-        raise PublicChatShareValidationError("Snapshot is too large.")
     return snapshot, encoded
 
 
@@ -171,7 +162,7 @@ class PublicChatShareStore:
                     created_at REAL NOT NULL,
                     expires_at REAL,
                     message_count INTEGER NOT NULL CHECK(message_count >= 1),
-                    snapshot_json BLOB NOT NULL CHECK(length(snapshot_json) <= 2097152),
+                    snapshot_json BLOB NOT NULL,
                     snapshot_sha256 BLOB NOT NULL CHECK(length(snapshot_sha256) = 32)
                 )"""
             )
@@ -181,21 +172,37 @@ class PublicChatShareStore:
                     revoked_at REAL NOT NULL
                 )"""
             )
+        connection.execute(f"""CREATE TABLE IF NOT EXISTS public_chat_share_pages{suffix} (
+            share_id TEXT NOT NULL REFERENCES public_chat_shares{suffix}(share_id) DEFERRABLE INITIALLY DEFERRED,
+            page_index INTEGER NOT NULL CHECK(page_index >= 1),
+            snapshot_json BLOB NOT NULL,
+            snapshot_sha256 BLOB NOT NULL CHECK(length(snapshot_sha256) = 32),
+            PRIMARY KEY(share_id, page_index))""")
 
     @classmethod
     def _ensure_schema(cls, connection):
-        """Authenticated-write-only, atomic preservation of immutable v1 rows."""
+        """Authenticated-write-only, atomic preservation of existing snapshots."""
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         if version not in (0, 1, 2, 3):
             raise OSError("Unsupported public chat share database version.")
-        if version == 1:
-            cls._create_tables(connection, "_v2")
-            connection.execute("INSERT INTO public_chat_shares_v2 SELECT * FROM public_chat_shares")
-            connection.execute("INSERT INTO public_chat_share_revocations_v2 SELECT * FROM public_chat_share_revocations")
+        # Only the old SQL size constraints change; columns and persisted JSON
+        # are identical. Keep schema version 3 so a previous server can reopen
+        # its existing shares after rollback instead of refusing the database.
+        bounded_schema = any(re.search(r"CHECK\s*\(\s*length\s*\(\s*snapshot_json\s*\)", row[0] or "", re.IGNORECASE)
+            for row in connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name IN ('public_chat_shares','public_chat_share_pages')"))
+        if version == 1 or bounded_schema:
+            cls._create_tables(connection, "_expanded")
+            connection.execute("INSERT INTO public_chat_shares_expanded SELECT * FROM public_chat_shares")
+            connection.execute("INSERT INTO public_chat_share_revocations_expanded SELECT * FROM public_chat_share_revocations")
+            has_pages = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='public_chat_share_pages'").fetchone()
+            if has_pages:
+                connection.execute("INSERT INTO public_chat_share_pages_expanded SELECT * FROM public_chat_share_pages")
+                connection.execute("DROP TABLE public_chat_share_pages")
             connection.execute("DROP TABLE public_chat_share_revocations")
             connection.execute("DROP TABLE public_chat_shares")
-            connection.execute("ALTER TABLE public_chat_shares_v2 RENAME TO public_chat_shares")
-            connection.execute("ALTER TABLE public_chat_share_revocations_v2 RENAME TO public_chat_share_revocations")
+            connection.execute("ALTER TABLE public_chat_shares_expanded RENAME TO public_chat_shares")
+            connection.execute("ALTER TABLE public_chat_share_revocations_expanded RENAME TO public_chat_share_revocations")
+            connection.execute("ALTER TABLE public_chat_share_pages_expanded RENAME TO public_chat_share_pages")
         else:
             cls._create_tables(connection)
         connection.execute(
@@ -208,12 +215,6 @@ class PublicChatShareStore:
                     f"BEFORE {operation} ON {table} BEGIN "
                     "SELECT RAISE(ABORT, 'Public chat shares are immutable'); END"
                 )
-        connection.execute("""CREATE TABLE IF NOT EXISTS public_chat_share_pages (
-            share_id TEXT NOT NULL REFERENCES public_chat_shares(share_id) DEFERRABLE INITIALLY DEFERRED,
-            page_index INTEGER NOT NULL CHECK(page_index >= 1),
-            snapshot_json BLOB NOT NULL CHECK(length(snapshot_json) <= 2097152),
-            snapshot_sha256 BLOB NOT NULL CHECK(length(snapshot_sha256) = 32),
-            PRIMARY KEY(share_id, page_index))""")
         for operation in ("UPDATE", "DELETE"):
             connection.execute(f"CREATE TRIGGER IF NOT EXISTS public_chat_share_pages_no_{operation.lower()} "
                 f"BEFORE {operation} ON public_chat_share_pages BEGIN "
@@ -351,11 +352,12 @@ class PublicChatShareStore:
         return True
 
     def create_streamed_share(self, session_id: str, load_messages: Callable, *, title=None, expires_at=None) -> dict[str, Any]:
-        """Capture arbitrarily many bounded pages atomically from a message sink.
+        """Capture complete messages in paginated snapshots atomically.
 
         The loader must emit projected messages synchronously and raise before
         returning if a reviewed digest changed. No whole-chat list/JSON is kept.
         Existing snapshots retain their original first-page representation.
+        A message larger than the page target is stored intact on its own page.
         """
         session_id = _session_id(session_id)
         created_at = _timestamp(self._now(), "current time")
@@ -392,10 +394,9 @@ class PublicChatShareStore:
 
             def emit(message) -> None:
                 nonlocal total, page_bytes
-                checked, _ = _snapshot([message], title, created_at)
-                item = checked["messages"][0]
+                item = _projected_message(message)
                 size = len(json.dumps(item, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8"))
-                if page and (len(page) >= MAX_SNAPSHOT_PAGE_MESSAGES or overhead + page_bytes + size + len(page) > MAX_SNAPSHOT_BYTES):
+                if page and (len(page) >= TARGET_SNAPSHOT_PAGE_MESSAGES or overhead + page_bytes + size + len(page) > TARGET_SNAPSHOT_PAGE_BYTES):
                     flush()
                 page.append(item)
                 page_bytes += size
@@ -455,7 +456,7 @@ class PublicChatShareStore:
         encoded = row["snapshot_json"]
         digest = row["snapshot_sha256"]
         if (
-            not isinstance(encoded, bytes) or len(encoded) > MAX_SNAPSHOT_BYTES
+            not isinstance(encoded, bytes)
             or not isinstance(digest, bytes)
             or not hmac.compare_digest(hashlib.sha256(encoded).digest(), digest)
         ):
@@ -753,7 +754,4 @@ def render_public_chat_html(snapshot: dict[str, Any], *, page: int = 0, page_cou
         parts.append('</div>')
         parts.append('</section>')
     parts.append(f'</div>{navigation}<footer class="conversation-footer"><p>This is a saved copy. Replies and updates stay in the original chat.</p><p class="footer-brand">Shared with AgentsDock</p></footer><div id="conversation-end"></div></main></body></html>')
-    rendered = "".join(parts).encode("utf-8")
-    if len(rendered) > MAX_RENDER_BYTES:
-        raise PublicChatShareValidationError("Rendered snapshot is too large.")
-    return rendered
+    return "".join(parts).encode("utf-8")

@@ -119,10 +119,45 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(provider.runtime_effort(selected, retained, "high"), "high")
         self.assertEqual(retained["models"], [{"value": selected["model"], "label": selected["model"]}])
         self.assertEqual(retained["model_capabilities"][selected["model"]]["compatibility"], "unverified")
-        self.assertEqual(provider.runtime_summary(selected, retained), "none")
+        self.assertEqual(provider.runtime_summary(selected, retained), "auto")
         record.write_text("invalid optional catalog")
         unavailable = provider.ProviderStore(self.store.root).cached_catalog(selected)
         self.assertEqual(provider.runtime_effort(selected, unavailable, "high"), "")
+
+    def test_discovered_summary_support_reloads_without_crossing_models_or_credentials(self):
+        self.store.save(SELECTION)
+        selected = self.store.registration(include_key=True)
+        self.store.cache_catalog(selected, {
+            "models": [{"value": selected["model"]}, {"value": "denied/model"}, {"value": "unknown/model"}],
+            "model_capabilities": {
+                selected["model"]: {"reasoning_summary_supported": True},
+                "denied/model": {"reasoning_summary_supported": False},
+                "unknown/model": {"reasoning_supported": True, "reasoning_efforts": ["high"]},
+            },
+        })
+        record = self.store.root / ("summary-capabilities-" + selected["credential_id"] + ".json")
+        self.assertEqual(record.stat().st_mode & 0o777, 0o600)
+        self.assertNotIn(KEY, record.read_text())
+        self.assertEqual(json.loads(record.read_text())["models"], {
+            selected["model"]: True, "denied/model": False,
+        })
+        reloaded = provider.ProviderStore(self.store.root)
+        catalog = reloaded.cached_catalog(selected)
+        self.assertEqual(provider.runtime_summary(selected, catalog), "auto")
+        for model in ("denied/model", "unknown/model", "unlisted/model"):
+            self.assertEqual(provider.runtime_summary({**selected, "model": model}, catalog), "none")
+        # Discovery without an explicit statement cannot erase earlier proof.
+        reloaded.cache_catalog(selected, {"models": [{"value": selected["model"]}]})
+        self.assertEqual(provider.runtime_summary(selected, provider.ProviderStore(self.store.root).cached_catalog(selected)), "auto")
+        for replacement in (
+            {**SELECTION, "api_key": "new-synthetic-key"},
+            {**SELECTION, "base_url": "https://other.example.invalid/v1"},
+        ):
+            reloaded.save(replacement)
+            current = reloaded.registration(include_key=True)
+            reopened = provider.ProviderStore(self.store.root)
+            self.assertEqual(provider.runtime_summary(current, reopened.cached_catalog(current)), "none")
+            self.assertEqual(provider.runtime_summary(selected, reopened.cached_catalog(selected)), "auto")
 
     def test_summary_evidence_reloads_privately_without_persisting_basic_compatibility(self):
         self.store.save(SELECTION)
@@ -353,6 +388,20 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(KEY, response.text)
         self.assertEqual(provider.runtime_summary(selected, self.store.cached_catalog(selected)), "auto")
         self.assertEqual(provider.runtime_summary(selected, provider.ProviderStore(self.store.root).cached_catalog()), "none")
+
+    def test_accepted_summary_parameter_persists_even_without_visible_summary(self):
+        self.store.save(SELECTION)
+        selected = self.store.registration(include_key=True)
+        self.probe.return_value = {**provider.test_result("ready"), "compatibility": "verified",
+            "reasoning_summary_supported": True, "summary_check": "inconclusive"}
+        response = self.client.post("/api/admin/codex/provider/test", headers=NATIVE,
+            json={"model": selected["model"], "credential_id": selected["credential_id"]})
+        self.assertEqual(response.status_code, 200)
+        self.assertIs(response.json()["reasoning_summary_supported"], True)
+        self.assertEqual(response.json()["summary_check"], "inconclusive")
+        reloaded = provider.ProviderStore(self.store.root)
+        self.assertEqual(provider.runtime_summary(selected, reloaded.cached_catalog(selected)), "auto")
+        self.assertEqual(provider.runtime_summary({**selected, "model": "other/model"}, reloaded.cached_catalog(selected)), "none")
 
     def test_custom_preserves_normal_login_and_busy_work_does_not_block_reset(self):
         self.store.save(SELECTION)
@@ -784,7 +833,7 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["compatibility"], "verified")
         self.assertTrue(all(result["checks"].values()))
         self.assertEqual(len(turns), 3)
-        self.assertIsNone(result["reasoning_summary_supported"])
+        self.assertIs(result["reasoning_summary_supported"], True)
         self.assertEqual(result["summary_check"], "inconclusive")
         for turn in turns:
             turn.close.assert_awaited_once()
@@ -825,19 +874,24 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         native.start_turn.assert_awaited_once()
         native.close.assert_awaited_once()
 
-    async def test_optional_summary_check_requires_visible_evidence_and_preserves_basic_success(self):
+    async def test_optional_summary_check_uses_request_acceptance_and_preserves_basic_success(self):
         cases = [
-            ([{"method": "item/reasoning/summaryTextDelta", "params": {"delta": "Compare the products."}}], True),
-            ([{"method": "item/completed", "params": {"item": {"type": "reasoning", "summary": ["Compare the products."]}}}], True),
-            ([{"method": "item/reasoning/textDelta", "params": {"delta": "Raw text is not summary support."}}], None),
-            ([], None),
-            ([{"method": "error", "params": {"error": {"message": "Unsupported parameter " + KEY, "param": "reasoning.summary"}}}], False),
-            ([{"method": "error", "params": {"error": "Unsupported parameter reasoning.effort " + KEY}}], None),
-            ([{"method": "error", "params": {"error": "401 unauthorized " + KEY}}], None),
-            ([TimeoutError()], None),
+            ([{"method": "item/reasoning/summaryTextDelta", "params": {"delta": "Compare the products."}}], True, "supported"),
+            ([{"method": "item/completed", "params": {"item": {"type": "reasoning", "summary": ["Compare the products."]}}}], True, "supported"),
+            ([{"method": "item/completed", "params": {"item": {"type": "reasoning", "summary": [
+                {"type": "summary_text", "text": "Compare the products."}, {"summary_text": "Then answer."},
+            ]}}}], True, "supported"),
+            ([{"method": "item/reasoning/textDelta", "params": {"delta": "Raw text is not summary support."}}], True, "inconclusive"),
+            ([], True, "inconclusive"),
+            ([{"method": "error", "params": {"error": {"message": "Unsupported parameter " + KEY, "param": "reasoning.summary"}}}], False, "unsupported"),
+            ([{"method": "error", "params": {"error": "Unsupported parameter reasoning.effort " + KEY}}], None, "inconclusive"),
+            ([{"method": "error", "params": {"error": "401 unauthorized " + KEY}}], None, "inconclusive"),
+            ([{"method": "turn/completed", "params": {"turn": {"status": "failed"}}}], None, "inconclusive"),
+            ([{"method": "turn/completed", "params": {"turn": {"status": "interrupted"}}}], None, "inconclusive"),
+            ([TimeoutError()], None, "inconclusive"),
         ]
         for model in ("gpt-6-astra", "unknown/provider-model"):
-            for notifications, expected in cases:
+            for notifications, expected, expected_check in cases:
                 with self.subTest(model=model, summary_supported=expected, notifications=len(notifications)):
                     selected = {**SELECTION, "model": model}
                     native = SimpleNamespace(client=SimpleNamespace(), start=AsyncMock(), close=AsyncMock(),
@@ -869,7 +923,7 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual((result["ok"], result["compatibility"]), (True, "verified"))
                     self.assertTrue(all(result["checks"].values()))
                     self.assertIs(result["reasoning_summary_supported"], expected)
-                    self.assertEqual(result["summary_check"], "supported" if expected is True else "unsupported" if expected is False else "inconclusive")
+                    self.assertEqual(result["summary_check"], expected_check)
                     self.assertNotIn(KEY, str(result))
                     self.assertEqual(native.start_turn.await_count, 3)
                     for turn in turns:

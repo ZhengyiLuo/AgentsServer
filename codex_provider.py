@@ -377,12 +377,16 @@ class ProviderStore:
                 "model_capabilities": {model["value"]: model_capability(catalog.get("model_capabilities", {}).get(model["value"])) for model in models},
                 "default_model": catalog.get("default_model", "")}
             self._save_model_catalog(selected, self._catalogs[catalog_key(selected)])
-            # Apply fresh explicit denials when discovery completes, rather
-            # than letting old metadata veto a later successful model check.
-            denials = {model["value"]: False for model in models
-                if catalog.get("model_capabilities", {}).get(model["value"], {}).get("reasoning_summary_supported") is False}
-            if denials:
-                self._cache_summary_capabilities(selected, denials)
+            # Keep affirmative discovery evidence after restart too. An
+            # explicit denial still wins over advertised support; only a
+            # successful model check can replace that observed rejection.
+            previous = self._saved_summary_capabilities(selected)
+            summaries = {model: capability["reasoning_summary_supported"]
+                for model, capability in self._catalogs[catalog_key(selected)]["model_capabilities"].items()
+                if isinstance(capability["reasoning_summary_supported"], bool)
+                and (capability["reasoning_summary_supported"] is False or previous.get(model) is not False)}
+            if summaries:
+                self._cache_summary_capabilities(selected, summaries)
 
     def _save_model_catalog(self, selected: dict, catalog: dict) -> None:
         identifier = selected.get("credential_id")
@@ -920,8 +924,9 @@ async def test_connection(selected: dict, *, executable: str, environment: dict,
                         await turn.close()
                 basic_ready = True
                 # Optional evidence from this explicit operator check only.
-                # Missing summaries or an unrelated failure never invalidate
-                # the completed basic tool/continuation check.
+                # Successful completion proves this parameter was accepted;
+                # short answers need not emit a summary. Summary content or
+                # an unrelated failure never invalidate the basic check.
                 summary_check = "inconclusive"
                 try:
                     async with asyncio.timeout(10):
@@ -937,14 +942,20 @@ async def test_connection(selected: dict, *, executable: str, environment: dict,
                                     observed_summary = True
                                 if method == "item/completed" and data.get("item", {}).get("type") == "reasoning":
                                     summaries = data["item"].get("summary")
-                                    if isinstance(summaries, list) and any(isinstance(text, str) and text.strip() for text in summaries):
-                                        observed_summary = True
+                                    if isinstance(summaries, list):
+                                        texts = [part.get("text") or part.get("summary_text")
+                                            if isinstance(part, dict) else part for part in summaries]
+                                        if any(isinstance(text, str) and text.strip() for text in texts):
+                                            observed_summary = True
                                 error = (data.get("error") or data.get("message")) if method == "error" else None
                                 if method == "turn/completed":
                                     completed = data.get("turn", {})
                                     error = completed.get("error")
-                                    if completed.get("status") == "completed" and not error and observed_summary and not unexpected_request:
-                                        summary_supported, summary_check = True, "supported"
+                                    if completed.get("status") == "completed" and not error and not unexpected_request:
+                                        summary_supported = True
+                                        # Existing apps describe "supported" as
+                                        # returned text, not just acceptance.
+                                        summary_check = "supported" if observed_summary else "inconclusive"
                                 if error:
                                     observe_summary_failure(error)
                                 if error or method == "turn/completed":

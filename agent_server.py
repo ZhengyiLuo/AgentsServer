@@ -69813,6 +69813,7 @@ async def run_codex_app_server(
     current_run_id = run_id
     current_provider_prompt = prompt
     current_diff_baseline = diff_baseline
+    initial_provider_turn_id = ""
     manifest_watch_task: asyncio.Task[None] | None = None
     goal_time_budget_task: asyncio.Task[None] | None = None
     goal_continuation_result: dict[str, Any] | None = None
@@ -70267,7 +70268,11 @@ async def run_codex_app_server(
         return text
 
     def current_metadata() -> dict[str, Any]:
-        return run_event_metadata(current_run_id)
+        return {
+            **run_event_metadata(current_run_id),
+            **({"provider_initial_turn_id": initial_provider_turn_id,
+                "provider_thread_id": provider_id} if initial_provider_turn_id else {}),
+        }
 
     async def emit_final_text(value: Any, *, item_id: str = "") -> None:
         text = clean_assistant_text(str(value or ""))
@@ -70608,7 +70613,7 @@ async def run_codex_app_server(
     ) -> dict[str, Any]:
         nonlocal current_run_id, current_provider_prompt
         nonlocal current_diff_baseline, manifest_watch_task, last_activity
-        nonlocal delivery_unknown
+        nonlocal delivery_unknown, initial_provider_turn_id
         if turn is None or turn_completed:
             raise NativeSteerHandoffError(
                 "the active Codex turn has already completed",
@@ -70766,7 +70771,7 @@ async def run_codex_app_server(
                     client_user_message_id=candidate_run_id,
                 )
             else:
-                await turn.steer(
+                _turn_id = await turn.steer(
                     [{
                         "type": "text",
                         "text": request_prompt,
@@ -70920,7 +70925,7 @@ async def run_codex_app_server(
                 await join_task_despite_caller_cancellation(completion)
 
         try:
-            previous_metadata = run_event_metadata(previous_run_id)
+            previous_metadata = current_metadata()
             with suppress(Exception):
                 await flush_pending_unknown(final=False)
             previous_watcher = manifest_watch_task
@@ -70972,6 +70977,9 @@ async def run_codex_app_server(
                     )
                 stopped_during_handoff = bool(active.get("stop_requested"))
                 current_run_id = candidate_run_id
+                # Force Send accepts a new logical input on the current
+                # native turn; it must not inherit the predecessor's input ID.
+                initial_provider_turn_id = str(_turn_id or "")
                 reasoning_stream_run_ids.add(candidate_run_id)
                 current_provider_prompt = request_prompt
                 current_diff_baseline = candidate_diff_baseline
@@ -71115,6 +71123,7 @@ async def run_codex_app_server(
         }
 
     async def bind_active_turn_and_reconcile_stop() -> None:
+        nonlocal initial_provider_turn_id
         if turn is None or not turn.turn_id:
             return
         should_interrupt = False
@@ -71135,6 +71144,8 @@ async def run_codex_app_server(
                 )
             )
             if active_owned:
+                if not initial_provider_turn_id:
+                    initial_provider_turn_id = str(getattr(turn, "initial_turn_id", "") or turn.turn_id)
                 active["provider_turn_ready"] = True
                 active["provider_turn_id"] = turn.turn_id
                 if (

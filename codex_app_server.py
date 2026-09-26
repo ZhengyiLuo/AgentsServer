@@ -354,6 +354,12 @@ class CodexAppServerTurn:
     # Native turn identities are retained only for this owner's lifetime.
     # Delayed duplicate starts must not resurrect one of its finished turns.
     _completed_turn_ids: set[str] = field(default_factory=set)
+    # Unlike turn_id, this identity does not follow native goal/child turns.
+    # History repair needs the turn that accepted the original user input.
+    initial_turn_id: str = field(init=False, default="")
+
+    def __post_init__(self) -> None:
+        self.initial_turn_id = self.turn_id
 
     async def next_notification(self, timeout: float | None = None) -> dict[str, Any]:
         return await self._subscription.next_notification(timeout)
@@ -498,6 +504,8 @@ class CodexAppServerTurn:
                 f"provisional turn already bound to {self.turn_id}, not {resolved}"
             )
         self.turn_id = resolved
+        if not self.initial_turn_id:
+            self.initial_turn_id = resolved
         if not self._retain_thread_stream:
             self._subscription.turn_id = resolved
 
@@ -1451,6 +1459,8 @@ class CodexAppServerClient:
             # keeping this id current is required for both event routing and
             # turn/interrupt to target the work that is actually running.
             if not active_turn.turn_id or method == "turn/started":
+                if not active_turn.initial_turn_id:
+                    active_turn.initial_turn_id = turn_id
                 active_turn.turn_id = turn_id
                 if method == "turn/started":
                     active_turn._completed = False
@@ -2674,6 +2684,7 @@ class CodexAppServerClient:
                     # continue before its delayed start response is read.
                     # Acceptance of that exact completed ID is proven; leave
                     # the handle bound to the newer live turn, not the reply.
+                    provisional.initial_turn_id = turn_id
                     return provisional
                 raise CodexAppServerProtocolError(
                     "turn/start response did not match its early notifications",
@@ -2681,6 +2692,7 @@ class CodexAppServerClient:
                     safe_to_retry=False,
                 )
             provisional.turn_id = turn_id
+            provisional.initial_turn_id = turn_id
             if not retain_thread_stream:
                 provisional._subscription.turn_id = turn_id
             return provisional

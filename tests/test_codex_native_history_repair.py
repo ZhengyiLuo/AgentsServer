@@ -376,6 +376,106 @@ class CodexNativeHistoryRepairTests(unittest.TestCase):
         self.assertTrue(filtered[0]["metadata_only"])
         self.assertEqual(before, (self.events.read_bytes(), self.source.read_bytes()))
 
+    def test_mailbox_wake_before_native_continuation_keeps_original_turn_owner(self):
+        self.wake_fixture()
+        self.native[1]["item_id"] = self.raw[1]["payload"]["id"]
+        self.native[2]["provider_turn_id"] = "continuation-turn"
+        self.fixture()
+        before = self.events.read_bytes(), self.source.read_bytes()
+        self.prepare()
+        projected = self.cache.project_event("chat", self.imports[0])
+        self.assertIsNotNone(projected)
+        self.assertEqual(projected["prompt"], "")
+        self.assertEqual(projected["provider_origin"]["native_event_id"], self.native[0]["id"])
+        self.assertIsNotNone(self.cache.project_event("chat", self.imports[1]))
+        items = [self.parse(row) for row in self.raw]
+        filtered = filter_native_codex_history_items("chat", PROVIDER, self.events, items)
+        self.assertEqual([item["text"] for item in filtered], ["", ""])
+        self.assertTrue(all(self.cache.project_event("chat", row) is None for row in self.native))
+        self.assertEqual(before, (self.events.read_bytes(), self.source.read_bytes()))
+
+    def test_initial_native_turn_metadata_proves_wake_without_an_assistant_item(self):
+        self.wake_fixture()
+        self.native[2].update(provider_turn_id="continuation-turn", provider_initial_turn_id="turn-1")
+        self.fixture(); self.prepare()
+        self.assertEqual(self.cache.project_event("chat", self.imports[0])["prompt"], "")
+        item = self.parse(self.raw[0])
+        filtered = filter_native_codex_history_items("chat", PROVIDER, self.events, [item])
+        self.assertEqual(filtered[0]["text"], "")
+
+    def test_continued_wake_requires_exact_unique_native_assistant_ownership(self):
+        original = dict(self.native[1])
+        for patch in ({"item_id": "other-item"}, {"text": "Different answer"}, {"type": "tool_finished"}):
+            with self.subTest(patch=patch):
+                self.wake_fixture()
+                self.native[1] = {**original, "item_id": self.raw[1]["payload"]["id"], **patch}
+                self.native[2]["provider_turn_id"] = "continuation-turn"
+                self.fixture(); self.cache.forget("chat"); self.prepare()
+                self.assertIsNone(self.cache.project_event("chat", self.imports[0]))
+                items = [self.parse(row) for row in self.raw]
+                self.assertEqual(filter_native_codex_history_items("chat", PROVIDER, self.events, items)[0], items[0])
+
+    def test_continued_wake_does_not_hide_same_words_from_another_user_turn(self):
+        self.wake_fixture()
+        self.native[1]["item_id"] = self.raw[1]["payload"]["id"]
+        self.native[2]["provider_turn_id"] = "continuation-turn"
+        extra = {**self.raw[0], "timestamp": "2026-09-11T12:09:00Z", "payload": {**self.raw[0]["payload"],
+            "id": "human-quote", "internal_chat_message_metadata_passthrough": {
+                "turn_id": "human-turn", "content_item_kinds": ["user.text"]}}}
+        self.raw.append(extra)
+        self.fixture(); self.prepare()
+        self.assertEqual(self.cache.project_event("chat", self.imports[0])["prompt"], "")
+        self.assertIsNone(self.cache.project_event("chat", self.imports[-1]))
+        items = [self.parse(row) for row in self.raw]
+        self.assertEqual(filter_native_codex_history_items("chat", PROVIDER, self.events, items)[-1], items[-1])
+
+    def test_continued_wake_ambiguous_assistant_item_does_not_prove_input(self):
+        self.wake_fixture()
+        self.native[1]["item_id"] = self.raw[1]["payload"]["id"]
+        self.native[2]["provider_turn_id"] = "continuation-turn"
+        # The same native item attributed to two runs cannot prove either one.
+        self.native[4].update(item_id=self.native[1]["item_id"], text=self.native[1]["text"])
+        self.fixture(); self.prepare()
+        self.assertIsNone(self.cache.project_event("chat", self.imports[0]))
+        items = [self.parse(row) for row in self.raw]
+        self.assertEqual(filter_native_codex_history_items("chat", PROVIDER, self.events, items)[0], items[0])
+
+    def test_continued_wake_reused_source_item_in_two_turns_does_not_prove_input(self):
+        self.wake_fixture()
+        self.native[1]["item_id"] = self.raw[1]["payload"]["id"]
+        self.native[2]["provider_turn_id"] = "continuation-turn"
+        self.raw.append({**self.raw[1], "timestamp": "2026-09-11T12:09:00Z", "payload": {**self.raw[1]["payload"],
+            "internal_chat_message_metadata_passthrough": {"turn_id": "other-turn", "content_item_kinds": []}}})
+        self.fixture(); self.prepare()
+        self.assertIsNone(self.cache.project_event("chat", self.imports[0]))
+        items = [self.parse(row) for row in self.raw]
+        self.assertEqual(filter_native_codex_history_items("chat", PROVIDER, self.events, items)[0], items[0])
+
+    def test_checkpointed_malformed_provider_lines_do_not_hide_valid_native_proof(self):
+        self.wake_fixture()
+        self.native[1]["item_id"] = self.raw[1]["payload"]["id"]
+        self.native[2]["provider_turn_id"] = "continuation-turn"
+        self.fixture()
+        source_lines = self.source.read_bytes().splitlines(keepends=True)
+        raw = b"".join([source_lines[0], b'{"type":"event_msg", broken}\n', *source_lines[1:], b'not-json\n'])
+        self.source.write_bytes(raw)
+        events = [json.loads(line) for line in self.events.read_text().splitlines()]
+        for event in events:
+            if event.get("type") == "history_imported":
+                event["_history_sync_checkpoint"]["cursor"].update(
+                    source_offset=len(raw), source_digest=hashlib.sha256(raw).hexdigest())
+        self.events.write_text("".join(json.dumps(event) + "\n" for event in events))
+        before = self.events.read_bytes(), self.source.read_bytes()
+        self.prepare()
+        self.assertEqual(self.cache.project_event("chat", self.imports[0])["prompt"], "")
+        self.assertEqual(before, (self.events.read_bytes(), self.source.read_bytes()))
+        # Native ledger records remain strict; malformed evidence is not ignored.
+        with self.events.open("ab") as target:
+            target.write(b'not-json\n')
+        self.cache.forget("chat")
+        with self.assertRaises(CodexNativeHistoryProofUnavailable):
+            self.prepare()
+
     def test_current_mailbox_wake_in_fork_delta_keeps_original_native_owner(self):
         # Use the real infrastructure input, not a text-prefix suppression rule.
         # The observed fork had its own completed native wake and subsequently

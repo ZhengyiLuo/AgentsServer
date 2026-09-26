@@ -157,7 +157,7 @@ def _native_stamp(path: Path) -> tuple[int, int, int, int]:
 
 
 def _native_records(path: Path, expected: tuple[int, int, int, int], budget: _NativeReadBudget,
-                    *, end: int | None = None):
+                    *, end: int | None = None, provider_source: bool = False):
     """Stream one fixed prefix; tool volume does not consume retained-key budget.
 
     A source proof needs only the prefix ending at its newest checkpoint. Never
@@ -181,7 +181,14 @@ def _native_records(path: Path, expected: tuple[int, int, int, int], budget: _Na
             if not line or len(line) > NATIVE_PROOF_LINE_BYTES or not line.endswith(b"\n"):
                 raise _Unproven()
             offset += len(line)
-            record = json.loads(line)
+            try:
+                record = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                if not provider_source:
+                    raise
+                # The provider importer skips malformed records. Their exact
+                # bytes still participate in the checkpoint digest below.
+                record = {}
             if not isinstance(record, dict):
                 raise _Unproven()
             yield record, offset, line
@@ -227,6 +234,20 @@ def _public_assistant_item_id(event: dict) -> str | None:
         event.get("type") == "reasoning_summary" and event.get("phase") == "commentary"
     )
     return item_id if public and isinstance(item_id, str) and 0 < len(item_id) <= 256 else None
+
+
+def _native_owned_turn_ids(event: dict) -> set[str]:
+    """One logical run can retain its initial input across native continuations."""
+    return {value for field in ("provider_turn_id", "provider_initial_turn_id")
+            if isinstance(value := event.get(field), str) and 0 < len(value) <= 256}
+
+
+def _native_assistant_item_owners(assistant_items: dict, completed_runs: set[str]) -> dict:
+    owners: dict = {}
+    for run, item_id, body_key in assistant_items:
+        if run in completed_runs:
+            owners.setdefault((item_id, body_key), set()).add(run)
+    return owners
 
 
 @dataclass
@@ -783,11 +804,12 @@ def _prove_native_replays(session_id: str, provider_id: str, events: Path, sourc
                     candidates.append(target)
         elif event.get("imported") is not True and event.get("backend") in (None, "codex"):
             if event.get("type") == "turn_finished" and event.get("backend") == "codex" and event.get("transport") == "app-server":
-                thread, turn = event.get("provider_thread_id"), event.get("provider_turn_id")
-                if isinstance(thread, str) and _PROVIDER_ID.fullmatch(thread) and isinstance(turn, str) and 0 < len(turn) <= 256:
-                    owned = owners.setdefault((thread, turn), set())
-                    retained += run not in owned
-                    owned.add(run)
+                thread = event.get("provider_thread_id")
+                if isinstance(thread, str) and _PROVIDER_ID.fullmatch(thread):
+                    for turn in _native_owned_turn_ids(event):
+                        owned = owners.setdefault((thread, turn), set())
+                        retained += run not in owned
+                        owned.add(run)
             kind = "user" if event.get("type") == "turn_started" else "assistant" if event.get("type") in ("assistant_text", "reasoning_summary", "turn_finished") else None
             body = event.get("prompt") if kind == "user" else event.get("result_text") if event.get("type") == "turn_finished" else event.get("text")
             if kind and isinstance(body, str) and body and len(body) <= 4 * 1024 * 1024:
@@ -868,10 +890,19 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
     compactions, candidate_assistants = {}, set()
     compaction_tracker = CodexCompactionSummaryTracker(thread)
     delivery_bodies, delivery_source_ids = {}, {}
+    completed_runs = {run for (owner_thread, _turn), runs in owners.items()
+                      if owner_thread == thread for run in runs}
+    assistant_item_owners = _native_assistant_item_owners({
+        (run, item_id, body_key): event
+        for (run, kind, body_key), events in native.items() if kind == "assistant"
+        for event in events if (item_id := _public_assistant_item_id(event)) is not None
+    }, completed_runs)
+    assistant_owner_evidence: dict = {}
+    assistant_source_turns: dict = {}
     allowed_header_owners, header_parents = {thread}, {}
     context_turn = None
     retained = 0
-    for record, offset, line in _native_records(source, stamp, budget, end=max(wanted)):
+    for record, offset, line in _native_records(source, stamp, budget, end=max(wanted), provider_source=True):
         payload = record.get("payload")
         if offset == len(line) or record.get("type") == "session_meta":
             if record.get("type") != "session_meta" or not isinstance(payload, dict):
@@ -922,6 +953,14 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
                 or not isinstance(timestamp, str) or not 0 < len(timestamp) <= 64):
             continue
         key = (turn, item["kind"], _text_key(item["text"]), item.get("source_text_sha256"))
+        if origin and item["kind"] == "assistant" and item.get("source_text_sha256") is None:
+            item_key = (origin["event_id"], _text_key(_native_assistant_text(item["text"])))
+            if item_key in assistant_item_owners:
+                assistant_source_turns.setdefault(item_key, set()).add(turn)
+                assistant_owner_evidence.setdefault(turn, []).append((offset, item_key))
+                retained += 1
+                if retained > MAX_KEYS:
+                    raise _Unproven()
         if origin and item["kind"] == "user" and any(run in deliveries.starts for run in owners.get((thread, turn), ())):
             ids = delivery_source_ids.setdefault(turn, set())
             if len(ids) < 2:
@@ -968,7 +1007,14 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
         if len(matches) != 1:
             continue
         key = next(iter(matches))
-        source_ids, owned_runs = canonical.get(key, {}), owners.get((thread, key[0]), set())
+        source_ids = canonical.get(key, {})
+        owned_runs = set(owners.get((thread, key[0]), set()))
+        # Older ledgers retained only the final continuation's turn ID. An
+        # exact public assistant item proves the earlier turn belongs to the
+        # same completed native run, without classifying any user wording.
+        for offset, item_key in assistant_owner_evidence.get(key[0], ()):
+            if offset <= end and len(assistant_source_turns[item_key]) == 1:
+                owned_runs.update(assistant_item_owners[item_key])
         # Compaction owns a particular source item and timestamp. Another
         # genuine answer with the same body in this turn is a distinct item.
         timestamp_origins = [origin for origin in source_ids.values() if origin["timestamp"] == timestamp]
@@ -1177,11 +1223,11 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
                 or not 0 < len(run) <= 256 or run.startswith("import_")):
                 continue
             if (event.get("type") == "turn_finished" and event.get("backend") == "codex"
-                and event.get("transport") == "app-server" and event.get("provider_thread_id") == provider_id
-                and isinstance(event.get("provider_turn_id"), str) and 0 < len(event["provider_turn_id"]) <= 256):
-                owned = owners.setdefault(event["provider_turn_id"], set())
-                owner_count += run not in owned
-                owned.add(run)
+                and event.get("transport") == "app-server" and event.get("provider_thread_id") == provider_id):
+                for turn_id in _native_owned_turn_ids(event):
+                    owned = owners.setdefault(turn_id, set())
+                    owner_count += run not in owned
+                    owned.add(run)
             kind = "user" if event.get("type") == "turn_started" else "assistant" if event.get("type") in ("assistant_text", "reasoning_summary", "turn_finished") else None
             body = event.get("prompt") if kind == "user" else event.get("result_text") if event.get("type") == "turn_finished" else event.get("text")
             wake_hash = _native_mailbox_wake_hash(event) if kind == "user" else None
@@ -1198,6 +1244,25 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
                         assistant_items[(run, item_id, key[1])] = event["id"]
             if native_count + owner_count + len(assistant_items) + deliveries.count > MAX_KEYS:
                 raise _Unproven()
+        assistant_item_owners = _native_assistant_item_owners(
+            assistant_items, {run for runs in owners.values() for run in runs},
+        )
+        assistant_source_turns: dict = {}
+        for item in items:
+            budget.check()
+            origin = item.get("provider_origin")
+            if (item.get("kind") != "assistant" or not isinstance(item.get("text"), str)
+                or item.get("source_text_sha256") is not None or not isinstance(origin, dict)
+                or origin.get("provider") != "codex" or origin.get("kind") != "assistant"
+                or origin.get("session_id", provider_id) != provider_id
+                or not isinstance(origin.get("turn_id"), str) or not 0 < len(origin["turn_id"]) <= 256):
+                continue
+            item_key = (origin.get("event_id"), _text_key(_native_assistant_text(item["text"])))
+            if item_key in assistant_item_owners:
+                assistant_source_turns.setdefault(item_key, set()).add(origin["turn_id"])
+        for item_key, turns in assistant_source_turns.items():
+            if len(turns) == 1:
+                owners.setdefault(next(iter(turns)), set()).update(assistant_item_owners[item_key])
         delivery_proofs = _prove_pending_async_deliveries(
             session_id, provider_id, items, source_path, root, sync_checkpoint, parse_item,
             previous_seq, owners, deliveries, budget,

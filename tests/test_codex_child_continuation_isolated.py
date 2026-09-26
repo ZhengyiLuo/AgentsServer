@@ -157,6 +157,12 @@ class CodexChildContinuationTests(unittest.IsolatedAsyncioTestCase):
         self.ns["finalize_owned_turn_finished"].assert_awaited_once()
         self.assertEqual(self.ns["finalize_owned_turn_finished"].await_args.kwargs["payload"]["result_text"],
                          "Consolidated child result")
+        terminal = self.ns["finalize_owned_turn_finished"].await_args.kwargs["payload"]
+        self.assertEqual(terminal["provider_initial_turn_id"], "turn-1")
+        self.assertEqual(terminal["provider_turn_id"], "turn-2")
+        self.assertEqual(terminal["provider_thread_id"], "thread")
+        self.assertTrue(all(row["provider_initial_turn_id"] == "turn-1"
+                            for kind, row in self.events if kind == "assistant_text"))
         self.assertTrue(self.turn._closed)
         self.assertEqual(self.client._subscriptions, set())
 

@@ -82,6 +82,7 @@ class NpmReleasePackageTests(unittest.TestCase):
         self.assertEqual({p.relative_to(staged).as_posix() for p in staged.rglob("*") if p.is_file()}, expected)
         self.assertFalse((staged / "server/.env").exists())
         self.assertEqual((staged / "server/install.sh").stat().st_mode & 0o777, 0o755)
+        self.assertEqual((staged / "server/instances.sh").stat().st_mode & 0o777, 0o755)
         self.assertTrue(json.loads((self.root / "package.json").read_text())["private"])
         for name in ("LICENSE", "NOTICE"):
             self.assertEqual((staged / name).read_bytes(), (self.root.parent / name).read_bytes())
@@ -159,6 +160,10 @@ class NpmReleasePackageTests(unittest.TestCase):
         descriptor = package.prepare(self.root, npm_output)
         version = descriptor["version"]
         with tarfile.open(npm_output / descriptor["archive"]["name"]) as npm, tarfile.open(legacy_output / f"agents-server-{version}.tar.gz") as legacy:
+            for name in package.runtime_files():
+                with self.subTest(runtime_permissions=name):
+                    self.assertEqual(npm.getmember(f"package/server/{name}").mode & 0o111,
+                                     legacy.getmember(f"agents-server-{version}/{name}").mode & 0o111)
             for name in ("LICENSE", "NOTICE"):
                 expected = (self.root / name).read_bytes()
                 for archive, member_name in [(npm, f"package/{name}"), (npm, f"package/server/{name}"), (legacy, f"agents-server-{version}/{name}")]:

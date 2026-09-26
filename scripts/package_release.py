@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
+import os
+import re
 import shutil
 import subprocess
 import tarfile
@@ -211,10 +214,43 @@ def validate_release_directory(path: Path) -> None:
         )
 
 
+def source_date_epoch() -> int | None:
+    """Opt into reproducibility without changing existing legacy callers."""
+    value = os.environ.get("SOURCE_DATE_EPOCH")
+    if value is None:
+        return None
+    if not re.fullmatch(r"(0|[1-9][0-9]*)", value) or int(value) > 0xFFFFFFFF:
+        raise ValueError("SOURCE_DATE_EPOCH must be a nonnegative 32-bit Unix timestamp")
+    return int(value)
+
+
+def write_archive(package_root: Path, archive_path: Path, epoch: int | None = None) -> None:
+    if epoch is None:
+        with tarfile.open(archive_path, "w:gz", format=tarfile.PAX_FORMAT) as archive:
+            archive.add(package_root, arcname=package_root.name)
+        return
+
+    def canonical(member: tarfile.TarInfo) -> tarfile.TarInfo:
+        member.uid = member.gid = 0
+        member.uname = member.gname = ""
+        member.mtime = epoch
+        member.mode = 0o755 if member.isdir() or member.mode & 0o111 else 0o644
+        member.pax_headers = {}
+        return member
+
+    # Do not encode the destination filename, host ownership, checkout times or
+    # fractional filesystem timestamps. tarfile.add traverses names in order.
+    with archive_path.open("wb") as destination:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=destination, mtime=epoch) as compressed:
+            with tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as archive:
+                archive.add(package_root, arcname=package_root.name, filter=canonical)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", default="dist")
     args = parser.parse_args()
+    epoch = source_date_epoch()
     root = Path(__file__).resolve().parents[1]
     version = (root / "VERSION").read_text().strip()
     output = (root / args.output).resolve()
@@ -244,8 +280,7 @@ def main() -> int:
         (package_root / "agentsdock_mail.py").chmod(0o755)
         (package_root / "agentsdock_team.py").chmod(0o755)
         (package_root / "update_runner.py").chmod(0o755)
-        with tarfile.open(archive_path, "w:gz", format=tarfile.PAX_FORMAT) as archive:
-            archive.add(package_root, arcname=package_root.name)
+        write_archive(package_root, archive_path, epoch)
 
     commit = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True, check=False

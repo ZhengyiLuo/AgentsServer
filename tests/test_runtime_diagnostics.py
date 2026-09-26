@@ -17,6 +17,9 @@ def completed(args: list[str], returncode: int = 0, stdout: str = "", stderr: st
 
 class RuntimeDiagnosticTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.native_models = self.enterContext(patch.object(
+            agent_server, "discover_claude_native_models", return_value=([], "unavailable"),
+        ))
         with agent_server.RUNTIME_DIAGNOSTICS_LOCK:
             agent_server.RUNTIME_DIAGNOSTICS.clear()
             agent_server.RUNTIME_DIAGNOSTIC_GENERATIONS.clear()
@@ -722,6 +725,61 @@ class RuntimeDiagnosticTests(unittest.TestCase):
         self.assertEqual(diagnostic["status"], "missing")
         self.assertFalse(diagnostic["installed"])
 
+    def test_claude_catalog_uses_native_versions_without_changing_alias_values(self) -> None:
+        self.native_models.return_value = ([
+            {"value": "opus[1m]", "label": "Opus 5.5 (1M context)"},
+            {"value": "sonnet", "label": "Sonnet 5"},
+        ], "success")
+        with patch.object(agent_server, "run_catalog_command", return_value="--effort <level> (low, high)"), patch.object(
+            agent_server, "claude_supports_effort", return_value=False,
+        ), patch.object(agent_server, "discover_claude_provider_models", return_value=([], "unavailable")) as api, patch.dict(
+            agent_server.os.environ, {"CLAUDE_MODEL": "sonnet"},
+        ):
+            result = agent_server.parse_claude_help_catalog()
+        self.assertEqual(result["models"], [
+            {"value": "", "label": "Sonnet 5"},
+            {"value": "opus[1m]", "label": "Opus 5.5 (1M context)"},
+            {"value": "sonnet", "label": "Sonnet 5"},
+        ])
+        self.assertEqual(result["model_source"], "Claude SDK initialize")
+        self.assertEqual(result["default_model"], "sonnet")
+        api.assert_called_once_with(timeout_seconds=2.0)
+
+    def test_claude_native_empty_list_does_not_reintroduce_restricted_models(self) -> None:
+        self.native_models.return_value = ([], "success")
+        with patch.object(agent_server, "run_catalog_command", return_value="--model <model> 'opus'"), patch.object(
+            agent_server, "claude_supports_effort", return_value=False,
+        ), patch.object(agent_server, "discover_claude_provider_models", return_value=([], "unavailable")) as api:
+            result = agent_server.parse_claude_help_catalog()
+        self.assertEqual([option["value"] for option in result["models"]], [""])
+        self.assertEqual(result["model_source"], "Claude SDK initialize")
+        api.assert_called_once_with(timeout_seconds=2.0)
+
+    def test_claude_api_models_are_candidates_for_native_permission_filtering(self) -> None:
+        self.native_models.return_value = ([
+            {"value": "opus", "label": "Opus 5.5"},
+            {"value": "claude-opus-5", "label": "Opus 5"},
+        ], "success")
+        with patch.object(agent_server, "run_catalog_command", return_value=""), patch.object(
+            agent_server, "claude_supports_effort", return_value=False,
+        ), patch.object(agent_server, "discover_claude_provider_models", return_value=([
+            {"value": "claude-opus-5", "label": "Opus 5"},
+            {"value": "claude-org-blocked", "label": "Blocked"},
+        ], "success")):
+            result = agent_server.parse_claude_help_catalog()
+        self.native_models.assert_called_once_with(candidates=("claude-opus-5", "claude-org-blocked"))
+        self.assertIn({"value": "claude-opus-5", "label": "Opus 5"}, result["models"])
+        self.assertNotIn("claude-org-blocked", [row["value"] for row in result["models"]])
+
+    def test_claude_native_labels_survive_help_failure(self) -> None:
+        self.native_models.return_value = ([{"value": "opus", "label": "Opus 6.1"}], "success")
+        with patch.object(agent_server, "run_catalog_command", side_effect=RuntimeError), patch.object(
+            agent_server, "claude_supports_effort", return_value=False,
+        ):
+            result = agent_server.parse_claude_help_catalog()
+        self.assertIn({"value": "opus", "label": "Opus 6.1"}, result["models"])
+        self.assertNotIn("current fallback", result["model_source"])
+
     def test_claude_catalog_parses_wrapped_effort_levels(self) -> None:
         help_text = """\
   --effort <level>                      Effort level for the current session
@@ -1290,6 +1348,30 @@ class SessionRuntimeValidationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(updated["effort"], "ultra")
         save.assert_awaited_once()
+
+
+class NativeModelDiscoveryIntegrationTests(unittest.TestCase):
+    def test_native_probe_uses_runtime_environment_and_bounded_budget(self):
+        with patch.object(agent_server, "runner_env", return_value={"SAFE": "1"}), patch.object(
+            agent_server, "RUNTIME_CATALOG_TIMEOUT_SECONDS", 2.0,
+        ), patch(
+            "claude_model_catalog.probe_native_models",
+            return_value=[{"value": "opus", "label": "Opus 5.5"}],
+        ) as probe:
+            models, status = agent_server.discover_claude_native_models()
+        self.assertEqual(status, "success")
+        self.assertEqual(models[0]["label"], "Opus 5.5")
+        probe.assert_called_once_with(agent_server.CLAUDE_BIN, env={"SAFE": "1"}, timeout=2.0, candidates=None)
+
+    def test_native_probe_failure_does_not_leak_or_poison_readiness(self):
+        ready = {"status": "ready"}
+        with patch.dict(agent_server.RUNTIME_DIAGNOSTICS, {"claude": ready}, clear=True), patch(
+            "claude_model_catalog.probe_native_models", side_effect=RuntimeError("private@example.com secret"),
+        ), self.assertLogs(agent_server.logger, level="DEBUG") as logs:
+            self.assertEqual(agent_server.discover_claude_native_models(), ([], "unavailable"))
+            self.assertEqual(agent_server.RUNTIME_DIAGNOSTICS["claude"], ready)
+        self.assertNotIn("private", str(logs.output))
+        self.assertNotIn("secret", str(logs.output))
 
 
 if __name__ == "__main__":

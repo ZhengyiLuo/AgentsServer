@@ -938,9 +938,9 @@ RUNTIME_CATALOG_DEADLINE: ContextVar[float | None] = ContextVar(
 RUNTIME_DIAGNOSTIC_TTL_SECONDS = float(agentsdock_setting("RUNTIME_DIAGNOSTIC_TTL_SECONDS", "60"))
 # Claude Code only promises the family aliases in ``--help``; account-scoped
 # pinned models come from Anthropic's Models API when an API key is available.
-# These entries are therefore a last-resort catalog for OAuth/third-party
-# Claude Code installs, not the primary source of truth. Keep the aliases so a
-# newly released model remains selectable even before this fallback is updated.
+# These entries are therefore a last-resort catalog when native SDK metadata
+# and the API are unavailable, not the primary source of truth. Keep aliases
+# so new models remain selectable even before this fallback is updated.
 CLAUDE_CLI_MODEL_ALIASES = (
     ("fable", "Fable"),
     ("opus", "Opus"),
@@ -59009,13 +59009,14 @@ def claude_models_api_base_url_allowed(parsed_base: Any) -> bool:
 
 
 def discover_claude_provider_models(
+    *, timeout_seconds: float = 6.0,
 ) -> tuple[list[dict[str, Any]], Literal["unavailable", "success", "failed"]]:
     """Return models available to the configured Anthropic API account.
 
-    Claude subscription/OAuth installs do not expose a model-list command, so
-    they fall through without network access. API-key installs can use the
-    official account-scoped Models API; failures remain non-fatal and never
-    log the credential or a response body.
+    Claude subscription/OAuth installs fall through without network access
+    here; their native picker comes from SDK initialization. API-key installs
+    can use the official account-scoped Models API; failures remain non-fatal
+    and never log the credential or a response body.
     """
 
     api_key = str(os.environ.get("ANTHROPIC_API_KEY") or "").strip()
@@ -59042,7 +59043,7 @@ def discover_claude_provider_models(
         return [], "unavailable"
     try:
         timeout_seconds = runtime_probe_timeout(
-            max(0.5, min(RUNTIME_CATALOG_TIMEOUT_SECONDS, 6.0))
+            max(0.5, min(RUNTIME_CATALOG_TIMEOUT_SECONDS, timeout_seconds))
         )
         # Keep the key out of argv, the child environment, and disk by feeding
         # curl's header-file syntax through stdin. curl's total-time limit is
@@ -59120,6 +59121,24 @@ def claude_fallback_model_options() -> list[dict[str, Any]]:
     ]
 
 
+def discover_claude_native_models(*, candidates: tuple[str, ...] | None = None) -> tuple[list[dict[str, Any]], str]:
+    from claude_model_catalog import probe_native_models
+
+    try:
+        models = probe_native_models(
+            CLAUDE_BIN,
+            env=runner_env(),
+            timeout=runtime_probe_timeout(min(RUNTIME_CATALOG_TIMEOUT_SECONDS, 6.0)),
+            candidates=candidates,
+        )
+        return models, "success"
+    except Exception as exc:
+        # Optional metadata must neither poison readiness nor leak the init
+        # response (which contains account data), stderr, or subprocess args.
+        logger.debug("claude native model discovery unavailable error_type=%s", type(exc).__name__)
+        return [], "unavailable"
+
+
 def parse_claude_help_catalog() -> dict[str, Any]:
     model_options: list[dict[str, Any]] = []
     effort_options: list[dict[str, Any]] = []
@@ -59131,7 +59150,13 @@ def parse_claude_help_catalog() -> dict[str, Any]:
     )
     default_effort = os.environ.get("CLAUDE_EFFORT") or agentsdock_setting("CLAUDE_EFFORT", "")
     supports_ultracode = claude_supports_effort("ultracode")
-    provider_options, provider_status = discover_claude_provider_models()
+    # Optional candidate discovery must leave time for the native picker,
+    # especially if a configured API endpoint is slow or unreachable.
+    provider_options, provider_status = discover_claude_provider_models(timeout_seconds=2.0)
+    native_options, native_status = discover_claude_native_models(
+        candidates=tuple(option["value"] for option in provider_options)
+        if provider_status == "success" else None,
+    )
     help_text = ""
     help_available = False
     try:
@@ -59146,19 +59171,22 @@ def parse_claude_help_catalog() -> dict[str, Any]:
     discovered_help_aliases, discovered_help_full_names = (
         parse_claude_help_model_option_groups(help_text)
     )
-    # Alias pointers remain first: unlike pinned fallback IDs, they follow a
-    # new Claude release without requiring an AgentsServer update.
-    model_options.extend(discovered_help_aliases)
-    model_options.extend(runtime_option(value, label) for value, label in CLAUDE_CLI_MODEL_ALIASES)
-    if provider_status == "success":
-        # The API is account-scoped, so do not add pinned models that this
-        # credential did not return (notably limited-access Mythos models), or
-        # full-name examples from CLI help that may not be account-available.
-        model_options.extend(provider_options)
+    if native_status == "success":
+        # Native values preserve alias semantics; native labels identify the
+        # actual version (e.g. Opus 5.5). Legacy candidates are included only
+        # after the native picker applies account/organization restrictions.
+        # Never append unfiltered static pins to a successful native result.
+        model_options.extend(native_options)
     else:
-        model_options.extend(claude_fallback_model_options())
-        model_options.extend(discovered_help_full_names)
-    if provider_status != "success" and default_model and not any(
+        model_options.extend(discovered_help_aliases)
+        model_options.extend(runtime_option(value, label) for value, label in CLAUDE_CLI_MODEL_ALIASES)
+        if provider_status == "success":
+            # The API is account-scoped; don't add static pins absent from it.
+            model_options.extend(provider_options)
+        else:
+            model_options.extend(claude_fallback_model_options())
+            model_options.extend(discovered_help_full_names)
+    if native_status != "success" and provider_status != "success" and default_model and not any(
         str(option.get("value") or "") == default_model
         for option in model_options
     ):
@@ -59179,16 +59207,23 @@ def parse_claude_help_catalog() -> dict[str, Any]:
         effort_options.append(runtime_option("ultracode", "Ultracode"))
 
     model_sources = []
-    if provider_status == "success":
+    if native_status == "success":
+        model_sources.append("Claude SDK initialize")
+    elif provider_status == "success":
         model_sources.append("Anthropic Models API")
-    model_sources.append("claude --help" if help_available else "claude --help failed")
-    if provider_status != "success":
+    if native_status != "success":
+        model_sources.append("claude --help" if help_available else "claude --help failed")
+    if native_status != "success" and provider_status != "success":
         if provider_status == "failed":
             model_sources.append("Anthropic Models API failed")
         model_sources.append("current fallback")
     effort_source = "claude --help" if help_available else "claude --help failed"
+    default_model_label = next(
+        (option["label"] for option in model_options if option["value"] == default_model),
+        title_model_label(default_model),
+    )
     return {
-        "models": unique_runtime_options(model_options, title_model_label(default_model)),
+        "models": unique_runtime_options(model_options, default_model_label),
         "efforts": unique_runtime_options(effort_options, title_effort_label(default_effort) if default_effort else ""),
         "model_source": " + ".join(model_sources),
         "effort_source": effort_source,

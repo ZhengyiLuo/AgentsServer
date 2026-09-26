@@ -54,6 +54,7 @@ FILES = (
     "provider_commands.py",
     "provider_usage.py",
     "claude_sdk_client.py",
+    "claude_model_catalog.py",
     "claude_goals.py",
     "claude_background_reconciliation.py",
     "codex_app_server.py",

@@ -194,6 +194,34 @@ class RuntimeProbeTimeoutTests(unittest.TestCase):
         args = run.call_args.args[0]
         self.assertEqual(args[args.index("--max-time") + 1], "0.25")
 
+    def test_native_models_cannot_outlive_remaining_catalog_budget(self):
+        agent_server.RUNTIME_CATALOG_DEADLINE.set(102.0)
+        with patch.object(agent_server.time, "monotonic", return_value=100.0), patch(
+            "claude_model_catalog.probe_native_models", return_value=[],
+        ) as probe:
+            _, status = agent_server.discover_claude_native_models()
+        self.assertEqual(status, "success")
+        self.assertEqual(probe.call_args.kwargs["timeout"], 2.0)
+
+    def test_native_models_expired_budget_starts_no_process(self):
+        agent_server.RUNTIME_CATALOG_DEADLINE.set(100.0)
+        with patch.object(agent_server.time, "monotonic", return_value=100.0), patch(
+            "claude_model_catalog.probe_native_models",
+        ) as probe:
+            models, status = agent_server.discover_claude_native_models()
+        probe.assert_not_called()
+        self.assertEqual((models, status), ([], "unavailable"))
+
+    def test_models_api_respects_callers_smaller_candidate_budget(self):
+        with patch.dict(agent_server.os.environ, {"ANTHROPIC_API_KEY": "synthetic-key"}), patch.object(
+            agent_server.shutil, "which", return_value="/test/curl",
+        ), patch.object(agent_server.subprocess, "run", return_value=completed([], b'{"data":[]}')) as run:
+            _, status = agent_server.discover_claude_provider_models(timeout_seconds=2.0)
+        self.assertEqual(status, "success")
+        self.assertEqual(run.call_args.kwargs["timeout"], 3.0)  # One second to reap curl.
+        args = run.call_args.args[0]
+        self.assertEqual(args[args.index("--max-time") + 1], "2")
+
     def test_catalog_deadline_restored_on_exception_and_not_shared_between_threads(self):
         agent_server.RUNTIME_CATALOG_DEADLINE.set(123.0)
         seen = []

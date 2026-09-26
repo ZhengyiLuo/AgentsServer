@@ -146,7 +146,9 @@ class NpmReleasePackageTests(unittest.TestCase):
         # Copy real execution sources so this checks actual runtime bytes in
         # both layouts, including modules whose entry points run with python -m.
         self.assertTrue(EXECUTION_MODULES <= set(package.runtime_files()))
-        for name in EXECUTION_MODULES:
+        runtime_modules = EXECUTION_MODULES | {"claude_model_catalog.py"}
+        self.assertTrue(runtime_modules <= set(package.runtime_files()))
+        for name in runtime_modules:
             shutil.copyfile(ROOT / name, self.root / name)
         scripts = self.root / "scripts"
         scripts.mkdir()
@@ -165,7 +167,7 @@ class NpmReleasePackageTests(unittest.TestCase):
                         self.assertTrue(member.isfile())
                         self.assertEqual(member.mode & 0o111, 0)
                         self.assertEqual(archive.extractfile(member).read(), expected)
-            for name in sorted(EXECUTION_MODULES):
+            for name in sorted(runtime_modules):
                 expected = (ROOT / name).read_bytes()
                 for archive, member_name in [(npm, f"package/server/{name}"), (legacy, f"agents-server-{version}/{name}")]:
                     with self.subTest(member=member_name):

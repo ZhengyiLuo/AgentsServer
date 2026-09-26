@@ -562,6 +562,7 @@ class CodexAppServerClient:
         process_factory: ProcessFactory | None = None,
         before_start: Callable[[], Awaitable[Any]] | None = None,
         server_request_handler: ServerRequestHandler | None = None,
+        notification_guard: Callable[[dict[str, Any]], bool] | None = None,
         initialize_params: dict[str, Any] | None = None,
         on_process_started: ProcessLifecycleHook | None = None,
         on_process_exited: ProcessLifecycleHook | None = None,
@@ -599,6 +600,7 @@ class CodexAppServerClient:
         # arbitrary/recycled PIDs, so never derive a signal target from them.
         self._owns_spawned_process_groups = process_factory is None and os.name == "posix"
         self._server_request_handler = server_request_handler or decline_server_request
+        self._notification_guard = notification_guard
         self._initialize_params = initialize_params or {
             "clientInfo": {
                 "name": "agents_server",
@@ -635,6 +637,8 @@ class CodexAppServerClient:
         self._thread_names: dict[str, str] = {}
         self._subscriptions: set[CodexAppServerSubscription] = set()
         self._notification_handlers: set[NotificationHandler] = set()
+        self._account_usage_handlers: set[NotificationHandler] = set()
+        self._account_epoch = 0
         self._callback_tasks: set[asyncio.Task[Any]] = set()
         self._callback_tails: dict[
             tuple[NotificationHandler, str],
@@ -1401,10 +1405,19 @@ class CodexAppServerClient:
         # Authentication notifications are not chat events. Do not expose
         # account metadata or upstream login errors to event subscribers.
         if method in {"account/login/completed", "account/updated"}:
+            self._account_epoch += 1
+            self._dispatch_notification_handlers(
+                {"method": "account/changed", "params": {}},
+                tuple(self._account_usage_handlers), ordered=False,
+            )
             return
         params = notification.get("params")
         if not isinstance(params, dict):
             return
+        if method == "account/rateLimits/updated":
+            self._dispatch_notification_handlers(
+                notification, tuple(self._account_usage_handlers), ordered=False,
+            )
 
         if method == "serverRequest/resolved":
             request_id = params.get("requestId")
@@ -1457,35 +1470,14 @@ class CodexAppServerClient:
                 "at": time.time(),
             })
 
-        for handler in tuple(self._notification_handlers):
-            owner = (handler, thread_id or "")
-            previous = self._callback_tails.get(owner)
-            if previous is None:
-                try:
-                    result = handler(notification)
-                except Exception:
-                    continue
-                if not inspect.isawaitable(result):
-                    # Preserve the original inline contract for synchronous
-                    # caches consumed by immediately following server requests.
-                    continue
-                task = asyncio.ensure_future(result)
-            else:
-                task = asyncio.create_task(
-                    self._invoke_notification_handler(
-                        handler,
-                        notification,
-                        previous,
-                    )
-                )
-            self._callback_tails[owner] = task
-            self._callback_tasks.add(task)
-            task.add_done_callback(
-                lambda completed, owner=owner: self._finish_callback_task(
-                    owner,
-                    completed,
-                )
-            )
+        handlers = tuple(self._notification_handlers)
+        try:
+            allowed = self._notification_guard is None or self._notification_guard(notification)
+        except Exception:
+            allowed = False
+        if not allowed:
+            handlers = ()
+        self._dispatch_notification_handlers(notification, handlers)
 
         # Synchronous handlers (including the scoped fork watcher) must see
         # whether this identity was known *before* this notification. Record a
@@ -1516,6 +1508,54 @@ class CodexAppServerClient:
                 include_thread_subscription=True,
             )
 
+    @property
+    def account_epoch(self) -> int:
+        return self._account_epoch
+
+    def add_account_usage_handler(self, handler: NotificationHandler) -> None:
+        """Observe rate limits/auth invalidation in native receive order.
+
+        Synchronous observers update their cache inline; any returned async
+        invalidation broadcast is tracked without postponing later cache edits.
+        Authentication payloads are never passed to these handlers.
+        """
+        self._account_usage_handlers.add(handler)
+
+    def _dispatch_notification_handlers(
+        self, notification: dict[str, Any], handlers: tuple[NotificationHandler, ...],
+        *, ordered: bool = True,
+    ) -> None:
+        thread_id, _turn_id = _notification_scope(notification)
+        for handler in handlers:
+            owner = (handler, thread_id or "")
+            previous = self._callback_tails.get(owner) if ordered else None
+            if previous is None:
+                try:
+                    result = handler(notification)
+                except Exception:
+                    continue
+                if not inspect.isawaitable(result):
+                    # Preserve the original inline contract for synchronous
+                    # caches consumed by immediately following server requests.
+                    continue
+                task = asyncio.ensure_future(result)
+            else:
+                task = asyncio.create_task(
+                    self._invoke_notification_handler(
+                        handler,
+                        notification,
+                        previous,
+                    )
+                )
+            self._callback_tails[owner] = task
+            self._callback_tasks.add(task)
+            task.add_done_callback(
+                lambda completed, owner=owner: self._finish_callback_task(
+                    owner,
+                    completed,
+                )
+            )
+
     async def _invoke_notification_handler(
         self,
         handler: NotificationHandler,
@@ -1530,6 +1570,8 @@ class CodexAppServerClient:
                 # notification already received for the same handler.
                 pass
         try:
+            if self._notification_guard is not None and not self._notification_guard(notification):
+                return
             result = handler(notification)
         except Exception:
             return
@@ -1749,7 +1791,11 @@ class CodexAppServerClient:
                     isinstance(exc, CodexAppServerDisconnected)
                     and exc.request_sent
                 )
-                if ambiguous:
+                # Ephemeral forks disappear with their owning process. After
+                # explicit close there can be no late child left to delete;
+                # durable forks still require their usual ambiguity cleanup.
+                closing_ephemeral = payload.get("ephemeral") is True and self._closing
+                if ambiguous and not closing_ephemeral:
                     cleanup = asyncio.create_task(
                         self._delete_late_fork_child(late_children)
                     )
@@ -2696,6 +2742,7 @@ class CodexAppServerManager:
         process_factory: ProcessFactory | None = None,
         before_start: Callable[[], Awaitable[Any]] | None = None,
         server_request_handler: ServerRequestHandler | None = None,
+        notification_guard: Callable[[dict[str, Any]], bool] | None = None,
         initialize_params: dict[str, Any] | None = None,
         on_process_started: ProcessLifecycleHook | None = None,
         on_process_exited: ProcessLifecycleHook | None = None,
@@ -2715,6 +2762,7 @@ class CodexAppServerManager:
             process_factory=process_factory,
             before_start=before_start,
             server_request_handler=server_request_handler,
+            notification_guard=notification_guard,
             initialize_params=initialize_params,
             on_process_started=on_process_started,
             on_process_exited=on_process_exited,

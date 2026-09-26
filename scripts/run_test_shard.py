@@ -31,18 +31,15 @@ def main() -> int:
     if args.count < 1 or not 0 <= args.index < args.count:
         parser.error('require count > 0 and 0 <= index < count')
     root = Path(__file__).resolve().parents[1]
-    # The existing suite is flat. Fail visibly if package-based discovery grows
-    # nested tests, instead of silently leaving them out of all eight workers.
-    for package in root.iterdir():
-        if package.is_dir() and (package / '__init__.py').is_file():
-            if any(package.rglob('test_*.py')):
-                parser.error('nested test modules require updating shard discovery')
-    paths = sorted(root.glob('test_*.py'))
+    paths = sorted((root / 'tests').rglob('test_*.py'))
+    if list(root.glob('test_*.py')):
+        parser.error('server tests must live under tests/')
+    names = {path: '.'.join(path.relative_to(root).with_suffix('').parts) for path in paths}
     selected = paths[args.index::args.count]
     if not selected:
         parser.error('empty test shard')
     if args.list:
-        print('\n'.join(path.stem for path in selected))
+        print('\n'.join(names[path] for path in selected))
         return 0
     for path in selected:
         compile(path.read_bytes(), str(path), 'exec')
@@ -50,7 +47,7 @@ def main() -> int:
     import unittest
 
     sys.path.insert(0, str(root))
-    discovered = unittest.defaultTestLoader.loadTestsFromNames([path.stem for path in paths])
+    discovered = unittest.defaultTestLoader.loadTestsFromNames([names[path] for path in paths])
     cases = list(test_cases(discovered))
     selected_cases = cases[args.index::args.count]
     print(f'Shard {args.index + 1}/{args.count}: {len(selected_cases)}/{len(cases)} test cases', flush=True)

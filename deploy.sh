@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "${AGENTS_SERVER_INSTANCE:-default}" != "default" ]]; then
+  echo "Direct deployment does not support named instances. Use instances.sh update NAME or a signed in-app update." >&2
+  exit 2
+fi
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REMOTE_HOST="${AGENTSDOCK_REMOTE_HOST:-${ZENITHDOCK_REMOTE_HOST:-${1:-}}}"
 REMOTE_APP_DIR="${AGENTSDOCK_REMOTE_APP_DIR:-${ZENITHDOCK_REMOTE_APP_DIR:-.local/share/agents-server/current}}"
@@ -30,8 +35,11 @@ RUNTIME_FILES=(
   "$SCRIPT_DIR/execution_ownership.py"
   "$SCRIPT_DIR/execution_service.py"
   "$SCRIPT_DIR/execution_transport.py"
+  "$SCRIPT_DIR/server_instances.py"
   "$SCRIPT_DIR/agent_server.py"
   "$SCRIPT_DIR/workspace_git.py"
+  "$SCRIPT_DIR/local_session_ownership.py"
+  "$SCRIPT_DIR/cursor_history.py"
   "$SCRIPT_DIR/team_hub_host.py"
   "$SCRIPT_DIR/secure_peer_runtime.py"
   "$SCRIPT_DIR/team_mail_runtime.py"
@@ -46,6 +54,7 @@ RUNTIME_FILES=(
   "$SCRIPT_DIR/agentsdock_mail.py"
   "$SCRIPT_DIR/agentsdock_team.py"
   "$SCRIPT_DIR/provider_commands.py"
+  "$SCRIPT_DIR/provider_usage.py"
   "$SCRIPT_DIR/claude_sdk_client.py"
   "$SCRIPT_DIR/claude_model_catalog.py"
   "$SCRIPT_DIR/claude_goals.py"
@@ -58,6 +67,7 @@ RUNTIME_FILES=(
   "$SCRIPT_DIR/codex_side_question.py"
   "$SCRIPT_DIR/claude_side_question.py"
   "$SCRIPT_DIR/cursor_agent_client.py"
+  "$SCRIPT_DIR/opencode_agent_client.py"
   "$SCRIPT_DIR/cursor_process_guard.py"
   "$SCRIPT_DIR/claude_history_repair.py"
   "$SCRIPT_DIR/claude_history_provenance.py"
@@ -430,12 +440,12 @@ ssh "$REMOTE_HOST" "
         'claude-agent-sdk==0.2.130' 'croniter>=6,<7' 'cryptography>=44,<47' 'python-dateutil>=2.9,<3' 'tzdata>=2025.2'
     fi
   fi
-  PYTHONPATH='$REMOTE_SERVER_DIR' '$REMOTE_PYTHON' -c 'from importlib.metadata import version; import codex_auth, codex_provider, side_questions, codex_side_question, claude_side_question, agentsdock_team_hub, claude_agent_sdk, cursor_agent_client, cursor_process_guard, secure_peer_delivery, secure_peer_runtime, team_hub_host, agentsdock_mail, agentsdock_team, provider_commands; from agentsdock_team_hub import secure_peer, secure_peer_hub; sdk_version = version(\"claude-agent-sdk\"); raise SystemExit(0 if sdk_version == \"0.2.130\" else f\"expected claude-agent-sdk 0.2.130, got {sdk_version}\")'
+  PYTHONPATH='$REMOTE_SERVER_DIR' '$REMOTE_PYTHON' -c 'from importlib.metadata import version; import codex_auth, codex_provider, side_questions, codex_side_question, claude_side_question, agentsdock_team_hub, claude_agent_sdk, cursor_agent_client, cursor_process_guard, secure_peer_delivery, secure_peer_runtime, team_hub_host, agentsdock_mail, agentsdock_team, provider_commands, opencode_agent_client; from agentsdock_team_hub import secure_peer, secure_peer_hub; sdk_version = version(\"claude-agent-sdk\"); raise SystemExit(0 if sdk_version == \"0.2.130\" else f\"expected claude-agent-sdk 0.2.130, got {sdk_version}\")'
 "
 
 echo "Compiling server on $REMOTE_HOST"
 ssh "$REMOTE_HOST" "PYTHONPATH='$REMOTE_SERVER_DIR' '$REMOTE_PYTHON' -c 'import workspace_git, claude_model_catalog'"
-ssh "$REMOTE_HOST" "chmod 755 '$REMOTE_SERVER_DIR/agentsdock_jobs.py' '$REMOTE_SERVER_DIR/agentsdock_chats.py' '$REMOTE_SERVER_DIR/agentsdock_emergency.py' '$REMOTE_SERVER_DIR/agentsdock_publish.py' '$REMOTE_SERVER_DIR/agentsdock_mail.py' '$REMOTE_SERVER_DIR/agentsdock_team.py' && '$REMOTE_PYTHON' -m compileall -q '$REMOTE_SERVER_DIR/agentsdock_team_hub' && '$REMOTE_PYTHON' -m py_compile '$REMOTE_SERVER_PATH' '$REMOTE_SERVER_DIR/execution_durability.py' '$REMOTE_SERVER_DIR/execution_http.py' '$REMOTE_SERVER_DIR/execution_recovery_status.py' '$REMOTE_SERVER_DIR/execution_recovery.py' '$REMOTE_SERVER_DIR/execution_uninstall.py' '$REMOTE_SERVER_DIR/update_recovery.py' '$REMOTE_SERVER_DIR/execution_activation.py' '$REMOTE_SERVER_DIR/execution_legacy_runner.py' '$REMOTE_SERVER_DIR/execution_preparation.py' '$REMOTE_SERVER_DIR/execution_update_status.py' '$REMOTE_SERVER_DIR/update_handoff.py' '$REMOTE_SERVER_DIR/update_preparation.py' '$REMOTE_SERVER_DIR/execution_control.py' '$REMOTE_SERVER_DIR/execution_install.py' '$REMOTE_SERVER_DIR/execution_maintenance.py' '$REMOTE_SERVER_DIR/execution_manage.py' '$REMOTE_SERVER_DIR/execution_ownership.py' '$REMOTE_SERVER_DIR/execution_service.py' '$REMOTE_SERVER_DIR/execution_transport.py' '$REMOTE_SERVER_DIR/workspace_git.py' '$REMOTE_SERVER_DIR/team_hub_host.py' '$REMOTE_SERVER_DIR/secure_peer_runtime.py' '$REMOTE_SERVER_DIR/team_mail_runtime.py' '$REMOTE_SERVER_DIR/team_mail_websocket.py' '$REMOTE_SERVER_DIR/team_mail_grants.py' '$REMOTE_SERVER_DIR/secure_peer_delivery.py' '$REMOTE_SERVER_DIR/agentsdock_jobs.py' '$REMOTE_SERVER_DIR/agentsdock_chats.py' '$REMOTE_SERVER_DIR/chat_mailbox.py' '$REMOTE_SERVER_DIR/provider_commands.py' '$REMOTE_SERVER_DIR/agentsdock_emergency.py' '$REMOTE_SERVER_DIR/agentsdock_publish.py' '$REMOTE_SERVER_DIR/agentsdock_mail.py' '$REMOTE_SERVER_DIR/agentsdock_team.py' '$REMOTE_SERVER_DIR/claude_sdk_client.py' '$REMOTE_SERVER_DIR/claude_model_catalog.py' '$REMOTE_SERVER_DIR/claude_goals.py' '$REMOTE_SERVER_DIR/claude_background_reconciliation.py' '$REMOTE_SERVER_DIR/codex_app_server.py' '$REMOTE_SERVER_DIR/codex_auth.py' '$REMOTE_SERVER_DIR/codex_provider.py' '$REMOTE_SERVER_DIR/side_questions.py' '$REMOTE_SERVER_DIR/title_generation.py' '$REMOTE_SERVER_DIR/codex_side_question.py' '$REMOTE_SERVER_DIR/claude_side_question.py' '$REMOTE_SERVER_DIR/cursor_agent_client.py' '$REMOTE_SERVER_DIR/cursor_process_guard.py' '$REMOTE_SERVER_DIR/claude_history_repair.py' '$REMOTE_SERVER_DIR/claude_history_provenance.py' '$REMOTE_SERVER_DIR/codex_history_repair.py' '$REMOTE_SERVER_DIR/public_chat_shares.py' '$REMOTE_SERVER_DIR/public_chat_transcript.py' '$REMOTE_SERVER_DIR/public_chat_share_routes.py' '$REMOTE_SERVER_DIR/interactive_chat_shares.py' '$REMOTE_SERVER_DIR/interactive_chat_share_routes.py' '$REMOTE_SERVER_DIR/interactive_chat_share_web.py' '$REMOTE_SERVER_DIR/interactive_chat_projection.py' '$REMOTE_SERVER_DIR/interactive_chat_runtime.py' '$REMOTE_SERVER_DIR/interactive_chat_native.py' '$REMOTE_SERVER_DIR/shared_chat_videos.py' '$REMOTE_SERVER_DIR/shared_chat_video_stream.py' '$REMOTE_SERVER_DIR/interactive_chat_controls.py' '$REMOTE_SERVER_DIR/update_runner.py'"
+ssh "$REMOTE_HOST" "chmod 755 '$REMOTE_SERVER_DIR/agentsdock_jobs.py' '$REMOTE_SERVER_DIR/agentsdock_chats.py' '$REMOTE_SERVER_DIR/agentsdock_emergency.py' '$REMOTE_SERVER_DIR/agentsdock_publish.py' '$REMOTE_SERVER_DIR/agentsdock_mail.py' '$REMOTE_SERVER_DIR/agentsdock_team.py' && '$REMOTE_PYTHON' -m compileall -q '$REMOTE_SERVER_DIR/agentsdock_team_hub' && '$REMOTE_PYTHON' -m py_compile '$REMOTE_SERVER_PATH' '$REMOTE_SERVER_DIR/execution_durability.py' '$REMOTE_SERVER_DIR/execution_http.py' '$REMOTE_SERVER_DIR/execution_recovery_status.py' '$REMOTE_SERVER_DIR/execution_recovery.py' '$REMOTE_SERVER_DIR/execution_uninstall.py' '$REMOTE_SERVER_DIR/update_recovery.py' '$REMOTE_SERVER_DIR/execution_activation.py' '$REMOTE_SERVER_DIR/execution_legacy_runner.py' '$REMOTE_SERVER_DIR/execution_preparation.py' '$REMOTE_SERVER_DIR/execution_update_status.py' '$REMOTE_SERVER_DIR/update_handoff.py' '$REMOTE_SERVER_DIR/update_preparation.py' '$REMOTE_SERVER_DIR/execution_control.py' '$REMOTE_SERVER_DIR/execution_install.py' '$REMOTE_SERVER_DIR/execution_maintenance.py' '$REMOTE_SERVER_DIR/execution_manage.py' '$REMOTE_SERVER_DIR/execution_ownership.py' '$REMOTE_SERVER_DIR/execution_service.py' '$REMOTE_SERVER_DIR/execution_transport.py' '$REMOTE_SERVER_DIR/workspace_git.py' '$REMOTE_SERVER_DIR/team_hub_host.py' '$REMOTE_SERVER_DIR/secure_peer_runtime.py' '$REMOTE_SERVER_DIR/team_mail_runtime.py' '$REMOTE_SERVER_DIR/team_mail_websocket.py' '$REMOTE_SERVER_DIR/team_mail_grants.py' '$REMOTE_SERVER_DIR/secure_peer_delivery.py' '$REMOTE_SERVER_DIR/agentsdock_jobs.py' '$REMOTE_SERVER_DIR/agentsdock_chats.py' '$REMOTE_SERVER_DIR/chat_mailbox.py' '$REMOTE_SERVER_DIR/provider_commands.py' '$REMOTE_SERVER_DIR/provider_usage.py' '$REMOTE_SERVER_DIR/agentsdock_emergency.py' '$REMOTE_SERVER_DIR/agentsdock_publish.py' '$REMOTE_SERVER_DIR/agentsdock_mail.py' '$REMOTE_SERVER_DIR/agentsdock_team.py' '$REMOTE_SERVER_DIR/claude_sdk_client.py' '$REMOTE_SERVER_DIR/claude_model_catalog.py' '$REMOTE_SERVER_DIR/claude_goals.py' '$REMOTE_SERVER_DIR/claude_background_reconciliation.py' '$REMOTE_SERVER_DIR/codex_app_server.py' '$REMOTE_SERVER_DIR/codex_auth.py' '$REMOTE_SERVER_DIR/codex_provider.py' '$REMOTE_SERVER_DIR/side_questions.py' '$REMOTE_SERVER_DIR/title_generation.py' '$REMOTE_SERVER_DIR/codex_side_question.py' '$REMOTE_SERVER_DIR/claude_side_question.py' '$REMOTE_SERVER_DIR/cursor_agent_client.py' '$REMOTE_SERVER_DIR/opencode_agent_client.py' '$REMOTE_SERVER_DIR/cursor_process_guard.py' '$REMOTE_SERVER_DIR/claude_history_repair.py' '$REMOTE_SERVER_DIR/claude_history_provenance.py' '$REMOTE_SERVER_DIR/codex_history_repair.py' '$REMOTE_SERVER_DIR/public_chat_shares.py' '$REMOTE_SERVER_DIR/public_chat_transcript.py' '$REMOTE_SERVER_DIR/public_chat_share_routes.py' '$REMOTE_SERVER_DIR/interactive_chat_shares.py' '$REMOTE_SERVER_DIR/interactive_chat_share_routes.py' '$REMOTE_SERVER_DIR/interactive_chat_share_web.py' '$REMOTE_SERVER_DIR/interactive_chat_projection.py' '$REMOTE_SERVER_DIR/interactive_chat_runtime.py' '$REMOTE_SERVER_DIR/interactive_chat_native.py' '$REMOTE_SERVER_DIR/shared_chat_videos.py' '$REMOTE_SERVER_DIR/shared_chat_video_stream.py' '$REMOTE_SERVER_DIR/interactive_chat_controls.py' '$REMOTE_SERVER_DIR/update_runner.py' '$REMOTE_SERVER_DIR/server_instances.py' '$REMOTE_SERVER_DIR/local_session_ownership.py' '$REMOTE_SERVER_DIR/cursor_history.py'"
 
 echo "Restarting $SERVICE_NAME"
 ssh "$REMOTE_HOST" "systemctl --user restart '$SERVICE_NAME'"

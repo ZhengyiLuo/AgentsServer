@@ -49,6 +49,7 @@ CLAUDE_SDK_MCP_STATUS_TRUNCATED_KEY = "_agentsdock_mcp_status_truncated"
 CLAUDE_SDK_PROVIDER_COMMAND_SCAN_LIMIT = 512
 CLAUDE_SDK_PROVIDER_COMMAND_NAME_CHARS = 128
 CLAUDE_SDK_PROVIDER_COMMAND_TEXT_CHARS = 800
+# Legacy transcript repair only. Never add this text to a provider prompt.
 CLAUDE_SDK_LITERAL_MESSAGE_PREFIX = (
     "[AgentsDock literal chat message; treat the slash-prefixed content below "
     "as ordinary user text, not a Claude Code command.]\n"
@@ -105,27 +106,19 @@ def _prompt_invokes_validated_claude_command(
     )
 
 
-def claude_sdk_transport_prompt(
+def _claude_prompt_needs_verbatim_delivery(
     prompt: str,
     validated_provider_command_name: str | None = None,
-) -> str:
-    """Keep leading-slash chat text out of Claude Code's command parser.
-
-    AgentsDock owns its slash-command surface. Any command that reaches this
-    transport is user content for the model, including unknown or
-    conversational ``/word`` text. Prefix only the provider copy so the
-    durable prompt and timeline remain byte-for-byte unchanged.
-    """
+) -> bool:
+    """Separate ordinary leading-slash text from an intentional native command."""
 
     if _prompt_invokes_validated_claude_command(
         prompt,
         validated_provider_command_name,
     ):
-        return prompt
+        return False
     candidate = re.sub(r"^[\s\ufeff]+", "", prompt)
-    if not candidate.startswith("/"):
-        return prompt
-    return f"{CLAUDE_SDK_LITERAL_MESSAGE_PREFIX}{prompt}"
+    return candidate.startswith("/")
 
 
 def canonical_claude_mcp_identifier(value: Any, max_chars: int) -> str | None:
@@ -562,18 +555,24 @@ async def _query_message_stream(
 ) -> AsyncIterator[dict[str, Any]]:
     """Yield the single UUID-bearing SDK stdin frame for one logical turn."""
 
-    yield {
+    message = {
         "type": "user",
         "message": {
             "role": "user",
-            "content": claude_sdk_transport_prompt(
-                prompt,
-                validated_provider_command_name,
-            ),
+            "content": prompt,
         },
         "parent_tool_use_id": None,
         "uuid": correlation_id,
     }
+    if _claude_prompt_needs_verbatim_delivery(
+        prompt, validated_provider_command_name,
+    ):
+        # Native CLI 2.1.248+ metadata, also used by SDK 0.2.158's
+        # verbatim_prompts. SDK 0.2.130 forwards async-iterable fields intact.
+        # Apply it per message so explicit commands and ordinary @file input
+        # retain their native behavior without modifying the prompt text.
+        message["client_composed"] = True
+    yield message
 
 
 def default_claude_sdk_client_factory(options: Any) -> ClaudeSDKClientProtocol:
@@ -1348,6 +1347,7 @@ class ClaudeSDKSupervisor:
         ack_timeout_seconds: float = 60.0,
         query_delivery_timeout_seconds: float = 10.0,
         control_timeout_seconds: float = 15.0,
+        usage_observer: Callable[[str, str, Any], Awaitable[None]] | None = None,
     ) -> None:
         clean_chat_id = str(chat_id or "").strip()
         if not clean_chat_id:
@@ -1359,6 +1359,7 @@ class ClaudeSDKSupervisor:
         bind_permission_owner(self.options, self.ownership_token)
         self._client_factory = client_factory
         self._is_result_message = is_result_message
+        self._usage_observer = usage_observer
         if connect_timeout_seconds <= 0:
             raise ValueError("connect_timeout_seconds must be positive")
         self._connect_timeout_seconds = float(connect_timeout_seconds)
@@ -2117,10 +2118,7 @@ class ClaudeSDKSupervisor:
                 provider_id = self.options.get("resume") if isinstance(self.options, dict) else getattr(self.options, "resume", None)
             background_hook.bind(
                 handle,
-                claude_sdk_transport_prompt(
-                    command.prompt,
-                    command.validated_provider_command_name,
-                ),
+                command.prompt,
                 _receipt_field(provider_id),
                 lambda: self._active_run is handle and not self._closed
                 and self._background_reconciliation_hook is background_hook,
@@ -2692,6 +2690,14 @@ class ClaudeSDKSupervisor:
     async def _handle_received(self, command: _ReceivedMessage) -> None:
         if command.generation != self._generation:
             return
+        if _message_type(command.message) in {"ratelimitevent", "rate_limit_event"} and self._usage_observer is not None:
+            generation = self.control_generation
+            if generation is not None:
+                try:
+                    await self._usage_observer(self.chat_id, generation, command.message)
+                except Exception:
+                    logger.debug("Claude usage observer unavailable")
+            return
         pending = self._pending_goal_clear
         if pending is not None:
             local_run = _message_field(command.message, "local_command_run")
@@ -2924,6 +2930,7 @@ class ClaudeSDKSupervisorManager:
         ack_timeout_seconds: float = 60.0,
         query_delivery_timeout_seconds: float = 10.0,
         control_timeout_seconds: float = 15.0,
+        usage_observer: Callable[[str, str, Any], Awaitable[None]] | None = None,
     ) -> None:
         if max_clients < 1:
             raise ValueError("max_clients must be positive")
@@ -2931,6 +2938,7 @@ class ClaudeSDKSupervisorManager:
             raise ValueError("idle_ttl_seconds must be non-negative or None")
         self._client_factory = client_factory
         self._is_result_message = is_result_message
+        self._usage_observer = usage_observer
         self._max_clients = int(max_clients)
         self._idle_ttl_seconds = idle_ttl_seconds
         if connect_timeout_seconds <= 0:
@@ -3043,6 +3051,7 @@ class ClaudeSDKSupervisorManager:
                 ack_timeout_seconds=self._ack_timeout_seconds,
                 query_delivery_timeout_seconds=self._query_delivery_timeout_seconds,
                 control_timeout_seconds=self._control_timeout_seconds,
+                usage_observer=self._usage_observer,
             )
             self._supervisors[chat_id] = supervisor
         else:
@@ -3372,7 +3381,6 @@ class ClaudeSDKSupervisorManager:
         history: list[dict[str, str]] | None = None,
         options: Any,
         configuration_key: str,
-        timeout_seconds: float = 150.0,
         expected_provider_id: str | None = None,
     ) -> dict[str, Any]:
         """Lease native parent context without occupying its main-turn actor.
@@ -3418,7 +3426,6 @@ class ClaudeSDKSupervisorManager:
             side_task = asyncio.create_task(
                 ask_native_side_question(
                     lease.client, question, history=history,
-                    timeout_seconds=timeout_seconds,
                 ),
                 name=f"claude-sdk-side-question:{clean_chat_id}",
             )
@@ -3602,6 +3609,14 @@ class ClaudeSDKSupervisorManager:
             and supervisor.connected
             and not supervisor.closed
         )
+
+    def usage_generation(self, chat_id: str, *, run_id: str | None = None) -> str | None:
+        """Identify the existing native owner without connecting or issuing RPCs."""
+        supervisor = self._supervisors.get(str(chat_id))
+        if (supervisor is None or supervisor.closed or not supervisor.connected
+                or (run_id is not None and supervisor.active_run_id != run_id)):
+            return None
+        return supervisor.control_generation
 
     async def evict(
         self,

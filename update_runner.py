@@ -335,6 +335,21 @@ def installer_environment() -> dict[str, str]:
     return environment
 
 
+def instance_installer_arguments(source: Path) -> list[str]:
+    """Never let a named server run an old default-only installer."""
+    from server_instances import instance_name
+    name = instance_name(os.environ.get("AGENTS_SERVER_INSTANCE", "default"))
+    if name == "default":
+        return []  # Preserve older signed default installers.
+    helper = source / "server_instances.py"
+    installer = source / "install.sh"
+    if (not helper.is_file() or helper.is_symlink()
+            or "INSTANCE_PROTOCOL = 1" not in helper.read_text()
+            or '--instance)' not in installer.read_text()):
+        raise RuntimeError("This release does not support named instances; the existing server was not replaced.")
+    return ["--instance", name]
+
+
 def run_installer(
     command: list[str],
     *,
@@ -1549,6 +1564,7 @@ def run_update(args: argparse.Namespace) -> None:
             command.extend(["--execution-handoff-file", handoff_file])
         if manifest.get("schema") == 2 or prepared_update is not None:
             command.extend(["--expected-api-contract", str(manifest["api_contract_version"])])
+        command.extend(instance_installer_arguments(source))
         if expected_team_hub_id is not None:
             command.extend(
                 [

@@ -1,4 +1,4 @@
-"""Native ephemeral Codex forks with an independently owned lifetime.
+"""Native Codex forks with an independently owned lifetime.
 
 The provider copies its own conversation history, including tool results. We
 never reconstruct that history from the renderer transcript or resume, steer,
@@ -131,18 +131,20 @@ async def _verify_isolated_protocol(executable: str, temporary: str, env: dict):
 
 
 class NativeCodexSideChat:
-    """One ephemeral provider fork, reused until its server-owned chat closes.
+    """One native fork; synced chats opt into durable provider persistence.
 
     The app-server process is private to this side chat. Closing it cannot
     interrupt the parent's process; no RPC that mutates the parent is issued.
-    The owning service must close this object on dismissal, expiry, and shutdown.
+    The owning service closes idle transports, cancellation and shutdown.
+    A durable fork is resumed from its native rollout after transport closure.
     """
 
     def __init__(self, parent_thread_id: str, *, executable: str, model: str | None,
                  env: dict, parent_rollout_path: str | None = None,
                  provider_selection: dict | None = None, cwd: str | None = None,
                  fork_overrides: dict | None = None, turn_overrides: dict | None = None,
-                 server_request_handler=None):
+                 server_request_handler=None, durable: bool = False,
+                 resume_state: dict | None = None, persist_state=None):
         if not isinstance(parent_thread_id, str) or not parent_thread_id.strip():
             raise SideQuestionError(409, "The parent Codex conversation is not available yet")
         self.parent_thread_id = parent_thread_id
@@ -153,6 +155,9 @@ class NativeCodexSideChat:
         self.fork_overrides = deepcopy(fork_overrides or {})
         self.turn_overrides = deepcopy(turn_overrides or {})
         self.server_request_handler = server_request_handler
+        self.durable = durable
+        self.resume_state = deepcopy(resume_state)
+        self.persist_state = persist_state
         self.env = isolated_environment(env)
         self.provider_config = {}
         self.provider_turn_overrides = {}
@@ -172,6 +177,7 @@ class NativeCodexSideChat:
         self._temporary: tempfile.TemporaryDirectory | None = None
         self._opening: asyncio.Task | None = None
         self._cleaning: asyncio.Task | None = None
+        self._process_started = asyncio.Event()
         self._active: asyncio.Task | None = None
         self._lock = asyncio.Lock()
         self._closed = False
@@ -220,11 +226,12 @@ class NativeCodexSideChat:
         args = config_args(config)
         self._client = CodexAppServerClient(
             self.executable, cwd=self.cwd or temporary, env_factory=lambda: self.env,
-            app_server_args=args, request_timeout=20, lifecycle_timeout=30,
+            app_server_args=args,
             process_stream_limit=MAX_OUTPUT_BYTES, notification_queue_limit=512,
             sensitive_values=self.sensitive_values,
             protected_env_keys=self.protected_env_keys,
             server_request_handler=self._handle_server_request,
+            on_process_started=lambda _pid, _group: self._process_started.set(),
             **client_options,
         )
         await self._client.start()
@@ -233,7 +240,7 @@ class NativeCodexSideChat:
         inherited_instructions = self.fork_overrides.get("developerInstructions") or ""
         params = {
             **self.fork_overrides,
-            "ephemeral": True, "excludeTurns": True,
+            "ephemeral": not self.durable, "excludeTurns": True,
             "developerInstructions": "\n\n".join(value for value in (inherited_instructions, SIDE_INSTRUCTIONS) if value),
             "config": config,
         }
@@ -245,13 +252,36 @@ class NativeCodexSideChat:
             params["modelProvider"] = self.provider_config["model_provider"]
         if self.parent_rollout_path:
             params["path"] = self.parent_rollout_path
-        # Native ephemeral forks cannot carry a goal. In particular, do not set
-        # deferGoalContinuation: Codex rejects it when ephemeral is true.
-        self.thread_id = await self._client.fork_thread(self.parent_thread_id, params)
+        if self.durable:
+            # Preserve full native context across server restart without ever
+            # allowing an inherited parent goal to continue in the side chat.
+            params["deferGoalContinuation"] = True
+        if self.resume_state is not None:
+            saved_id = self.resume_state.get("thread_id")
+            if not self.durable or not isinstance(saved_id, str) or not saved_id or saved_id == self.parent_thread_id:
+                raise SideQuestionError(410, "Saved Codex side conversation is unavailable; clear Side chat")
+            params.pop("ephemeral", None)
+            params.pop("path", None)
+            if self.resume_state.get("path"):
+                params["path"] = self.resume_state["path"]
+            self.thread_id = await self._client.resume_thread(saved_id, params)
+        else:
+            # Native ephemeral forks cannot carry deferGoalContinuation.
+            self.thread_id = await self._client.fork_thread(self.parent_thread_id, params)
+        if self._closed:
+            # A fork reply can race Stop. Do not let the following read lazily
+            # restart a private transport that cleanup has already closed.
+            raise SideQuestionError(409, "Side chat was closed; open a new side chat")
         if self.thread_id == self.parent_thread_id:
             raise SideQuestionError(503, "Codex did not create a separate side chat")
         metadata = await self._client.read_thread(self.thread_id, include_turns=False)
-        if metadata.get("ephemeral") is not True or metadata.get("path") is not None:
+        if self.durable:
+            if metadata.get("ephemeral") is not False or not isinstance(metadata.get("path"), str):
+                raise SideQuestionError(503, "Codex did not save the native side conversation")
+            if self.persist_state is not None:
+                await self.persist_state({"thread_id": self.thread_id, "path": metadata["path"]})
+            await self._client.clear_thread_goal(self.thread_id)
+        elif metadata.get("ephemeral") is not True or metadata.get("path") is not None:
             raise SideQuestionError(503, "Codex did not confirm an ephemeral side chat")
 
     async def ask(self, question: str) -> str:
@@ -312,15 +342,31 @@ class NativeCodexSideChat:
             active.cancel()
         if self._cleaning is None:
             async def cleanup():
-                if self._opening is not None:
-                    with suppress(BaseException):
-                        await self._opening
+                client_closed = False
                 try:
-                    if self._client is not None:
+                    if self._opening is not None and not self._opening.done():
+                        # Keep ownership while subprocess creation is in flight.
+                        # Once its handle exists, Stop can close this private
+                        # process without waiting for initialize/fork replies.
+                        started = asyncio.create_task(self._process_started.wait())
+                        try:
+                            await asyncio.wait({self._opening, started}, return_when=asyncio.FIRST_COMPLETED)
+                        finally:
+                            started.cancel()
+                            await asyncio.gather(started, return_exceptions=True)
+                    if self._process_started.is_set() and self._client is not None:
                         await self._client.close()
+                        client_closed = True
+                    if self._opening is not None:
+                        with suppress(BaseException):
+                            await self._opening
                 finally:
-                    if self._temporary is not None:
-                        self._temporary.cleanup()
+                    try:
+                        if self._client is not None and not client_closed:
+                            await self._client.close()
+                    finally:
+                        if self._temporary is not None:
+                            self._temporary.cleanup()
             self._cleaning = asyncio.create_task(cleanup())
         cancelled = False
         while not self._cleaning.done():

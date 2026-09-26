@@ -542,6 +542,21 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
                 self.fail("native provider turn never became ready")
             await asyncio.sleep(0)
 
+    async def test_superseded_login_result_does_not_overwrite_current_readiness(self):
+        for status in ("completed", "failed"):
+            with self.subTest(status=status):
+                manager = FakeManager(FakeTurn([agent_message("answer", "fixture reply", "final_answer"),
+                                              completed_notification(status)]))
+                manager._agentsdock_login_superseded = True
+                stack, events, _finished, _fallback = self.runner_patches(manager)
+                with stack:
+                    await agent_server.run_codex_app_server(
+                        "chat-native", "run-original", "fixture prompt", dict(self.session),
+                        Path(self.cwd) / ".runner-test-manifest.json", allow_exec_fallback=False)
+                    agent_server.record_runtime_success.assert_not_called()
+                    agent_server.record_runtime_failure.assert_not_called()
+                self.assertTrue(events.await_count)
+
     async def assert_unpin_failure_still_drains_successor(
         self,
         unpin_error: BaseException,

@@ -1,4 +1,4 @@
-"""Authentication headroom and bounded, non-poisoning catalog refreshes."""
+"""Passive Claude checks and bounded, non-poisoning catalog refreshes."""
 
 import asyncio
 import json
@@ -24,37 +24,32 @@ class RuntimeProbeTimeoutTests(unittest.TestCase):
         token = agent_server.RUNTIME_CATALOG_DEADLINE.set(None)
         self.addCleanup(agent_server.RUNTIME_CATALOG_DEADLINE.reset, token)
         self.enterContext(patch.object(agent_server, "RUNTIME_CATALOG_TIMEOUT_SECONDS", 6.0))
-        self.enterContext(patch.object(agent_server, "CLAUDE_AUTH_PROBE_TIMEOUT_SECONDS", 15.0))
         self.enterContext(patch.object(agent_server, "runner_env", return_value={}))
 
-    def test_slow_successful_claude_auth_gets_15_seconds_not_six(self):
+    def test_claude_check_only_runs_version_and_leaves_authentication_unknown(self):
         def run(cmd, **kwargs):
-            if cmd[1:] == ["--version"]:
-                self.assertEqual(kwargs["timeout"], 6.0)
-                return completed(cmd, "2.1.277 (Claude Code)")
-            self.assertEqual(cmd[1:], ["auth", "status", "--json"])
-            self.assertEqual(kwargs["timeout"], 15.0)
-            # The real regression: a successful 6.6s auth check must survive.
-            if kwargs["timeout"] < 6.6:
-                raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
-            return completed(cmd, json.dumps({"loggedIn": True, "email": "private@example.com"}))
+            self.assertEqual(cmd[1:], ["--version"])
+            self.assertEqual(kwargs["timeout"], 6.0)
+            return completed(cmd, "2.1.283 (Claude Code)")
 
         with patch.object(agent_server.shutil, "which", return_value="/test/claude"), patch.object(
             agent_server.subprocess, "run", side_effect=run,
         ):
             result = agent_server.probe_runtime("claude")
-        self.assertEqual(result["status"], "ready")
-        self.assertNotIn("private@example.com", json.dumps(result))
+        self.assertEqual(result["status"], "unknown")
+        self.assertTrue(result["installed"])
+        self.assertIsNone(result["authenticated"])
+        self.assertIsNone(result["action"])
 
     def test_auth_timeout_is_explicit_unknown_auth_and_does_not_leak_output(self):
         error = subprocess.TimeoutExpired(
-            ["claude", "auth", "status", "--json"], 15,
+            ["codex", "login", "status"], 6,
             output=b"private-account@example.com", stderr=b"secret-token",
         )
         with patch.object(agent_server.shutil, "which", return_value="/test/claude"), patch.object(
             agent_server, "runtime_command", side_effect=[completed([], "2.1.277"), error],
         ), self.assertLogs(agent_server.logger, level="WARNING") as logs:
-            result = agent_server.probe_runtime("claude")
+            result = agent_server.probe_runtime("codex")
         self.assertEqual(result["status"], "error")
         self.assertIsNone(result["authenticated"])
         self.assertTrue(result["installed"])
@@ -64,17 +59,17 @@ class RuntimeProbeTimeoutTests(unittest.TestCase):
         self.assertNotIn("private-account", exposed)
         self.assertNotIn("secret-token", exposed)
 
-    def test_explicit_signed_out_still_blocks(self):
+    def test_codex_explicit_signed_out_still_blocks(self):
         with patch.object(agent_server.shutil, "which", return_value="/test/claude"), patch.object(
             agent_server, "runtime_command", side_effect=[
-                completed([], "2.1.277"), completed([], '{"loggedIn":false}', 1),
+                completed([], "codex-cli"), completed([], 'Not logged in', 1),
             ],
         ):
-            result = agent_server.probe_runtime("claude")
+            result = agent_server.probe_runtime("codex")
         self.assertEqual(result["status"], "unauthenticated")
         self.assertFalse(result["available"])
         self.assertFalse(result["authenticated"])
-        self.assertIn("claude auth login", result["action"])
+        self.assertIn("codex login", result["action"])
 
     def test_version_help_and_other_auth_keep_six_second_limit(self):
         with patch.object(agent_server.subprocess, "run", return_value=completed([])) as run:
@@ -86,14 +81,15 @@ class RuntimeProbeTimeoutTests(unittest.TestCase):
             agent_server.claude_supports_effort("ultracode")
             self.assertEqual(run.call_args.kwargs["timeout"], 6.0)
 
-    def test_auth_deadline_is_configurable(self):
-        with patch.object(agent_server, "CLAUDE_AUTH_PROBE_TIMEOUT_SECONDS", 19.0), patch.object(
+    def test_forced_claude_recheck_never_starts_auth_even_after_cached_failure(self):
+        agent_server.record_runtime_failure("claude", "Not logged in")
+        with patch.object(
             agent_server.shutil, "which", return_value="/test/claude",
-        ), patch.object(agent_server.subprocess, "run", side_effect=[
-            completed([], "2.1.277"), completed([], '{"loggedIn":true}'),
-        ]) as run:
-            agent_server.probe_runtime("claude")
-        self.assertEqual(run.call_args.kwargs["timeout"], 19.0)
+        ), patch.object(agent_server.subprocess, "run", return_value=completed([], "2.1.283")) as run:
+            result = agent_server.runtime_diagnostic("claude", force=True)
+        self.assertEqual(result["status"], "unauthenticated")
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], ["/test/claude", "--version"])
 
     def test_remaining_catalog_budget_clamps_each_command(self):
         agent_server.RUNTIME_CATALOG_DEADLINE.set(102.0)
@@ -259,9 +255,7 @@ class RuntimeProbeTimeoutTests(unittest.TestCase):
                 clock[0] += 0.1
                 return completed(cmd, "2.1.277")
             if cmd[0] == "/test/claude" and cmd[1:] == ["auth", "status", "--json"]:
-                self.assertGreaterEqual(kwargs["timeout"], 6.6)
-                clock[0] += 6.6
-                return completed(cmd, '{"loggedIn":true}')
+                self.fail("catalog must not invoke Claude authentication commands")
             clock[0] += kwargs["timeout"]
             raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
 
@@ -278,7 +272,7 @@ class RuntimeProbeTimeoutTests(unittest.TestCase):
         self.assertAlmostEqual(clock[0] - 100, 25.0)
         self.assertTrue(started)
         self.assertEqual(set(result["backends"]), agent_server.VALID_BACKENDS)
-        self.assertEqual(result["backends"]["claude"]["diagnostic"]["status"], "ready")
+        self.assertEqual(result["backends"]["claude"]["diagnostic"]["status"], "unknown")
         self.assertEqual(result["backends"]["opencode"]["diagnostic"]["status"], "unknown")
         self.assertNotIn("opencode", agent_server.RUNTIME_DIAGNOSTICS)
         self.assertTrue(result["backends"]["claude"]["models"])

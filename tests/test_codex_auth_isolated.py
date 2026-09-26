@@ -59,6 +59,7 @@ class CodexAuthTests(unittest.IsolatedAsyncioTestCase):
             "codex_subagent_has_live_owner": lambda thread, state: state.get("live") is True,
             "SIDE_QUESTIONS": side_questions.SideQuestions(), "codex_app_server_manager": AsyncMock(return_value=self.manager)})
         self.ns["codex_app_server_managers"] = lambda: (self.manager,)
+        self.ns["refresh_codex_app_server_login"] = AsyncMock()
         exec(OPERATION_CODE, self.ns)
         self.app = FastAPI()
         self.app.middleware("http")(self.ns["require_agent_token"])

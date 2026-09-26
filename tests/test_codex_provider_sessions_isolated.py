@@ -296,22 +296,55 @@ class PerChatTests(unittest.IsolatedAsyncioTestCase):
 
     def test_custom_native_results_do_not_change_default_diagnostic_or_fall_back_to_exec(self):
         runner = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_codex_app_server")
-        failure = next(node for node in ast.walk(runner) if isinstance(node, ast.If)
-            and isinstance(node.test, ast.Compare) and "codex_provider.session_choice" in ast.unparse(node.test)
-            and any(isinstance(item, ast.Call) and isinstance(item.func, ast.Name) and item.func.id == "record_runtime_failure" for statement in node.body for item in ast.walk(statement)))
-        success = next(node for node in ast.walk(runner) if isinstance(node, ast.If)
-            and isinstance(node.test, ast.BoolOp) and "codex_provider.session_choice" in ast.unparse(node.test)
-            and any(isinstance(item, ast.Call) and isinstance(item.func, ast.Name) and item.func.id == "record_runtime_success" for statement in node.body for item in ast.walk(statement)))
+
+        def diagnostic_guard(call_name):
+            # Select the immediate guard by its call, not the shape of its
+            # predicate: provider and login-generation checks compose here.
+            candidates = [node for node in ast.walk(runner) if isinstance(node, ast.If)
+                and any(isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call)
+                    and isinstance(statement.value.func, ast.Name) and statement.value.func.id == call_name
+                    for statement in node.body)]
+            self.assertEqual(len(candidates), 1, call_name)
+            return candidates[0]
+
+        failure = diagnostic_guard("record_runtime_failure")
+        success = diagnostic_guard("record_runtime_success")
         fallback = next(node for node in ast.walk(runner) if isinstance(node, ast.Assign)
             and any(isinstance(target, ast.Name) and target.id == "can_fallback" for target in node.targets))
-        statements = [copy.deepcopy(failure), copy.deepcopy(success), copy.deepcopy(fallback)]
-        code = compile(ast.fix_missing_locations(ast.Module(body=statements, type_ignores=[])), str(SOURCE), "exec")
+        codes = {name: compile(ast.fix_missing_locations(ast.Module(body=[copy.deepcopy(node)], type_ignores=[])), str(SOURCE), "exec")
+            for name, node in (("failure", failure), ("success", success), ("fallback", fallback))}
         for provider in ("default", "custom"):
-            ns = {"sess": {"codex_provider": provider}, "codex_provider": codex_provider, "BACKEND_CODEX": "codex",
-                "terminal_error": "synthetic", "stopped": False, "record_runtime_failure": Mock(), "record_runtime_success": Mock(),
-                "allow_exec_fallback": True, "provider_command": None, "stop_requested": False,
-                "turn_start_attempted": False, "safe_pre_accept_failure": True}
-            exec(code, ns)
-            self.assertEqual(ns["record_runtime_failure"].call_count, int(provider == "default"))
-            self.assertEqual(ns["record_runtime_success"].call_count, int(provider == "default"))
-            self.assertEqual(ns["can_fallback"], provider == "default")
+            for login_state in ("unmarked", "current", "superseded"):
+                manager = SimpleNamespace()
+                if login_state != "unmarked":
+                    manager._agentsdock_login_superseded = login_state == "superseded"
+                for stopped in (False, True):
+                    for outcome in ("failure", "success"):
+                        with self.subTest(provider=provider, login_state=login_state, stopped=stopped, outcome=outcome):
+                            ns = {"sess": {"codex_provider": provider}, "codex_provider": codex_provider, "BACKEND_CODEX": "codex",
+                                "manager": manager, "terminal_error": "synthetic", "stopped": stopped,
+                                "record_runtime_failure": Mock(), "record_runtime_success": Mock()}
+                            exec(codes[outcome], ns)
+                            may_record = provider == "default" and login_state != "superseded"
+                            if outcome == "failure" and may_record:
+                                ns["record_runtime_failure"].assert_called_once_with("codex", "synthetic")
+                            else:
+                                ns["record_runtime_failure"].assert_not_called()
+                            if outcome == "success" and may_record and not stopped:
+                                ns["record_runtime_success"].assert_called_once_with("codex")
+                            else:
+                                ns["record_runtime_success"].assert_not_called()
+
+            # Exec fallback is a separate boundary: only ordinary-provider
+            # requests known not to have been accepted may be replayed.
+            cases = (({}, True), ({"allow_exec_fallback": False}, False),
+                ({"provider_command": "synthetic-command"}, False), ({"stop_requested": True}, False),
+                ({"turn_start_attempted": True, "safe_pre_accept_failure": True}, True),
+                ({"turn_start_attempted": True, "safe_pre_accept_failure": False}, False))
+            for overrides, safe in cases:
+                with self.subTest(provider=provider, fallback=overrides):
+                    ns = {"sess": {"codex_provider": provider}, "codex_provider": codex_provider,
+                        "allow_exec_fallback": True, "provider_command": None, "stop_requested": False,
+                        "turn_start_attempted": False, "safe_pre_accept_failure": True, **overrides}
+                    exec(codes["fallback"], ns)
+                    self.assertEqual(ns["can_fallback"], provider == "default" and safe)

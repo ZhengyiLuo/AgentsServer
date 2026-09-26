@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+from functools import lru_cache
 import logging
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ import weakref
 from fastapi import HTTPException
 from codex_app_server import CodexAppServerClient, CodexAppServerRequestError
 import codex_provider
+import codex_auth
 
 
 class Manager:
@@ -21,6 +23,7 @@ class Manager:
         self.options = options
         self.client = SimpleNamespace(_loaded_threads=set(), _pending={},
             _server_request_tasks={}, _callback_tasks=set(), _turns_by_thread={},
+            _start_lock=asyncio.Lock(),
             add_account_usage_handler=lambda handler: None)
         self.generation = 1
         self.ready = True
@@ -45,18 +48,25 @@ class Manager:
 
 
 class BinaryRefreshTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def lifecycle_code():
         source = (Path(__file__).resolve().parents[1] / "agent_server.py")
         names = {"codex_app_server_managers", "retain_codex_manager_caller",
             "codex_manager_has_callers", "codex_manager_has_callbacks", "codex_manager_owns_notification",
             "refresh_codex_app_server_binary", "codex_manager_session_busy",
             "prepare_codex_app_server_process",
+            "refresh_codex_app_server_login", "release_idle_codex_manager_session", "prepare_codex_login_turn",
             "drain_retired_codex_managers", "existing_codex_app_server_manager",
             "existing_codex_app_server_manager_for_thread", "codex_app_server_manager",
             "close_codex_app_server_manager", "session_registry_has_live_tasks"}
         names.update({"handle_codex_server_request", "cache_codex_approval_item", "schedule_codex_manager_drain"})
         nodes = [node for node in ast.parse(source.read_text()).body
                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
+        module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *nodes], type_ignores=[])
+        return compile(ast.fix_missing_locations(module), str(source), "exec")
+
+    def setUp(self):
         self.identity = ("/fixture/codex", 1, 2, 3, 4, "codex-cli 0.153.4")
         self.locks = {}
         self.ns = ns = {"asyncio": asyncio, "time": time, "weakref": weakref,
@@ -65,6 +75,11 @@ class BinaryRefreshTests(unittest.IsolatedAsyncioTestCase):
             "CODEX_APP_SERVER_MANAGER": None, "CODEX_CUSTOM_APP_SERVER_MANAGERS": {},
             "CODEX_RETIRED_APP_SERVER_MANAGERS": [], "CODEX_SESSION_APP_SERVER_MANAGERS": {},
             "CODEX_BINARY_IDENTITY": None, "CODEX_BINARY_CHECKED_AT": 0,
+            "CODEX_LOGIN_REVISION": None,
+            "codex_auth": SimpleNamespace(native_login_revision=lambda *_args, **_kwargs: None,
+                native_login_handoff_supported=lambda *_args, **_kwargs: True,
+                HANDOFF_MESSAGE=codex_auth.HANDOFF_MESSAGE),
+            "TransientAdmissionWait": HTTPException,
             "CODEX_APP_SERVER_MANAGER_EPOCH": 0, "CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH": None,
             "CODEX_MANAGER_DRAIN_TASK": None, "CODEX_MANAGER_DRAIN_REQUESTED": False,
             "CODEX_MANAGER_CLOSING": False,
@@ -76,17 +91,19 @@ class BinaryRefreshTests(unittest.IsolatedAsyncioTestCase):
             "ensure_provider_manager_factory_admission": lambda **_kwargs: None,
             "STORE": SimpleNamespace(sessions={}), "CODEX_PROVIDER_STORE": SimpleNamespace(
                 for_session=lambda session, **_kwargs: None, for_thread=lambda thread: None),
+            "SIDE_QUESTIONS": SimpleNamespace(active_session_ids=lambda: set()),
             "session_provider_id": lambda session: session.get("codex_thread_id"),
             "session_lifecycle_lock": lambda session: self.locks.setdefault(session, asyncio.Lock()),
             "codex_session_has_live_subagents": lambda session: False,
             "schedule_codex_manager_drain": Mock(),
+            "expire_codex_login_diagnostic": Mock(),
             "cancel_codex_interactions": AsyncMock(), "cancel_codex_native_actions": AsyncMock(),
             "decline_server_request": AsyncMock(return_value={"decision": "decline"}),
             "CODEX_INTERACTION_METHODS": {"item/commandExecution/requestApproval"},
             "codex_request_is_interactive": lambda *_args: True,
             "reset_codex_ephemeral_runtime_metadata": AsyncMock(),
             "CODEX_SESSION_CLEANUP_TIMEOUT_SECONDS": .1}
-        for name in ("CODEX_BINARY_PROBE_LOCK", "CODEX_GOALS_CONFIG_LOCK", "CODEX_AUTH_LOCK",
+        for name in ("CODEX_BINARY_PROBE_LOCK", "CODEX_LOGIN_PROBE_LOCK", "CODEX_GOALS_CONFIG_LOCK", "CODEX_AUTH_LOCK",
                      "CODEX_APP_SERVER_MANAGER_LOCK", "CODEX_APP_SERVER_THREAD_LRU_LOCK"):
             ns[name] = asyncio.Lock()
         for name in ("ACTIVE", "CURRENT_TURNS", "SESSION_TURN_TASKS", "CODEX_NATIVE_ACTION_TASKS",
@@ -112,8 +129,7 @@ class BinaryRefreshTests(unittest.IsolatedAsyncioTestCase):
             manager.client._loaded_threads.discard(thread)
             return True
         ns["evict_codex_app_server_thread"] = AsyncMock(side_effect=evict)
-        module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *nodes], type_ignores=[])
-        exec(compile(ast.fix_missing_locations(module), str(source), "exec"), ns)
+        exec(self.lifecycle_code(), ns)
         self.real_schedule_drain = ns["schedule_codex_manager_drain"]
         ns["schedule_codex_manager_drain"] = Mock()
 

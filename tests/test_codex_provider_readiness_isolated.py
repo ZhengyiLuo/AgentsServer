@@ -38,7 +38,7 @@ class CodexProviderReadinessTests(unittest.IsolatedAsyncioTestCase):
             "BACKEND_OPENCODE": "opencode", "VALID_BACKENDS": {"claude", "codex", "cursor", "opencode"},
             "ThreadPoolExecutor": ThreadPoolExecutor, "copy_context": copy_context,
             "RUNTIME_CATALOG_DEADLINE": ContextVar("test_catalog_deadline", default=None),
-            "RUNTIME_CATALOG_BUDGET_SECONDS": 25.0, "CLAUDE_AUTH_PROBE_TIMEOUT_SECONDS": 15.0,
+            "RUNTIME_CATALOG_BUDGET_SECONDS": 25.0,
             "CODEX_PROVIDER_STORE": self.store, "CODEX_TRANSPORT": "app-server", "CODEX_TRANSPORT_EXEC": "exec",
             "runtime_display_name": lambda backend: backend, "runtime_action": lambda *args, **kwargs: None,
             "now_iso": lambda: "2026-09-17T00:00:00Z", "runtime_executable": lambda backend: backend,
@@ -93,7 +93,7 @@ class CodexProviderReadinessTests(unittest.IsolatedAsyncioTestCase):
         self.store.catalog.assert_called_once_with(available=True)
 
     def test_claude_does_not_read_or_use_codex_provider_settings(self):
-        self.command.side_effect = [subprocess.CompletedProcess([], 0, "Claude 1.0", ""),
-                                   subprocess.CompletedProcess([], 0, '{"loggedIn":true}', "")]
-        self.assertEqual(self.ns["probe_runtime"]("claude")["status"], "ready")
+        self.command.side_effect = [subprocess.CompletedProcess([], 0, "Claude 1.0", "")]
+        self.assertEqual(self.ns["probe_runtime"]("claude")["status"], "unknown")
+        self.command.assert_called_once()
         self.store.selection.assert_not_called()

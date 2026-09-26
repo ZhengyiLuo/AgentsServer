@@ -610,6 +610,7 @@ class ManagerGenerationTests(unittest.IsolatedAsyncioTestCase):
                 "CODEX_RETIRED_APP_SERVER_MANAGERS": [], "CODEX_SESSION_APP_SERVER_MANAGERS": {},
                 "CODEX_BINARY_IDENTITY": None,
                 "refresh_codex_app_server_binary": AsyncMock(),
+                "refresh_codex_app_server_login": AsyncMock(), "CODEX_LOGIN_REVISION": None,
                 "retain_codex_manager_caller": Mock(), "schedule_codex_manager_drain": Mock(),
                 "session_provider_id": lambda session: session.get("codex_thread_id"),
                 "CODEX_APP_SERVER_MANAGER_EPOCH": 0, "CODEX_GOALS_CONFIG_LOCK": asyncio.Lock(),

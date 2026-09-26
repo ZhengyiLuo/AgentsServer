@@ -929,7 +929,6 @@ CODEX_APP_SERVER_MAX_LOADED_THREADS = max(
 )
 CODEX_RESUME_ACTIVITY_TIMEOUT_SECONDS = int(agentsdock_setting("CODEX_RESUME_ACTIVITY_TIMEOUT_SECONDS", "120"))
 RUNTIME_CATALOG_TIMEOUT_SECONDS = float(agentsdock_setting("RUNTIME_CATALOG_TIMEOUT_SECONDS", "6"))
-CLAUDE_AUTH_PROBE_TIMEOUT_SECONDS = float(agentsdock_setting("CLAUDE_AUTH_PROBE_TIMEOUT_SECONDS", "15"))
 # Leave room for HTTP/JSON overhead before desktop and mobile's 30s deadline.
 RUNTIME_CATALOG_BUDGET_SECONDS = 25.0
 RUNTIME_CATALOG_DEADLINE: ContextVar[float | None] = ContextVar(
@@ -14096,6 +14095,8 @@ CODEX_SESSION_APP_SERVER_MANAGERS: dict[str, CodexAppServerManager] = {}
 CODEX_BINARY_IDENTITY: tuple[Any, ...] | None = None
 CODEX_BINARY_CHECKED_AT = 0.0
 CODEX_BINARY_PROBE_LOCK = asyncio.Lock()
+CODEX_LOGIN_PROBE_LOCK = asyncio.Lock()
+CODEX_LOGIN_REVISION: codex_auth.LoginRevision | None = None
 CODEX_MANAGER_DRAIN_TASK: asyncio.Task[Any] | None = None
 CODEX_MANAGER_DRAIN_REQUESTED = False
 CODEX_MANAGER_CLOSING = False
@@ -55196,8 +55197,8 @@ def retain_codex_manager_caller(manager: CodexAppServerManager, session_id: str)
     users[task] = session_id
 
 
-def codex_manager_has_callers(manager: CodexAppServerManager, session_id: str | None = None) -> bool:
-    return any(not task.done() and (session_id is None or not owner or owner == session_id)
+def codex_manager_has_callers(manager: CodexAppServerManager, session_id: str | None = None, *, ignore_task=None) -> bool:
+    return any(task is not ignore_task and not task.done() and (session_id is None or not owner or owner == session_id)
                for task, owner in tuple(getattr(manager, "_agentsdock_callers", {}).items()))
 
 
@@ -55252,20 +55253,133 @@ async def refresh_codex_app_server_binary(*, force: bool = False) -> None:
     schedule_codex_manager_drain()
 
 
-def codex_manager_session_busy(manager: CodexAppServerManager, session_id: str) -> bool:
+async def refresh_codex_app_server_login(*, request_handoff: bool = False) -> None:
+    """Change normal-Codex admission; never kill a credential-owning process.
+
+    Ordinary lookups use a conservative native file revision. Recheck CLIs is
+    an explicit handoff request, also covering keyring and same-account logins
+    without an OIDC auth_time. This is not a token refresh or login operation.
+    """
+    global CODEX_APP_SERVER_MANAGER, CODEX_LOGIN_REVISION
+    if CODEX_TRANSPORT == CODEX_TRANSPORT_EXEC or CODEX_AUTH_LOCK.locked() or CODEX_MANAGER_CLOSING:
+        return
+    async with CODEX_LOGIN_PROBE_LOCK:
+        if not await asyncio.to_thread(codex_auth.native_login_handoff_supported,
+                codex_app_server_env(), cwd=existing_cwd(DEFAULT_CWD)):
+            return
+        revision = await asyncio.to_thread(codex_auth.native_login_revision,
+            codex_app_server_env(), cwd=existing_cwd(DEFAULT_CWD))
+        async with CODEX_GOALS_CONFIG_LOCK:
+            async with CODEX_APP_SERVER_MANAGER_LOCK:
+                if CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH is not None or CODEX_AUTH_LOCK.locked() or CODEX_MANAGER_CLOSING:
+                    return
+                observed_change = revision is not None and revision != CODEX_LOGIN_REVISION
+                CODEX_LOGIN_REVISION = revision
+                if observed_change or request_handoff:
+                    expire_codex_login_diagnostic()
+                for manager in codex_app_server_managers():
+                    if getattr(manager, "_agentsdock_provider_revision", None):
+                        continue
+                    previous = getattr(manager, "_agentsdock_login_revision", None)
+                    changed = revision is not None and revision != previous
+                    if changed or request_handoff:
+                        manager._agentsdock_login_superseded = True
+                        if not any(manager is item for item in CODEX_RETIRED_APP_SERVER_MANAGERS):
+                            CODEX_RETIRED_APP_SERVER_MANAGERS.append(manager)
+                        if CODEX_APP_SERVER_MANAGER is manager:
+                            CODEX_APP_SERVER_MANAGER = None
+    schedule_codex_manager_drain()
+
+
+def codex_manager_session_busy(manager: CodexAppServerManager, session_id: str, *, ignore_task=None, ignore_maintenance=False) -> bool:
     session = STORE.sessions.get(session_id) or {}
     return bool(
         session_id in BUSY_SESSIONS or ACTIVE.get(session_id) is not None
-        or session_id in SERVER_MAINTENANCE_SESSIONS
-        or codex_manager_has_callers(manager, session_id)
+        or (not ignore_maintenance and session_id in SERVER_MAINTENANCE_SESSIONS)
+        or codex_manager_has_callers(manager, session_id, ignore_task=ignore_task)
         or codex_manager_has_callbacks(manager)
-        or any(session_registry_has_live_tasks(registry, session_id) for registry in (
-            SESSION_TURN_TASKS, CODEX_NATIVE_ACTION_TASKS, CODEX_INTERACTION_HANDLER_TASKS))
+        or any(task is not ignore_task and not task.done()
+            for registry in (SESSION_TURN_TASKS, CODEX_NATIVE_ACTION_TASKS, CODEX_INTERACTION_HANDLER_TASKS)
+            for task in registry.get(session_id, ()))
         or any(item.get("session_id") == session_id for item in CODEX_PENDING_INTERACTIONS.values())
+        or session_id in SIDE_QUESTIONS.active_session_ids()
         or (isinstance(session.get("codex_goal"), dict)
             and session["codex_goal"].get("status") == "active")
         or codex_session_has_live_subagents(session_id)
     )
+
+
+async def release_idle_codex_manager_session(manager: CodexAppServerManager, session_id: str, *, ignore_task=None) -> bool:
+    """Called under the session lifecycle lock; retain ownership on any doubt."""
+    def blocked(*, own_maintenance=False):
+        return (codex_manager_session_busy(manager, session_id, ignore_task=ignore_task,
+                    ignore_maintenance=own_maintenance)
+                or bool(manager.client._pending or manager.client._server_request_tasks))
+
+    if blocked():
+        return False
+    deadline = time.monotonic() + 8.0
+    SERVER_MAINTENANCE_SESSIONS.add(session_id)
+    try:
+        threads = [thread for thread in tuple(manager.client._loaded_threads)
+                   if codex_session_id_for_thread(thread) == session_id]
+        for thread in threads:
+            if time.monotonic() >= deadline:
+                return False
+            if (thread in CODEX_APP_SERVER_PINNED_THREADS or thread in CODEX_INTERACTIVE_CONTROL_THREADS
+                    or manager.active_turn(thread) is not None):
+                return False
+            try:
+                goal = await asyncio.wait_for(manager.get_thread_goal(thread), timeout=min(3.0, deadline - time.monotonic()))
+            except CodexAppServerRequestError as exc:
+                if exc.code not in {-32600, -32601}:
+                    raise
+                goal = None
+            if isinstance(goal, dict) and goal.get("status") == "active":
+                return False
+            try:
+                terminals = await asyncio.wait_for(manager.list_background_terminals(thread), timeout=min(3.0, deadline - time.monotonic()))
+            except CodexAppServerRequestError as exc:
+                if exc.code not in {-32600, -32601}:
+                    raise
+                terminals = []
+            # Those metadata requests yielded. A new borrower or native
+            # request may now own the process even without a registered turn.
+            if terminals or blocked(own_maintenance=True):
+                return False
+            evicted = await asyncio.wait_for(evict_codex_app_server_thread(manager, thread, reinsert_on_failure=True),
+                timeout=max(0.0, deadline - time.monotonic()))
+            if not evicted or manager.is_thread_loaded(thread):
+                return False
+        if blocked(own_maintenance=True):
+            return False
+        if CODEX_SESSION_APP_SERVER_MANAGERS.get(session_id) is manager:
+            CODEX_SESSION_APP_SERVER_MANAGERS.pop(session_id, None)
+            CODEX_GOAL_SYNC_GENERATIONS.pop(session_id, None)
+        return True
+    except Exception:
+        logger.debug("Codex handoff retained an unverified idle owner", exc_info=True)
+        return False
+    finally:
+        SERVER_MAINTENANCE_SESSIONS.discard(session_id)
+
+
+async def prepare_codex_login_turn(session: dict[str, Any]) -> None:
+    """Pre-admission handoff under the chat lock, before message acceptance."""
+    if CODEX_TRANSPORT == CODEX_TRANSPORT_EXEC or codex_provider.session_choice(session.get("codex_provider")) == "custom":
+        return
+    await refresh_codex_app_server_login()
+    session_id = str(session.get("id") or "")
+    manager = existing_codex_app_server_manager(session)
+    if getattr(manager, "_agentsdock_login_superseded", False) is not True:
+        return
+    # Busy messages retain the normal durable queue path. Promotion repeats
+    # this preflight after the accepted prior turn has settled; no replay.
+    if session_id in BUSY_SESSIONS or ACTIVE.get(session_id) is not None:
+        return
+    if not await release_idle_codex_manager_session(manager, session_id, ignore_task=asyncio.current_task()):
+        raise TransientAdmissionWait(409, codex_auth.HANDOFF_MESSAGE)
+    schedule_codex_manager_drain()
 
 
 async def drain_retired_codex_managers() -> None:
@@ -55285,43 +55399,7 @@ async def drain_retired_codex_managers() -> None:
                 if lock.locked():
                     continue  # Never invert the session -> manager lock order.
                 async with lock:
-                    if codex_manager_session_busy(manager, session_id):
-                        continue
-                    SERVER_MAINTENANCE_SESSIONS.add(session_id)
-                    try:
-                        threads = [thread for thread in tuple(manager.client._loaded_threads)
-                                   if codex_session_id_for_thread(thread) == session_id]
-                        for thread in threads:
-                            if (thread in CODEX_APP_SERVER_PINNED_THREADS
-                                    or thread in CODEX_INTERACTIVE_CONTROL_THREADS
-                                    or manager.active_turn(thread) is not None):
-                                break
-                            try:
-                                goal = await asyncio.wait_for(manager.get_thread_goal(thread), timeout=3.0)
-                            except CodexAppServerRequestError as exc:
-                                if exc.code not in {-32600, -32601}:
-                                    raise
-                                goal = None
-                            if isinstance(goal, dict) and goal.get("status") == "active":
-                                break
-                            try:
-                                terminals = await asyncio.wait_for(manager.list_background_terminals(thread), timeout=3.0)
-                            except CodexAppServerRequestError as exc:
-                                if exc.code not in {-32600, -32601}:
-                                    raise
-                                terminals = []
-                            if terminals or not await evict_codex_app_server_thread(manager, thread, reinsert_on_failure=True):
-                                break
-                        else:
-                            if (CODEX_SESSION_APP_SERVER_MANAGERS.get(session_id) is manager
-                                    and not codex_manager_has_callers(manager, session_id)
-                                    and not codex_manager_has_callbacks(manager)):
-                                CODEX_SESSION_APP_SERVER_MANAGERS.pop(session_id, None)
-                                CODEX_GOAL_SYNC_GENERATIONS.pop(session_id, None)
-                    except Exception:
-                        logger.debug("Codex CLI refresh retained an unverified idle owner", exc_info=True)
-                    finally:
-                        SERVER_MAINTENANCE_SESSIONS.discard(session_id)
+                    await release_idle_codex_manager_session(manager, session_id)
             client = manager.client
             if (any(owner is manager for owner in CODEX_SESSION_APP_SERVER_MANAGERS.values())
                     or codex_manager_has_callers(manager) or client._loaded_threads
@@ -55330,8 +55408,15 @@ async def drain_retired_codex_managers() -> None:
                 continue
             # Keep the exact object registered until close has settled;
             # shutdown can still discover and close it on cancellation.
-            await manager.close()
-            CODEX_RETIRED_APP_SERVER_MANAGERS.remove(manager)
+            async with client._start_lock:
+                # Recheck after waiting: a pending resume/start or caller can
+                # appear without a native turn. Never discard that generation.
+                if (codex_manager_has_callers(manager) or client._loaded_threads
+                        or client._pending or client._server_request_tasks or codex_manager_has_callbacks(manager)
+                        or any(not turn._completed for turn in client._turns_by_thread.values())):
+                    continue
+                await manager.close()
+                CODEX_RETIRED_APP_SERVER_MANAGERS.remove(manager)
 
 
 def existing_codex_app_server_manager(sess: dict[str, Any] | None = None) -> CodexAppServerManager | None:
@@ -55369,7 +55454,7 @@ def existing_codex_app_server_manager_for_thread(thread_id: str) -> CodexAppServ
 async def codex_app_server_manager_for_thread(thread_id: str) -> CodexAppServerManager:
     session_id = codex_session_id_for_thread(thread_id)
     if session_id and session_id in STORE.sessions:
-        return await codex_app_server_manager(STORE.sessions[session_id])
+        return await codex_app_server_manager(STORE.sessions[session_id], allow_retired_login=True)
     owner = existing_codex_app_server_manager_for_thread(thread_id)
     if owner is not None:
         retain_codex_manager_caller(owner, "")
@@ -55382,6 +55467,9 @@ async def codex_app_server_manager_for_thread(thread_id: str) -> CodexAppServerM
 
 async def prepare_codex_app_server_process(manager: CodexAppServerManager, selected: dict | None) -> None:
     manager._agentsdock_binary_identity = await asyncio.to_thread(codex_binary_identity)
+    if not selected:
+        manager._agentsdock_login_revision = await asyncio.to_thread(codex_auth.native_login_revision,
+            codex_app_server_env(), cwd=existing_cwd(DEFAULT_CWD))
     if selected:
         await codex_provider.prepare_native_catalog(
             CODEX_BIN, codex_app_server_env(), CODEX_PROVIDER_STORE.root / "native-models.json")
@@ -55424,12 +55512,13 @@ async def observe_claude_provider_usage(session_id: str, generation: str, messag
         await broadcast_provider_usage_changed(session_id, BACKEND_CLAUDE)
 
 
-async def codex_app_server_manager(sess: dict[str, Any] | None = None) -> CodexAppServerManager:
+async def codex_app_server_manager(sess: dict[str, Any] | None = None, *, allow_retired_login: bool = False) -> CodexAppServerManager:
     """Keep normal Codex stable; custom credentials own immutable managers."""
     global CODEX_APP_SERVER_MANAGER
     global CODEX_APP_SERVER_MANAGER_EPOCH
     ensure_provider_manager_factory_admission(codex=True)
     await refresh_codex_app_server_binary()
+    await refresh_codex_app_server_login()
     selected = CODEX_PROVIDER_STORE.for_session(sess, include_key=True) if sess is not None else None
     revision = selected["credential_id"] if selected else None
     session_id = str((sess or {}).get("id") or "")
@@ -55445,6 +55534,10 @@ async def codex_app_server_manager(sess: dict[str, Any] | None = None) -> CodexA
             manager = None
         manager = manager or (CODEX_CUSTOM_APP_SERVER_MANAGERS.get(revision) if revision else CODEX_APP_SERVER_MANAGER)
         if manager is not None:
+            if (getattr(manager, "_agentsdock_login_superseded", False) is True and not allow_retired_login
+                    and getattr(manager, "_agentsdock_callers", {}).get(asyncio.current_task()) != session_id):
+                schedule_codex_manager_drain()
+                raise TransientAdmissionWait(409, codex_auth.HANDOFF_MESSAGE)
             if session_id:
                 CODEX_SESSION_APP_SERVER_MANAGERS[session_id] = manager
             retain_codex_manager_caller(manager, session_id)
@@ -55501,6 +55594,7 @@ async def codex_app_server_manager(sess: dict[str, Any] | None = None) -> CodexA
                 manager.add_notification_handler(schedule_codex_manager_drain)
                 manager._agentsdock_binary_identity = CODEX_BINARY_IDENTITY
                 manager._agentsdock_provider_revision = revision
+                manager._agentsdock_login_revision = CODEX_LOGIN_REVISION if not selected else None
                 CODEX_APP_SERVER_MANAGER_EPOCH += 1
                 if revision:
                     CODEX_CUSTOM_APP_SERVER_MANAGERS[revision] = manager
@@ -56098,6 +56192,9 @@ async def acquire_codex_control_thread(
             detail="Codex controls require the app-server transport",
         )
 
+    if reserve_session:
+        await prepare_codex_login_turn(session)
+
     reserved = False
     reservation_id = (
         f"codexcontrol_{uuid.uuid4().hex[:16]}" if reserve_session else ""
@@ -56208,7 +56305,7 @@ async def acquire_codex_control_thread(
             return manager, thread_id, dict(
                 STORE.sessions.get(session_id) or session
             )
-        manager = await codex_app_server_manager(session)
+        manager = await codex_app_server_manager(session, allow_retired_login=not reserve_session)
         await manager.start()
         cwd = existing_cwd(str(session.get("cwd") or DEFAULT_CWD))
         thread_id, _instruction_hash = await ensure_codex_app_server_thread(
@@ -58070,7 +58167,10 @@ def runtime_action(
         return f"Install {runtime_display_name(backend)} for the server user, make `{public_executable}` available on PATH, then restart the agent server."
     if status == "unauthenticated":
         if backend == BACKEND_CLAUDE:
-            command = "claude auth login"
+            return (
+                "Run `claude auth login` as the server user, then retry your "
+                "message. Claude checks sign-in during the actual request."
+            )
         elif backend == BACKEND_OPENCODE:
             command = "opencode auth login"
         elif backend == BACKEND_CURSOR:
@@ -58084,7 +58184,10 @@ def runtime_action(
         return f"Run `{command}` as the server user, then click Recheck CLIs."
     if status == "error":
         if backend == BACKEND_CLAUDE:
-            command = "claude auth status"
+            return (
+                f"Run `{public_executable} --version` as the server user to "
+                "check the Claude installation, then retry your message."
+            )
         elif backend == BACKEND_OPENCODE:
             return (
                 "Run `opencode --version`, `opencode auth list`, and "
@@ -58438,15 +58541,24 @@ def probe_runtime(backend: str) -> dict[str, Any]:
         )
 
     if backend == BACKEND_CLAUDE:
-        auth_cmd = [resolved, "auth", "status", "--json"]
-    else:
-        auth_cmd = [resolved, "login", "status"]
-    try:
-        auth_result = (
-            runtime_command(auth_cmd, timeout_seconds=CLAUDE_AUTH_PROBE_TIMEOUT_SECONDS)
-            if backend == BACKEND_CLAUDE
-            else runtime_command(auth_cmd)
+        # Even `auth status` can start OAuth renewal during CLI initialization
+        # and exit before the replacement credential is saved. Never invoke it
+        # for startup, catalog refresh, manual recheck, or turn admission.
+        # Actual Claude runs own authentication and update the cached result.
+        return runtime_diagnostic_payload(
+            backend,
+            "unknown",
+            installed=True,
+            authenticated=None,
+            version=version,
+            message=(
+                "Claude Code is installed. Authentication will be checked by "
+                "Claude when you send a message."
+            ),
         )
+    auth_cmd = [resolved, "login", "status"]
+    try:
+        auth_result = runtime_command(auth_cmd)
     except subprocess.TimeoutExpired:
         logger.warning("%s authentication check timed out", backend)
         return runtime_diagnostic_payload(
@@ -58473,15 +58585,6 @@ def probe_runtime(backend: str) -> dict[str, Any]:
         )
 
     combined = f"{auth_result.stdout}\n{auth_result.stderr}"
-    if backend == BACKEND_CLAUDE and auth_result.stdout.strip():
-        try:
-            auth_payload = json.loads(auth_result.stdout)
-        except (TypeError, ValueError):
-            auth_payload = None
-        if isinstance(auth_payload, dict) and auth_payload.get("loggedIn") is False:
-            return runtime_diagnostic_payload(backend, "unauthenticated", installed=True, authenticated=False, version=version)
-        if isinstance(auth_payload, dict) and auth_payload.get("loggedIn") is True:
-            return runtime_diagnostic_payload(backend, "ready", installed=True, authenticated=True, version=version)
     if auth_result.returncode == 0:
         return runtime_diagnostic_payload(backend, "ready", installed=True, authenticated=True, version=version)
     if auth_failure_text(combined):
@@ -58504,11 +58607,20 @@ def store_runtime_diagnostic(diagnostic: dict[str, Any], *, preserve_last_error:
         return dict(current)
 
 
+def expire_codex_login_diagnostic() -> None:
+    """A login hint requires new native evidence, never reuse a cached denial."""
+    with RUNTIME_DIAGNOSTICS_LOCK:
+        current = dict(RUNTIME_DIAGNOSTICS.get(BACKEND_CODEX) or runtime_diagnostic_payload(
+            BACKEND_CODEX, "unknown", installed=None, authenticated=None))
+        current["checked_at_epoch"] = 0.0
+        store_runtime_diagnostic(current)
+
+
 def runtime_diagnostic(backend: str, *, force: bool = False) -> dict[str, Any]:
     with RUNTIME_DIAGNOSTICS_LOCK:
         cached = dict(RUNTIME_DIAGNOSTICS.get(backend) or {})
         generation = RUNTIME_DIAGNOSTIC_GENERATIONS.get(backend, 0)
-    checked_at = cached.get("checked_at_epoch")
+    checked_at = cached.get("_installation_checked_at_epoch", cached.get("checked_at_epoch"))
     if not force and isinstance(checked_at, (int, float)) and time.time() - checked_at < RUNTIME_DIAGNOSTIC_TTL_SECONDS:
         return cached
     try:
@@ -58535,6 +58647,21 @@ def runtime_diagnostic(backend: str, *, force: bool = False) -> dict[str, Any]:
             current = dict(RUNTIME_DIAGNOSTICS.get(backend) or {})
             if current:
                 return current
+        if (
+            backend == BACKEND_CLAUDE
+            and probed.get("status") == "unknown"
+            and probed.get("installed") is True
+            and cached.get("status") in {"ready", "unauthenticated"}
+        ):
+            # Rechecking the executable is not new authentication evidence.
+            # Preserve the native run's timestamp and error as well as status;
+            # cache installation checks separately so each turn need not probe.
+            probed = {
+                **cached,
+                "installed": True,
+                "version": probed.get("version"),
+                "_installation_checked_at_epoch": probed.get("checked_at_epoch"),
+            }
         return store_runtime_diagnostic(probed)
 
 
@@ -58580,6 +58707,8 @@ def record_runtime_failure(
         if auth_failure is not None
         else auth_failure_text(text)
     )
+    if backend == BACKEND_CLAUDE and auth_failure is None:
+        is_auth_failure = is_auth_failure or "oauth session expired and could not be refreshed" in lower
     if is_auth_failure:
         current = runtime_diagnostic_payload(
             backend,
@@ -58629,6 +58758,7 @@ def record_runtime_success(backend: str) -> None:
         "ready",
         installed=True,
         authenticated=True,
+        message=("The last Claude request authenticated successfully." if backend == BACKEND_CLAUDE else None),
         version=previous.get("version"),
         executable=(
             str(previous.get("_executable") or "") or None
@@ -58641,6 +58771,14 @@ def record_runtime_success(backend: str) -> None:
 
 async def ensure_runtime_available(backend: str, *, session: dict[str, Any] | None = None) -> dict[str, Any]:
     diagnostic = await asyncio.to_thread(runtime_diagnostic, backend)
+    if (
+        backend == BACKEND_CLAUDE
+        and diagnostic.get("installed") is True
+        and diagnostic.get("status") in {"unknown", "ready", "unauthenticated"}
+    ):
+        # An unknown or previously rejected login must not prevent the native
+        # runtime from renewing it, or noticing an external login on retry.
+        return diagnostic
     if backend == BACKEND_CODEX and codex_provider.session_choice((session or {}).get("codex_provider")) == "custom":
         CODEX_PROVIDER_STORE.for_session(session)
         if CODEX_TRANSPORT != CODEX_TRANSPORT_EXEC and diagnostic.get("installed") is True:
@@ -71994,7 +72132,8 @@ async def run_codex_app_server(
                 failure_kind = codex_provider.classify_failure(terminal_error)
                 if failure_kind != "failed":
                     terminal_error = codex_provider.test_result(failure_kind)["message"]
-            if codex_provider.session_choice(sess.get("codex_provider")) == "default":
+            if (codex_provider.session_choice(sess.get("codex_provider")) == "default"
+                    and getattr(manager, "_agentsdock_login_superseded", False) is not True):
                 record_runtime_failure(BACKEND_CODEX, terminal_error)
             if not error_emitted:
                 await append_event(session_id, "error", {
@@ -72004,7 +72143,8 @@ async def run_codex_app_server(
                     "transport": CODEX_TRANSPORT_APP_SERVER,
                     **current_metadata(),
                 })
-        elif not stopped and codex_provider.session_choice(sess.get("codex_provider")) == "default":
+        elif (not stopped and codex_provider.session_choice(sess.get("codex_provider")) == "default"
+                and getattr(manager, "_agentsdock_login_superseded", False) is not True):
             record_runtime_success(BACKEND_CODEX)
 
         await flush_pending_unknown(
@@ -72672,6 +72812,8 @@ async def _start_turn_locked(
         ),
         runtime_validation_patch,
     )
+    if str(runtime_preview_session.get("backend") or DEFAULT_BACKEND).strip().lower() == BACKEND_CODEX:
+        await prepare_codex_login_turn(runtime_preview_session)
     opencode_cwd: str | None = None
     opencode_execution_key: tuple[str] | None = None
     if str(
@@ -82660,6 +82802,8 @@ def require_native_admin_control(request: Request) -> None:
 @asynccontextmanager
 async def codex_auth_operation(*, mutate: bool, existing_only: bool = False):
     """Fence native authentication changes with the existing Codex admission barrier."""
+    if not mutate:
+        await refresh_codex_app_server_login()
     async with CODEX_AUTH_LOCK:
         reserved = False
         try:
@@ -85987,10 +86131,10 @@ async def host_diagnostics(limit: int = 40) -> dict[str, Any]:
 
 @app.get("/api/runtime/catalog")
 async def runtime_catalog(refresh: bool = False) -> dict[str, Any]:
-    catalog = await asyncio.to_thread(discover_runtime_catalog, force_runtime_probe=refresh)
     if refresh:
         await refresh_codex_app_server_binary(force=True)
-    return catalog
+        await refresh_codex_app_server_login(request_handoff=True)
+    return await asyncio.to_thread(discover_runtime_catalog, force_runtime_probe=refresh)
 
 
 @app.get("/api/runtime/usage")
@@ -86014,7 +86158,7 @@ async def runtime_provider_usage(
             result = provider_usage.unavailable(backend, "unsupported_transport")
         else:
             try:
-                manager = await codex_app_server_manager(session)
+                manager = await codex_app_server_manager(session, allow_retired_login=True)
                 result = await PROVIDER_USAGE.read_codex(manager, refresh=refresh)
             except Exception:
                 result = provider_usage.unavailable(backend, "temporarily_unavailable")
@@ -87616,6 +87760,8 @@ async def load_codex_runtime(session_id: str) -> dict[str, Any]:
         # not turn merely selecting a chat into thread/start.
         if not provider_id:
             return await codex_runtime_snapshot(session_id)
+
+        await prepare_codex_login_turn(session)
 
         manager: CodexAppServerManager | None = None
         maintenance_reserved = False

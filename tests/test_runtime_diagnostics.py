@@ -24,6 +24,27 @@ class RuntimeDiagnosticTests(unittest.TestCase):
             agent_server.RUNTIME_DIAGNOSTICS.clear()
             agent_server.RUNTIME_DIAGNOSTIC_GENERATIONS.clear()
 
+    def test_codex_login_hint_expires_cached_denial_without_claiming_authentication(self):
+        agent_server.record_runtime_failure("codex", "Not logged in")
+        agent_server.expire_codex_login_diagnostic()
+        expired = agent_server.RUNTIME_DIAGNOSTICS["codex"]
+        self.assertEqual(expired["status"], "unauthenticated")
+        self.assertEqual(expired["checked_at_epoch"], 0)
+        fresh = agent_server.runtime_diagnostic_payload("codex", "ready", installed=True, authenticated=True)
+        with patch.object(agent_server, "probe_runtime", return_value=fresh) as probe:
+            self.assertEqual(agent_server.runtime_diagnostic("codex")["status"], "ready")
+        probe.assert_called_once_with("codex")
+
+    def test_codex_login_hint_fences_an_older_probe_and_leaves_recheck_due(self):
+        agent_server.record_runtime_success("codex")
+        def older_probe(_backend):
+            agent_server.expire_codex_login_diagnostic()
+            return agent_server.runtime_diagnostic_payload("codex", "unauthenticated", installed=True, authenticated=False)
+        with patch.object(agent_server, "probe_runtime", side_effect=older_probe):
+            result = agent_server.runtime_diagnostic("codex", force=True)
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["checked_at_epoch"], 0)
+
     def test_missing_runtime_is_explicit(self) -> None:
         with patch.object(agent_server.shutil, "which", return_value=None):
             diagnostic = agent_server.probe_runtime(agent_server.BACKEND_CLAUDE)
@@ -87,22 +108,17 @@ class RuntimeDiagnosticTests(unittest.TestCase):
         self.assertTrue(capability["available"])
         self.assertFalse(capability["required"])
 
-    def test_claude_ready_probe_does_not_expose_identity(self) -> None:
-        responses = [
-            completed(["claude", "--version"], stdout="2.3.4 (Claude Code)\n"),
-            completed(
-                ["claude", "auth", "status", "--json"],
-                stdout=json.dumps({"loggedIn": True, "email": "private@example.com", "organizationName": "Secret"}),
-            ),
-        ]
+    def test_claude_probe_does_not_read_account_identity(self) -> None:
         with patch.object(agent_server.shutil, "which", return_value="/usr/local/bin/claude"), patch.object(
-            agent_server, "runtime_command", side_effect=responses
-        ):
+            agent_server, "runtime_command",
+            return_value=completed(["claude", "--version"], stdout="2.3.4 (Claude Code)\n"),
+        ) as command:
             diagnostic = agent_server.probe_runtime(agent_server.BACKEND_CLAUDE)
-        self.assertEqual(diagnostic["status"], "ready")
+        command.assert_called_once_with(["/usr/local/bin/claude", "--version"])
+        self.assertEqual(diagnostic["status"], "unknown")
         self.assertEqual(diagnostic["version"], "2.3.4 (Claude Code)")
-        self.assertNotIn("private@example.com", json.dumps(diagnostic))
-        self.assertNotIn("Secret", json.dumps(diagnostic))
+        self.assertIsNone(diagnostic["authenticated"])
+        self.assertIsNone(diagnostic["action"])
 
     def test_codex_auth_failure_is_actionable(self) -> None:
         responses = [

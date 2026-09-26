@@ -788,7 +788,6 @@ without losing chat state:
 | `AGENTSDOCK_CLAUDE_SDK_MAX_LOADED_CHATS` | Maximum retained per-chat SDK clients | `4` |
 | `CODEX_BIN` | Codex executable name/path | `codex` |
 | `AGENTSDOCK_RUNTIME_CATALOG_TIMEOUT_SECONDS` | Per-command CLI version/help/model probe timeout | `6` |
-| `AGENTSDOCK_CLAUDE_AUTH_PROBE_TIMEOUT_SECONDS` | Separate timeout for `claude auth status --json` | `15` |
 | `AGENTSDOCK_RUNTIME_DIAGNOSTIC_TTL_SECONDS` | Cache lifetime for safe CLI version/auth probes | `60` |
 | `CLAUDE_PROJECTS_ROOT` | Claude history search root | `~/.claude/projects` |
 | `CODEX_SESSIONS_ROOT` | Codex history search root | `~/.codex/sessions` |
@@ -807,8 +806,8 @@ Runtime catalog refreshes share a 25-second CLI/network-probe budget so they
 can finish before the desktop and mobile clients' 30-second request timeout.
 Provider health checks run concurrently so a slow provider cannot prevent the
 others from being checked.
-The Claude authentication timeout is independent of the six-second version,
-help, and model probes. A timeout does not establish that a user is signed out.
+Claude checks only its installation and CLI capabilities; it does not run an
+authentication-status command. A timeout does not establish that a user is signed out.
 If the refresh budget is exhausted, unfinished checks keep any prior diagnostic
 with its original timestamp; providers without a prior result are reported as
 unknown, not missing or unauthenticated. Model discovery uses its existing
@@ -945,19 +944,48 @@ GET /api/runtime/catalog?refresh=true
 ```
 
 The health response includes cached `runtimes` entries. The catalog endpoint's
-`refresh=true` query forces a fresh version/authentication probe. Each backend
-reports `ready`, `missing`, `unauthenticated`, or probe `error`, plus an
+`refresh=true` query forces a fresh runtime probe. Each backend
+reports `ready`, `missing`, `unauthenticated`, `unknown`, or probe `error`, plus an
 actionable recovery instruction. It never returns account identity, auth
 output, or tokens.
+
+Claude startup, automatic refresh, manual **Recheck CLIs**, and turn admission
+never execute `claude auth status`. Short-lived auth-status commands can start
+OAuth renewal and exit before persisting the replacement credential (see
+[upstream report #95822](https://github.com/anthropics/claude-code/issues/95822)).
+Authentication readiness is recorded from real native Claude requests. Before
+the first request, an installed Claude reports `unknown` with `authenticated: null`;
+the desktop client can still start a chat. Updated desktop clients keep this
+passive authentication state in Settings rather than warning in the composer
+before a send. A cached backend-wide login failure is not evidence that a
+different chat has failed; the composer shows its own latest run error.
+Installation checks retain
+the last native authentication result and its original timestamp rather than
+claiming to have checked the account again. A successful request clears the
+previous authentication error. After an external `claude auth login`, retry the
+message; rechecking the installation alone does not prove a successful login.
+The former `AGENTSDOCK_CLAUDE_AUTH_PROBE_TIMEOUT_SECONDS` setting is no longer used.
+
+This removes standalone authentication monitoring, not every native Claude
+process started by the catalog. [Native model discovery](CLAUDE_MODEL_DISCOVERY.md)
+still initializes disposable SDK processes using the native authentication
+environment. Its behavior during token renewal and process termination has not
+been validated by the passive-readiness tests. Do not treat a successful model
+list as authentication evidence or this change as a guarantee against all
+native login failures.
 
 Cursor capability contract v2 advertises the hardened process guard, bounded
 idle warning/timeout lifecycle, and explicit permission-mode semantics.
 
-A new prompt performs the same preflight before reserving real agent work. If
+A new prompt performs installation preflight before reserving real agent work. If
 the selected CLI is unavailable, the endpoint returns a structured
 `503 runtime_unavailable` response. Failures after a healthy launch remain a
 `last_error` on a ready runtime so model overloads, bad thread IDs, and ordinary
 provider failures are not mislabeled as missing installations.
+Claude permits a native retry when authentication is unknown or previously
+failed, so an external login can take effect without a server restart. Missing
+or broken executables still block admission. Other providers keep their own
+existing readiness checks.
 
 ## Agent-managed scheduled jobs
 

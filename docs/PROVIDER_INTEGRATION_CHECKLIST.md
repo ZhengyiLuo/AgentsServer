@@ -30,6 +30,10 @@ Describe differences and extra provider usage for server-provided equivalents.
   finished work. Clean up only owned processes and temporary resources.
 - [ ] Check native session ownership/locking: document how a chat can return to
   the native app/terminal. Closing a client is not proof the server released it.
+- [ ] Verify Delete releases this chat's owned provider runtime/lock before
+  reporting success, removes only AgentsDock-owned chat data, preserves native
+  history, and allows native app/CLI resume. Test cleanup failures and confirm
+  other chats are unaffected for each provider/version.
 
 ## 3. Reasoning, activity and tracing
 

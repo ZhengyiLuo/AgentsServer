@@ -35033,6 +35033,12 @@ def collect_semantic_timeline_events(
     page_repairs: list[dict[str, Any]] = []
     native_steer_retired_keys: set[str] = set()
     stopped_turn_keys: set[str] = set()
+    mailbox_interleaved_turn_keys: set[str] = set()
+    mailbox_turn_ranges = {
+        key: (int(landmark.get("start_seq") or 0), int(landmark.get("end_seq") or 0))
+        for key, landmark in selected_by_key.items()
+        if key.startswith("turn:")
+    }
     current_turn_by_run: dict[str, str] = {}
     current_job_timeline_group_by_run: dict[str, str] = {}
     current_job_attempt_by_run: dict[str, str] = {}
@@ -35137,6 +35143,17 @@ def collect_semantic_timeline_events(
                 key = f"event:{event.get('id') or seq}"
             elif cross_chat_key:
                 key = cross_chat_key
+                if event.get("delivery_mode") == "mailbox" and event_type in {
+                    "chat_conversation_message_registered", "chat_conversation_message_received",
+                    "chat_conversation_message_mailbox_migrated",
+                }:
+                    # Incoming mail has no run_id. Its arrival still separates
+                    # the public commentary of any turn spanning this sequence.
+                    # A later read receipt must not move that boundary.
+                    mailbox_interleaved_turn_keys.update(
+                        turn_key for turn_key, (start, end) in mailbox_turn_ranges.items()
+                        if start < seq < end
+                    )
                 is_target_delivery_event = (
                     event.get("purpose") == "cross_chat_handoff_delivery"
                 )
@@ -35464,6 +35481,7 @@ def collect_semantic_timeline_events(
                 preserve_completed_commentary=(
                     key in native_steer_retired_keys
                     or key in stopped_turn_keys
+                    or key in mailbox_interleaved_turn_keys
                     # A semantic full-tail refresh replaces the mobile
                     # snapshot. Completed commentary from the unfinished
                     # active turn is therefore durable display content, not

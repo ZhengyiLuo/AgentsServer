@@ -186,6 +186,112 @@ class AsyncChatTimelineIndexTests(unittest.TestCase):
         page = self.page()
         self.assertTrue(any(event.get("text") == "Agent answer" for event in page["events"]))
 
+    def test_completed_mailbox_turn_keeps_commentary_between_cards_on_reopen(self):
+        events = []
+
+        def emit(event_type, **fields):
+            seq = len(events) + 1
+            event = {
+                "id": f"event-{seq}", "seq": seq, "session_id": "recipient",
+                "ts": "2026-09-10T10:00:00Z", "type": event_type,
+                "run_id": "ordinary-run", **fields,
+            }
+            events.append(event)
+            return event
+
+        emit("turn_started", prompt="Work with the other chats")
+        commentary = []
+        cards = []
+        for section in range(6):
+            commentary.append(emit(
+                "reasoning_summary", phase="commentary",
+                text=f"Public progress paragraph {section}",
+                item_id=f"commentary-{section}",
+            ))
+            if section == 5:
+                continue
+            for offset in range(5):
+                number = section * 5 + offset
+                for tool in range(4):
+                    tool_id = f"tool-{number}-{tool}"
+                    emit("tool_started", tool_id=tool_id, tool_name="exec_command")
+                    emit("tool_finished", tool_id=tool_id, tool_name="exec_command")
+                incoming = number % 2 == 0
+                cards.append(emit(
+                    "chat_conversation_message_received" if incoming else "chat_conversation_message_registered",
+                    conversation_mode="async_route_v1", delivery_mode="mailbox",
+                    handoff_id=f"mail-{number}", cross_chat_envelope_id=f"mail-{number}",
+                    message_id=f"mail-{number}", conversation_id="pair_one",
+                    source_session_id="sender" if incoming else "recipient",
+                    target_session_id="recipient" if incoming else "sender",
+                    source_title="Research agent", target_title="Desktop agent",
+                    handoff_preview=f"Message {number}",
+                    run_id=None if incoming else "ordinary-run",
+                ))
+        final = emit("assistant_text", text="Final answer after all messages")
+        emit("turn_finished", result_text=final["text"])
+        self.append(*events)
+        original_anchors = [
+            item["start_seq"] for item in self.index()["landmarks"]
+            if item["key"].startswith("cross-chat:")
+        ]
+        first_read = len(events)
+        for card in cards:
+            emit("chat_conversation_message_read", **{
+                key: value for key, value in card.items()
+                if key not in {"id", "seq", "ts", "type", "run_id"}
+            }, run_id=None)
+        self.append(*events[first_read:])
+
+        expected = [event["seq"] for event in events if event in commentary or event in cards or event is final]
+        page = self.page(limit=100)
+        actual = [event["seq"] for event in page["events"] if (
+            event.get("phase") == "commentary"
+            or event["type"] in {"chat_conversation_message_received", "chat_conversation_message_registered", "assistant_text"}
+        )]
+        self.assertEqual(actual, expected)
+        self.assertLess(
+            sum(event["type"].startswith("tool_") for event in page["events"]),
+            sum(event["type"].startswith("tool_") for event in events),
+        )
+        self.assertEqual(
+            [item["start_seq"] for item in self.index()["landmarks"] if item["key"].startswith("cross-chat:")],
+            original_anchors,
+        )
+        self.assertEqual(original_anchors, [card["seq"] for card in cards])
+        self.ns["TIMELINE_INDEX_CACHE"].clear()
+        self.assertEqual(self.page(limit=100), page)
+
+        # The turn can be selected independently of the newer message cards.
+        # Incoming mail has no run_id, but still separates its public progress.
+        older = self.page(limit=1, semantic_before=cards[0]["seq"])
+        self.assertEqual(
+            [event["seq"] for event in older["events"] if event.get("phase") == "commentary"],
+            [event["seq"] for event in commentary],
+        )
+
+    def test_mail_read_update_does_not_expand_an_unrelated_completed_turn(self):
+        self.append(message(1, "received", delivery_mode="mailbox"), {
+            "id": "start", "seq": 2, "type": "turn_started",
+            "session_id": "recipient", "run_id": "later-run", "prompt": "Unrelated work",
+        }, {
+            "id": "commentary", "seq": 3, "type": "reasoning_summary", "phase": "commentary",
+            "session_id": "recipient", "run_id": "later-run", "text": "Earlier progress",
+        }, *({
+            "id": f"tool-{seq}", "seq": seq, "type": "tool_finished",
+            "session_id": "recipient", "run_id": "later-run", "tool_name": "exec_command",
+        } for seq in range(4, 44)), message(44, "read", delivery_mode="mailbox"), {
+            "id": "final", "seq": 45, "type": "assistant_text",
+            "session_id": "recipient", "run_id": "later-run", "text": "Final answer",
+        }, {
+            "id": "finished", "seq": 46, "type": "turn_finished",
+            "session_id": "recipient", "run_id": "later-run", "result_text": "Final answer",
+        })
+        page = self.page()
+        self.assertNotIn(3, [event["seq"] for event in page["events"]])
+        self.assertIn(45, [event["seq"] for event in page["events"]])
+        self.assertLess(len(page["events"]), 20)
+
     def test_legacy_handoff_and_exchange_keys_and_visibility_are_unchanged(self):
         self.append(message(1, "received", type="cross_chat_handoff_received", conversation_mode=None))
         self.assertEqual(self.index()["landmarks"][0]["key"], "cross_chat:handoff_one")

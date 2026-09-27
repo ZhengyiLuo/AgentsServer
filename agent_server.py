@@ -83068,6 +83068,11 @@ async def custom_codex_discovery_native_models() -> dict:
 
 app.include_router(provider_connections.create_router(
     authorize=require_native_admin_control, store=PROVIDER_CONNECTION_STORE,
+    account=lambda backend: provider_connections.native_account_metadata(
+        backend, env=runner_env(),
+        cursor_executable=shutil.which(CURSOR_BIN, path=runner_env().get("PATH")) if backend == BACKEND_CURSOR else None,
+        command=lambda cmd: runtime_command(cmd, timeout_seconds=4),
+    ),
 ))
 
 app.include_router(codex_provider.create_router(

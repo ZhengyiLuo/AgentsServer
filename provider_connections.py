@@ -416,7 +416,74 @@ async def probe(selected: dict) -> str:
         return "invalid_response"
 
 
-def create_router(*, authorize, store: ConnectionStore, check=probe) -> APIRouter:
+def native_account_metadata(backend: str, *, env=None, cursor_executable=None, command=None) -> dict:
+    """Allowlisted account display fields only; never log in or renew credentials.
+
+    Claude's profile is cached metadata, not proof of current authentication.
+    OpenCode can hold several providers and has no single email/subscription.
+    """
+    if backend not in {"claude", "cursor", "opencode"}:
+        raise HTTPException(400, "Unsupported CLI account.")
+    env = os.environ if env is None else env
+    result = {"backend": backend, "email": None, "plan_type": None, "source": "unavailable"}
+
+    def clean(value, *, email=False):
+        if not isinstance(value, str) or not 1 <= len(value) <= (254 if email else 80):
+            return None
+        if any(ord(c) < 32 or ord(c) == 127 for c in value):
+            return None
+        if email and not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value):
+            return None
+        return value
+
+    def document(path, limit):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+                    return {}
+                raw = stream.read(limit + 1)
+            value = json.loads(raw) if len(raw) <= limit else {}
+            return value if isinstance(value, dict) else {}
+        except (OSError, ValueError, RecursionError):
+            return {}
+
+    if backend == "claude":
+        # Environment credentials may represent an entirely different account.
+        if any(env.get(key) for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+                                       "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")):
+            return result
+        root = Path(env.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+        profile = document(root / ".claude.json" if env.get("CLAUDE_CONFIG_DIR") else Path.home() / ".claude.json", 2 * 1024 * 1024)
+        account = profile.get("oauthAccount")
+        oauth = document(root / ".credentials.json", 65536).get("claudeAiOauth")
+        if isinstance(account, dict):
+            result["email"] = clean(account.get("emailAddress"), email=True)
+        if isinstance(oauth, dict) and oauth.get("accessToken"):
+            result["plan_type"] = clean(oauth.get("subscriptionType"))
+        if result["email"] or result["plan_type"]:
+            result["source"] = "local_profile"
+    elif backend == "cursor" and cursor_executable and command and not env.get("CURSOR_API_KEY"):
+        from cursor_agent_client import parse_cursor_auth_status, parse_cursor_account_tier
+        try:
+            status = command([cursor_executable, "status"])
+            if status.returncode != 0:
+                return result
+            parsed = parse_cursor_auth_status(status.stdout + "\n" + status.stderr, executable_name=Path(cursor_executable).name)
+            if parsed.get("state") != "ready":
+                return result
+            result["email"] = clean(parsed.get("email"), email=True)
+            result["source"] = "cli"
+            about = command([cursor_executable, "about"])
+            if about.returncode == 0:
+                result["plan_type"] = clean(parse_cursor_account_tier(about.stdout + "\n" + about.stderr))
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return result
+
+
+def create_router(*, authorize, store: ConnectionStore, check=probe, account=native_account_metadata) -> APIRouter:
     router = APIRouter()
     locks = {name: asyncio.Lock() for name in PROTOCOLS}
 
@@ -444,6 +511,13 @@ def create_router(*, authorize, store: ConnectionStore, check=probe) -> APIRoute
 
     def reply(value):
         return JSONResponse(value, headers={"Cache-Control": "no-store"})
+
+    @router.get("/api/admin/provider-accounts/{backend}")
+    async def native_account(backend: str, request: Request):
+        authorize(request)
+        if backend not in {"claude", "cursor", "opencode"}:
+            raise HTTPException(400, "Unsupported CLI account.")
+        return reply(await asyncio.to_thread(account, backend))
 
     @router.get("/api/admin/provider-connections/{backend}")
     async def status(backend: str, request: Request):

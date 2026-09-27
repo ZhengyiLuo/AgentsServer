@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import tempfile
 import threading
+import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -52,6 +53,36 @@ class SettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.root.stat().st_mode & 0o777, 0o700)
         self.assertFalse(self.store.public("opencode")["configured"])
         self.ns["codex_app_server_manager"].assert_not_awaited()
+
+    def test_account_metadata_requires_native_admin_and_never_changes_auth(self):
+        path = "/api/admin/provider-accounts/opencode"
+        self.assertNotEqual(self.client.get(path).status_code, 200)
+        self.assertEqual(self.client.get(path, headers={**NATIVE, "Origin": "https://example.test"}).status_code, 403)
+        result = self.client.get(path, headers=NATIVE)
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.headers["cache-control"], "no-store")
+        self.assertEqual(result.json(), {"backend": "opencode", "email": None, "plan_type": None, "source": "unavailable"})
+        self.check.assert_not_awaited()
+    def test_cached_claude_fields_are_allowlisted_and_env_identity_is_not_misattributed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / ".claude").mkdir()
+            (root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "fixture@example.test", "other": "private"}}))
+            (root / ".claude/.credentials.json").write_text(json.dumps({"claudeAiOauth": {"accessToken": KEY, "subscriptionType": "max"}}))
+            with patch.object(Path, "home", return_value=root), patch.object(connections.subprocess, "run") as process:
+                result = connections.native_account_metadata("claude", env={})
+                self.assertEqual(result, {"backend": "claude", "email": "fixture@example.test", "plan_type": "max", "source": "local_profile"})
+                self.assertNotIn(KEY, json.dumps(result))
+                self.assertIsNone(connections.native_account_metadata("claude", env={"ANTHROPIC_API_KEY": KEY})["email"])
+                process.assert_not_called()
+
+    def test_cursor_uses_only_status_and_about_and_does_not_guess_missing_plan(self):
+        from unittest.mock import Mock
+        command = Mock(side_effect=[subprocess.CompletedProcess([], 0, "Logged in as fixture@example.test", ""),
+                                    subprocess.CompletedProcess([], 0, "Subscription Tier   Pro", "")])
+        result = connections.native_account_metadata("cursor", env={}, cursor_executable="/fixture/agent", command=command)
+        self.assertEqual(result, {"backend": "cursor", "email": "fixture@example.test", "plan_type": "Pro", "source": "cli"})
+        self.assertEqual([item.args[0] for item in command.call_args_list], [["/fixture/agent", "status"], ["/fixture/agent", "about"]])
 
     def test_failed_replacement_preserves_old_key_and_stale_revision_never_probes(self):
         self.client.put(PATH, headers=NATIVE, json=INPUT)

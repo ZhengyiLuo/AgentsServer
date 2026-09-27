@@ -63,6 +63,16 @@ a small charge; default read-only checks do not run inference. Checks
 send neither conversation history nor tools. Rechecking failure removes the
 success state. Failed replacements leave the previous saved credentials intact.
 
+Each provider uses matching **CLI Login** and **Custom API** cards. Account
+details belong only to CLI Login, never to an independent API key. Codex reports
+email and plan through its account API. Claude can expose saved profile email
+and subscription metadata, labeled as cached; this does not run auth-status,
+renew credentials or assert freshness. Cursor reports email from `status` and
+plan from `about` when available. OpenCode has no universal email/plan across
+its many providers; missing fields stay absent. Optional account reads occur
+on expanding a connected CLI card, use native-only administration and are fenced
+to the selected server. Failure to read details does not invalidate the login.
+
 Codex's native account and custom API are separate cards; native usage/account
 data is not queried for custom API chats. Connect requires server credential
 verification before saving. Its optional advanced model-discovery check is

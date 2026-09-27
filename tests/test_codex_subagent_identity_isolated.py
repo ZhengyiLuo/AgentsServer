@@ -15,13 +15,15 @@ from codex_app_server import CodexAppServerClient
 
 
 FUNCTIONS = {
-    "compact_subagent_text", "useful_subagent_identity_text",
+    "compact_subagent_text", "useful_subagent_identity_text", "codex_subagent_assignment_label",
     "codex_subagent_thread_identity", "normalize_subagent_status",
     "emit_codex_subagent_state", "_emit_codex_subagent_state_once", "reconcile_codex_subagents",
     "durable_event_seq", "build_subagent_snapshot",
     "is_agent_visible_event", "should_bump_session_updated_at",
     "codex_child_status_from_thread", "codex_child_status_from_turn",
-    "project_codex_notification",
+    "project_codex_notification", "project_codex_subagent_item",
+    "codex_collaboration_thread_ids", "codex_collaboration_states",
+    "session_codex_subagent_states", "rebuild_codex_subagent_indexes",
 }
 
 
@@ -79,6 +81,121 @@ class CodexSubagentIdentityTests(unittest.IsolatedAsyncioTestCase):
     async def rename(self, value, *, thread="child"):
         await self.ns["project_codex_notification"]({"method": "thread/name/updated",
             "params": {"threadId": thread, "threadName": value}})
+
+    async def test_native_nickname_only_spawn_keeps_assignment_through_status_and_restart(self):
+        # Current native collaboration items have a prompt, but no task_name,
+        # title or path. Child nickname arrives separately from thread metadata.
+        await self.ns["project_codex_subagent_item"]("chat", "parent", {
+            "type": "collabAgentToolCall", "id": "spawn-tool", "tool": "spawnAgent",
+            "senderThreadId": "parent", "receiverThreadIds": ["child"],
+            "status": "completed", "agentsStates": {"child": {"status": "running"}},
+            "prompt": "Inspect attachment download handling. Check authenticated browser downloads.",
+        }, run_id="original-run", completed=True)
+        manager = SimpleNamespace(list_descendant_threads=AsyncMock(return_value=[{
+            "id": "child", "name": None, "agentNickname": "Aquinas",
+            "source": {"subAgent": {"thread_spawn": {
+                "parent_thread_id": "parent", "depth": 1,
+                "agent_nickname": "Aquinas", "agent_path": None,
+            }}},
+            "preview": "A later or inherited preview must not replace the spawn assignment",
+            "status": {"type": "active"},
+        }]))
+        await self.ns["reconcile_codex_subagents"]("chat", manager)
+        self.assertEqual(self.ns["CODEX_SUBAGENT_STATE"]["child"]["subagent_task"],
+                         "Inspect attachment download handling")
+        self.assertEqual(self.ns["CODEX_SUBAGENT_STATE"]["child"]["subagent_nickname"], "Aquinas")
+        for operation in ("sendInput", "wait"):
+            await self.ns["project_codex_subagent_item"]("chat", "parent", {
+                "type": "collabAgentToolCall", "id": operation, "tool": operation,
+                "receiverThreadIds": ["child"], "prompt": "Replace the displayed assignment",
+                "agentsStates": {"child": {"status": "running", "message": "Working"}},
+            }, run_id="original-run", completed=True)
+        await self.ns["emit_codex_subagent_state"]("chat", "child", "completed", summary="Finished")
+        before = dict(self.ns["CODEX_SUBAGENT_STATE"]["child"])
+        self.ns["CODEX_SUBAGENT_STATE"].clear()
+        self.ns["rebuild_codex_subagent_indexes"]()
+        self.assertEqual(self.ns["build_subagent_snapshot"]("chat")["subagents"], [before])
+        self.assertEqual(before["subagent_task"], "Inspect attachment download handling")
+        self.assertEqual(before["subagent_name"], "Aquinas")
+        self.assertEqual(self.session["codex_subagents"]["child"], before)
+
+    async def test_completed_nickname_only_child_recovers_preview_task_without_new_lifecycle(self):
+        self.session.update(codex_provider="custom", codex_provider_revision="synthetic-assignment")
+        await self.ns["emit_codex_subagent_state"](
+            "chat", "child", "completed", run_id="original-run", nickname="Chandrasekhar",
+            activity="Finished", summary="Result")
+        before = dict(self.ns["CODEX_SUBAGENT_STATE"]["child"])
+        self.ns["append_event"].reset_mock()
+        self.store.save.reset_mock()
+        self.now = "2026-09-27T04:00:00Z"
+        manager = self.terminal_manager(name=None, agentNickname="Chandrasekhar",
+            preview="Review stream ordering. Report any lost commentary.")
+        await self.ns["reconcile_codex_subagents"]("chat", manager)
+        after = dict(self.ns["CODEX_SUBAGENT_STATE"]["child"])
+        self.assertEqual(after["subagent_task"], "Review stream ordering")
+        self.assert_lifecycle_unchanged(before, after)
+        self.ns["append_event"].assert_awaited_once()
+        self.ns["rebuild_codex_subagent_indexes"]()
+        await self.ns["reconcile_codex_subagents"]("chat", manager)
+        self.assertEqual(self.ns["build_subagent_snapshot"]("chat")["subagents"], [after])
+        self.ns["append_event"].assert_awaited_once()
+
+    async def test_assignment_excerpt_is_bounded_and_excludes_internal_wrappers(self):
+        label = self.ns["codex_subagent_assignment_label"]
+        for value in (None, {}, [], "", "Codex subagent", "[AgentsDock context]\nPrivate instructions",
+                      "<environment_context>internal</environment_context>", "```\ncommands",
+                      "Unread peer mail is available in this chat. Use the helper.", "# AGENTS.md instructions"):
+            with self.subTest(value=value):
+                self.assertEqual(label(value), "")
+        self.assertEqual(label("\n## Inspect  attachment\tdownloads. More details.\nOther work"),
+                         "Inspect attachment downloads")
+        self.assertEqual(label("检查下载流程。验证授权和文件内容。"), "检查下载流程")
+        self.assertEqual(label("Inspect server/agent_server.py handling. Check the route."),
+                         "Inspect server/agent_server.py handling")
+        for value in ("Inspect " + "download handling " * 30, "检查" * 100):
+            result = label(value)
+            self.assertLessEqual(len(result), 120)
+            self.assertTrue(result.endswith("…"))
+
+    async def test_spawn_assignment_supersedes_preview_but_native_path_clears_fallback(self):
+        await self.ns["emit_codex_subagent_state"](
+            "chat", "child", "running", assignment="Inherited preview", nickname="Aquinas")
+        await self.ns["project_codex_subagent_item"]("chat", "parent", {
+            "type": "collabToolCall", "id": "spawn", "tool": "spawn_agent",
+            "receiverThreadId": "child", "prompt": "Inspect downloads. Verify the bytes.",
+        }, run_id="original-run", completed=True)
+        self.assertEqual(self.ns["CODEX_SUBAGENT_STATE"]["child"]["subagent_task"], "Inspect downloads")
+        await self.rename("Native review title")
+        self.assertEqual(self.ns["CODEX_SUBAGENT_STATE"]["child"]["subagent_task"], "Inspect downloads")
+        await self.rename(None)
+        self.assertEqual(self.ns["CODEX_SUBAGENT_STATE"]["child"]["subagent_task"], "Inspect downloads")
+        await self.ns["emit_codex_subagent_state"]("chat", "child", "running", agent_path="/root/download_audit")
+        await self.ns["emit_codex_subagent_state"]("chat", "child", "completed", assignment="Different preview")
+        state = self.ns["build_subagent_snapshot"]("chat")["subagents"][0]
+        self.assertIsNone(state["subagent_task"])
+        self.assertEqual(state["subagent_path"], "/root/download_audit")
+        self.assertEqual(state["subagent_nickname"], "Aquinas")
+
+    async def test_explicit_task_wins_over_assignment_and_status_without_task_omits_clear(self):
+        await self.ns["project_codex_subagent_item"]("chat", "parent", {
+            "type": "collabAgentToolCall", "id": "spawn", "tool": "spawnAgent",
+            "receiverThreadIds": ["child"], "task_name": "download_audit",
+            "prompt": "This longer assignment should not replace an explicit task name.",
+        }, run_id="original-run", completed=True)
+        await self.ns["emit_codex_subagent_state"]("chat", "child", "completed", summary="All checks passed")
+        self.assertEqual(self.ns["CODEX_SUBAGENT_STATE"]["child"]["subagent_task"], "download_audit")
+        await self.ns["emit_codex_subagent_state"]("chat", "other-child", "running", nickname="Kepler")
+        self.assertNotIn("subagent_task", self.ns["CODEX_SUBAGENT_STATE"]["other-child"])
+
+    async def test_unusable_native_path_does_not_erase_assignment(self):
+        for path in ("/root", "/root/child"):
+            with self.subTest(path=path):
+                await self.ns["emit_codex_subagent_state"](
+                    "chat", "child", "running", agent_path=path, nickname="Aquinas",
+                    assignment="Inspect attachment download handling. Verify content.")
+                state = self.ns["CODEX_SUBAGENT_STATE"]["child"]
+                self.assertEqual(state["subagent_task"], "Inspect attachment download handling")
+                self.assertEqual(state["subagent_path"], path)
 
     async def test_custom_session_reconciliation_and_generation_use_its_manager(self):
         self.session.update(codex_provider="custom", codex_provider_revision="synthetic-generation")
@@ -304,7 +421,7 @@ class CodexSubagentIdentityTests(unittest.IsolatedAsyncioTestCase):
         }]))
 
     def assert_lifecycle_unchanged(self, before, after):
-        identity = {"id", "seq", "subagent_title", "subagent_name", "subagent_nickname", "subagent_path"}
+        identity = {"id", "seq", "subagent_title", "subagent_name", "subagent_nickname", "subagent_path", "subagent_task"}
         self.assertEqual({k: v for k, v in before.items() if k not in identity},
                          {k: v for k, v in after.items() if k not in identity})
 

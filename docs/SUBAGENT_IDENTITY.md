@@ -6,6 +6,24 @@ agent path. AgentsServer preserves the explicit `Thread.name` value as optional
 output or a task-name guess. Existing `subagent_nickname`, `subagent_path` and
 legacy `subagent_name` composition remain unchanged.
 
+When a child has no native task path, a separate optional `subagent_task` gives
+clients a useful assignment label ahead of the nickname. It uses an explicit
+task name when supplied, otherwise a short opening excerpt from the native
+spawn prompt. Existing descendant reconciliation can recover a missing label
+from the child preview. Assignment excerpts use the opening line/sentence,
+collapse whitespace, and are limited to 120 characters; internal context,
+mailbox and code wrappers are excluded. They are display text, not inferred
+native thread titles, and never rename a provider thread or call a model.
+
+The explicit native title still takes priority. A native task path clears this
+fallback with `subagent_task: null`, allowing clients to display the real path;
+an omitted task field retains a client's known task. A learned spawn assignment
+survives generic status updates, follow-up messages, completion and reopening.
+It supersedes a preview learned before the spawn arrived. Activity and result
+summaries never become task labels. Task labels persist alongside the existing
+native identity in durable events and session snapshots; restoring a label for
+a known completed child preserves its original lifecycle and chronology.
+
 The existing descendant reconciliation reads `name` directly from each returned
 thread. A known child's `thread/started` notification can supply the same field
 immediately. Subsequent `thread/name/updated` notifications carry `threadId` and
@@ -55,3 +73,6 @@ gated rename/completion races in both orders.
 It also covers terminal identity recovery, ID-less memory and legacy metadata,
 repeat/restart idempotence, strict snapshot event identity, unchanged unread and
 chat-recency projection, and reconciliation/new-run races in both orders.
+Current native nickname-only spawn shapes additionally cover assignment label
+retention, preview recovery, native identity priority and internal-wrapper
+filtering without provider startup.

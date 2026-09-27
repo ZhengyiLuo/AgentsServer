@@ -30768,6 +30768,31 @@ def useful_subagent_identity_text(value: Any) -> str:
     return clean
 
 
+def codex_subagent_assignment_label(value: Any) -> str:
+    """Keep a short assignment opening for children without a native label."""
+
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not text or re.match(
+        r"^(?:\[AgentsDock context\](?:\s|$)|<|```|"
+        r"Unread peer mail is available in this chat\.|#\s*AGENTS\.md\b)",
+        text,
+        re.IGNORECASE,
+    ):
+        return ""
+    opening = text.splitlines()[0]
+    opening = re.sub(r"^\s*(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+)", "", opening)
+    opening = re.split(r"(?<=[.!?])\s+|[。！？]", opening, maxsplit=1)[0]
+    label = useful_subagent_identity_text(opening).strip(" `*_\t.!?")
+    if len(label) > 120:
+        prefix = label[:119]
+        if " " in prefix:
+            prefix = prefix.rsplit(" ", 1)[0]
+        label = prefix.rstrip() + "…"
+    return label
+
+
 def codex_subagent_thread_identity(
     thread: dict[str, Any],
 ) -> tuple[str, str, str]:
@@ -30915,6 +30940,8 @@ async def _emit_codex_subagent_state_once(
     title: Any = ...,
     nickname: Any = None,
     agent_path: Any = None,
+    task_name: Any = None,
+    assignment: Any = None,
     activity: Any = None,
     summary: Any = None,
     persist_event: bool = True,
@@ -31014,6 +31041,19 @@ async def _emit_codex_subagent_state_once(
         useful_subagent_identity_text(agent_path)
         or useful_subagent_identity_text(identity_previous.get("subagent_path"))
     )
+    # Keep the assignment separate from native identity. A later generic
+    # status/follow-up or inherited preview must not replace the original task.
+    # Explicit provider paths supersede this fallback, including on reopen.
+    path_segments = [segment for segment in clean_path.split("/") if segment]
+    has_task_path = len(path_segments) > 1 and path_segments[-1] != child_thread_id
+    clean_task = "" if has_task_path else (
+        (useful_subagent_identity_text(task_name) if isinstance(task_name, str) else "")
+        or useful_subagent_identity_text(identity_previous.get("subagent_task"))
+        or codex_subagent_assignment_label(assignment)
+    )
+    task_fields = {"subagent_task": clean_task} if clean_task else (
+        {"subagent_task": None} if has_task_path else {}
+    )
     clean_name = (
         clean_nickname
         or clean_path
@@ -31049,6 +31089,7 @@ async def _emit_codex_subagent_state_once(
         ),
         "subagent_name": clean_name,
         **title_fields,
+        **task_fields,
         "subagent_nickname": clean_nickname or None,
         "subagent_path": clean_path or None,
         "subagent_kind": "collaborator",
@@ -31068,6 +31109,7 @@ async def _emit_codex_subagent_state_once(
             identity_fields.update({key: payload[key] for key in (
                 "subagent_name", "subagent_nickname", "subagent_path",
             )})
+            identity_fields.update(task_fields)
         payload = {key: previous.get(key) for key in payload if key not in identity_fields}
         payload.update(identity_fields)
         if isinstance(previous.get("ts"), str):
@@ -31079,6 +31121,7 @@ async def _emit_codex_subagent_state_once(
         "subagent_tool_id",
         "subagent_name",
         "subagent_title",
+        "subagent_task",
         "subagent_nickname",
         "subagent_path",
         "subagent_status",
@@ -31322,6 +31365,8 @@ async def reconcile_codex_subagents(
             status,
             parent_thread_id=source_parent_thread_id or root_thread_id,
             name=thread.get("preview"),
+            task_name=thread.get("taskName") or thread.get("task_name"),
+            assignment=thread.get("preview"),
             title=thread.get("name", ...),
             nickname=nickname,
             agent_path=agent_path,
@@ -54486,6 +54531,9 @@ async def project_codex_subagent_item(
             tool_id=str(item.get("id") or "") or None,
             nickname=state.get("agentNickname") or item.get("agentNickname"),
             agent_path=state.get("agentPath") or item.get("agentPath"),
+            task_name=(item.get("taskName") or item.get("task_name")
+                       or codex_subagent_assignment_label(item.get("prompt")))
+            if operation == "spawnagent" else None,
             activity=activity,
             summary=state.get("message"),
         )

@@ -154,6 +154,19 @@ class CodexHistoryMetadataTests(unittest.IsolatedAsyncioTestCase):
         self.ns["bounded_jsonl_records_range"] = Mock(return_value=iter([]))
         self.assertEqual(self.ns["load_provider_history_with_cursor"](session, 400, cursor)[1], [])
 
+    def test_loader_binds_native_origin_to_selected_source_thread(self):
+        session = {"id": "chat", "backend": "codex", "codex_thread_id": "selected-thread"}
+        source = source_user("Real follow-up", kinds=("user.text",))
+        source["timestamp"] = STAMP
+        self.assertNotIn("session_id", self.parse([source])[0]["provider_origin"])
+        snapshot = {"source_offset": 10, "source_digest": "a" * 64, "source_dev": 1,
+                    "source_ino": 2, "source_mtime_ns": 3, "expected_stat": {}}
+        self.ns["provider_history_path"] = Mock(return_value=Path("/exact/transcript.jsonl"))
+        self.ns["provider_history_source_snapshot"] = Mock(return_value=(snapshot, False))
+        self.ns["bounded_jsonl_events_range"] = Mock(return_value=iter([source]))
+        _, items, _, _ = self.ns["load_provider_history_with_cursor"](session, 400, None)
+        self.assertEqual(items[0]["provider_origin"]["session_id"], "selected-thread")
+
     async def test_both_import_paths_emit_commentary_progress_final_answer_and_original_time(self):
         items = self.parse([assistant(phase="commentary", timestamp=STAMP), assistant("Done", phase="final_answer", timestamp=STAMP)])
         session = {"id": "chat", "backend": "codex", "codex_thread_id": "thread"}

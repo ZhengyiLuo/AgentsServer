@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import json
 from copy import deepcopy
 from pathlib import Path
 import re
@@ -68,6 +69,7 @@ class CodexHistoryDeferralTests(unittest.IsolatedAsyncioTestCase):
         self.ns.update(
             STORE=self.store, logger=Mock(), BACKEND_CODEX="codex", BACKEND_CLAUDE="claude", BACKEND_CURSOR="cursor", DEFAULT_BACKEND="codex",
             HISTORY_SYNC_CURSOR_VERSION=1, HISTORY_SYNC_CHECKPOINT_VERSION=1,
+            HISTORY_SYNC_EVENT_SCAN_LIMIT=20000,
             MAX_WORKSPACE_PATH_CHARS=4096, MAX_LOCAL_TRANSCRIPT_BYTES=1 << 40,
             session_provider_id=lambda session: session.get("codex_thread_id"),
             provider_session_identifier=lambda identity: identity,
@@ -104,6 +106,49 @@ class CodexHistoryDeferralTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["reason"], "native_history_proof_unavailable")
         self.assert_no_persistence()
         self.assertEqual(self.items, [{"kind": "assistant", "text": "Candidate provider replay"}])
+
+    async def test_sync_cursor_persists_inverted_credit_across_bounded_deltas(self):
+        from tests.test_codex_history_metadata_isolated import projection
+        from tests.test_goal_followup_projection_isolated import event, followup
+        path = self.root / "events.jsonl"
+        path.write_text("".join(json.dumps(row) + "\n" for row in [
+            event(1, "provider_session", provider_session_id=PROVIDER),
+            followup(2, "First", provider_turn_id="native-turn"),
+            event(3, "reasoning_summary", text="Public update", phase="commentary",
+                  provider_turn_id="native-turn", item_id="native-item"),
+            followup(4, "Second", provider_turn_id="native-turn"),
+        ]))
+        matcher = projection()
+        matcher.update(events_path=lambda _: path, HISTORY_SYNC_EVENT_SCAN_LIMIT=2)
+        self.ns["reconcile_cursor_history_items"] = matcher["reconcile_cursor_history_items"]
+        self.ns["last_event_seq_from_file"].return_value = 4
+        self.session["_history_sync_cursor"].update(timeline_seq=1, checkpoint_seq=4)
+        def source(kind, text, identity):
+            return {"kind": kind, "text": text, "provider_user_authored": kind == "user",
+                    "provider_origin": {"provider": "codex", "kind": kind, "event_id": identity,
+                                        "turn_id": "native-turn", "session_id": PROVIDER}}
+        self.next_cursor.update(source_caught_up=False)
+        self.items = [source("assistant", "Public update", "native-item")]
+        result = await self.ns["sync_provider_history"](dict(self.session))
+        self.assertEqual(result["imported"], 0)
+        saved = self.ns["normalized_history_sync_cursor"](self.session)
+        self.assertEqual((saved["timeline_seq"], saved["timeline_consumed_receipts"]), (1, [3]))
+        # Simulate reload: only the durable normalized cursor carries the
+        # assistant receipt into a new source delta.
+        self.session["_history_sync_cursor"] = deepcopy(saved)
+        self.next_cursor.update(source_offset=300, source_size=300)
+        self.ns["provider_history_source_stamp"].return_value[1] = 300
+        self.items = [source("user", "First", "first-user")]
+        await self.ns["sync_provider_history"](dict(self.session))
+        saved = self.ns["normalized_history_sync_cursor"](self.session)
+        self.assertEqual(saved["timeline_seq"], 3)
+        self.assertNotIn("timeline_consumed_receipts", saved)
+        self.next_cursor.update(source_offset=400, source_size=400, source_caught_up=True)
+        self.ns["provider_history_source_stamp"].return_value[1] = 400
+        self.items = [source("user", "Second", "second-user")]
+        await self.ns["sync_provider_history"](dict(self.session))
+        self.assertEqual(self.session["_history_sync_cursor"]["timeline_seq"], 4)
+        self.ns["append_durable_event_batch"].assert_not_awaited()
 
     async def test_explicit_import_defers_without_failure_marker_or_cursor_commit(self):
         result = await self.ns["import_session_history"](dict(self.session), force=False)

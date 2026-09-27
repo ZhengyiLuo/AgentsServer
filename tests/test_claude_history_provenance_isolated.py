@@ -304,6 +304,7 @@ class ClaudeHistoryProvenanceTests(unittest.TestCase):
                "source_size": 30, "source_offset": 30, "source_mtime_ns": 4,
                "source_digest": "a" * 64, "last_item_digest": "", "timeline_seq": 0}
         session = {"backend": "claude", "claude_session_id": SESSION_ID, "_history_sync_cursor": raw}
+        self.projection["HISTORY_SYNC_EVENT_SCAN_LIMIT"] = 20000
         self.assertNotIn("claude_interruption_context", self.projection["normalized_history_sync_cursor"](session))
         context = {"version": 1, "session_id": SESSION_ID, "prompt_id": PROMPT_ID, "anchor_event_id": EVENT_ID, "last_event_id": PARENT_ID}
         raw["claude_interruption_context"] = {**context, "path": "private", "prompt": "private"}

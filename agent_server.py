@@ -48732,6 +48732,15 @@ def normalized_history_sync_cursor(
         )
     if backend == BACKEND_CODEX and raw.get("codex_last_item_phase") in ("commentary", "final_answer"):
         cursor["codex_last_item_phase"] = raw["codex_last_item_phase"]
+    consumed_receipts = raw.get("timeline_consumed_receipts", [])
+    if not (isinstance(consumed_receipts, list)
+            and len(consumed_receipts) <= max(1, HISTORY_SYNC_EVENT_SCAN_LIMIT)
+            and all(isinstance(seq, int) and not isinstance(seq, bool)
+                    and raw["timeline_seq"] < seq <= cursor["checkpoint_seq"]
+                    for seq in consumed_receipts)):
+        return None
+    if consumed_receipts:
+        cursor["timeline_consumed_receipts"] = sorted(set(consumed_receipts))
     source_sha256 = raw.get("last_item_source_text_sha256")
     if isinstance(source_sha256, str) and re.fullmatch(r"[0-9a-f]{64}", source_sha256):
         cursor["last_item_source_text_sha256"] = source_sha256
@@ -49261,6 +49270,13 @@ def load_provider_history_with_cursor(
             expected_stat=snapshot["expected_stat"],
         )
     )
+    if backend == BACKEND_CODEX:
+        for item in items:
+            origin = item.get("provider_origin")
+            if isinstance(origin, dict) and origin.get("provider") == BACKEND_CODEX:
+                # The parsed native item identifies its turn/message; the
+                # validated transcript selection supplies its source thread.
+                item["provider_origin"] = {**origin, "session_id": provider_id}
     interruptions = [item for item in items if item.get("kind") == "interruption"] if backend == BACKEND_CLAUDE else []
     if interruptions:
         # This loader already runs in the import worker. Native-control proof
@@ -49319,6 +49335,8 @@ def load_provider_history_with_cursor(
         cursor["claude_interruption_context"] = normalize_claude_interruption_context(interruption_context, provider_session_id=provider_id)
     if backend == BACKEND_CODEX and codex_phase_context.get("phase") in ("commentary", "final_answer"):
         cursor["codex_last_item_phase"] = codex_phase_context["phase"]
+    if continued and previous and previous.get("timeline_consumed_receipts"):
+        cursor["timeline_consumed_receipts"] = list(previous["timeline_consumed_receipts"])
     if source_text_context.get("sha256"):
         cursor["last_item_source_text_sha256"] = source_text_context["sha256"]
     return path, items, cursor, continued
@@ -49349,11 +49367,24 @@ def history_message_match_details(
     """Keep exact text and Claude ownership separate from display cleaning."""
     key = history_dedup_key(kind, text, source_text_sha256=metadata.get("source_text_sha256"))
     details: dict[str, Any] = {"key": key, "backend": str(metadata.get("backend") or ""), "provider_item": provider_item}
-    if kind != "assistant":
-        return details
     raw_origin = metadata.get("provider_origin")
     if not details["backend"] and isinstance(raw_origin, dict):
         details["backend"] = str(raw_origin.get("provider") or "")
+    if details["backend"] == BACKEND_CODEX:
+        origin = raw_origin if isinstance(raw_origin, dict) and raw_origin.get("provider") == BACKEND_CODEX else {}
+        turn_id = str(origin.get("turn_id") or metadata.get("provider_turn_id") or "")
+        item_id = str(origin.get("event_id") or metadata.get("item_id") or "")
+        is_goal_input = kind == "user" and (
+            provider_item and metadata.get("provider_user_authored") is True
+            or not provider_item and is_native_goal_steer_event(metadata)
+        )
+        if (not metadata.get("forked") and turn_id and key[1]
+                and (kind == "assistant" and item_id or is_goal_input)):
+            details["codex_identity"] = (kind, turn_id, item_id if kind == "assistant" else "", key[1])
+            details["codex_thread_id"] = str(origin.get("session_id") or metadata.get("provider_session_id") or "")
+        return details
+    if kind != "assistant":
+        return details
     if details["backend"] not in ("", BACKEND_CLAUDE):
         return details
     origin = normalized_history_provider_origin(metadata.get("provider_origin")) or {}
@@ -49439,6 +49470,7 @@ def history_timeline_message_keys(
     selected: list[dict[str, Any]] | deque[dict[str, Any]]
     selected = deque(maxlen=maximum) if tail else []
     provider_runs: dict[str, str] = {}
+    codex_provider_runs: dict[str, str] = {}
     prior_message: dict[str, Any] | None = None
     timeline_has_messages = False
     front_window_truncated = False
@@ -49503,6 +49535,10 @@ def history_timeline_message_keys(
                 provider_runs[run_id] = str(event.get("provider_session_id") or "")
                 if len(provider_runs) > maximum:
                     provider_runs.pop(next(iter(provider_runs)))
+            if run_id and event_type == "provider_session" and event.get("backend") == BACKEND_CODEX:
+                codex_provider_runs[run_id] = str(event.get("provider_session_id") or "")
+                if len(codex_provider_runs) > maximum:
+                    codex_provider_runs.pop(next(iter(codex_provider_runs)))
             before_window = raw_seq <= after_seq
             if event_type == "turn_started" or is_native_goal_steer_event(event):
                 key = history_dedup_key("user", event.get("prompt"), source_text_sha256=event.get("source_text_sha256"))
@@ -49551,6 +49587,9 @@ def history_timeline_message_keys(
             if run_id in provider_runs and not event.get("imported"):
                 metadata["backend"] = metadata.get("backend") or BACKEND_CLAUDE
                 metadata["provider_session_id"] = metadata.get("provider_session_id") or provider_runs[run_id]
+            if run_id in codex_provider_runs and not event.get("imported"):
+                metadata["backend"] = metadata.get("backend") or BACKEND_CODEX
+                metadata["provider_session_id"] = metadata.get("provider_session_id") or codex_provider_runs[run_id]
             details = history_message_match_details(key[0], text, metadata)
             details.update(seq=raw_seq, run_id=run_id)
             if details.get("message_id") and details.get("canonical_key"):
@@ -49614,6 +49653,7 @@ def reconcile_cursor_history_items(
     *,
     timeline_after_seq: int,
     timeline_through_seq: int,
+    consumed_receipts: list[int] | None = None,
 ) -> tuple[list[dict[str, str]], int]:
     """Subtract timeline-owned occurrences from one exact provider delta.
 
@@ -49641,19 +49681,51 @@ def reconcile_cursor_history_items(
         message_details=message_details,
     )
 
+    # Native steer acceptance and assistant notifications can reach our event
+    # loop in the opposite order to the provider transcript. Only exact native
+    # identities may consume a credit out of order; text-only legacy matching
+    # retains its existing chronological behavior.
+    already_consumed = set(consumed_receipts or ())
+    consumed_indices = {index for index, (seq, _) in enumerate(timeline_messages)
+                        if seq in already_consumed}
+    exact_positions: dict[tuple[str, ...], list[int]] = defaultdict(list)
+    for index, (seq, _) in enumerate(timeline_messages):
+        identity = message_details.get(seq, {}).get("codex_identity")
+        if identity:
+            exact_positions[identity].append(index)
     fresh: list[dict[str, str]] = []
     timeline_index = 0
     consumed_seq = after_seq
-    for item in items:
-        item_details = history_message_match_details(item.get("kind", ""), item.get("text", ""), item, provider_item=True)
-        if (
-            timeline_index < len(timeline_messages)
-            and history_messages_match(item_details, message_details.get(
-                timeline_messages[timeline_index][0], {"key": timeline_messages[timeline_index][1]},
-            ))
-        ):
+    def advance_consumed_prefix() -> None:
+        nonlocal timeline_index, consumed_seq
+        while timeline_index in consumed_indices:
             consumed_seq = timeline_messages[timeline_index][0]
             timeline_index += 1
+    advance_consumed_prefix()
+    for item in items:
+        item_details = history_message_match_details(item.get("kind", ""), item.get("text", ""), item, provider_item=True)
+        def matches_credit(index: int) -> bool:
+            seq, key = timeline_messages[index]
+            credit = message_details.get(seq, {"key": key})
+            if item_details.get("codex_identity") and credit.get("codex_identity"):
+                threads = (item_details.get("codex_thread_id"), credit.get("codex_thread_id"))
+                return (item_details["codex_identity"] == credit["codex_identity"]
+                        and not (all(threads) and threads[0] != threads[1]))
+            return history_messages_match(item_details, credit)
+        matched_index = -1
+        if (
+            timeline_index < len(timeline_messages)
+            and matches_credit(timeline_index)
+        ):
+            matched_index = timeline_index
+        else:
+            for index in exact_positions.get(item_details.get("codex_identity"), ()):
+                if index not in consumed_indices and matches_credit(index):
+                    matched_index = index
+                    break
+        if matched_index >= 0:
+            consumed_indices.add(matched_index)
+            advance_consumed_prefix()
         else:
             fresh.append(item)
 
@@ -49667,6 +49739,14 @@ def reconcile_cursor_history_items(
             timeline_messages[-1][0]
             if timeline_window_truncated and timeline_messages
             else through_seq
+        )
+    if consumed_receipts is not None:
+        # Persist noncontiguous consumption with the provider byte cursor. A
+        # later bounded delta must not reuse a receipt whose source was already
+        # consumed, or wait forever for that source message to appear again.
+        consumed_receipts[:] = sorted(
+            timeline_messages[index][0] for index in consumed_indices
+            if timeline_messages[index][0] > consumed_seq
         )
     return fresh, consumed_seq
 
@@ -49857,6 +49937,7 @@ async def sync_provider_history(
         last_event_seq_from_file,
         events_path(session_id),
     )
+    consumed_receipts = list(previous_cursor.get("timeline_consumed_receipts", [])) if continued and previous_cursor else []
     if continued and previous_cursor is not None:
         timeline_scan_through_seq = timeline_latest_seq
         fresh, consumed_timeline_seq = await asyncio.to_thread(
@@ -49865,6 +49946,7 @@ async def sync_provider_history(
             items,
             timeline_after_seq=int(previous_cursor.get("timeline_seq") or 0),
             timeline_through_seq=timeline_scan_through_seq,
+            consumed_receipts=consumed_receipts,
         )
     else:
         # First sync or invalidated/rotated source: retain the conservative
@@ -49909,6 +49991,11 @@ async def sync_provider_history(
             int(next_cursor.get("checkpoint_seq") or 0),
             timeline_latest_seq,
         )
+        pending_receipts = [seq for seq in consumed_receipts if seq > timeline_seq]
+        if pending_receipts:
+            next_cursor["timeline_consumed_receipts"] = pending_receipts
+        else:
+            next_cursor.pop("timeline_consumed_receipts", None)
         checkpoint = history_sync_checkpoint(
             previous_cursor,
             next_cursor,
@@ -50011,6 +50098,12 @@ async def persist_history_sync_cursor(
         **cursor,
         "timeline_seq": max(0, int(timeline_seq)),
     }
+    pending_receipts = [seq for seq in stored.get("timeline_consumed_receipts", [])
+                        if seq > stored["timeline_seq"]]
+    if pending_receipts:
+        stored["timeline_consumed_receipts"] = pending_receipts
+    else:
+        stored.pop("timeline_consumed_receipts", None)
     stored.pop("source_caught_up", None)
     async with STORE._lock:
         current = STORE.sessions.get(session_id)
@@ -50487,6 +50580,7 @@ async def import_session_history(sess: dict[str, Any], *, force: bool = False, l
             )
         return result
 
+    consumed_receipts = list(previous_cursor.get("timeline_consumed_receipts", [])) if continued and previous_cursor else []
     # ``force`` means bypass the one-time import marker, not append the same
     # provider transcript again. Anchor against the durable timeline exactly
     # like automatic catch-up and import only the unseen suffix.
@@ -50498,6 +50592,7 @@ async def import_session_history(sess: dict[str, Any], *, force: bool = False, l
             items,
             timeline_after_seq=int(previous_cursor.get("timeline_seq") or 0),
             timeline_through_seq=timeline_scan_through_seq,
+            consumed_receipts=consumed_receipts,
         )
     else:
         fresh = await asyncio.to_thread(
@@ -50539,6 +50634,11 @@ async def import_session_history(sess: dict[str, Any], *, force: bool = False, l
             int(next_cursor.get("checkpoint_seq") or 0),
             timeline_latest_seq,
         )
+        pending_receipts = [seq for seq in consumed_receipts if seq > timeline_seq]
+        if pending_receipts:
+            next_cursor["timeline_consumed_receipts"] = pending_receipts
+        else:
+            next_cursor.pop("timeline_consumed_receipts", None)
         checkpoint = history_sync_checkpoint(
             previous_cursor,
             next_cursor,

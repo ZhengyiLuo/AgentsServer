@@ -105,6 +105,97 @@ class GoalFollowupProjectionTests(unittest.TestCase):
         self.assertEqual(ns["_build_timeline_index_locked"]("chat"), warm)
         self.assertEqual(len(warm["landmarks"]), 3)
 
+    def inverted_history(self):
+        self.write([
+            event(1, "provider_session", provider_session_id="thread-native"),
+            followup(2, "First follow-up", provider_turn_id="turn-native"),
+            event(3, "reasoning_summary", text="Earlier public update", phase="commentary",
+                  item_id="assistant-native", provider_turn_id="turn-native"),
+            followup(4, "Next follow-up", provider_turn_id="turn-native"),
+        ])
+        ns = projection()
+        ns["events_path"] = lambda _: self.path
+        def source(kind, text, item_id, *, turn_id="turn-native", thread_id="thread-native"):
+            return {"kind": kind, "text": text, "provider_user_authored": kind == "user",
+                    "provider_origin": {"provider": "codex", "kind": kind,
+                        "event_id": item_id, "turn_id": turn_id, "session_id": thread_id}}
+        return ns, source, [
+            source("assistant", "Earlier public update", "assistant-native"),
+            source("user", "First follow-up", "user-first"),
+            source("user", "Next follow-up", "user-next"),
+        ]
+
+    def test_native_identity_reconciles_inverted_goal_receipt_order(self):
+        ns, _, items = self.inverted_history()
+        fresh, consumed = ns["reconcile_cursor_history_items"](
+            "chat", items, timeline_after_seq=1, timeline_through_seq=4)
+        self.assertEqual(fresh, [])
+        self.assertEqual(consumed, 4)
+
+    def test_inverted_receipt_does_not_consume_repeated_text_or_other_native_identity(self):
+        ns, source, items = self.inverted_history()
+        repeated = source("user", "Next follow-up", "user-repeated")
+        other_turn = source("user", "Next follow-up", "user-other", turn_id="other-turn")
+        other_thread = source("assistant", "Earlier public update", "assistant-native", thread_id="other-thread")
+        other_item = source("assistant", "Earlier public update", "other-assistant")
+        unknown = {"kind": "user", "text": "Next follow-up"}
+        # The native identities must not consume an unrelated item before the
+        # real source occurrence, even if its text and native turn are equal.
+        extras = [other_turn, other_thread, other_item, unknown]
+        fresh, consumed = ns["reconcile_cursor_history_items"](
+            "chat", [*extras, *items, repeated], timeline_after_seq=1, timeline_through_seq=4)
+        self.assertEqual(fresh, [*extras, repeated])
+        self.assertEqual(consumed, 4)
+
+    def test_inverted_receipts_split_across_sync_preserve_contiguous_watermark(self):
+        ns, _, items = self.inverted_history()
+        ns["HISTORY_SYNC_EVENT_SCAN_LIMIT"] = 2
+        consumed_receipts = []
+        fresh, consumed = ns["reconcile_cursor_history_items"](
+            "chat", items[:1], timeline_after_seq=1, timeline_through_seq=4,
+            consumed_receipts=consumed_receipts)
+        self.assertEqual(fresh, [])
+        self.assertEqual(consumed, 1, "An assistant receipt must not skip the preceding user credit")
+        self.assertEqual(consumed_receipts, [3])
+        # The next bounded source delta contains no second copy of the earlier
+        # assistant. Its outstanding credit cannot block later exact inputs.
+        fresh, consumed = ns["reconcile_cursor_history_items"](
+            "chat", items[1:2], timeline_after_seq=consumed, timeline_through_seq=4,
+            consumed_receipts=consumed_receipts)
+        self.assertEqual(fresh, [])
+        self.assertEqual(consumed, 3)
+        self.assertEqual(consumed_receipts, [])
+        fresh, consumed = ns["reconcile_cursor_history_items"](
+            "chat", items[2:], timeline_after_seq=consumed, timeline_through_seq=4,
+            consumed_receipts=consumed_receipts)
+        self.assertEqual((fresh, consumed, consumed_receipts), ([], 4, []))
+        repeated = {**items[2], "provider_origin": {**items[2]["provider_origin"], "event_id": "new-repeat"}}
+        fresh, consumed = ns["reconcile_cursor_history_items"](
+            "chat", [repeated], timeline_after_seq=consumed, timeline_through_seq=4,
+            consumed_receipts=consumed_receipts)
+        self.assertEqual(fresh, [repeated])
+
+    def test_unproven_steer_cannot_match_out_of_order_native_input(self):
+        ns, _, items = self.inverted_history()
+        events = [json.loads(line) for line in self.path.read_text().splitlines()]
+        events[-1]["provider_user_authored"] = False
+        self.write(events)
+        fresh, _ = ns["reconcile_cursor_history_items"](
+            "chat", items, timeline_after_seq=1, timeline_through_seq=4)
+        self.assertEqual(fresh, items[-1:])
+
+    def test_inherited_fork_receipts_keep_first_sync_tail_anchor(self):
+        ns, source, items = self.inverted_history()
+        events = [json.loads(line) for line in self.path.read_text().splitlines()]
+        for row in events:
+            row.update(forked=True, original_session_id="parent-chat")
+        self.write(events)
+        child_items = [{**item, "provider_origin": {**item["provider_origin"], "session_id": "child-thread"}}
+                       for item in [items[1], items[0], items[2]]]
+        new_item = source("user", "New child question", "child-message", turn_id="child-turn", thread_id="child-thread")
+        self.assertEqual(ns["unsynced_history_items"](
+            "chat", [*child_items, new_item], timeline_through_seq=4), [new_item])
+
     def test_public_transcript_keeps_user_followup_not_raw_control_payload(self):
         result = read_public_transcript(self.path, lambda item: item)
         self.assertEqual([(item["role"], item["text"]) for item in result["messages"]], [

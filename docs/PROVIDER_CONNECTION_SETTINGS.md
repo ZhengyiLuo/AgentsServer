@@ -57,7 +57,8 @@ model list alone never produces a verified state. If a gateway cannot check
 keys this way, Claude/OpenCode offer an explicit model request through Advanced.
 A successful check does **not** establish native agent login, tool use,
 streaming, reasoning, context continuity or full runtime compatibility.
-The UI labels this **Connected · last check passed**, not “logged in”.
+The UI labels this **Connected**, not “logged in”; it records the last explicit
+check, not continuous verification.
 Checks happen only on explicit user actions. Optional model checks can incur
 a small charge; default read-only checks do not run inference. Checks
 send neither conversation history nor tools. Rechecking failure removes the
@@ -87,14 +88,20 @@ CLI Login keeps the native runtime's model catalog. Custom API independently
 queries the saved endpoint using its own key: OpenAI-compatible `/models`,
 Anthropic `/v1/models` with pagination, or OpenRouter's user-filtered
 `/api/v1/models/user`. Opening a connected Custom API card reads its inventory;
-**Reload models** refreshes it. No inference runs during discovery.
+reopening the card refreshes it. No inference runs during discovery.
 
-Choose **Default API model → Save default** once to reuse that choice for new
+Choose **Default model** once to reuse that choice for new
 chats, without entering the key again. We do not randomly pick a model or treat
-the first inventory row as a default. If discovery is unsupported, empty or
-incomplete, **Enter model ID manually** remains available. Friendly names are
+the first inventory row as a default. Selection saves automatically. If discovery
+is unavailable, the card does not invent a model; advanced connection setup and
+the chat selector still allow an exact ID. Friendly names are
 shown alongside exact IDs; confirmed non-chat/non-tool models are filtered out.
 Inventory presence is not proof of permission, billing or agent-tool compatibility.
+
+Connected Custom API cards offer **⋯ → Forget endpoint**, with confirmation.
+This removes the saved selection for new chats, not native CLI login. Existing
+custom chats keep their pinned credentials. CLI Login has no Disconnect or
+global logout action, so other server instances and terminal logins are untouched.
 
 Saving a default retains the previous credential-check timestamp and creates a
 new settings revision. Existing chats retain their original credentials/model;

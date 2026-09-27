@@ -20702,7 +20702,7 @@ def provider_tool_active_matches(
     expected_transport = (
         CODEX_TRANSPORT_APP_SERVER
         if backend == BACKEND_CODEX
-        else "exec" if backend == BACKEND_CURSOR
+        else "exec" if backend in {BACKEND_CURSOR, BACKEND_OPENCODE}
         else CLAUDE_TRANSPORT_AGENT_SDK
     )
     matches = bool(
@@ -20727,11 +20727,13 @@ def provider_tool_active_matches(
             and str(active.get("provider_turn_id") or "") == provider_turn_id
             and active.get("provider_turn_ready") is True
         )
-    elif backend == BACKEND_CURSOR:
+    elif backend in {BACKEND_CURSOR, BACKEND_OPENCODE}:
         proc = active.get("proc")
         matches = bool(
             matches and cursor_owner_token
-            and hmac.compare_digest(str(active.get("cursor_mcp_owner_token") or ""), cursor_owner_token)
+            # Historical argument name; both exec transports use an exact,
+            # backend-specific owner, never an interchangeable session token.
+            and hmac.compare_digest(str(active.get(f"{backend}_mcp_owner_token") or ""), cursor_owner_token)
             and proc is not None and proc.returncode is None
             and active.get("provider_turn_ready") is True
             and isinstance(ready, asyncio.Event) and ready.is_set()
@@ -20798,7 +20800,7 @@ async def provider_tool_capability_snapshot(
                      and codex_native_mailbox_owner_matches(session_id, run_id, provider_thread_id, provider_turn_id))
         ):
             raise ProviderToolError("provider tool turn is stale")
-    elif backend != BACKEND_CURSOR:
+    elif backend not in {BACKEND_CURSOR, BACKEND_OPENCODE}:
         raise ProviderToolError("provider tool backend is unsupported")
 
     async with ACTIVE_LOCK:
@@ -38457,6 +38459,10 @@ def cross_chat_supported_target_backends() -> list[str]:
         )
     if cursor_diagnostic.get("status") == "ready":
         supported.append(BACKEND_CURSOR)
+    with RUNTIME_DIAGNOSTICS_LOCK:
+        opencode_diagnostic = dict(RUNTIME_DIAGNOSTICS.get(BACKEND_OPENCODE) or {})
+    if opencode_diagnostic.get("status") == "ready":
+        supported.append(BACKEND_OPENCODE)
     return supported
 
 
@@ -38479,12 +38485,12 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
     else:
         message = (
             "Cross-chat handoffs require native Codex app-server, Claude "
-            "Agent SDK, or a compatible authenticated Cursor CLI target "
+            "Agent SDK, or a ready Cursor/OpenCode CLI target "
             "transport."
         )
         action = (
             "Enable Codex app-server, install and enable Claude Agent SDK, "
-            "or install and authenticate a compatible Cursor CLI."
+            "or install and authenticate a compatible Cursor/OpenCode CLI."
         )
     return {
         "available": available,
@@ -38608,8 +38614,12 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
             BACKEND_CODEX: CODEX_TRANSPORT_APP_SERVER,
             BACKEND_CLAUDE: CLAUDE_TRANSPORT_AGENT_SDK,
             BACKEND_CURSOR: "headless-stream-json",
+            BACKEND_OPENCODE: "headless-stream-json",
         },
     }
+
+
+OPENCODE_CROSS_CHAT_CLIENT_CAPABILITY = "opencode_cross_chat_v1"
 
 
 def cross_chat_delivery_client_capabilities(target: dict[str, Any]) -> list[str]:
@@ -38641,6 +38651,10 @@ def cross_chat_delivery_client_capabilities(target: dict[str, Any]) -> list[str]
         # An empty immutable client-capability set selects that exact headless
         # path; request/reply final answers are relayed by the server ledger.
         return []
+    if backend == BACKEND_OPENCODE:
+        if not cross_chat_target_backend_supported(backend):
+            raise HTTPException(status_code=409, detail="target OpenCode chat requires a ready OpenCode CLI for cross-chat delivery")
+        return [OPENCODE_CROSS_CHAT_CLIENT_CAPABILITY]
     raise HTTPException(
         status_code=409,
         detail=f"target backend {backend!r} does not support cross-chat delivery",
@@ -38651,6 +38665,7 @@ CROSS_CHAT_DELIVERY_CAPABILITIES_BY_BACKEND: dict[str, frozenset[str]] = {
     BACKEND_CODEX: frozenset({CODEX_INTERACTIVE_CLIENT_CAPABILITY}),
     BACKEND_CLAUDE: frozenset({CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY}),
     BACKEND_CURSOR: frozenset(),
+    BACKEND_OPENCODE: frozenset({OPENCODE_CROSS_CHAT_CLIENT_CAPABILITY}),
 }
 
 
@@ -68276,6 +68291,45 @@ async def run_opencode(
     prompt: str,
     sess: dict[str, Any],
     manifest_path: Path,
+    **kwargs: Any,
+) -> None:
+    """Attach a private native MCP only for an admitted helper-capable run."""
+    from cursor_provider_mcp import CursorToolBroker
+
+    async with CROSS_CHAT_CAPABILITY_LOCK:
+        has_authority = any(c.get("source_session_id") == session_id
+                            and c.get("source_run_id") == run_id
+                            for c in CROSS_CHAT_CAPABILITIES.values())
+    if not has_authority:
+        return await run_opencode_process(session_id, run_id, prompt, sess, manifest_path, **kwargs)
+    owner = secrets.token_urlsafe(48)
+    name = "agentsdock_" + secrets.token_hex(16)
+
+    async def execute(value: Any, key: str) -> tuple[str, bool]:
+        try:
+            return await execute_provider_tool_once(
+                session_id, run_id, value, replay_key="opencode:" + key,
+                backend=BACKEND_OPENCODE, cursor_owner_token=owner,
+            )
+        except ProviderToolError as exc:
+            return str(exc), True
+
+    broker = CursorToolBroker(codex_provider_mcp_tool_definition(), execute)
+    try:
+        tool_env = await broker.start()
+        selected = {**sess, "_opencode_mcp_owner_token": owner,
+                    "_opencode_tool_env": tool_env, "_opencode_tool_name": name}
+        await run_opencode_process(session_id, run_id, prompt, selected, manifest_path, **kwargs)
+    finally:
+        await broker.close()
+
+
+async def run_opencode_process(
+    session_id: str,
+    run_id: str,
+    prompt: str,
+    sess: dict[str, Any],
+    manifest_path: Path,
     *,
     standalone_provider_context: bool = False,
     provider_command: ProviderCommandRecord | None = None,
@@ -68299,6 +68353,7 @@ async def run_opencode(
         OpenCodeEventParseError,
         build_opencode_cmd,
         build_opencode_env_overrides,
+        build_opencode_mcp_overrides,
         merge_opencode_usage,
         new_opencode_enforced_agent_name,
         normalize_opencode_stream_event,
@@ -68309,6 +68364,19 @@ async def run_opencode(
 
     runtime_env = validate_provider_runtime_env(provider_runtime_env)
     redact_helper_output = opencode_helper_output_redactor(session_id, run_id, runtime_env)
+    tool_env = dict(sess.get("_opencode_tool_env") or {})
+    tool_name = str(sess.get("_opencode_tool_name") or "")
+    tool_owner = str(sess.get("_opencode_mcp_owner_token") or "")
+    if tool_name:
+        from cursor_provider_mcp import ENV_SECRET
+        original_redact = redact_helper_output
+
+        def redact_helper_output(value: Any) -> str:
+            text = original_redact(value)
+            for private in (tool_env.get(ENV_SECRET), tool_owner):
+                if private:
+                    text = text.replace(private, "<provider-private>")
+            return text
     if standalone_provider_context:
         sess = standalone_provider_session(sess)
     requested_cwd = str(sess.get("cwd") or DEFAULT_CWD)
@@ -68421,6 +68489,18 @@ async def run_opencode(
         provider_prompt, instruction_hash, _injected, memory_injected = (
             build_opencode_provider_prompt(session_id, sess, prompt, manifest_path)
         )
+    if tool_name:
+        # The key changes on every run. Old transcript tool names/IPC bearers
+        # cannot grant access to a later turn. No helper shell fallback.
+        provider_prompt = (
+            f"[Current run provider tool]\nUse only {tool_name}_run for the AgentsDock "
+            "Chats, Jobs, Publish, Emergency, Mail and Team helpers. Pass helper, arguments "
+            "and optional stdin; never pass authority or chat identity flags. "
+            "This replaces any earlier internal provider tool name. Its server checks "
+            "this exact live run and existing user authorization. Do not use shell "
+            "helper commands or unrelated MCP servers for these actions.\n\n"
+            + provider_prompt.replace(CLAUDE_PROVIDER_MCP_TOOL_NAME, tool_name + "_run")
+        )
     permission_mode = effective_opencode_permission_mode(sess)
     enforced_agent_name = (
         new_opencode_enforced_agent_name()
@@ -68482,6 +68562,12 @@ async def run_opencode(
             deny_skill_tool=provider_command is not None,
             enforced_agent_name=enforced_agent_name,
         ))
+        if tool_name:
+            env.update(build_opencode_mcp_overrides(
+                env.get("OPENCODE_CONFIG_CONTENT"), name=tool_name,
+                command=[sys.executable, str(CURSOR_PROCESS_GUARD.with_name("cursor_provider_mcp.py")), "--mcp"],
+                environment=tool_env, enforced_agent_name=enforced_agent_name,
+            ))
         opencode_dir = os.path.dirname(os.path.abspath(opencode_bin))
         if opencode_dir and opencode_dir not in env.get("PATH", "").split(os.pathsep):
             env["PATH"] = opencode_dir + os.pathsep + env.get("PATH", "")
@@ -68546,6 +68632,8 @@ async def run_opencode(
                 "run_id": run_id,
                 "backend": BACKEND_OPENCODE,
                 "transport": "exec",
+                "opencode_mcp_owner_token": tool_owner,
+                "provider_tools_ready": asyncio.Event(),
                 "pid": proc.pid,
                 "pgid": pgid,
                 "cwd": cwd,
@@ -68955,6 +69043,10 @@ async def run_opencode(
                     provider_id = event_provider_id
                     provider_started = True
                     await mark_provider_turn_ready(session_id, run_id, provider_id)
+                    async with ACTIVE_LOCK:
+                        active = ACTIVE.get(session_id) or {}
+                        if active.get("run_id") == run_id and isinstance(active.get("provider_tools_ready"), asyncio.Event):
+                            active["provider_tools_ready"].set()
             if normalized is None:
                 continue
             # Detect the forbidden tool on the raw normalized event. In

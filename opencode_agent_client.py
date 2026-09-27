@@ -486,6 +486,38 @@ def build_opencode_env_overrides(
     }
 
 
+def build_opencode_mcp_overrides(
+    existing_config: str | None, *, name: str, command: list[str],
+    environment: dict[str, str], enforced_agent_name: str | None = None,
+) -> dict[str, str]:
+    """Add one unpredictable, run-bound tool without granting shell/MCP wildcards.
+
+    Merge after the endpoint and permission configuration. Never persist this
+    configuration, credentials, or permission to the user's OpenCode files.
+    Default mode keeps the native agent and any higher-priority managed rules.
+    """
+    if not re.fullmatch(r"agentsdock_[0-9a-f]{32}", name):
+        raise ValueError("invalid OpenCode provider tool name")
+    config = json.loads(existing_config) if existing_config else {}
+    if not isinstance(config, dict):
+        raise ValueError("OpenCode inline config must be an object")
+    mcp = config.setdefault("mcp", {})
+    if not isinstance(mcp, dict) or name in mcp:
+        raise ValueError("OpenCode provider MCP configuration conflicts")
+    mcp[name] = {"type": "local", "command": command,
+                 "environment": environment, "enabled": True}
+    permissions = config.get("permission", {})
+    if isinstance(permissions, str):
+        permissions = {"*": permissions}
+    if not isinstance(permissions, dict):
+        raise ValueError("OpenCode permissions must be an object or action")
+    config["permission"] = {**permissions, name + "_run": "allow"}
+    if enforced_agent_name:
+        agent = config["agent"][enforced_agent_name]
+        agent["permission"][name + "_run"] = "allow"
+    return {"OPENCODE_CONFIG_CONTENT": json.dumps(config, separators=(",", ":"))}
+
+
 def build_opencode_cmd(
     sess: dict[str, Any],
     prompt: str,

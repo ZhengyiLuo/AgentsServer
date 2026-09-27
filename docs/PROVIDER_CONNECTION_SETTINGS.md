@@ -20,11 +20,12 @@ trust; it and its upstream provider receive the requests you submit.
 | OpenCode | `https://openrouter.ai/api/v1` | Chat Completions; Bearer; OpenRouter API key |
 | Cursor | Not a generic OpenRouter endpoint | Native Cursor login / Cursor-issued CLI key |
 
-The new Claude Code and OpenCode cards are **settings-only**. Select the
+Claude Code and OpenCode custom APIs can now be selected **per chat**. Select the
 intended server, open **Settings → AI Providers → Configure API**, enter the
 URL and key, and choose **Connect**. Protocol, authentication header and an
-optional model ID live in **Advanced**. They do not
-alter native login, environment files, chat choices or message routing.
+optional model ID live in **Advanced**. Saving does not alter native login or
+reroute existing chats. Choose the separate custom-endpoint option in a new
+chat and select an API model (or enter its exact ID if discovery is unavailable).
 Codex uses the same Configure API entry while retaining its separate endpoint
 credentials, chat routing and optional model check.
 
@@ -33,7 +34,10 @@ A green API check means the last explicit credential check passed; it does
 not certify every model or tool. Merely saving a legacy configuration cannot
 turn it green. The native account card is independent of custom API billing.
 
-Native-provider **Sign-in instructions** reveal a fixed command to run as the
+Four collapsed provider rows show a check when either login method is detected
+or connected. Expand to distinguish native credentials from a checked API.
+Only unsigned native providers show a short CLI sign-in command and a Read more
+link. Run the command as the
 user owning the selected server: [Codex](https://developers.openai.com/codex/auth),
 [Claude Code](https://code.claude.com/docs/en/authentication),
 [Cursor](https://cursor.com/docs/cli/reference/authentication), or
@@ -68,8 +72,25 @@ public model discovery. Legacy saved keys remain usable but are shown as
 saved/unverified until explicitly checked again with the key.
 
 Unconfigured custom APIs do not appear in new-chat/composer provider menus.
-Removing the current Codex endpoint does not switch existing custom chats
+Removing a current endpoint does not switch existing custom chats
 to native Codex or erase the immutable credentials those chats already use.
+
+Claude/OpenCode bindings are private immutable snapshots, retained across
+profile replacement or removal. Endpoint changes require a new chat after the
+first turn. Forks inherit the original binding. Importing a native conversation
+directly into a custom API is rejected. Claude uses chat-local process env and a
+private flag-settings file; OpenCode uses a dedicated custom provider namespace,
+explicit model, and process-local config. Neither rewrites global CLI settings.
+
+On macOS/Linux, desktop startup also discovers this OS user's managed default
+and named AgentsServer installations. It reads only owned private credentials,
+authenticates loopback health without redirects, verifies the persisted server
+identity and adds missing profiles to the existing switcher. Existing profiles
+and the active selection are preserved; stopped/untrusted installations are
+skipped. It is not LAN discovery and does not install or restart servers.
+Native credential presence is not a promise that a token remains valid; actual
+sends still determine authentication. Claude discovery never runs auth-status
+or renews credentials. Custom API keys are always entered explicitly.
 
 Cursor CLI's `--endpoint` configures a Cursor service API, not an arbitrary
 OpenAI-compatible model endpoint. Its API key is issued by Cursor. Cursor

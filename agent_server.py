@@ -6288,6 +6288,7 @@ class CreateSessionRequest(BaseModel):
     cwd: str | None = None
     backend: str | None = None
     codex_provider: Literal["default", "custom"] | None = None
+    provider_connection: Literal["default", "custom"] | None = None
     model: str | None = None
     effort: str | None = None
     subagent_limit: int | None = Field(default=None, strict=True, ge=1)
@@ -6361,6 +6362,7 @@ class UpdateSessionRequest(BaseModel):
     cwd: str | None = None
     backend: str | None = None
     codex_provider: Literal["default", "custom"] | None = None
+    provider_connection: Literal["default", "custom"] | None = None
     model: str | None = None
     effort: str | None = None
     subagent_limit: int | None = Field(default=None, strict=True, ge=1)
@@ -6388,6 +6390,7 @@ SESSION_LIFECYCLE_UPDATE_FIELDS = frozenset({
     "cwd",
     "backend",
     "codex_provider",
+    "provider_connection",
     "model",
     "effort",
     "system_prompt",
@@ -7179,6 +7182,15 @@ def preview_session_runtime_update(
     if provider_changed and session_backend_locked(sess):
         raise HTTPException(409, "Codex provider is locked after the chat starts; create a new chat to use another provider.")
 
+    current_connection = sess.get("provider_connection") or "default"
+    connection = (patch.get("provider_connection") or "default") if "provider_connection" in patch else "default" if backend_changed else current_connection
+    if connection not in {"default", "custom"} or connection == "custom" and prospective_backend not in {BACKEND_CLAUDE, BACKEND_OPENCODE}:
+        raise HTTPException(400, "This backend does not support that API connection.")
+    connection_changed = current_connection != connection
+    if connection_changed and session_backend_locked(sess):
+        raise HTTPException(409, "API connection is locked after the chat starts; create a new chat to change it.")
+    provider_changed = provider_changed or connection_changed
+
     prospective_model = (
         str(patch.get("model") or "").strip() or None
         if "model" in patch
@@ -7205,6 +7217,13 @@ def preview_session_runtime_update(
         preview.pop("codex_provider_revision", None)
     preview["model"] = prospective_model
     preview["effort"] = normalized_effort
+    preview["provider_connection"] = connection
+    if connection_changed or connection == "default":
+        preview.pop("provider_connection_revision", None)
+    if connection == "custom":
+        selected_connection = PROVIDER_CONNECTION_STORE.bind(preview)
+        preview["provider_connection_revision"] = selected_connection["credential_id"]
+        preview["model"] = selected_connection.get("model")
     if prospective_provider == "custom" and {"backend", "codex_provider", "model", "effort"}.intersection(patch):
         if CODEX_TRANSPORT == CODEX_TRANSPORT_EXEC:
             raise HTTPException(409, "Custom endpoints require native Codex app-server transport.")
@@ -10503,8 +10522,13 @@ class SessionStore:
             runtime_source.update({name: parent.get(name) for name in (
                 "codex_provider", "codex_provider_binding", "codex_provider_revision",
             )})
+        if initializing_fork and parent_id and req.provider_connection == "custom":
+            parent = self.sessions.get(parent_id) or {}
+            runtime_source.update({name: parent.get(name) for name in ("provider_connection", "provider_connection_revision")})
+        if req.provider_connection == "custom" and not initializing_fork and any((req.provider_session_id, req.session_id, req.claude_session_id, req.opencode_session_id)):
+            raise HTTPException(409, "Import native conversations with their native login. Create a new chat for a custom API.")
         runtime = preview_session_runtime_update(runtime_source, {
-            "codex_provider": req.codex_provider, "model": req.model, "effort": req.effort,
+            "codex_provider": req.codex_provider, "provider_connection": req.provider_connection, "model": req.model, "effort": req.effort,
         })
         model, effort = runtime["model"], runtime["effort"]
         session_cwd = req.cwd or DEFAULT_CWD
@@ -10601,6 +10625,8 @@ class SessionStore:
             "codex_provider": runtime["codex_provider"],
             "codex_provider_binding": runtime.get("codex_provider_binding"),
             "codex_provider_revision": runtime.get("codex_provider_revision"),
+            "provider_connection": runtime["provider_connection"],
+            "provider_connection_revision": runtime.get("provider_connection_revision"),
             "model": model,
             "effort": effort,
             "system_prompt": clean_session_system_prompt(req.system_prompt),
@@ -10721,7 +10747,7 @@ class SessionStore:
                 raise HTTPException(status_code=404, detail="session not found")
             if "subagent_limit" in patch:
                 validate_session_subagent_limit({**sess, "backend": patch.get("backend") or sess.get("backend")}, patch["subagent_limit"])
-            previous_provider_runtime = dict(sess) if {"codex_provider", "subagent_limit"}.intersection(patch) else None
+            previous_provider_runtime = dict(sess) if {"codex_provider", "provider_connection", "subagent_limit"}.intersection(patch) else None
             missing_policy = object()
             previous_provider_jobs_access = sess.get(
                 "provider_jobs_access",
@@ -10734,6 +10760,7 @@ class SessionStore:
             ).lower()
             backend_changed = prospective_backend != current_backend
             provider_changed = runtime_preview["codex_provider"] != codex_provider.session_choice(sess.get("codex_provider"))
+            provider_changed = provider_changed or runtime_preview["provider_connection"] != (sess.get("provider_connection") or "default")
             previous_opencode_permission_mode = (
                 effective_opencode_permission_mode(sess)
             )
@@ -10802,6 +10829,9 @@ class SessionStore:
                 sess["codex_provider"] = runtime_preview["codex_provider"]
                 sess["codex_provider_binding"] = runtime_preview.get("codex_provider_binding")
                 sess["codex_provider_revision"] = runtime_preview.get("codex_provider_revision")
+            if "provider_connection" in patch or backend_changed:
+                sess["provider_connection"] = runtime_preview["provider_connection"]
+                sess["provider_connection_revision"] = runtime_preview.get("provider_connection_revision")
             if provider_changed:
                 sess["model"] = runtime_preview["model"]
                 sess["effort"] = runtime_preview["effort"]
@@ -16865,6 +16895,9 @@ async def append_event(
     event_type: str,
     payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    connection_session = STORE.sessions.get(session_id) or {}
+    if connection_session.get("provider_connection") == "custom" and payload:
+        payload = PROVIDER_CONNECTION_STORE.redact(connection_session, payload)
     def discarded_event() -> dict[str, Any]:
         return {
             "seq": 0,
@@ -51441,6 +51474,10 @@ def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, 
     # UI still needs the authoritative first-turn backend fence.
     public["backend_locked"] = session_backend_locked(sess)
     public["codex_provider"] = codex_provider.session_choice(sess.get("codex_provider"))
+    public["provider_connection"] = sess.get("provider_connection") or "default"
+    if public["provider_connection"] == "custom":
+        public["provider_connection_catalog"] = PROVIDER_CONNECTION_STORE.catalog(sess["backend"], session=sess)
+    public.pop("provider_connection_revision", None)
     if public["codex_provider"] == "custom":
         public["codex_provider_catalog"] = CODEX_PROVIDER_STORE.catalog(
             available=CODEX_TRANSPORT != CODEX_TRANSPORT_EXEC, session=sess, summary=summary,
@@ -58828,6 +58865,12 @@ def record_runtime_success(backend: str) -> None:
 
 async def ensure_runtime_available(backend: str, *, session: dict[str, Any] | None = None) -> dict[str, Any]:
     diagnostic = await asyncio.to_thread(runtime_diagnostic, backend)
+    if (session or {}).get("provider_connection") == "custom":
+        selected = PROVIDER_CONNECTION_STORE.for_session(session)
+        provider_connections.require_model(selected)
+        if backend not in {BACKEND_CLAUDE, BACKEND_OPENCODE} or diagnostic.get("installed") is not True:
+            raise HTTPException(503, "Install this provider's native CLI to use its custom API.")
+        diagnostic = {**diagnostic, "status": "ready", "authenticated": True}
     if (
         backend == BACKEND_CLAUDE
         and diagnostic.get("installed") is True
@@ -59630,6 +59673,9 @@ def discover_runtime_backend_catalog(backend: str, *, force_runtime_probe: bool 
         })
     catalog["diagnostic"] = public_runtime_diagnostic(diagnostic)
     catalog["available"] = ready
+    catalog["native_credentials_present"] = provider_connections.native_credentials_present(backend, diagnostic)
+    if backend in {BACKEND_CLAUDE, BACKEND_OPENCODE}:
+        catalog["custom_provider"] = PROVIDER_CONNECTION_STORE.catalog(backend, installed=diagnostic.get("installed") is True)
     return catalog
 
 
@@ -60478,6 +60524,12 @@ def build_claude_cmd(
         cmd.extend(["--settings", json.dumps({"env": {
             "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": str(subagent_limit),
         }}, separators=(",", ":"))])
+    if sess.get("provider_connection") == "custom":
+        _, settings_path = PROVIDER_CONNECTION_STORE.claude_overrides(sess)
+        if "--settings" in cmd:
+            index = cmd.index("--settings")
+            del cmd[index:index + 2]
+        cmd.extend(["--settings", settings_path])
     if no_session_persistence and not provider_id:
         cmd.append("--no-session-persistence")
     if provider_id:
@@ -60533,6 +60585,7 @@ def claude_sdk_configuration_key(
         "allowed_tools": [CLAUDE_PROVIDER_MCP_TOOL_NAME],
         "thinking": {"type": "adaptive", "display": "summarized"},
         "agentsdock_provider_tool": 1,
+        "provider_connection_revision": sess.get("provider_connection_revision"),
     }
     subagent_limit = sess.get("subagent_limit")
     if type(subagent_limit) is int and subagent_limit > 0:
@@ -60581,6 +60634,10 @@ def build_claude_sdk_options(
             {"env": subagent_env}, separators=(",", ":"),
         )
     cli_path = claude_sdk_cli_path(env)
+    if sess.get("provider_connection") == "custom":
+        custom_env, custom_settings = PROVIDER_CONNECTION_STORE.claude_overrides(sess)
+        env.update(custom_env)
+        subagent_settings["settings"] = custom_settings
     system_prompt = session_system_prompt(session_id, sess, manifest_path)
     provider_id = resolve_claude_resume_provider(sess, cwd)[0]
     if sess.get("fork_resume_session_at") and not (provider_id and sess.get("fork_from")):
@@ -60718,7 +60775,7 @@ def build_claude_sdk_options(
         stderr=lambda line: logger.warning(
             "Claude SDK stderr session=%s: %s",
             session_id,
-            compact_memory_text(line, 2_000),
+            compact_memory_text(PROVIDER_CONNECTION_STORE.redact(sess, line), 2_000),
         ),
     )
     def bind_provider_tool_owner(ownership_token: str, run_id: str) -> None:
@@ -63332,7 +63389,7 @@ async def run_claude_print(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
-            env=agent_runner_env(session_id, runtime_env),
+            env={**agent_runner_env(session_id, runtime_env), **PROVIDER_CONNECTION_STORE.claude_overrides(sess)[0]} if sess.get("provider_connection") == "custom" else agent_runner_env(session_id, runtime_env),
             limit=PROCESS_STREAM_LIMIT,
             start_new_session=True,
         )
@@ -68379,7 +68436,7 @@ async def run_opencode(
     cmd = build_opencode_cmd(
         {
             "opencode_session_id": resumed_provider_id,
-            "model": sess.get("model"),
+            "model": "agentsdock_custom/" + provider_connections.require_model(PROVIDER_CONNECTION_STORE.for_session(sess)) if sess.get("provider_connection") == "custom" else sess.get("model"),
             "effort": sess.get("effort"),
         },
         "",
@@ -68415,6 +68472,7 @@ async def run_opencode(
                 instruction_content
             )
         env = agent_runner_env(session_id, runtime_env)
+        env.update(PROVIDER_CONNECTION_STORE.opencode_overrides(sess, env))
         env.update(build_opencode_env_overrides(
             permission_mode,
             existing_config=env.get("OPENCODE_CONFIG_CONTENT"),
@@ -81580,6 +81638,7 @@ async def health() -> dict[str, Any]:
             "side_questions": side_questions.capability(),
             "codex_auth_v1": codex_auth.capability(available=bool(AGENT_TOKEN) and CODEX_TRANSPORT != CODEX_TRANSPORT_EXEC),
             "codex_provider_v1": {"available": bool(AGENT_TOKEN) and CODEX_TRANSPORT != CODEX_TRANSPORT_EXEC, "wire_api": "responses", "per_chat": True, "per_chat_models": True, "model_discovery": True, "model_compatibility": True},
+            "provider_connections_v1": {"available": bool(AGENT_TOKEN), "per_chat": True, "backends": [BACKEND_CLAUDE, BACKEND_OPENCODE]},
             "team_mail_hints_v1": SECURE_PEER_RUNTIME.team_mail_hint_capability(),
             "team_mail_hints_v2": SECURE_PEER_RUNTIME.team_notification_hint_capability(),
             "websocket_auth_v1": {
@@ -90610,6 +90669,7 @@ async def _fork_session_locked(
             cwd=parent.get("cwd"),
             backend=parent_backend,
             codex_provider=codex_provider.session_choice(parent.get("codex_provider")),
+            provider_connection=parent.get("provider_connection") or "default",
             model=parent.get("model"),
             effort=parent.get("effort"),
             subagent_limit=parent.get("subagent_limit"),

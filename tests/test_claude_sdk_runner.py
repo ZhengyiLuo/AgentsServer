@@ -2132,6 +2132,28 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual({**inherited, **child_env}[secret_name], "")
         self.assertEqual(child_env["ANTHROPIC_API_KEY"], "provider-credential")
 
+    async def test_custom_api_options_pin_credentials_without_changing_native_session(self) -> None:
+        from provider_connections import ConnectionStore
+        store = ConnectionStore(Path(self.authority_temporary.name) / "api-private")
+        store.write("claude", 0, {"base_url": "https://example.invalid", "api_key": "synthetic-custom-secret",
+            "model": "api-model", "protocol": "anthropic", "auth_header": "bearer", "expected_revision": 0}, "verified")
+        with patch.object(agent_server, "PROVIDER_CONNECTION_STORE", store), patch.object(
+            agent_server, "claude_sdk_cli_path", return_value="/usr/bin/claude",
+        ), patch.object(agent_server, "resolve_claude_resume_provider", return_value=(None, None)), patch.object(
+            agent_server, "create_claude_agent_options", side_effect=lambda **values: values,
+        ):
+            custom = agent_server.preview_session_runtime_update({"backend": "claude"}, {"provider_connection": "custom"})
+            self.assertEqual(custom["model"], "api-model")
+            options, key, _ = agent_server.build_claude_sdk_options("synthetic-chat", custom, self.cwd, Path(self.cwd) / "manifest.json")
+            self.assertEqual(options["env"]["ANTHROPIC_AUTH_TOKEN"], "synthetic-custom-secret")
+            self.assertEqual(options["env"]["CLAUDE_CODE_OAUTH_TOKEN"], "")
+            self.assertEqual(json.loads(Path(options["settings"]).read_text())["env"]["ANTHROPIC_AUTH_TOKEN"], "synthetic-custom-secret")
+            self.assertNotIn("synthetic-custom-secret", json.dumps(options["extra_args"]))
+            self.assertNotEqual(key, agent_server.claude_sdk_configuration_key(self.session, self.cwd, "/usr/bin/claude", "synthetic"))
+            with self.assertRaises(HTTPException):
+                agent_server.preview_session_runtime_update({**custom, "backend_locked": True}, {"provider_connection": "default"})
+            self.assertEqual(agent_server.preview_session_runtime_update({"backend": "claude"}, {})["provider_connection"], "default")
+
     async def test_server_secrets_are_removed_from_process_environment(self) -> None:
         inherited = {
             name: f"server-secret-{index}"

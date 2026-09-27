@@ -22,7 +22,8 @@ trust; it and its upstream provider receive the requests you submit.
 
 The new Claude Code and OpenCode cards are **settings-only**. Select the
 intended server, open **Settings → AI Providers → Configure API**, enter the
-URL, protocol, model ID and key, and choose **Verify and save**. They do not
+URL and key, and choose **Connect**. Protocol, authentication header and an
+optional model ID live in **Advanced**. They do not
 alter native login, environment files, chat choices or message routing.
 Codex retains its existing separate Custom endpoint workflow and model check.
 
@@ -32,13 +33,29 @@ Anthropic console. Use base URL `https://api.anthropic.com`, Anthropic Messages,
 company gateway, ask its administrator for the corresponding protocol, base
 URL, exact model ID and authentication header instead of guessing these.
 
-A successful new-card check means one short text request to the exact API
-and model succeeded. It does **not** establish native agent login, tool use,
+A default connection check uses a read-only authenticated route: OpenRouter's
+private `/api/v1/key`, or a protected model catalog for other APIs. A public
+model list alone never produces a verified state. If a gateway cannot check
+keys this way, Claude/OpenCode offer an explicit model request through Advanced.
+A successful check does **not** establish native agent login, tool use,
 streaming, reasoning, context continuity or full runtime compatibility.
-The UI labels this **Last API check passed** with a timestamp, not “logged in”.
-Checks happen only on explicit user actions, can incur a small charge, and
+The UI labels this **Connected · last check passed**, not “logged in”.
+Checks happen only on explicit user actions. Optional model checks can incur
+a small charge; default read-only checks do not run inference. Checks
 send neither conversation history nor tools. Rechecking failure removes the
 success state. Failed replacements leave the previous saved credentials intact.
+
+Codex's native account and custom API are separate cards; native usage/account
+data is not queried for custom API chats. Connect requires server credential
+verification before saving. Its optional advanced model-discovery check is
+not authentication proof. The saved verification flag is server-written and
+bound to the exact credential revision, not inferred from native login or
+public model discovery. Legacy saved keys remain usable but are shown as
+saved/unverified until explicitly checked again with the key.
+
+Unconfigured custom APIs do not appear in new-chat/composer provider menus.
+Removing the current Codex endpoint does not switch existing custom chats
+to native Codex or erase the immutable credentials those chats already use.
 
 Cursor CLI's `--endpoint` configures a Cursor service API, not an arbitrary
 OpenAI-compatible model endpoint. Its API key is issued by Cursor. Cursor
@@ -62,8 +79,13 @@ card explains the limitation and links to native authentication instructions.
   or authentication. Old servers show an upgrade notice, not a fake success.
 - A compatible desktop **and** server build are required. No automatic
   deployment or account migration is part of this feature.
+- Codex's native GET response advertises `connection_check_available`; PUT
+  accepts `verify_connection: true`. Only a successful server check can produce
+  `connection_verified: true`. Legacy PUT remains compatible but cannot claim
+  verification. Neither mutation changes the server's native Codex login.
 
 References: [OpenRouter Codex](https://openrouter.ai/docs/cookbook/coding-agents/codex-cli),
+[OpenRouter key status](https://openrouter.ai/docs/api/api-reference/api-keys/get-current-api-key),
 [OpenRouter Claude Code](https://openrouter.ai/docs/cookbook/coding-agents/claude-code-integration),
 [Claude gateways](https://code.claude.com/docs/en/llm-gateway-connect),
 [OpenCode providers](https://opencode.ai/docs/providers#custom-provider),

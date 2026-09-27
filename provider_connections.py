@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 import stat
 import tempfile
 import threading
@@ -14,11 +15,11 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from codex_provider import validate_selection, validate_model
+from codex_provider import validate_selection
 
 MAX_BODY_BYTES = 16 * 1024
 PROTOCOLS = {"claude": {"anthropic"}, "opencode": {"anthropic", "chat_completions", "responses"}}
-RESULTS = {"verified", "authentication_failed", "rate_limited", "unsupported", "connection_failed", "invalid_response"}
+RESULTS = {"verified", "authentication_failed", "rate_limited", "unsupported", "connection_failed", "invalid_response", "model_required"}
 
 
 def backend_name(value: str) -> str:
@@ -41,8 +42,9 @@ def selection(backend: str, value: object) -> dict:
         raise HTTPException(400, "Unsupported API protocol or authentication header.")
     if value["protocol"] != "anthropic" and value["auth_header"] != "bearer":
         raise HTTPException(400, "This API protocol requires bearer authentication.")
-    selected = validate_selection({key: value[key] for key in ("base_url", "api_key", "model")})
-    selected["model"] = validate_model(value["model"])
+    selected = validate_selection({"base_url": value["base_url"], "api_key": value["api_key"],
+                                   "model": None if value["model"] == "" else value["model"]})
+    selected.setdefault("model", None)
     if selected["base_url"].lower().endswith("/messages"):
         raise HTTPException(400, "Enter the base URL, without an API operation suffix.")
     return {**selected, "protocol": value["protocol"], "auth_header": value["auth_header"],
@@ -130,8 +132,53 @@ class ConnectionStore:
             return self.public(backend)
 
 
+async def probe_credentials(selected: dict) -> str:
+    """Read-only key check. Public model lists alone never verify a credential."""
+    base = selected["base_url"]
+    protocol = selected.get("protocol", "responses")
+    headers = {"Accept": "application/json", "anthropic-version": "2023-06-01"}
+    if selected.get("auth_header") == "x-api-key":
+        headers["x-api-key"] = selected["api_key"]
+    else:
+        headers["Authorization"] = "Bearer " + selected["api_key"]
+    url = urlsplit(base)
+    router = url.scheme == "https" and url.netloc == "openrouter.ai" and url.path in {"/api", "/api/v1"}
+    target = "https://openrouter.ai/api/v1/key" if router else base + (
+        "/v1/models" if protocol == "anthropic" and not base.endswith("/v1") else "/models")
+    async def send():
+        async with httpx.AsyncClient(timeout=10, follow_redirects=False, trust_env=False) as client:
+            async with client.stream("GET", target, headers=headers) as response:
+                if response.status_code in {401, 403}: return "authentication_failed"
+                if response.status_code == 429: return "rate_limited"
+                if response.status_code in {404, 405}: return "model_required"
+                if response.status_code != 200: return "connection_failed"
+                raw = bytearray()
+                async for chunk in response.aiter_bytes():
+                    raw.extend(chunk)
+                    if len(raw) > 2 * 1024 * 1024: return "invalid_response"
+                payload = json.loads(raw)
+                data = payload.get("data") if isinstance(payload, dict) else None
+                if router:
+                    # Do not return the key label, account metadata or spend.
+                    return "verified" if isinstance(data, dict) and isinstance(data.get("label"), str) else "invalid_response"
+                if not isinstance(data, list) or not all(isinstance(item, dict) and isinstance(item.get("id"), str) for item in data):
+                    return "invalid_response"
+            # A gateway may expose its catalog publicly. Confirm this route
+            # actually distinguishes credentials before showing a green check.
+            async with client.stream("GET", target, headers={"Accept": "application/json", "anthropic-version": "2023-06-01"}) as public:
+                return "verified" if public.status_code in {401, 403} else "model_required"
+    try:
+        return await asyncio.wait_for(send(), timeout=20)
+    except (asyncio.TimeoutError, httpx.HTTPError):
+        return "connection_failed"
+    except (ValueError, TypeError, AttributeError, RecursionError):
+        return "invalid_response"
+
+
 async def probe(selected: dict) -> str:
     """One small, explicit model request; no tools/history, redirects or retries."""
+    if not selected.get("model"):
+        return await probe_credentials(selected)
     protocol = selected["protocol"]
     headers = {"Content-Type": "application/json"}
     if selected["auth_header"] == "x-api-key":

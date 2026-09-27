@@ -7,7 +7,7 @@ import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
@@ -93,12 +93,20 @@ class SettingsTests(unittest.IsolatedAsyncioTestCase):
     def test_rejects_malformed_protocol_model_and_secrets_without_echo(self):
         for field in INPUT:
             for invalid in (None, [], {}, True):
+                if field == "model" and invalid is None:
+                    continue
                 result = self.client.put(PATH, headers=NATIVE, json={**INPUT, field: invalid})
                 self.assertEqual(result.status_code, 400, (field, invalid, result.text))
                 self.assertNotIn(KEY, result.text)
         for path in (PATH.replace("claude", "cursor"), PATH.replace("claude", "codex")):
             self.assertEqual(self.client.put(path, headers=NATIVE, json=INPUT).status_code, 400)
         self.check.assert_not_awaited()
+
+    def test_optional_model_is_saved_as_null_for_read_only_verification(self):
+        response = self.client.put(PATH, headers=NATIVE, json={**INPUT, "model": None})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIsNone(response.json()["configuration"]["model"])
+        self.assertIsNone(self.store.read("claude")["model"])
 
     def test_oversized_body_and_symlink_fail_closed(self):
         response = self.client.put(PATH, headers=NATIVE, json={**INPUT, "api_key": "x" * (connections.MAX_BODY_BYTES + 1)})
@@ -133,8 +141,17 @@ class WireProbeTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.calls = []
         self.status, self.payload = 200, {}
+        self.public_status = 401
         case = self
         class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                case.calls.append((self.path, dict(self.headers), None))
+                self.send_response(case.status if self.headers.get("Authorization") or self.headers.get("x-api-key") else case.public_status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Location", "/credential-leak")
+                self.end_headers()
+                self.wfile.write(json.dumps(case.payload).encode())
+
             def do_POST(self):
                 case.calls.append((self.path, dict(self.headers), json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
                 self.send_response(case.status)
@@ -179,6 +196,46 @@ class WireProbeTests(unittest.IsolatedAsyncioTestCase):
         for payload in ({}, [], {"type": "message", "content": "wrong"}, {"text": "x" * 150000}):
             self.payload = payload
             self.assertEqual(await connections.probe({**INPUT, "base_url": self.base}), "invalid_response")
+
+    async def test_read_only_key_check_requires_a_protected_endpoint(self):
+        self.payload = {"data": [{"id": "fixture/model"}]}
+        for protocol, header, path in [("responses", "bearer", "/models"), ("anthropic", "x-api-key", "/v1/models")]:
+            selected = {**INPUT, "base_url": self.base, "model": None, "protocol": protocol, "auth_header": header}
+            self.public_status = 401
+            self.assertEqual(await connections.probe(selected), "verified")
+            self.assertEqual(self.calls[-2][0], path)
+            self.assertEqual(self.calls[-1][0], path)
+            self.assertNotIn("Authorization", self.calls[-1][1])
+            self.assertNotIn("x-api-key", self.calls[-1][1])
+            self.public_status = 200
+            self.assertEqual(await connections.probe(selected), "model_required")
+        self.assertTrue(all(body is None for _, _, body in self.calls))  # no inference or tools
+
+    async def test_read_only_auth_errors_redirect_and_missing_routes_never_verify(self):
+        for status, expected in [(401, "authentication_failed"), (429, "rate_limited"), (302, "connection_failed"), (404, "model_required")]:
+            self.status = status
+            self.assertEqual(await connections.probe({**INPUT, "base_url": self.base, "model": None}), expected)
+        self.assertEqual(len(self.calls), 4)
+
+    async def test_openrouter_uses_private_key_status_not_public_model_list(self):
+        seen = []
+        def handler(request):
+            seen.append(str(request.url))
+            return httpx.Response(200, json={"data": {"label": "private-key-label", "limit": 100}})
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with patch.object(connections.httpx, "AsyncClient", return_value=client):
+            self.assertEqual(await connections.probe_credentials({**INPUT, "base_url": "https://openrouter.ai/api"}), "verified")
+        self.assertEqual(seen, ["https://openrouter.ai/api/v1/key"])
+
+    async def test_lookalike_router_is_not_treated_as_private_key_endpoint(self):
+        seen = []
+        def handler(request):
+            seen.append(str(request.url))
+            return httpx.Response(200, json={"data": []})
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with patch.object(connections.httpx, "AsyncClient", return_value=client):
+            self.assertEqual(await connections.probe_credentials({**INPUT, "base_url": "https://openrouter.ai.example/api/v1"}), "model_required")
+        self.assertEqual(seen, ["https://openrouter.ai.example/api/v1/models"] * 2)
 
 
 if __name__ == "__main__":

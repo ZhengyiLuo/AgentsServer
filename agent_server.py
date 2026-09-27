@@ -82995,6 +82995,7 @@ app.include_router(codex_provider.create_router(
     available=lambda: CODEX_TRANSPORT != CODEX_TRANSPORT_EXEC,
     session_lookup=lambda session_id: STORE.sessions.get(session_id),
     native_models=custom_codex_discovery_native_models,
+    check_credentials=provider_connections.probe_credentials,
 ))
 
 

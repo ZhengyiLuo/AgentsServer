@@ -313,17 +313,47 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         self.ns["suppress"] = suppress
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), self.ns)
         self.probe = AsyncMock(return_value=provider.test_result("ready"))
+        self.check_credentials = AsyncMock(return_value="verified")
         self.discover = Mock(return_value={**provider.test_result("ready"), "models": [{"value": "first/model", "label": "first/model"}], "default_model": "first/model"})
         app = FastAPI()
         app.middleware("http")(self.ns["require_agent_token"])
         app.include_router(provider.create_router(authorize=self.ns["require_native_admin_control"], store=self.store,
             mutate=self.ns["mutate_codex_provider"], probe=self.probe, available=lambda: True, discover=self.discover,
-            session_lookup=lambda session_id: self.ns["STORE"].sessions.get(session_id)))
+            session_lookup=lambda session_id: self.ns["STORE"].sessions.get(session_id), check_credentials=self.check_credentials))
         app.include_router(codex_auth.create_router(authorize=self.ns["require_native_admin_control"],
             operation=self.ns["codex_auth_operation"], available=lambda: True,
             ))
         self.client = TestClient(app)
         self.addCleanup(self.client.close)
+
+    def test_verified_save_binds_evidence_to_exact_credentials_without_native_login(self):
+        route = "/api/admin/codex/provider"
+        self.assertTrue(self.client.get(route, headers=NATIVE).json()["connection_check_available"])
+        response = self.client.put(route, headers=NATIVE, json={**SELECTION, "verify_connection": True})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["connection_verified"])
+        self.assertNotIn(KEY, response.text)
+        self.assertTrue(provider.ProviderStore(self.store.root).status()["connection_verified"])
+        self.assertNotIn("connection_verified", self.store.selection(include_key=True))
+        self.check_credentials.assert_awaited_once()
+        self.manager.close.assert_not_awaited()
+        self.ns["codex_app_server_manager"].assert_not_awaited()
+        previous = self.store.revision()
+        self.check_credentials.return_value = "authentication_failed"
+        rejected = self.client.put(route, headers=NATIVE, json={**SELECTION, "api_key": "bad-key", "verify_connection": True})
+        self.assertEqual(rejected.status_code, 400)
+        self.assertEqual(previous, self.store.revision())
+        self.assertTrue(self.store.status()["connection_verified"])
+        self.client.put(route, headers=NATIVE, json=SELECTION)  # legacy save is not proof
+        self.assertNotIn("connection_verified", self.store.status())
+
+    def test_client_cannot_forge_verification_evidence(self):
+        route = "/api/admin/codex/provider"
+        for field, value in [("connection_verified", True), ("verify_connection", "true")]:
+            result = self.client.put(route, headers=NATIVE, json={**SELECTION, field: value})
+            self.assertEqual(result.status_code, 400)
+        self.check_credentials.assert_not_awaited()
+        self.assertFalse(self.store.status()["configured"])
 
     def test_save_reset_preserve_manager_and_normal_readiness(self):
         response = self.client.put("/api/admin/codex/provider", headers=NATIVE, json=SELECTION)

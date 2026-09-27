@@ -295,12 +295,15 @@ class ProviderStore:
                 raise HTTPException(503, "Saved provider settings or credentials are unavailable.") from None
 
     def status(self, *, available=True) -> dict:
-        selected = self.selection(include_revision=True)
+        with self.lock:
+            selected = self.selection(include_revision=True)
+            metadata = self._read("settings.json") or {}
+        evidence = {"connection_verified": True} if selected and metadata.get("credential_id") == selected.get("credential_id") and metadata.get("connection_verified") is True else {}
         return {"available": available, "configured": selected is not None,
             "base_url": selected["base_url"] if selected else None,
             "model": selected.get("model") if selected else None,
             "credential_id": selected.get("credential_id") if selected else None,
-            "has_api_key": selected is not None, "wire_api": "responses"}
+            "has_api_key": selected is not None, "wire_api": "responses", **evidence}
 
     def for_session(self, session: dict, *, include_key=False) -> dict | None:
         if session_choice(session.get("codex_provider")) == "default":
@@ -982,7 +985,7 @@ async def test_connection(selected: dict, *, executable: str, environment: dict,
                 raise asyncio.CancelledError
 
 
-def create_router(*, authorize, store: ProviderStore, mutate, probe, available, discover=discover_models, session_lookup=None, native_models=None) -> APIRouter:
+def create_router(*, authorize, store: ProviderStore, mutate, probe, available, discover=discover_models, session_lookup=None, native_models=None, check_credentials=None) -> APIRouter:
     router = APIRouter()
 
     async def body(request, *, saved=False):
@@ -993,6 +996,9 @@ def create_router(*, authorize, store: ProviderStore, mutate, probe, available, 
                 raise HTTPException(413, "Provider request is too large.")
         try:
             parsed = json.loads(raw)
+            verify = isinstance(parsed, dict) and request.method == "PUT" and parsed.pop("verify_connection", False)
+            if verify is not False and verify is not True:
+                raise HTTPException(400, "Invalid connection check.")
             if saved and isinstance(parsed, dict) and "base_url" not in parsed and "api_key" not in parsed:
                 if set(parsed) - {"model", "session_id", "credential_id"}:
                     raise HTTPException(400, "Provide a model and the saved endpoint identity.")
@@ -1015,7 +1021,10 @@ def create_router(*, authorize, store: ProviderStore, mutate, probe, available, 
                     selected.clear()
                     raise HTTPException(409, "The saved endpoint changed. Refresh before checking this model.")
                 return {**selected, "model": selected_model}
-            return validate_selection(parsed)
+            selected = validate_selection(parsed)
+            if verify:
+                selected["verify_connection"] = True
+            return selected
         except (ValueError, UnicodeError, RecursionError):
             raise HTTPException(400, "Provide a valid provider request.") from None
         finally:
@@ -1045,7 +1054,10 @@ def create_router(*, authorize, store: ProviderStore, mutate, probe, available, 
     @router.get("/api/admin/codex/provider")
     async def status(request: Request):
         authorize(request)
-        return JSONResponse(await asyncio.to_thread(store.status, available=available()), headers={"Cache-Control": "no-store"})
+        configuration = await asyncio.to_thread(store.status, available=available())
+        if check_credentials is not None:
+            configuration["connection_check_available"] = True
+        return JSONResponse(configuration, headers={"Cache-Control": "no-store"})
 
     @router.post("/api/admin/codex/provider/test")
     async def test(request: Request):
@@ -1097,8 +1109,20 @@ def create_router(*, authorize, store: ProviderStore, mutate, probe, available, 
         access(request)
         selected = await body(request)
         try:
+            if selected.pop("verify_connection", False):
+                if check_credentials is None:
+                    raise HTTPException(501, "Update the server to verify an API connection.")
+                result = await check_credentials(selected)
+                if result != "verified":
+                    raise HTTPException(400, "API connection check failed. Check the URL and key.")
+                # Only this server-attested result may be persisted. It is not
+                # an accepted field in client-supplied provider selections.
+                selected["connection_verified"] = True
             await mutate(selected)
-            return JSONResponse(await asyncio.to_thread(store.status), headers={"Cache-Control": "no-store"})
+            configuration = await asyncio.to_thread(store.status)
+            if check_credentials is not None:
+                configuration["connection_check_available"] = True
+            return JSONResponse(configuration, headers={"Cache-Control": "no-store"})
         except HTTPException:
             raise
         except Exception:
@@ -1111,7 +1135,10 @@ def create_router(*, authorize, store: ProviderStore, mutate, probe, available, 
         access(request)
         try:
             await mutate(None)
-            return JSONResponse(await asyncio.to_thread(store.status), headers={"Cache-Control": "no-store"})
+            configuration = await asyncio.to_thread(store.status)
+            if check_credentials is not None:
+                configuration["connection_check_available"] = True
+            return JSONResponse(configuration, headers={"Cache-Control": "no-store"})
         except HTTPException:
             raise
         except Exception:

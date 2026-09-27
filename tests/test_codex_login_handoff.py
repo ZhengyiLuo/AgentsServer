@@ -141,9 +141,7 @@ class LoginHandoffTests(binary.BinaryRefreshTests):
         await self.drain()
         self.assertFalse(old.closed)
         self.assertFalse(new.closed)
-        with self.assertRaises(HTTPException) as error:
-            await self.manager("old")
-        self.assertEqual(error.exception.status_code, 409)
+        self.assertIs(await self.manager("old"), old)
 
     async def test_idle_preflight_releases_same_thread_before_next_turn(self):
         old = await self.manager("idle")
@@ -166,13 +164,46 @@ class LoginHandoffTests(binary.BinaryRefreshTests):
         await self.preflight("queued")
         self.assertIsNot(await self.manager("queued"), old)
 
+    async def test_queued_promotion_keeps_live_child_owner_after_login_change(self):
+        old = await self.manager("queued")
+        thread = self.load("queued", old)
+        self.ns["BUSY_SESSIONS"].add("queued")
+        await self.relogin()
+        await self.preflight("queued")
+        # The parent stopped so its accepted queue can promote, while native
+        # children continue on the existing process. Retain both, not a gate.
+        self.ns["BUSY_SESSIONS"].clear()
+        self.ns["codex_session_has_live_subagents"] = lambda sid: sid == "queued"
+        await self.preflight("queued")
+        self.assertIs(await self.manager("queued"), old)
+        self.assertTrue(old.is_thread_loaded(thread))
+        self.assertFalse(old.closed)
+        self.ns["evict_codex_app_server_thread"].assert_not_awaited()
+        self.assertFalse(self.ns["SERVER_MAINTENANCE_SESSIONS"])
+        self.assertIsNot(await self.manager("new"), old)
+
+    async def test_unrelated_manager_request_does_not_block_existing_chat_input(self):
+        old = await self.manager("idle")
+        thread = self.load("idle", old)
+        old.client._pending[1] = ("thread/read", object(), "other-thread")
+        await self.relogin()
+        await self.preflight("idle")
+        self.assertIs(await self.manager("idle"), old)
+        self.assertTrue(old.is_thread_loaded(thread))
+        self.assertFalse(old.closed)
+        self.ns["evict_codex_app_server_thread"].assert_not_awaited()
+        # Once the other request ends, the same thread can move normally.
+        old.client._pending.clear()
+        await self.preflight("idle")
+        self.assertIsNot(await self.manager("idle"), old)
+
     async def test_pending_nonturn_request_blocks_unsubscribe_and_process_close(self):
         old = await self.manager("idle")
         self.load("idle", old)
         old.client._pending[1] = ("thread/resume", object(), None)
         await self.relogin()
-        with self.assertRaises(HTTPException):
-            await self.preflight("idle")
+        await self.preflight("idle")
+        self.assertIs(await self.manager("idle"), old)
         await self.drain()
         self.assertFalse(old.closed)
         self.ns["evict_codex_app_server_thread"].assert_not_awaited()
@@ -213,8 +244,8 @@ class LoginHandoffTests(binary.BinaryRefreshTests):
         await borrowed.wait()
         try:
             await self.relogin()
-            with self.assertRaises(HTTPException):
-                await self.preflight("idle")
+            await self.preflight("idle")
+            self.assertIs(await self.manager("idle"), old)
             self.ns["evict_codex_app_server_thread"].assert_not_awaited()
         finally:
             release.set()
@@ -230,8 +261,9 @@ class LoginHandoffTests(binary.BinaryRefreshTests):
             old.terminals = [{"id": "background"}] if kind == "terminal" else []
             self.ns["SIDE_QUESTIONS"].active_session_ids = lambda: {"idle"} if kind == "side" else set()
             self.ns["codex_session_has_live_subagents"] = lambda _sid: kind == "subagent"
-            with self.subTest(kind=kind), self.assertRaises(HTTPException):
+            with self.subTest(kind=kind):
                 await self.preflight("idle")
+                self.assertIs(await self.manager("idle"), old)
             self.assertFalse(old.closed)
 
     async def test_cancelled_handoff_preserves_owner_and_releases_maintenance_fence(self):
@@ -311,6 +343,6 @@ class LoginHandoffTests(binary.BinaryRefreshTests):
         self.load("idle", old)
         await self.relogin()
         self.ns["evict_codex_app_server_thread"] = AsyncMock(return_value=True)
-        with self.assertRaises(HTTPException):
-            await self.preflight("idle")
+        await self.preflight("idle")
+        self.assertIs(await self.manager("idle"), old)
         self.assertIs(self.ns["CODEX_SESSION_APP_SERVER_MANAGERS"]["idle"], old)

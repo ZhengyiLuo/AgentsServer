@@ -55539,7 +55539,7 @@ async def release_idle_codex_manager_session(manager: CodexAppServerManager, ses
 
 
 async def prepare_codex_login_turn(session: dict[str, Any]) -> None:
-    """Pre-admission handoff under the chat lock, before message acceptance."""
+    """Move an idle chat to fresh sign-in without blocking its current owner."""
     if CODEX_TRANSPORT == CODEX_TRANSPORT_EXEC or codex_provider.session_choice(session.get("codex_provider")) == "custom":
         return
     await refresh_codex_app_server_login()
@@ -55551,8 +55551,10 @@ async def prepare_codex_login_turn(session: dict[str, Any]) -> None:
     # this preflight after the accepted prior turn has settled; no replay.
     if session_id in BUSY_SESSIONS or ACTIVE.get(session_id) is not None:
         return
-    if not await release_idle_codex_manager_session(manager, session_id, ignore_task=asyncio.current_task()):
-        raise TransientAdmissionWait(409, codex_auth.HANDOFF_MESSAGE)
+    # Children, terminals, approvals or another request may still need this
+    # process. Keep routing this chat to its owner until it can be released;
+    # retaining that work is not a reason to reject the user's next message.
+    await release_idle_codex_manager_session(manager, session_id, ignore_task=asyncio.current_task())
     schedule_codex_manager_drain()
 
 
@@ -55708,10 +55710,9 @@ async def codex_app_server_manager(sess: dict[str, Any] | None = None, *, allow_
             manager = None
         manager = manager or (CODEX_CUSTOM_APP_SERVER_MANAGERS.get(revision) if revision else CODEX_APP_SERVER_MANAGER)
         if manager is not None:
-            if (getattr(manager, "_agentsdock_login_superseded", False) is True and not allow_retired_login
-                    and getattr(manager, "_agentsdock_callers", {}).get(asyncio.current_task()) != session_id):
-                schedule_codex_manager_drain()
-                raise TransientAdmissionWait(409, codex_auth.HANDOFF_MESSAGE)
+            # A retired login generation can still own this chat's native
+            # work. Existing chats keep that owner; unowned/new chats use the
+            # replacement generation. Native authentication errors stay native.
             if session_id:
                 CODEX_SESSION_APP_SERVER_MANAGERS[session_id] = manager
             retain_codex_manager_caller(manager, session_id)

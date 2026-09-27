@@ -25,7 +25,21 @@ intended server, open **Settings → AI Providers → Configure API**, enter the
 URL and key, and choose **Connect**. Protocol, authentication header and an
 optional model ID live in **Advanced**. They do not
 alter native login, environment files, chat choices or message routing.
-Codex retains its existing separate Custom endpoint workflow and model check.
+Codex uses the same Configure API entry while retaining its separate endpoint
+credentials, chat routing and optional model check.
+
+Neutral icons mean unconnected or unconfirmed, not necessarily signed out.
+A green API check means the last explicit credential check passed; it does
+not certify every model or tool. Merely saving a legacy configuration cannot
+turn it green. The native account card is independent of custom API billing.
+
+Native-provider **Sign-in instructions** reveal a fixed command to run as the
+user owning the selected server: [Codex](https://developers.openai.com/codex/auth),
+[Claude Code](https://code.claude.com/docs/en/authentication),
+[Cursor](https://cursor.com/docs/cli/reference/authentication), or
+[OpenCode](https://opencode.ai/docs/cli/#auth). They do not start a local login
+on a potentially unrelated client machine or claim login succeeded. Claude
+continues to verify authentication on actual sends, not a background recheck.
 
 For direct Anthropic API access, create a key and billing setup in the
 Anthropic console. Use base URL `https://api.anthropic.com`, Anthropic Messages,

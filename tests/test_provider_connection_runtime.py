@@ -92,3 +92,7 @@ class RuntimeBindingTests(unittest.TestCase):
     def test_opencode_free_runtime_is_not_mislabeled_signed_in(self):
         with patch.object(Path, "home", return_value=Path(self.temp.name)), patch.dict(connections.os.environ, {}, clear=True):
             self.assertFalse(connections.native_credentials_present("opencode", {"installed": True, "authenticated": True}))
+
+    def test_custom_claude_success_is_not_proof_of_native_login(self):
+        with patch.object(Path, "home", return_value=Path(self.temp.name)), patch.dict(connections.os.environ, {}, clear=True), patch.object(connections.sys, "platform", "linux"):
+            self.assertFalse(connections.native_credentials_present("claude", {"installed": True, "authenticated": True}))

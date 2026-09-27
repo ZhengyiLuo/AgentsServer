@@ -291,7 +291,9 @@ def native_credentials_present(backend: str, diagnostic: dict) -> bool:
     """Presence only, not a paid/auth-refresh probe; never return credential data."""
     if diagnostic.get("installed") is not True:
         return False
-    if backend != "opencode" and diagnostic.get("authenticated") is True:
+    # Claude/OpenCode successful turns may have used a chat-local custom API.
+    # Their runtime-ready cache is not proof of a separate native login.
+    if backend not in {"claude", "opencode"} and diagnostic.get("authenticated") is True:
         return True
     try:
         if backend == "claude":

@@ -895,6 +895,7 @@ class ServerCallbackTests(unittest.IsolatedAsyncioTestCase):
         bridge = self.namespace["handle_codex_server_request"]
         async def owns(*args, **kwargs):
             self.assertEqual(kwargs["side_session_id"], "chat")
+            self.assertEqual(kwargs["side_approval_policy"], "on-request")
             return kwargs["side_owner_is_current"]()
         bridge.side_effect = owns
         callback = options["server_request_handler"]

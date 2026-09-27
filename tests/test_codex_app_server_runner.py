@@ -1494,7 +1494,21 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             "codex_approvals_reviewer": "user",
         }
         stack, _events, _finished, exec_fallback = self.runner_patches(manager)
-        with stack:
+        start_turn = manager.start_turn
+
+        async def check_captured_policy(*args, **kwargs):
+            self.assertEqual(
+                agent_server.ACTIVE["chat-native"]["codex_approval_policy"],
+                kwargs["overrides"]["approvalPolicy"],
+            )
+            agent_server.STORE.sessions["chat-native"]["codex_approval_policy"] = "never"
+            self.assertEqual(
+                agent_server.active_codex_approval_policy("chat-native", "thread-native"),
+                "on-request",
+            )
+            return await start_turn(*args, **kwargs)
+
+        with stack, patch.object(manager, "start_turn", side_effect=check_captured_policy):
             await agent_server.run_codex_app_server(
                 "chat-native",
                 "run-original",

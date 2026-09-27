@@ -507,7 +507,100 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await future, {"decision": "accept"})
         self.assertEqual(pending["resolution"], "answered")
 
+    async def test_no_prompt_questions_skip_without_pending_interaction(self) -> None:
+        cases = (("never", None), (None, None), ("on-request", "never"))
+        for stored_policy, captured_policy in cases:
+            with self.subTest(stored=stored_policy, captured=captured_policy):
+                agent_server.STORE.sessions["chat"]["codex_approval_policy"] = stored_policy
+                active = {"provider_thread_id": "thread", "codex_approval_policy": captured_policy}
+                events = AsyncMock()
+                metadata = AsyncMock()
+                with (
+                    patch.object(agent_server, "ACTIVE", {"chat": active}),
+                    patch.object(agent_server, "codex_request_is_interactive", return_value=True),
+                    patch.object(agent_server, "append_event", events),
+                    patch.object(agent_server, "update_codex_pending_session_metadata", metadata),
+                    patch.object(agent_server, "CODEX_INTERACTION_HANDLER_TASKS", {}),
+                ):
+                    result = await asyncio.wait_for(agent_server.handle_codex_server_request(
+                        1, "item/tool/requestUserInput",
+                        {"threadId": "thread", "questions": [{"id": "choice"}]},
+                    ), 0.2)
+                    self.assertEqual(result, {"answers": {}})
+                    self.assertFalse(agent_server.CODEX_PENDING_INTERACTIONS)
+                    self.assertFalse(agent_server.CODEX_INTERACTION_HANDLER_TASKS)
+                    events.assert_not_awaited()
+                    metadata.assert_not_awaited()
+
+    async def test_prompting_questions_keep_active_policy_when_settings_change(self) -> None:
+        for policy in ("on-request", "untrusted"):
+            with self.subTest(policy=policy):
+                agent_server.STORE.sessions["chat"]["codex_approval_policy"] = "never"
+                events = AsyncMock()
+                with (
+                    patch.object(agent_server, "ACTIVE", {"chat": {
+                        "provider_thread_id": "thread", "codex_approval_policy": policy,
+                    }}),
+                    patch.object(agent_server, "codex_request_is_interactive", return_value=True),
+                    patch.object(agent_server, "append_event", events),
+                    patch.object(agent_server, "update_codex_pending_session_metadata", AsyncMock()),
+                ):
+                    task = asyncio.create_task(agent_server.handle_codex_server_request(
+                        1, "item/tool/requestUserInput",
+                        {"threadId": "thread", "questions": [{"id": "choice"}]},
+                    ))
+                    try:
+                        await asyncio.sleep(0)
+                        interaction_id = next(iter(agent_server.CODEX_PENDING_INTERACTIONS))
+                        self.assertFalse(task.done())
+                        self.assertEqual(events.await_args.args[1], "codex_interaction_requested")
+                        await agent_server.resolve_codex_interaction(
+                            "chat", interaction_id, {"answers": {"choice": {"answers": ["A"]}}},
+                        )
+                        self.assertEqual(await asyncio.wait_for(task, 0.2),
+                                         {"answers": {"choice": {"answers": ["A"]}}})
+                    finally:
+                        if not task.done():
+                            task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+
+    async def test_side_questions_use_the_side_policy_not_the_parent_turn(self) -> None:
+        for side_policy, parent_policy in (("never", "on-request"), ("on-request", "never")):
+            with self.subTest(side=side_policy):
+                agent_server.STORE.sessions["chat"]["codex_approval_policy"] = parent_policy
+                events = AsyncMock()
+                metadata = AsyncMock()
+                with (
+                    patch.object(agent_server, "ACTIVE", {"chat": {
+                        "provider_thread_id": "thread", "codex_approval_policy": parent_policy,
+                    }}),
+                    patch.object(agent_server, "append_event", events),
+                    patch.object(agent_server, "update_codex_pending_session_metadata", metadata),
+                ):
+                    task = asyncio.create_task(agent_server.handle_codex_server_request(
+                        1, "item/tool/requestUserInput",
+                        {"threadId": "side-thread", "questions": [{"id": "choice"}]},
+                        side_session_id="chat", side_owner_is_current=lambda: True,
+                        side_approval_policy=side_policy,
+                    ))
+                    try:
+                        await asyncio.sleep(0)
+                        if side_policy == "never":
+                            self.assertFalse(agent_server.CODEX_PENDING_INTERACTIONS)
+                            events.assert_not_awaited()
+                            metadata.assert_not_awaited()
+                        else:
+                            interaction_id = next(iter(agent_server.CODEX_PENDING_INTERACTIONS))
+                            self.assertFalse(task.done())
+                            await agent_server.resolve_codex_interaction("chat", interaction_id, {"answers": {}})
+                        self.assertEqual(await asyncio.wait_for(task, 0.2), {"answers": {}})
+                    finally:
+                        if not task.done():
+                            task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+
     async def test_user_response_wins_race_with_auto_resolution(self) -> None:
+        agent_server.STORE.sessions["chat"]["codex_approval_policy"] = "on-request"
         decline_started = asyncio.Event()
         release_decline = asyncio.Event()
 

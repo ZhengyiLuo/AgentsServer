@@ -7224,6 +7224,23 @@ def preview_session_runtime_update(
     return preview
 
 
+def effective_codex_approval_policy(sess: dict[str, Any]) -> str:
+    policy = str(sess.get("codex_approval_policy") or CODEX_DEFAULT_APPROVAL_POLICY)
+    return policy if policy in CODEX_APPROVAL_POLICIES else CODEX_DEFAULT_APPROVAL_POLICY
+
+
+def active_codex_approval_policy(session_id: str, thread_id: str) -> str:
+    """Use the current native turn's policy, not next-turn settings edits."""
+    active = ACTIVE.get(session_id) or {}
+    captured = str(active.get("codex_approval_policy") or "")
+    if (
+        str(active.get("provider_thread_id") or "") == thread_id
+        and captured in CODEX_APPROVAL_POLICIES
+    ):
+        return captured
+    return effective_codex_approval_policy(STORE.sessions.get(session_id) or {})
+
+
 def effective_claude_permission_mode(sess: dict[str, Any]) -> str:
     """Return one canonical SDK permission mode for persisted/legacy chats."""
 
@@ -53678,6 +53695,7 @@ async def handle_codex_server_request(
     *,
     side_session_id: str | None = None,
     side_owner_is_current: Any = None,
+    side_approval_policy: str | None = None,
     source_manager: CodexAppServerManager | None = None,
 ) -> dict[str, Any]:
     """Bridge one app-server prompt to the owning AgentsDock chat, fail closed."""
@@ -53712,6 +53730,16 @@ async def handle_codex_server_request(
         ):
             pending = None
         else:
+            if method == "item/tool/requestUserInput":
+                policy = (
+                    side_approval_policy or CODEX_DEFAULT_APPROVAL_POLICY
+                    if side_session_id is not None
+                    else active_codex_approval_policy(session_id, thread_id)
+                )
+                if policy == "never":
+                    # Native questions are optional input, not permission to
+                    # invent an answer. Skip before installing any UI waiter.
+                    return await decline_server_request(request_id, method, params)
             manager = (None if side_session_id is not None else source_manager or
                        existing_codex_app_server_manager_for_thread(thread_id))
             generation = manager.generation if manager is not None else 0
@@ -54112,15 +54140,20 @@ async def handle_claude_tool_permission(
 
             # The SDK normally shadows can_use_tool in bypassPermissions mode,
             # but the callback itself is not proof that approval is required.
-            # Honor the current persisted mode at the ownership fence so an
+            # Honor the captured mode at the ownership fence so an
             # unexpected callback cannot manufacture a desktop approval card.
-            # Explicit AskUserQuestion interactions remain user-facing questions.
+            permission_mode = active_claude_permission_mode(session_id, active)
+            if (
+                tool_name == "AskUserQuestion"
+                and permission_mode in {"bypassPermissions", "dontAsk"}
+            ):
+                return PermissionResultDeny(
+                    message="This question was skipped because this turn is configured not to prompt the user.",
+                    interrupt=False,
+                )
             if (
                 tool_name != "AskUserQuestion"
-                and active_claude_permission_mode(
-                    session_id,
-                    active,
-                ) == "bypassPermissions"
+                and permission_mode == "bypassPermissions"
             ):
                 return PermissionResultAllow(updated_input=dict(input_data))
 
@@ -56355,6 +56388,7 @@ async def acquire_codex_control_thread(
                     "provider_turn_id": None,
                     "provider_turn_ready": False,
                     "interactive_app_server": True,
+                    "codex_approval_policy": effective_codex_approval_policy(session),
                     "codex_native_operation": True,
                     "codex_native_operation_kind": None,
                     "owner_task": reservation_task,
@@ -69559,6 +69593,11 @@ async def run_codex_app_server(
         sess = standalone_provider_session(sess)
     requested_cwd = str(sess.get("cwd") or DEFAULT_CWD)
     cwd = existing_cwd(requested_cwd)
+    approval_policy = (
+        effective_codex_approval_policy(sess)
+        if interactive_app_server
+        else CODEX_NONINTERACTIVE_APPROVAL_POLICY
+    )
     if diff_baseline is None:
         diff_baseline = await capture_git_baseline(session_id, run_id, cwd)
     if str(Path(requested_cwd).expanduser()) != cwd:
@@ -71347,6 +71386,7 @@ async def run_codex_app_server(
                 "native_interrupt_sent": False,
                 "codex_app_server_turn": None,
                 "interactive_app_server": interactive_app_server,
+                "codex_approval_policy": approval_policy,
                 # turn/steer cannot replace the run-bound Responses metadata.
                 # Authority-bearing Force Send therefore uses the existing
                 # Stop -> queued fresh-start lifecycle; the thread remains
@@ -71439,23 +71479,7 @@ async def run_codex_app_server(
                     if interactive_app_server
                     else ""
                 )
-                approval_policy = (
-                    str(
-                        sess.get("codex_approval_policy")
-                        or CODEX_DEFAULT_APPROVAL_POLICY
-                    )
-                    if interactive_app_server
-                    else CODEX_NONINTERACTIVE_APPROVAL_POLICY
-                )
-                overrides["approvalPolicy"] = (
-                    approval_policy
-                    if approval_policy in CODEX_APPROVAL_POLICIES
-                    else (
-                        CODEX_DEFAULT_APPROVAL_POLICY
-                        if interactive_app_server
-                        else CODEX_NONINTERACTIVE_APPROVAL_POLICY
-                    )
-                )
+                overrides["approvalPolicy"] = approval_policy
                 if permission_profile:
                     # Permission profiles are an experimental app-server
                     # override and are mutually exclusive with sandbox policy,
@@ -83116,7 +83140,8 @@ async def create_native_side_chat(session_id: str, *, persisted_state=None, pers
                                         and self.codex.thread_id
                                         and str(params.get("threadId") or "") == self.codex.thread_id)
                         return await handle_codex_server_request(request_id, method, params,
-                            side_session_id=session_id, side_owner_is_current=is_current)
+                            side_session_id=session_id, side_owner_is_current=is_current,
+                            side_approval_policy=approval_policy)
 
                     provider_selection = CODEX_PROVIDER_STORE.for_session(current, include_key=True)
                     if provider_selection:

@@ -6943,13 +6943,54 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(getattr(result, "interrupt", False))
         self.assertFalse(agent_server.CLAUDE_PENDING_INTERACTIONS)
 
+    async def test_no_prompt_modes_skip_questions_without_pending_interaction(self) -> None:
+        manager = FakeClaudeManager()
+        manager.active_run_id = "run-claude"
+        agent_server.CLAUDE_SDK_MANAGER = manager
+        # A settings edit for the next turn must not change the current mode.
+        self.session["claude_permission_mode"] = "default"
+        for mode in ("bypassPermissions", "dontAsk"):
+            with self.subTest(mode=mode):
+                agent_server.ACTIVE = {"chat-claude": {
+                    "run_id": "run-claude",
+                    "backend": agent_server.BACKEND_CLAUDE,
+                    "transport": agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+                    "interactive_agent_sdk": True,
+                    "claude_sdk_owner_token": manager.owner_token,
+                    "claude_permission_run_id": "run-claude",
+                    "claude_permissions_open": True,
+                    "claude_permission_mode": mode,
+                }}
+                events = AsyncMock()
+                metadata = AsyncMock()
+                with (
+                    patch.dict(sys.modules, fake_claude_sdk_modules()),
+                    patch.object(agent_server, "append_event", events),
+                    patch.object(agent_server, "update_claude_pending_session_metadata", metadata),
+                ):
+                    result = await asyncio.wait_for(agent_server.handle_claude_tool_permission(
+                        "chat-claude", "AskUserQuestion",
+                        {"questions": [{"question": "Choose one", "options": []}]},
+                        {"tool_use_id": "question-no-prompts"}, owner_token=manager.owner_token,
+                    ), 0.2)
+                self.assertIsInstance(result, FakePermissionResultDeny)
+                self.assertFalse(result.interrupt)
+                self.assertIn("skipped", result.message.lower())
+                self.assertFalse(agent_server.CLAUDE_PENDING_INTERACTIONS)
+                self.assertFalse(agent_server.CLAUDE_INTERACTION_HANDLER_TASKS)
+                events.assert_not_awaited()
+                metadata.assert_not_awaited()
+
     async def test_ask_user_can_be_skipped_with_empty_answers(self) -> None:
+        # Settings saved for the next turn must not hide this default-mode question.
+        self.session["claude_permission_mode"] = "dontAsk"
         manager = FakeClaudeManager()
         manager.active_run_id = "run-claude"
         agent_server.CLAUDE_SDK_MANAGER = manager
         agent_server.ACTIVE = {
             "chat-claude": {
                 "run_id": "run-claude",
+                "claude_permission_mode": "default",
                 "backend": agent_server.BACKEND_CLAUDE,
                 "transport": agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
                 "interactive_agent_sdk": True,

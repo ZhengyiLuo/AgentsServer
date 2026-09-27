@@ -126,7 +126,7 @@ chats. Logical Cursor failures leave the digest job failed rather than sent.
 
 ## Packaging and validation
 
-`cursor_agent_client.py` and `cursor_process_guard.py` are required runtime
+`cursor_agent_client.py`, `cursor_provider_mcp.py` and `cursor_process_guard.py` are required runtime
 files in all three transports:
 
 - `scripts/package_release.py` archive packaging;
@@ -138,3 +138,11 @@ packaging parity, runner lifecycle/failure/bounds, resume/fork/standalone
 isolation, and scheduled-job failure projection. Run tests with
 `PYTHONDONTWRITEBYTECODE=1` so installer source-tree checks are not polluted by
 test-created `__pycache__` directories.
+
+## Run-bound internal MCP
+
+Helper-enabled turns now use the private native-CLI MCP integration described
+in [Cursor provider MCP](docs/CURSOR_PROVIDER_MCP.md). It preserves print-mode
+history and Default permissions. Older Shell-based handoff limitations in
+this historical integration note do not describe that new path. Native app
+acceptance is tracked separately from transport and fixture tests.

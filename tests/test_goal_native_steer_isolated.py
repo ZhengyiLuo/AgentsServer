@@ -15,7 +15,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock
 
 from codex_app_server import CodexAppServerError, CodexAppServerProtocolError, CodexAppServerRequestError
-from tests.test_goal_followup_admission_isolated import saved_route_snapshots
+from tests.test_goal_followup_admission_isolated import AdmissionHTTPException, saved_route_snapshots
 
 
 SOURCE = (Path(__file__).resolve().parents[1] / "agent_server.py")
@@ -29,6 +29,8 @@ NAMES = {
     "codex_reasoning_text", "codex_app_server_reasoning_summary", "codex_app_server_reasoning_plaintext",
     "persist_reasoning_summary",
     "session_lifecycle_lock",
+    "_run_queued_turn_now_once", "codex_goal_followup_requires_native",
+    "async_route_queue_fields", "NonNativeForceSendRequiresLifecycleLock",
 }
 TREE = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
 NODES = [node for node in TREE.body if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in NAMES]
@@ -229,6 +231,97 @@ class NativeGoalSteerTests(unittest.IsolatedAsyncioTestCase):
         self.ns["release_codex_interactive_control_lease"].assert_not_called()
         self.ns["release_codex_control_thread"].assert_not_awaited()
 
+    async def test_plain_goal_input_crosses_admission_and_writer_with_existing_owner_settings(self):
+        """Exercise the real admission -> delivery -> commit path together.
+
+        Only the consumer scheduling and provider transport are faked; both
+        rejection boundaries run against the same owner and queued message.
+        """
+        for ordinary in (False, True):
+            with self.subTest(ordinary=ordinary):
+                self.setUp()
+                if ordinary:
+                    self.ordinary_owner()
+                self.active.update(
+                    backend="codex", transport="app_server",
+                    provider_model="gpt-6-astra", provider_effort="xhigh",
+                    provider_service_tier="priority",
+                )
+                authority = self.active["provider_authority"] = {"proof": "original-owner"}
+                self.current.update(
+                    purpose="local_delivery", skill_selection={"name": "original-command"},
+                    chat_references=[{"session_id": "original-target"}],
+                    team_references=[{"id": "original-team"}],
+                    secure_peer_route_snapshots=[{"route_id": "original-route"}],
+                    cross_chat_obligation_ids=["original-obligation"],
+                    cross_chat_exchange_ids=["original-exchange"],
+                    cross_chat_envelope_id="original-envelope",
+                    cross_chat_exchange_id="original-exchange",
+                    cross_chat_exchange_leg_id="original-leg",
+                )
+                self.ns["STORE"].sessions["chat"].update(model="gpt-6-sol", effort="low")
+                active_before, current_before = dict(self.active), dict(self.current)
+                runtime_check = Mock(return_value=False)
+                forbidden = {
+                    name: AsyncMock(side_effect=AssertionError(f"unexpected {name}"))
+                    for name in ("stop_turn", "pause_active_codex_goal_for_stop")
+                }
+                forbidden.update({
+                    name: Mock(side_effect=AssertionError(f"unexpected {name}"))
+                    for name in ("prepare_steered_turn", "issue_native_steer_provider_authority", "native_steer_provider_actions")
+                })
+                self.ns.update({
+                    "HTTPException": AdmissionHTTPException,
+                    "BACKEND_CLAUDE": "claude", "CODEX_TRANSPORT_APP_SERVER": "app_server",
+                    "CLAUDE_TRANSPORT_AGENT_SDK": "agent_sdk",
+                    "CROSS_CHAT_DELIVERY_PURPOSES": {"local_delivery", "peer_delivery"},
+                    "LOCAL_CROSS_CHAT_DELIVERY_PURPOSE": "local_delivery",
+                    "RUN_NOW_TURNS": {}, "STEERING_SESSIONS": set(), "STEERING_WAIT_TASKS": {},
+                    "stop_cleanup_in_progress": lambda _: False,
+                    "managed_server_update_admission_blocker": lambda: None,
+                    "force_send_conflict_detail": lambda *_args, **kwargs: kwargs,
+                    "queued_codex_runtime_matches_active": runtime_check,
+                    **forbidden,
+                })
+
+                async def deliver(chat, selected, **kwargs):
+                    self.assertIs(kwargs["native_steer_queue"], self.queue)
+                    request = self.queue.get_nowait()
+                    self.assertIs(request["selected"], selected)
+                    pending = await (self.send_ordinary(request) if ordinary else self.send(request))
+                    return await self.ns["commit_codex_goal_steer"](
+                        "chat", "operation", "thread", "" if ordinary else "reservation", pending,
+                    )
+
+                self.ns["await_native_steer_result"] = deliver
+                for index in range(2):
+                    selected = {
+                        "queued_id": f"followup-{index}", "prompt": f"Follow-up {index}",
+                        "model": "gpt-6-sol", "effort": "low",
+                        # A legacy queue row has no capabilities; current app
+                        # settings describe the next turn, not this live turn.
+                    }
+                    self.ns["QUEUED_TURNS"]["chat"] = deque([selected])
+                    result = await self.ns["_run_queued_turn_now_once"]("chat", selected["queued_id"])
+                    self.assertTrue(result["native_goal_steer"])
+                    self.assertFalse(result["interrupted"])
+                    self.assertEqual(self.calls[index][:3], (
+                        "thread", "turn-1", [{"type": "text", "text": selected["prompt"], "text_elements": []}],
+                    ))
+                    self.assertEqual(self.active, active_before)
+                    self.assertEqual(self.current, current_before)
+                    self.assertIs(self.active["provider_authority"], authority)
+                    self.assertEqual(self.ns["STORE"].sessions["chat"]["model"], "gpt-6-sol")
+                    self.assertEqual(self.ns["STORE"].sessions["chat"]["effort"], "low")
+                    self.assertEqual(self.goal["status"], "active")
+                    self.assertNotIn("chat", self.ns["QUEUED_TURNS"])
+                    self.assertFalse(self.ns["STEERING_SESSIONS"])
+                self.assertEqual(sum(kind == "turn_steered" for kind, _ in self.events), 2)
+                runtime_check.assert_not_called()
+                self.manager.request.assert_not_awaited()
+                for call in forbidden.values():
+                    call.assert_not_called()
+
     async def test_automatic_saved_routes_are_inert_for_goal_text_and_attachments(self):
         for ordinary in (False, True):
             for owner_routes in ([], saved_route_snapshots()[:1]):
@@ -283,7 +376,6 @@ class NativeGoalSteerTests(unittest.IsolatedAsyncioTestCase):
             lambda selected: selected.update(purpose="scheduled_job"),
             lambda selected: selected["provider_cross_chat_route_snapshot"].append(
                 {**saved_route_snapshots()[0], "route_kind": "prompt_reference"}),
-            lambda selected: self.current.update(skill_selection={"name": "provider-command"}),
         )
         for ordinary in (False, True):
             for index, change in enumerate(changes):
@@ -336,7 +428,6 @@ class NativeGoalSteerTests(unittest.IsolatedAsyncioTestCase):
             "standalone_provider": lambda: self.active.update(standalone_provider_context=True),
             "lost_busy_slot": lambda: self.ns["BUSY_SESSIONS"].discard("chat"),
             "exhausted_budget": lambda: self.ns["STORE"].sessions["chat"].update(codex_goal_time_budget_exhausted=True),
-            "runtime_changed": lambda: self.ns.update(queued_codex_runtime_matches_active=lambda *args: False),
         }
         for name, mutate in mutations.items():
             with self.subTest(name=name):

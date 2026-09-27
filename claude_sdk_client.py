@@ -18,6 +18,7 @@ import copy
 import hashlib
 import inspect
 import json
+import os
 import logging
 import re
 import shlex
@@ -585,6 +586,29 @@ def default_claude_sdk_client_factory(options: Any) -> ClaudeSDKClientProtocol:
             "claude-agent-sdk is not installed; use the claude -p fallback"
         ) from exc
     class GoalAwareClaudeSDKClient(ClaudeSDKClient):
+        async def connect(self, prompt=None) -> None:
+            from claude_model_catalog import native_catalog_key, remember_native_models
+
+            # Read metadata already produced by this real connection. Never
+            # open a second connection merely to populate a model picker.
+            env = {**os.environ, **(getattr(options, "env", None) or {})}
+            executable = str(getattr(options, "cli_path", None) or "claude")
+            cwd = str(getattr(options, "cwd", None) or os.getcwd())
+            key = None
+            try:
+                key = native_catalog_key(executable, env)
+            except (OSError, ValueError):
+                pass  # Optional metadata must not block actual work.
+            await super().connect(prompt)
+            if key is not None:
+                try:
+                    # Pinned SDK get_server_info returns its cached initialize
+                    # response; it sends no control request or model prompt.
+                    info = await super().get_server_info()
+                    remember_native_models(info, key=key, executable=executable, env=env, cwd=cwd)
+                except Exception:
+                    pass  # Do not log raw initialization/account data.
+
         async def receive_messages(self) -> AsyncIterator[Any]:
             # SDK 0.2.130 drops local-command provenance and active_goal. Keep
             # those native fields without changing parsing of normal messages.

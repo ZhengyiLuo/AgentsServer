@@ -207,17 +207,18 @@ class GoalFollowupLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0)
         await asyncio.wait_for(poll(), 5)
 
-    async def start(self, *, runtime_authority=True):
+    async def start(self, *, runtime_authority=True, provider_command=None):
         runner = asyncio.create_task(self.ns["run_codex_app_server"](
             "chat", "operation", "Original goal request", self.session,
             self.root / "manifest.json", allow_exec_fallback=False,
             diff_baseline={"head": "synthetic"},
             provider_runtime_env={"AGENTSDOCK_PROVIDER_RUN_ID": "operation"} if runtime_authority else None,
+            provider_command=provider_command,
         ))
         self.tasks.append(runner)
         await self.wait(lambda: (self.ns["ACTIVE"].get("chat") or {}).get("provider_turn_ready"))
         self.active = self.ns["ACTIVE"]["chat"]
-        if runtime_authority:
+        if runtime_authority or provider_command is not None:
             self.assertIsNone(self.active["native_steer_queue"])
         else:
             self.assertIsInstance(self.active["native_steer_queue"], asyncio.Queue)
@@ -268,6 +269,27 @@ class GoalFollowupLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(visible, [("reasoning_summary", "Before follow-up"), ("turn_steered", "Please check this too"), ("reasoning_summary", "after")])
         self.assertEqual(len(self.calls), 1)
         self.assertIs(self.calls[0][3]["notification_subscription"], self.turn._subscription)
+        await self.finish_runner(runner)
+
+    async def test_skill_selected_goal_publishes_lane_and_accepts_plain_followup(self):
+        command = SimpleNamespace(name="original-skill", native={"path": "/synthetic/SKILL.md"})
+        self.current.update(
+            skill_selection={"name": "original-skill"},
+            chat_references=[{"session_id": "original-target"}],
+        )
+        runner = await self.start(runtime_authority=False, provider_command=command)
+        original_current = deepcopy(self.current)
+        task, _ = self.followup(client_capabilities=[], model="next-turn-model", effort="low")
+        result = await asyncio.wait_for(task, 5)
+        self.assert_original_owner()
+        self.assertEqual(self.current, original_current)
+        self.assertEqual((result["run_id"], result["interrupted"], result["native_goal_steer"]), ("operation", False, True))
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0][:3], (
+            "thread", "turn-1", [{"type": "text", "text": "Please check this too", "text_elements": []}],
+        ))
+        self.assertIsNone(self.active["native_steer_queue"])
+        self.assertIsInstance(self.active["codex_goal_steer_queue"], asyncio.Queue)
         await self.finish_runner(runner)
 
     async def test_file_followup_uses_context_but_records_only_display_files(self):

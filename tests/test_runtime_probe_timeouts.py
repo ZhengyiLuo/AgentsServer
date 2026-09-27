@@ -41,6 +41,26 @@ class RuntimeProbeTimeoutTests(unittest.TestCase):
         self.assertIsNone(result["authenticated"])
         self.assertIsNone(result["action"])
 
+    def test_claude_catalog_refresh_never_starts_a_metadata_or_auth_process(self):
+        from claude_model_catalog import clear_native_models
+        clear_native_models()
+        allowed = (["--help"], ["--effort", "ultracode", "--version"])
+        def run(cmd, **kwargs):
+            self.assertIn(cmd[1:], allowed)
+            return completed(cmd, "--effort <level> (low, medium, high)")
+        with patch.object(agent_server.subprocess, "Popen") as popen, patch.object(
+            agent_server.subprocess, "run", side_effect=run,
+        ), patch.object(agent_server, "discover_claude_provider_models", return_value=([], "unavailable")):
+            result = agent_server.parse_claude_help_catalog()
+        popen.assert_not_called()
+        self.assertTrue(result["models"])
+        self.assertIn("fallback", result["model_source"])
+
+    def test_authentication_failure_invalidates_model_cache(self):
+        with patch("claude_model_catalog.clear_native_models") as clear:
+            agent_server.record_runtime_failure("claude", "OAuth session expired and could not be refreshed")
+        clear.assert_called_once_with()
+
     def test_auth_timeout_is_explicit_unknown_auth_and_does_not_leak_output(self):
         error = subprocess.TimeoutExpired(
             ["codex", "login", "status"], 6,
@@ -190,20 +210,20 @@ class RuntimeProbeTimeoutTests(unittest.TestCase):
         args = run.call_args.args[0]
         self.assertEqual(args[args.index("--max-time") + 1], "0.25")
 
-    def test_native_models_cannot_outlive_remaining_catalog_budget(self):
+    def test_native_models_read_cache_without_allocating_a_process_budget(self):
         agent_server.RUNTIME_CATALOG_DEADLINE.set(102.0)
         with patch.object(agent_server.time, "monotonic", return_value=100.0), patch(
-            "claude_model_catalog.probe_native_models", return_value=[],
+            "claude_model_catalog.cached_native_models", return_value=[],
         ) as probe:
             _, status = agent_server.discover_claude_native_models()
         self.assertEqual(status, "success")
-        self.assertEqual(probe.call_args.kwargs["timeout"], 2.0)
+        self.assertNotIn("timeout", probe.call_args.kwargs)
 
     def test_native_models_expired_budget_starts_no_process(self):
         agent_server.RUNTIME_CATALOG_DEADLINE.set(100.0)
         with patch.object(agent_server.time, "monotonic", return_value=100.0), patch(
-            "claude_model_catalog.probe_native_models",
-        ) as probe:
+            "claude_model_catalog.cached_native_models", return_value=None,
+        ), patch("subprocess.Popen") as probe:
             models, status = agent_server.discover_claude_native_models()
         probe.assert_not_called()
         self.assertEqual((models, status), ([], "unavailable"))

@@ -234,7 +234,7 @@ class GoalFollowupLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.tasks.append(task)
         return task, selected
 
-    def assert_original_owner(self):
+    def assert_original_owner(self, *, goal_status="active"):
         self.assertIs(self.ns["ACTIVE"]["chat"], self.active)
         self.assertIs(self.ns["CURRENT_TURNS"]["chat"], self.current)
         self.assertEqual(self.active["run_id"], "operation")
@@ -242,7 +242,7 @@ class GoalFollowupLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.current["prompt"], "Original goal request")
         self.assertEqual(self.ns["RUN_METADATA"], {"operation": {"synthetic_authority": "original"}})
         self.assertIs(self.ns["CROSS_CHAT_CAPABILITIES"]["operation"], self.authority)
-        self.assertEqual(self.goal["status"], "active")
+        self.assertEqual(self.goal["status"], goal_status)
         self.assertEqual(self.manager.start_turn.await_count, 1)
         for call in self.forbidden.values():
             call.assert_not_called()
@@ -270,6 +270,147 @@ class GoalFollowupLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.calls), 1)
         self.assertIs(self.calls[0][3]["notification_subscription"], self.turn._subscription)
         await self.finish_runner(runner)
+
+    async def test_followup_during_initial_start_waits_for_native_ack_once(self):
+        start_entered = asyncio.Event()
+        release_start = asyncio.Event()
+
+        async def delayed_start(*_args, **_kwargs):
+            start_entered.set()
+            await release_start.wait()
+            return self.turn
+
+        self.manager.start_turn.side_effect = delayed_start
+        runner = asyncio.create_task(self.ns["run_codex_app_server"](
+            "chat", "operation", "Original goal request", self.session,
+            self.root / "manifest.json", allow_exec_fallback=False,
+            diff_baseline={"head": "synthetic"},
+            provider_runtime_env={"AGENTSDOCK_PROVIDER_RUN_ID": "operation"},
+        ))
+        self.tasks.append(runner)
+        try:
+            await asyncio.wait_for(start_entered.wait(), 5)
+            self.active = self.ns["ACTIVE"]["chat"]
+            self.assertFalse(self.active["provider_turn_ready"])
+            self.assertIsInstance(self.active["codex_goal_steer_queue"], asyncio.Queue)
+            task, selected = self.followup(
+                file_ids=["synthetic-private-file"],
+                display_file_ids=["synthetic-visible-file"],
+            )
+            await self.wait(lambda: bool(self.requests) or task.done())
+            if task.done():
+                await task  # Surface the pre-fix readiness rejection directly.
+            self.assertFalse(task.done())
+            self.assertEqual(self.calls, [])
+            self.assertEqual(self.requests[0]["expected_provider_turn_id"], "")
+            release_start.set()
+            result = await asyncio.wait_for(task, 5)
+            self.assert_original_owner()
+            self.assertEqual(result["run_id"], "operation")
+            self.assertFalse(result["interrupted"])
+            self.assertEqual([(call[0], call[1]) for call in self.calls], [("thread", "turn-1")])
+            self.ns["build_user_provider_prompt"].assert_called_once_with(
+                "chat", selected["prompt"], ["synthetic-private-file"],
+            )
+            steers = [row for kind, row in self.events if kind == "turn_steered"]
+            self.assertEqual(len(steers), 1)
+            self.assertEqual(steers[0]["file_ids"], ["synthetic-visible-file"])
+            self.assertFalse(self.ns["QUEUED_TURNS"].get("chat"))
+            await self.finish_runner(runner)
+        finally:
+            release_start.set()
+
+    async def test_followup_during_initial_goal_handoff_reaches_next_turn_once(self):
+        runner = await self.start()
+        original_queue = self.active["codex_goal_steer_queue"]
+        handoff_entered = asyncio.Event()
+        release_handoff = asyncio.Event()
+        waits = 0
+
+        async def delayed_projection(*_args, **_kwargs):
+            nonlocal waits
+            waits += 1
+            if waits == 1:
+                handoff_entered.set()
+                await release_handoff.wait()
+
+        self.manager.wait_for_notification_handler.side_effect = delayed_projection
+        self.turn._completed = True
+        self.turn.push("turn/completed", turn={"id": "turn-1", "status": "completed"})
+        try:
+            await asyncio.wait_for(handoff_entered.wait(), 5)
+            task, selected = self.followup(
+                prompt="Inspect this after the current answer",
+                file_ids=["synthetic-private-file"],
+                display_file_ids=["synthetic-visible-file"],
+            )
+            await self.wait(lambda: bool(self.requests) or task.done())
+            if task.done():
+                await task  # Surface the pre-fix detached-queue rejection.
+            self.assertFalse(task.done())
+            self.assertEqual(self.calls, [])
+            release_handoff.set()
+            await self.wait(lambda: self.active.get("codex_native_operation_kind") == "goal_resume")
+            self.assertIs(self.active["native_steer_queue"], original_queue)
+            self.assertFalse(task.done())
+            self.turn.push("turn/started", provider_turn="turn-2", turn={"id": "turn-2"})
+            result = await asyncio.wait_for(task, 5)
+            self.assert_original_owner()
+            self.assertEqual(result["run_id"], "operation")
+            self.assertFalse(result["interrupted"])
+            self.assertEqual([(call[0], call[1]) for call in self.calls], [("thread", "turn-2")])
+            self.ns["build_user_provider_prompt"].assert_called_once_with(
+                "chat", selected["prompt"], ["synthetic-private-file"],
+            )
+            steers = [row for kind, row in self.events if kind == "turn_steered"]
+            self.assertEqual(len(steers), 1)
+            self.assertEqual(steers[0]["provider_turn_id"], "turn-2")
+            self.assertEqual(steers[0]["file_ids"], ["synthetic-visible-file"])
+            self.assertFalse(self.ns["QUEUED_TURNS"].get("chat"))
+            await self.finish_runner(runner, turn="turn-2")
+        finally:
+            release_handoff.set()
+
+    async def test_initial_start_failure_settles_waiting_followup_before_runner_exits(self):
+        start_entered = asyncio.Event()
+        release_start = asyncio.Event()
+
+        async def failed_start(*_args, **_kwargs):
+            start_entered.set()
+            await release_start.wait()
+            raise self.ns["CodexAppServerProtocolError"](
+                "Native start failed before acceptance", request_sent=False, safe_to_retry=True,
+            )
+
+        self.manager.start_turn.side_effect = failed_start
+        runner = asyncio.create_task(self.ns["run_codex_app_server"](
+            "chat", "operation", "Original goal request", self.session,
+            self.root / "manifest.json", allow_exec_fallback=False,
+            diff_baseline={"head": "synthetic"},
+            provider_runtime_env={"AGENTSDOCK_PROVIDER_RUN_ID": "operation"},
+        ))
+        self.tasks.append(runner)
+        try:
+            await asyncio.wait_for(start_entered.wait(), 5)
+            self.active = self.ns["ACTIVE"]["chat"]
+            task, selected = self.followup()
+            await self.wait(lambda: bool(self.requests) or task.done())
+            if task.done():
+                await task
+            self.assertFalse(task.done())
+            release_start.set()
+            await asyncio.wait_for(runner, 5)
+            self.assertTrue(self.requests[0]["future"].done(), "Failed native startup left Send now waiting")
+            with self.assertRaises(self.ns["NativeSteerHandoffError"]) as error:
+                await asyncio.wait_for(task, 5)
+            self.assertTrue(error.exception.safe_to_requeue)
+            self.assertFalse(error.exception.delivery_uncertain)
+            self.assertEqual(self.calls, [])
+            self.assertIs(self.ns["QUEUED_TURNS"]["chat"][0], selected)
+            self.assertNotIn("_native_delivery_fenced", selected)
+            self.forbidden["stop_turn"].assert_not_awaited()
+        finally:
+            release_start.set()
 
     async def test_skill_selected_goal_publishes_lane_and_accepts_plain_followup(self):
         command = SimpleNamespace(name="original-skill", native={"path": "/synthetic/SKILL.md"})
@@ -368,6 +509,24 @@ class GoalFollowupLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([(row[0], row[1]) for row in self.calls], [("thread", "turn-2")])
         self.assertEqual(sum(kind == "turn_steered" for kind, _ in self.events), 1)
         self.ns["register_codex_native_action"].assert_called_once_with("chat", "operation", runner)
+        await self.finish_runner(runner, turn="turn-2")
+
+    async def test_paused_goal_running_turn_accepts_followup_without_resuming_goal(self):
+        runner = await self.start()
+        self.turn.push("turn/completed", turn={"id": "turn-1", "status": "completed"})
+        await self.wait(lambda: self.active.get("codex_native_operation_kind") == "goal_resume")
+        self.turn.push("turn/started", provider_turn="turn-2", turn={"id": "turn-2"})
+        await self.wait(lambda: self.active.get("provider_turn_id") == "turn-2")
+        self.goal["status"] = "paused"
+        self.manager.set_thread_goal = AsyncMock(side_effect=AssertionError("follow-up must not resume goal"))
+        task, _ = self.followup(prompt="Send this to the still-running turn")
+        result = await asyncio.wait_for(task, 5)
+        self.assert_original_owner(goal_status="paused")
+        self.assertFalse(result["interrupted"])
+        self.assertTrue(result["native_goal_steer"])
+        self.assertEqual([(call[0], call[1]) for call in self.calls], [("thread", "turn-2")])
+        self.assertEqual(sum(kind == "turn_steered" for kind, _ in self.events), 1)
+        self.manager.set_thread_goal.assert_not_awaited()
         await self.finish_runner(runner, turn="turn-2")
 
     async def enter_native_gap_with_followup(self):

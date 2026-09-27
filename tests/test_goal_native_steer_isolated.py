@@ -201,6 +201,28 @@ class NativeGoalSteerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.current["run_id"], "operation")
         self.manager.request.assert_not_awaited()
 
+    async def test_paused_goal_accepts_live_turn_input_without_resuming(self):
+        for pause_before_write in (False, True):
+            with self.subTest(pause_before_write=pause_before_write):
+                self.setUp()
+                request = self.request()
+                request["selected"]["file_ids"] = ["goal_followup_attachment"]
+                if pause_before_write:
+                    async def pause():
+                        self.goal["status"] = "paused"
+                    self.before_rpc = pause
+                else:
+                    self.goal["status"] = "paused"
+                pending = await self.send(request)
+                result = await self.ns["commit_codex_goal_steer"](
+                    "chat", "operation", "thread", "reservation", pending,
+                )
+                self.assertEqual(len(self.calls), 1)
+                self.assertEqual(self.goal["status"], "paused")
+                self.assertEqual(self.current["run_id"], "operation")
+                self.assertFalse(result["interrupted"])
+                self.manager.request.assert_not_awaited()
+
     async def test_first_turn_goal_steer_keeps_authority_and_ordinary_owner(self):
         self.ordinary_owner()
         authority = {"run_id": "operation", "proof": "original-runtime-proof"}
@@ -401,7 +423,7 @@ class NativeGoalSteerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_ordinary_goal_final_write_guard_rejects_changed_owner(self):
         mutations = {
-            "paused": lambda: self.goal.update(status="paused"),
+            "completed_goal": lambda: self.goal.update(status="complete"),
             "stopped": lambda: self.active.update(stop_requested=True),
             "stop_request": lambda: self.ns["STOP_REQUESTS"].add("chat"),
             "stopped_run": lambda: self.ns["STOPPED_RUNS"].add("operation"),
@@ -521,8 +543,8 @@ class NativeGoalSteerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls, [])
         self.assertEqual(self.goal["status"], "active")
 
-    async def test_final_write_guard_rechecks_pause_stop_owner_turn_budget_generation(self):
-        changes = [lambda: self.goal.update(status="paused"), lambda: self.goal.update(status="blocked"),
+    async def test_final_write_guard_rechecks_goal_stop_owner_turn_budget_generation(self):
+        changes = [lambda: self.goal.update(status="complete"), lambda: self.goal.update(status="blocked"),
                    lambda: self.active.update(stop_requested=True), lambda: self.ns["SERVER_MAINTENANCE_SESSIONS"].add("chat"),
                    lambda: self.active.update(provider_turn_id="turn-2"), lambda: self.current.update(run_id="successor"),
                    lambda: self.current.update(codex_control_reservation_id="successor"),

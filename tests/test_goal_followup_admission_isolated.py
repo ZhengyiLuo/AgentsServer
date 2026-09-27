@@ -222,17 +222,30 @@ class GoalFollowupAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.active.pop("native_steer_queue")
         await self.assert_rejected()
 
-    async def test_starting_ordinary_provider_keeps_goal_and_exact_queue_position(self):
+    async def test_starting_ordinary_provider_accepts_goal_followup_for_ready_binding(self):
         self.active.pop("codex_native_operation_kind")
         self.current.pop("purpose")
-        self.active["codex_goal_steer_queue"] = asyncio.Queue()
+        lane = self.active["codex_goal_steer_queue"] = asyncio.Queue()
         self.active["provider_turn_ready"] = False
-        await self.assert_rejected()
+        self.active["provider_turn_id"] = None
+        self.selected["file_ids"] = ["file_goal_followup"]
+        await self.assert_admitted_to_goal_lane(lane, expected_turn_id="")
 
     async def test_between_goal_turns_queues_native_followup_without_stale_turn_id(self):
         self.active["provider_turn_ready"] = False
         self.active["provider_turn_id"] = "previous-completed-turn"
         await self.assert_admitted_to_goal_lane(self.active["native_steer_queue"], expected_turn_id="")
+
+    async def test_paused_goal_accepts_input_only_while_native_turn_is_ready(self):
+        self.session["codex_goal"]["status"] = "paused"
+        self.selected["file_ids"] = ["file_goal_followup"]
+        await self.assert_admitted_to_goal_lane(self.active["native_steer_queue"])
+        self.assertEqual(self.session["codex_goal"]["status"], "paused")
+        self.setUp()
+        self.session["codex_goal"]["status"] = "paused"
+        self.active["provider_turn_ready"] = False
+        self.active["provider_turn_id"] = None
+        await self.assert_rejected()
 
     async def test_idle_cached_active_goal_rejects_before_stop_or_queue_mutation(self):
         self.ns["ACTIVE"].clear()

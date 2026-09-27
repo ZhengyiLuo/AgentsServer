@@ -47,26 +47,31 @@ errors remain subject to the existing failure and cleanup handling.
 
 An ordinary send remains queued. Send now can steer compatible text and uploaded
 attachments into the exact active native Codex goal turn without stopping that
-turn or pausing its persistent goal. The client must advertise
-`codex_goal_steer_v1`; model/runtime settings and the existing authority ceiling
-must match. Structured references, `/mail`, and other special-purpose
+turn or pausing its persistent goal. It uses the running turn's model, effort
+and authority; changed picker settings apply to future turns. Older queued
+messages do not need a capability flag to send ordinary input. Structured
+references, `/mail`, and other special-purpose
 deliveries do not use this lane. An incompatible follow-up stays queued with an
 actionable conflict instead of falling through the explicit Stop lifecycle.
 Between turns of an owned native goal, Send now holds one follow-up on the
-existing notification stream and binds it to the next ready native turn.
+existing notification stream and binds it to the next ready native turn. This
+also covers initial turn/start acknowledgement and the transfer from the first
+ordinary reply into native goal continuation, preserving the same pending queue.
 It does not require repeated clicks, add a poller or resume the goal. If an
 active cached goal has no local owner/steering transport, the follow-up remains
 queued; missing ownership is never permission to invoke Stop.
 
 The transport rechecks the exact goal, run, reservation, native turn, process
-generation, and Pause/Stop state immediately before writing. Accepted input is
+generation, and Stop state immediately before writing. Accepted input is
 recorded once as `turn_steered`, after all provider notifications preceding its
 acknowledgement. This creates a chronological user-message boundary, not a new
 run or a synthetic goal prompt. Later progress stays below that follow-up;
 history reconciliation credits it so reopening cannot import a duplicate.
 
-Explicit Pause and Stop still pause the goal. They are never silently undone.
-A safely rejected, already-dequeued follow-up is restored with a durable pause
+A paused goal can still have a native turn running. Send now delivers to that
+ready turn while leaving the goal paused; it does not enable another automatic
+continuation. Explicit Stop prevents delivery. Neither Pause nor Stop is
+silently undone. A safely rejected, already-dequeued follow-up is restored with a durable pause
 hold and requires an explicit retry. Uncertain delivery is fenced against
 automatic replay. Consumer cleanup settles outstanding callers even when it
 is cancelled again during cleanup.
@@ -79,14 +84,16 @@ run-bound provider authority disables ordinary logical-run replacement. It
 reuses the exact provider turn, subscription, run ID and authority; it does not
 issue a new authority, interrupt background tools or create a replacement run.
 The native goal consumer takes over only after the first turn actually ends.
-Standalone and selected-provider-command runs do not gain this additional lane.
+Standalone runs do not gain this additional lane. New provider commands remain
+separate queued work; plain input does not replace an existing run's command.
 
 The original consumer also rechecks goal activation after queue admission so
 an instruction admitted just before goal creation does not switch logical
 ownership. Attachments use the ordinary validated upload prompt path, and
 their display IDs are recorded on the single user-authored steering event.
-Both steering queues are retired before completion/cancellation cleanup and
-excluded from public runtime snapshots.
+Both steering queues are retired when the logical run ends and excluded from
+public runtime snapshots. Startup failure and cancellation settle pending
+follow-ups even before the native notification consumer has started.
 
 If a steer acknowledgement arrives after the first turn completed and the next
 one already started, its pending receipt transfers with the unread notification

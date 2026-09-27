@@ -611,6 +611,62 @@ class _NativeProof:
     targets: dict = field(default_factory=dict)
 
 
+@dataclass
+class _NativeGoalSteerIndex:
+    """Accepted human inputs, tied to the run's preceding native thread receipt."""
+    threads: dict = field(default_factory=dict)
+    receipts: dict = field(default_factory=dict)
+    count: int = 0
+
+    def observe(self, event: dict) -> None:
+        run = event.get("run_id")
+        if (event.get("backend") != "codex" or event.get("imported") is True
+            or event.get("forked") is True or not isinstance(run, str)
+            or not 0 < len(run) <= 256 or run.startswith("import_")):
+            return
+        if event.get("type") == "provider_session":
+            thread = event.get("provider_session_id")
+            if isinstance(thread, str) and _PROVIDER_ID.fullmatch(thread):
+                known = self.threads.setdefault(run, set())
+                self.count += thread not in known
+                known.add(thread)
+        elif (event.get("type") == "turn_steered" and event.get("purpose") == "codex_goal_resume"
+              and event.get("native_steer") is True and event.get("native_goal_steer") is True
+              and event.get("provider_user_authored") is True):
+            turn, body = event.get("provider_turn_id"), event.get("prompt")
+            threads = self.threads.get(run, set())
+            if (len(threads) != 1 or not isinstance(turn, str) or not 0 < len(turn) <= 256
+                or not isinstance(body, str) or not 0 < len(body) <= NATIVE_PROOF_LINE_BYTES
+                or event.get("source_text_sha256") is not None
+                or type(event.get("seq")) is not int or event["seq"] <= 0
+                or any(not isinstance(event.get(key), str) or not 0 < len(event[key]) <= 256
+                       for key in ("id", "queued_id"))):
+                return
+            key = (next(iter(threads)), turn, _text_key(body))
+            self.receipts.setdefault(key, []).append({
+                **_native_event_identity(event), "run_id": run, "queued_id": event["queued_id"],
+            })
+            self.count += 1
+        if self.count > MAX_KEYS:
+            raise _Unproven()
+
+    def match(self, thread: str, turn: str, body_key: str, source_ids: dict,
+              timestamp: str, before: int) -> dict | None:
+        receipts = [event for event in self.receipts.get((thread, turn, body_key), ())
+                    if event["seq"] < before and self.threads.get(event["run_id"]) == {thread}]
+        # Without native input item IDs, equal occurrence counts are necessary:
+        # one receipt must never hide an additional genuine same-turn repeat.
+        if (not receipts or len(receipts) != len(source_ids)
+            or len({event["run_id"] for event in receipts}) != 1
+            or any(len({event[key] for event in receipts}) != len(receipts) for key in ("id", "queued_id"))):
+            return None
+        origins = list(source_ids.values())
+        matched = [index for index, origin in enumerate(origins) if origin["timestamp"] == timestamp]
+        if len(matched) != 1 or any(origin.get("kind") != "user" for origin in origins):
+            return None
+        return sorted(receipts, key=lambda event: event["seq"])[matched[0]]
+
+
 def _native_mailbox_wake_hash(event: dict) -> str | None:
     """A server-authored hidden input, not a text-based provider classification."""
     digest = event.get("provider_input_sha256")
@@ -775,6 +831,7 @@ def _prove_native_replays(session_id: str, provider_id: str, events: Path, sourc
     stamp = _native_stamp(events)
     batches, terminals, candidates, native, owners = {}, {}, [], {}, {}
     deliveries = _AsyncDeliveryIndex()
+    goal_steers = _NativeGoalSteerIndex()
     previous_seq, retained = 0, 0
     for event, _offset, _line in _native_records(events, stamp, budget):
         seq = event.get("seq")
@@ -784,7 +841,8 @@ def _prove_native_replays(session_id: str, provider_id: str, events: Path, sourc
         if event.get("session_id") not in (None, "", session_id):
             continue
         deliveries.observe(event)
-        if len(candidates) + len(batches) + len(terminals) + retained + deliveries.count > MAX_KEYS:
+        goal_steers.observe(event)
+        if len(candidates) + len(batches) + len(terminals) + retained + deliveries.count + goal_steers.count > MAX_KEYS:
             raise _Unproven()
         run = event.get("run_id")
         if not isinstance(run, str) or not 0 < len(run) <= 256:
@@ -818,7 +876,7 @@ def _prove_native_replays(session_id: str, provider_id: str, events: Path, sourc
             elif kind == "user" and (wake_hash := _native_mailbox_wake_hash(event)):
                 native.setdefault((run, kind, wake_hash), []).append(_native_event_identity(event))
                 retained += 1
-        if len(candidates) + len(batches) + len(terminals) + retained + deliveries.count > MAX_KEYS:
+        if len(candidates) + len(batches) + len(terminals) + retained + deliveries.count + goal_steers.count > MAX_KEYS:
             raise _Unproven()
     if not candidates:
         return _NativeProof(provider_id)
@@ -844,7 +902,7 @@ def _prove_native_replays(session_id: str, provider_id: str, events: Path, sourc
     proofs = {}
     for thread, path in selected:
         proofs.update(_prove_native_source(thread, Path(path), root, groups[(thread, path)], candidates, native, owners, parse_item, budget,
-                                          session_id=session_id, deliveries=deliveries))
+                                          session_id=session_id, deliveries=deliveries, goal_steers=goal_steers))
     budget.check()
     return _NativeProof(provider_id, proofs)
 
@@ -852,6 +910,7 @@ def _prove_native_replays(session_id: str, provider_id: str, events: Path, sourc
 def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, candidates: list,
                          native: dict, owners: dict, parse_item: Callable, budget: _NativeReadBudget,
                          *, session_id: str, deliveries: _AsyncDeliveryIndex,
+                         goal_steers: _NativeGoalSteerIndex | None = None,
                          require_verified_checkpoint: bool = False) -> dict:
     if (not source.is_absolute() or source.is_symlink() or source.suffix != ".jsonl"
         or not (source.stem == thread or source.stem.endswith("-" + thread))):
@@ -1027,6 +1086,14 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
             if len(proofs) > MAX_TARGETS:
                 raise _Unproven()
             continue
+        if kind == "user" and source_hash is None and goal_steers is not None:
+            receipt = goal_steers.match(thread, key[0], body_key, source_ids, timestamp, first)
+            if receipt is not None:
+                origin = next(origin for origin in source_ids.values() if origin["timestamp"] == timestamp)
+                proofs[target] = {**origin, "native_event_id": receipt["id"], "source_text_sha256": body_key}
+                if len(proofs) > MAX_TARGETS:
+                    raise _Unproven()
+                continue
         if len(source_ids) != 1 or source_hash is not None:
             # Truncated source hashes need a separately retained native full-body
             # hash. Until one exists, the bounded preview cannot prove equality.

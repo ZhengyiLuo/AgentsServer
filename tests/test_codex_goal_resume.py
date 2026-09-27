@@ -1,12 +1,15 @@
 import asyncio
+import json
 import tempfile
 import unittest
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import ExitStack
 from types import SimpleNamespace
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import HTTPException
+from starlette.requests import Request
 
 import agent_server
 
@@ -89,6 +92,7 @@ class GoalResumeManager:
                 "busy": "chat" in agent_server.BUSY_SESSIONS,
                 "owner": dict(active) if active else None,
                 "subscribed": any(not item.closed for item in self.subscriptions),
+                "capabilities": [dict(value) for value in agent_server.CROSS_CHAT_CAPABILITIES.values()],
             })
         if self.goal_error is not None:
             raise self.goal_error
@@ -220,7 +224,15 @@ class CodexGoalResumeTests(unittest.IsolatedAsyncioTestCase):
             "managed_server_update_admission_blocker": Mock(return_value=None),
             "wait_for_queue_recovery_admission": AsyncMock(),
             "turn_start_blocker": AsyncMock(return_value=None),
-            "revoke_cross_chat_capability": AsyncMock(),
+            "AGENT_TOKEN": "goal-resume-test-token",
+            "CROSS_CHAT_CAPABILITIES": {},
+            "CROSS_CHAT_CAPABILITY_LOCK": asyncio.Lock(),
+            "CROSS_CHAT_AUTHORITY_ROOT": Path(self.cwd) / "authority",
+            "PROVIDER_TOOL_REPLAY": OrderedDict(),
+            "PROVIDER_TOOL_REPLAY_TOMBSTONES": OrderedDict(),
+            "PROVIDER_TOOL_REPLAY_LOCK": asyncio.Lock(),
+            "CROSS_CHAT_LIVE_RESPONSE_WAITERS": {},
+            "revoke_cross_chat_capability": AsyncMock(wraps=agent_server.revoke_cross_chat_capability),
             "cancel_codex_interactions": AsyncMock(),
             "cancel_claude_interactions": AsyncMock(),
             "schedule_next_queued_turn": Mock(),
@@ -233,6 +245,11 @@ class CodexGoalResumeTests(unittest.IsolatedAsyncioTestCase):
             patch.object(agent_server.HUB, "broadcast", AsyncMock())
         )
 
+        self.stack.enter_context(patch.object(
+            agent_server.SECURE_PEER_RUNTIME, "team_authority_generation",
+            return_value="isolated-team-generation",
+        ))
+
     async def asyncTearDown(self) -> None:
         tasks = list(agent_server.CODEX_NATIVE_ACTION_TASKS.values())
         for task in tasks:
@@ -240,6 +257,12 @@ class CodexGoalResumeTests(unittest.IsolatedAsyncioTestCase):
                 task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        for _ in range(20):
+            if not agent_server.CROSS_CHAT_CAPABILITIES:
+                break
+            await asyncio.sleep(0)
+        self.assertEqual(agent_server.CROSS_CHAT_CAPABILITIES, {})
+        self.assertEqual(list(agent_server.CROSS_CHAT_AUTHORITY_ROOT.glob("*.json")), [])
 
     async def resume(self, **values: object) -> dict:
         return await agent_server.put_codex_goal(
@@ -267,6 +290,156 @@ class CodexGoalResumeTests(unittest.IsolatedAsyncioTestCase):
             },
         })
 
+    async def test_resume_authority_exists_before_native_start_and_expires_at_completion(self) -> None:
+        await self.resume()
+        observed = self.manager.resume_observations[0]
+        self.assertEqual(len(observed["capabilities"]), 1)
+        capability = observed["capabilities"][0]
+        run_id = observed["owner"]["run_id"]
+        self.assertTrue(run_id.startswith("run_"))
+        self.assertEqual(capability["source_run_id"], run_id)
+        self.assertIn("publish", capability["actions"])
+        self.assertEqual(capability["provider_runtime_env"]["AGENTSDOCK_CHAT_ID"], "chat")
+        self.assertEqual(capability["source_user_instruction"], "")
+        self.assertEqual(capability["user_delegation_grants"], set())
+        path = Path(capability["authority_path"])
+        self.assertTrue(path.is_file())
+        consumer = next(iter(agent_server.CODEX_NATIVE_ACTION_TASKS.values()))
+        await self.complete_goal()
+        await asyncio.wait_for(asyncio.shield(consumer), timeout=2)
+        self.assertEqual(agent_server.CROSS_CHAT_CAPABILITIES, {})
+        self.assertFalse(path.exists())
+
+    async def test_resume_failure_after_native_start_revokes_fresh_authority(self) -> None:
+        self.manager.goal_error_after_start = RuntimeError("lost goal response")
+        self.manager.complete_on_interrupt = True
+        with self.assertRaises(HTTPException):
+            await self.resume()
+        observed = self.manager.resume_observations[0]
+        self.assertEqual(len(observed["capabilities"]), 1)
+        self.assertEqual(agent_server.CROSS_CHAT_CAPABILITIES, {})
+        self.assertFalse(Path(observed["capabilities"][0]["authority_path"]).exists())
+
+    def add_durable_peer(self) -> dict:
+        route = {
+            "route_id": "route_" + "1" * 32, "revision": "rev_" + "2" * 32,
+            "pair_id": "pair_" + "3" * 32, "paired_route_id": "route_" + "4" * 32,
+            "alias": "peer", "target_session_id": "peer", "actions": ["instruction"],
+        }
+        reverse = {**route, "route_id": route["paired_route_id"],
+                   "paired_route_id": route["route_id"], "target_session_id": "chat", "alias": "source"}
+        self.session["provider_cross_chat_routes"] = [route]
+        self.store.sessions["peer"] = {"id": "peer", "backend": "codex", "provider_cross_chat_routes": [reverse]}
+        return route
+
+    async def test_resume_uses_current_pairs_not_goal_text_or_legacy_grants(self) -> None:
+        route = self.add_durable_peer()
+        legacy = {**route, "route_id": "route_" + "5" * 32,
+                  "revision": "rev_" + "6" * 32, "alias": "legacy", "target_session_id": "legacy"}
+        legacy.pop("pair_id")
+        legacy.pop("paired_route_id")
+        self.session["provider_cross_chat_routes"].append(legacy)
+        self.store.sessions["legacy"] = {"id": "legacy", "backend": "codex"}
+        self.session["codex_goal"]["objective"] = "Send to @legacy and @@other-team"
+        self.session["provider_jobs_access"] = "blocked"
+        await self.resume()
+        capability = next(iter(agent_server.CROSS_CHAT_CAPABILITIES.values()))
+        self.assertEqual(set(capability["provider_route_grants"]), {route["route_id"]})
+        self.assertIn("agent_cross_chat_routes", capability["actions"])
+        self.assertNotIn("jobs", capability["actions"])
+        self.assertFalse(capability["provider_direct_grants"])
+        self.assertFalse(capability["user_delegation_grants"])
+        self.assertEqual(capability["provider_runtime_env"]["AGENTSDOCK_CROSS_CHAT_MODE"], "async_route_v1")
+
+    async def test_next_resume_reissues_authority_without_revoked_routes(self) -> None:
+        self.add_durable_peer()
+        await self.resume()
+        first_run = agent_server.ACTIVE["chat"]["run_id"]
+        first_token = next(iter(agent_server.CROSS_CHAT_CAPABILITIES))
+        consumer = next(iter(agent_server.CODEX_NATIVE_ACTION_TASKS.values()))
+        await self.complete_goal()
+        await asyncio.wait_for(asyncio.shield(consumer), timeout=2)
+        self.session["provider_cross_chat_routes"] = []
+        self.session["codex_goal"]["status"] = "paused"
+        self.manager.goal["status"] = "paused"
+        await self.resume()
+        capability = next(iter(agent_server.CROSS_CHAT_CAPABILITIES.values()))
+        self.assertNotEqual(capability["source_run_id"], first_run)
+        self.assertNotIn(first_token, agent_server.CROSS_CHAT_CAPABILITIES)
+        self.assertNotIn("agent_cross_chat_routes", capability["actions"])
+        self.assertFalse(capability["provider_route_grants"])
+
+    async def test_explicit_resume_mcp_accepts_native_turn_and_continuation_only(self) -> None:
+        self.add_durable_peer()
+        self.manager.ready = True
+        self.manager.active_turn = lambda _thread_id: None
+        await self.resume()
+        run_id = agent_server.ACTIVE["chat"]["run_id"]
+
+        async def invoke(turn_id: str, call_id: str) -> dict:
+            payload = {"jsonrpc": "2.0", "id": call_id, "method": "tools/call", "params": {
+                "name": "run", "arguments": {"helper": "chats", "arguments": ["inbox"]},
+                "_meta": {"callId": call_id, "x-codex-turn-metadata": {
+                    "thread_id": "thread-goal", "turn_id": turn_id}}}}
+            async def receive() -> dict:
+                return {"type": "http.request", "body": json.dumps(payload).encode()}
+            request = Request({"type": "http", "method": "POST", "path": agent_server.CODEX_PROVIDER_MCP_PATH,
+                "headers": [], "state": {"codex_provider_mcp_authenticated": True}}, receive)
+            return json.loads((await agent_server.codex_provider_mcp(request)).body)
+
+        async def helper(session_id, actual_run_id, value, **kwargs):
+            # Substitute only the helper subprocess. The actual MCP parser,
+            # exact native owner and capability/replay validation still run.
+            path, env = await agent_server.provider_tool_capability_snapshot(session_id, actual_run_id, **kwargs)
+            token = json.loads(path.read_text())["provider_capability"]
+            request = Request({"type": "http", "method": "GET", "path": "/api/agent/chats/inbox",
+                "headers": [(b"x-agentsdock-provider-capability", token.encode())],
+                "client": ("127.0.0.1", 12345)})
+            await agent_server.authorize_provider_action(request, action="agent_cross_chat_routes", session_id=session_id)
+            self.assertEqual(actual_run_id, run_id)
+            self.assertEqual(env["AGENTSDOCK_CHAT_ID"], "chat")
+            return json.dumps({"senders": [], "delivery_mode": "mailbox"}), False
+
+        with patch.object(agent_server, "execute_provider_tool", side_effect=helper) as execute:
+            first = await invoke("turn-resumed", "first-inbox")
+            self.assertFalse(first["result"]["isError"], first)
+            await self.manager.publish({"method": "turn/completed", "params": {
+                "threadId": "thread-goal", "turn": {"id": "turn-resumed", "status": "completed"}}})
+            await self.wait_for_subscription_reads(3)
+            await self.manager.publish({"method": "turn/started", "params": {
+                "threadId": "thread-goal", "turn": {"id": "turn-next", "status": "inProgress"}}})
+            await self.wait_for_subscription_reads(4)
+            second = await invoke("turn-next", "next-inbox")
+            self.assertFalse(second["result"]["isError"], second)
+            stale = await invoke("turn-resumed", "stale-inbox")
+            self.assertIn("error", stale)
+            self.assertEqual(execute.call_count, 2)
+            self.assertEqual(agent_server.ACTIVE["chat"]["run_id"], run_id)
+
+    async def test_failed_runtime_binding_revokes_authority_before_native_activation(self) -> None:
+        with patch.object(agent_server, "provider_authority_runtime_env", side_effect=ValueError("binding failed")):
+            with self.assertRaises(HTTPException):
+                await self.resume()
+        self.manager.set_thread_goal.assert_not_awaited()
+        self.assertEqual(agent_server.CROSS_CHAT_CAPABILITIES, {})
+        self.assertEqual(list(agent_server.CROSS_CHAT_AUTHORITY_ROOT.glob("*.json")), [])
+        self.assertNotIn("chat", agent_server.ACTIVE)
+
+    async def test_cancel_during_failed_resume_revocation_still_releases_owner(self) -> None:
+        revoke = agent_server.revoke_cross_chat_capability
+        async def cancel_after_revocation(run_id: str) -> None:
+            await revoke(run_id)
+            raise asyncio.CancelledError
+        with patch.object(agent_server, "provider_authority_runtime_env", side_effect=ValueError("binding failed")), \
+             patch.object(agent_server, "revoke_cross_chat_capability", side_effect=cancel_after_revocation):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.resume()
+        self.assertEqual(agent_server.CROSS_CHAT_CAPABILITIES, {})
+        self.assertNotIn("chat", agent_server.ACTIVE)
+        self.assertNotIn("chat", agent_server.CURRENT_TURNS)
+        self.assertNotIn("chat", agent_server.BUSY_SESSIONS)
+        self.assertTrue(self.manager.subscriptions[0].closed)
+
     async def test_idle_resume_owns_and_subscribes_before_native_goal_update(
         self,
     ) -> None:
@@ -292,6 +465,7 @@ class CodexGoalResumeTests(unittest.IsolatedAsyncioTestCase):
         await self.resume()
         owner = agent_server.ACTIVE["chat"]
         tasks = dict(agent_server.CODEX_NATIVE_ACTION_TASKS)
+        capabilities = dict(agent_server.CROSS_CHAT_CAPABILITIES)
         self.manager.emit_start = False
 
         result = await self.resume()
@@ -299,6 +473,7 @@ class CodexGoalResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["goal"]["status"], "active")
         self.assertIs(agent_server.ACTIVE["chat"], owner)
         self.assertEqual(agent_server.CODEX_NATIVE_ACTION_TASKS, tasks)
+        self.assertEqual(agent_server.CROSS_CHAT_CAPABILITIES, capabilities)
         self.assertEqual(len(self.manager.subscriptions), 1)
         self.assertIn("chat", agent_server.BUSY_SESSIONS)
         self.assertNotIn("chat", agent_server.SERVER_MAINTENANCE_SESSIONS)

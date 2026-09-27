@@ -89005,19 +89005,56 @@ async def stop_codex_goal_resume(
                 logger.warning("failed to quarantine interrupted goal session=%s thread=%s: %s", session_id, thread_id, concise_error_message(quarantine_error))
 
 
+async def issue_codex_goal_resume_provider_authority(session_id: str, run_id: str) -> None:
+    """Bind fresh helper authority to an explicitly resumed, user-owned goal.
+
+    Resume has no new user message or structured references. Reuse only the
+    chat's currently approved durable routes, never old turn grants or text
+    from the provider-authored goal. Native goal/set can start work before its
+    response, so issuance and runtime binding must finish before that call.
+    """
+    session = STORE.sessions.get(session_id) or {}
+    routes = provider_cross_chat_route_snapshot_for_authority(
+        provider_cross_chat_route_snapshot_for_hints(provider_cross_chat_routes(session), []),
+        [], source_session_id=session_id,
+    )
+    team_routes = team_mail_grants.snapshot(team_mail_grants.live_routes(session))
+    actions = {"publish", "emergency"}
+    if AGENT_TOKEN:
+        actions.add("team_read")
+        if effective_provider_jobs_access(session) != "blocked":
+            actions.add("jobs")
+        if team_routes:
+            actions.add("team_send")
+    if routes:
+        actions.add("agent_cross_chat_routes")
+    authority_path = await issue_cross_chat_capability(
+        session_id, run_id, [], actions=actions,
+        provider_route_snapshot=routes,
+        team_mail_route_snapshot=team_routes,
+        team_read_enabled="team_read" in actions,
+        async_route_v1=True,
+    )
+    await provider_authority_runtime_env(run_id, authority_path, session_id, [])
+
+
 def start_codex_goal_resume_consumer(
     session_id: str, operation_id: str, manager: CodexAppServerManager,
     thread_id: str, reservation_id: str, subscription: Any,
 ) -> asyncio.Task[None]:
     entered = False
 
-    async def consume() -> None:
+    async def consume(*, interrupted_before_start: bool = False) -> None:
         nonlocal entered
         entered = True
-        await consume_codex_native_turn(
-            session_id, operation_id, "goal_resume", manager,
-            thread_id, reservation_id, subscription,
-        )
+        try:
+            await consume_codex_native_turn(
+                session_id, operation_id, "goal_resume", manager,
+                thread_id, reservation_id, subscription,
+                interrupted_before_start=interrupted_before_start,
+            )
+        finally:
+            await revoke_cross_chat_capability(operation_id)
 
     task = asyncio.create_task(consume())
     register_codex_native_action(session_id, operation_id, task)
@@ -89026,11 +89063,7 @@ def start_codex_goal_resume_consumer(
         if not entered and completed.cancelled():
             # Cancelling a task before its first step does not execute its
             # finally block. Keep cleanup tracked under the same operation.
-            cleanup = asyncio.create_task(consume_codex_native_turn(
-                session_id, operation_id, "goal_resume", manager,
-                thread_id, reservation_id, subscription,
-                interrupted_before_start=True,
-            ))
+            cleanup = asyncio.create_task(consume(interrupted_before_start=True))
             register_codex_native_action(session_id, operation_id, cleanup)
 
     task.add_done_callback(reconcile_unstarted_cancel)
@@ -89096,7 +89129,7 @@ async def _put_codex_goal_locked(
             blocker = await turn_start_blocker(ignore_session_id=session_id)
             if blocker:
                 raise HTTPException(status_code=503, detail=f"agent launch deferred: {blocker}")
-            operation_id = f"codexgoal_{uuid.uuid4().hex[:16]}"
+            operation_id = f"run_{uuid.uuid4().hex[:16]}"
             subscription = manager.subscribe_thread(thread_id)
             provider_model, provider_effort, provider_service_tier = codex_runtime_settings(stored_session)
             async with ACTIVE_LOCK:
@@ -89113,6 +89146,7 @@ async def _put_codex_goal_locked(
                 if current_turn is not None:
                     current_turn["run_id"] = operation_id
                     current_turn["purpose"] = "codex_goal_resume"
+            await issue_codex_goal_resume_provider_authority(session_id, operation_id)
             await append_event(session_id, "turn_started", {
                 "run_id": operation_id,
                 "backend": BACKEND_CODEX,
@@ -89242,21 +89276,25 @@ async def _put_codex_goal_locked(
                         session_id, manager, thread_id, reservation_id,
                     )
             finally:
-                if subscription is not None:
-                    subscription.close()
-                await release_codex_control_thread(
-                    session_id, manager, thread_id,
-                    reserved_session=bool(reservation_id),
-                    reservation_id=reservation_id,
-                )
-                if resume_started_published:
-                    await append_event(session_id, "turn_finished", {
-                        "run_id": operation_id,
-                        "backend": BACKEND_CODEX,
-                        "purpose": "codex_goal_resume",
-                        "status": "failed",
-                        "message": "The goal could not be resumed.",
-                    })
+                try:
+                    if operation_id:
+                        await revoke_cross_chat_capability(operation_id)
+                finally:
+                    if subscription is not None:
+                        subscription.close()
+                    await release_codex_control_thread(
+                        session_id, manager, thread_id,
+                        reserved_session=bool(reservation_id),
+                        reservation_id=reservation_id,
+                    )
+                    if resume_started_published:
+                        await append_event(session_id, "turn_finished", {
+                            "run_id": operation_id,
+                            "backend": BACKEND_CODEX,
+                            "purpose": "codex_goal_resume",
+                            "status": "failed",
+                            "message": "The goal could not be resumed.",
+                        })
 
 
 @app.delete("/api/sessions/{session_id}/codex/goal")

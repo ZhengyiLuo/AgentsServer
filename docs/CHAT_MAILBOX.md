@@ -145,14 +145,20 @@ input hash. The desktop keeps progress and final output visible. History import
 must prove provider ownership and exact input identity before suppressing a
 replayed wake; ordinary human messages with similar words remain unchanged.
 
-Known limitation: explicitly resuming an idle native Codex goal currently creates
-a control operation without fresh provider-tool authority or client metadata.
-The installed app-server schema cannot rebind that metadata through goal/resume
-control calls. Mail remains safely stored, but agent reads on that path are not
-yet supported. This implementation does not reuse an old proof, weaken the
-authorization gate, or start a synthetic user turn to work around it. A normal
-authorized turn continuing into its existing goal retains its original run
-authority; that is a different path from explicit idle Resume.
+Explicitly resuming an idle native Codex goal issues fresh provider-tool
+authority for its new logical run before calling native goal/set. Existing
+permanent chat pairs and current saved helper permissions define that run's
+scope. The authenticated MCP endpoint binds metadata-free native calls to the
+exact current thread, turn and run; no old proof is reused and no synthetic
+user turn is started. Authority remains attached across automatic native goal
+continuations and is revoked on completion, Stop, cancellation or failed
+activation. Already-running goal edits keep their existing run and authority.
+
+Resume has no new user message or structured reference. Its sends are peer
+mail and do not mint fresh `user_delegation` attestation from the goal objective
+or past transcript. Recipients may act within their own existing authorization.
+An ordinary authorized turn continuing into its existing goal instead retains
+that original turn's authority and explicit-reference provenance.
 
 ## Durability and presentation
 

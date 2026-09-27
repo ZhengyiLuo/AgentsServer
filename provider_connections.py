@@ -21,7 +21,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from codex_provider import validate_selection
+from codex_provider import validate_selection, validate_model, endpoint_model_catalog
 
 MAX_BODY_BYTES = 16 * 1024
 PROTOCOLS = {"claude": {"anthropic"}, "opencode": {"anthropic", "chat_completions", "responses"}}
@@ -112,7 +112,7 @@ class ConnectionStore:
                 **{key: value.get(key) if value["configured"] else None for key in
                    ("base_url", "model", "protocol", "auth_header", "checked_at", "last_result")}}
 
-    def write(self, backend: str, expected: int, selected: dict | None, result: str | None = None) -> dict:
+    def write(self, backend: str, expected: int, selected: dict | None, result: str | None = None, *, checked_at: str | None = None) -> dict:
         with self.lock:
             if self.read(backend)["revision"] != revision(expected):
                 raise HTTPException(409, "Endpoint settings changed. Refresh and try again.")
@@ -121,7 +121,7 @@ class ConnectionStore:
                 if result not in RESULTS:
                     raise ValueError("invalid check result")
                 value.update(selection(backend, selected))
-                value.update(last_result=result, checked_at=datetime.now(timezone.utc).isoformat())
+                value.update(last_result=result, checked_at=checked_at or datetime.now(timezone.utc).isoformat())
             try:
                 self._directory(create=True)
                 target = self.root / f"{backend}.json"
@@ -265,26 +265,7 @@ def require_model(value: dict) -> str:
 
 
 def discover_models(value: dict) -> list[dict]:
-    """Bounded catalog lookup; no inference, redirects, proxies or secret output."""
-    base = value["base_url"]
-    headers = {"anthropic-version": "2023-06-01", "Accept": "application/json"}
-    headers["x-api-key" if value["auth_header"] == "x-api-key" else "Authorization"] = value["api_key"] if value["auth_header"] == "x-api-key" else "Bearer " + value["api_key"]
-    target = base + ("/v1/models" if value["protocol"] == "anthropic" and not base.endswith("/v1") else "/models")
-    try:
-        with httpx.Client(timeout=3, follow_redirects=False, trust_env=False) as client:
-            with client.stream("GET", target, headers=headers) as response:
-                if response.status_code != 200: return []
-                raw = bytearray()
-                deadline = time.monotonic() + 5
-                for chunk in response.iter_bytes():
-                    raw.extend(chunk)
-                    if len(raw) > 2 * 1024 * 1024 or time.monotonic() > deadline: return []
-                items = json.loads(raw).get("data", [])
-                if not isinstance(items, list): return []
-                ids = dict.fromkeys(item["id"] for item in items[:2000] if isinstance(item, dict) and isinstance(item.get("id"), str) and re.fullmatch(r"[\x21-\x7e]{1,256}", item["id"]))
-                return [{"value": model, "label": model} for model in ids]
-    except Exception:
-        return []
+    return endpoint_model_catalog(value, protocol=value["protocol"])["models"]
 
 
 def native_credentials_present(backend: str, diagnostic: dict) -> bool:
@@ -483,7 +464,8 @@ def native_account_metadata(backend: str, *, env=None, cursor_executable=None, c
     return result
 
 
-def create_router(*, authorize, store: ConnectionStore, check=probe, account=native_account_metadata) -> APIRouter:
+def create_router(*, authorize, store: ConnectionStore, check=probe, account=native_account_metadata,
+                  codex_store=None, codex_set_model=None, session_lookup=None) -> APIRouter:
     router = APIRouter()
     locks = {name: asyncio.Lock() for name in PROTOCOLS}
 
@@ -511,6 +493,67 @@ def create_router(*, authorize, store: ConnectionStore, check=probe, account=nat
 
     def reply(value):
         return JSONResponse(value, headers={"Cache-Control": "no-store"})
+
+    async def model_selection(backend, session_id=None):
+        if backend not in {"codex", "claude", "opencode"}:
+            raise HTTPException(400, "Unsupported custom endpoint.")
+        session = session_lookup(session_id) if session_id and session_lookup else None
+        if session_id and (not session or session.get("backend") != backend):
+            raise HTTPException(404, "Chat not found.")
+        if backend == "codex":
+            if codex_store is None: raise HTTPException(501, "Custom model settings are unavailable.")
+            selected = await asyncio.to_thread(codex_store.for_session, session, include_key=True) if session else await asyncio.to_thread(codex_store.selection, include_key=True, include_revision=True)
+        else:
+            selected = await asyncio.to_thread(store.for_session, session) if session else await asyncio.to_thread(store.read, backend)
+        if not selected or not selected.get("api_key"):
+            raise HTTPException(409, "Connect a custom API first.")
+        return selected
+
+    @router.get("/api/admin/provider-models/{backend}")
+    async def models(backend: str, request: Request, session_id: str | None = None):
+        authorize(request)
+        selected = await model_selection(backend, session_id)
+        result = await asyncio.to_thread(endpoint_model_catalog, selected, protocol=selected.get("protocol", "responses"))
+        # Fence a settings read that raced replacement/forget. Session bindings
+        # deliberately remain usable independently of the current settings.
+        if not session_id:
+            current = await model_selection(backend)
+            if (current.get("credential_id"), current.get("revision")) != (selected.get("credential_id"), selected.get("revision")):
+                raise HTTPException(409, "Endpoint settings changed. Refresh and try again.")
+        if backend == "codex":
+            codex_store.cache_catalog(selected, result)
+        else:
+            with store.lock:
+                store.catalog_cache[(backend, selected["revision"])] = (time.monotonic(), result["models"])
+                if len(store.catalog_cache) > 32: store.catalog_cache.pop(next(iter(store.catalog_cache)))
+        return reply({"backend": backend, "revision": selected.get("credential_id") if backend == "codex" else selected["revision"],
+                      "models": result["models"], "default_model": selected.get("model"), "discovery_status": result["discovery_status"]})
+
+    @router.put("/api/admin/provider-models/{backend}")
+    async def default_model(backend: str, request: Request):
+        authorize(request)
+        payload = await body(request)
+        if set(payload) != {"model", "expected_revision"}: raise HTTPException(400, "Provide model and saved revision only.")
+        model = validate_model(payload["model"]) if payload["model"] is not None else None
+        selected = await model_selection(backend)
+        if backend == "codex":
+            if not codex_set_model: raise HTTPException(501, "Custom model settings are unavailable.")
+            return reply(await codex_set_model(model, payload["expected_revision"]))
+        async with locks[backend]:
+            # No new credential check: only the default changes, and the previous
+            # check time/result must remain honest. Existing snapshots are untouched.
+            def save_model():
+                with store.lock:
+                    current = store.read(backend)
+                    if current["revision"] != revision(payload["expected_revision"]):
+                        raise HTTPException(409, "Endpoint settings changed. Refresh and try again.")
+                    if current.get("last_result") != "verified": raise HTTPException(409, "Check this API connection first.")
+                    value = {key: current[key] for key in ("base_url", "api_key", "protocol", "auth_header")}
+                    saved = store.write(backend, current["revision"], {**value, "model": model, "expected_revision": current["revision"]}, current["last_result"], checked_at=current["checked_at"])
+                    cached = store.catalog_cache.get((backend, current["revision"]))
+                    if cached: store.catalog_cache[(backend, saved["revision"])] = cached
+                    return {"backend": backend, "revision": saved["revision"], "default_model": saved["model"]}
+            return reply(await asyncio.to_thread(save_model))
 
     @router.get("/api/admin/provider-accounts/{backend}")
     async def native_account(backend: str, request: Request):

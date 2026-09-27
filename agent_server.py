@@ -83066,8 +83066,30 @@ async def custom_codex_discovery_native_models() -> dict:
     return await asyncio.to_thread(lambda: json.loads(Path(path).read_text(encoding="utf-8")))
 
 
+async def set_codex_default_model(model: str | None, expected_revision):
+    async with CODEX_PROVIDER_SETTINGS_LOCK:
+        selected = await asyncio.to_thread(CODEX_PROVIDER_STORE.selection, include_key=True, include_revision=True)
+        if not selected or selected.get("credential_id") != expected_revision:
+            raise HTTPException(409, "Endpoint settings changed. Refresh and try again.")
+        status = await asyncio.to_thread(CODEX_PROVIDER_STORE.status)
+        if status.get("connection_verified") is not True:
+            raise HTTPException(409, "Check this API connection first.")
+        replacement = {"base_url": selected["base_url"], "api_key": selected["api_key"],
+                       "model": model, "connection_verified": True}
+        task = asyncio.create_task(replace_codex_provider_settings(replacement))
+        try:
+            await asyncio.shield(task)
+        except BaseException:
+            with suppress(BaseException): await join_task_despite_caller_cancellation(task)
+            raise
+        current = await asyncio.to_thread(CODEX_PROVIDER_STORE.status)
+        return {"backend": "codex", "revision": current["credential_id"], "default_model": current["model"]}
+
+
 app.include_router(provider_connections.create_router(
     authorize=require_native_admin_control, store=PROVIDER_CONNECTION_STORE,
+    codex_store=CODEX_PROVIDER_STORE, codex_set_model=set_codex_default_model,
+    session_lookup=lambda session_id: STORE.sessions.get(session_id),
     account=lambda backend: provider_connections.native_account_metadata(
         backend, env=runner_env(),
         cursor_executable=shutil.which(CURSOR_BIN, path=runner_env().get("PATH")) if backend == BACKEND_CURSOR else None,

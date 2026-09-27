@@ -12,6 +12,8 @@ import stat
 import tempfile
 import threading
 import uuid
+import time
+import httpx
 from urllib.parse import urlsplit, urlunsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request as URLRequest, build_opener
@@ -315,6 +317,11 @@ class ProviderStore:
         if session.get("codex_provider_binding") not in (None, binding(selected), legacy_binding(selected)):
             raise HTTPException(409, "This conversation belongs to another Codex endpoint. Start a new Codex chat, or restore its original endpoint.")
         model = session.get("model") or selected.get("model") or self.cached_catalog(selected).get("default_model")
+        if not model and (session.get("codex_thread_id") or session.get("session_id")):
+            # Preserve the old inferred choice for an already-started thread;
+            # never offer that arbitrary first-row default to new chats.
+            previous = self._saved_model_catalog(selected)
+            model = previous.get("legacy_default_model") or previous.get("default_model")
         if model:
             selected["model"] = validate_model(model)
         return selected
@@ -333,6 +340,9 @@ class ProviderStore:
             # metadata without reopening credential files for every event.
             selected = self._public_selections.get(session.get("codex_provider_revision")) if session else None
             selected = selected or (self.for_session(session) if session is not None else self.registration())
+            if selected and session and not selected.get("model") and (session.get("codex_thread_id") or session.get("session_id")):
+                previous = self._saved_model_catalog(selected)
+                selected = {**selected, "model": session.get("model") or previous.get("legacy_default_model") or previous.get("default_model")}
         except HTTPException:
             selected = None
         result = {"configured": selected is not None, "available": available and selected is not None,
@@ -370,15 +380,17 @@ class ProviderStore:
                 "model_efforts": {model: [option for option in EFFORT_OPTIONS if option["value"] in capability["reasoning_efforts"]]
                     for model, capability in capabilities.items()},
                 "model_capabilities": capabilities,
-                "default_model": cached.get("default_model") or (selected or {}).get("model") or "",
+                "default_model": (selected or {}).get("model") or "",
                 "default_effort": ""}
 
     def cache_catalog(self, selected: dict, catalog: dict):
         with self.lock:
+            previous = self._saved_model_catalog(selected)
+            legacy_default = previous.get("legacy_default_model") or (previous.get("default_model") if not selected.get("model") else None)
             models = catalog.get("models", [])
             self._catalogs[catalog_key(selected)] = {"models": models,
                 "model_capabilities": {model["value"]: model_capability(catalog.get("model_capabilities", {}).get(model["value"])) for model in models},
-                "default_model": catalog.get("default_model", "")}
+                "default_model": catalog.get("default_model", ""), "legacy_default_model": legacy_default}
             self._save_model_catalog(selected, self._catalogs[catalog_key(selected)])
             # Apply fresh explicit denials when discovery completes, rather
             # than letting old metadata veto a later successful model check.
@@ -433,7 +445,7 @@ class ProviderStore:
                     or not isinstance(catalog, dict) or not isinstance(catalog.get("models"), list)
                     or len(catalog["models"]) > 512 or not isinstance(catalog.get("model_capabilities"), dict)):
                 raise ValueError("Invalid saved model catalog")
-            models = [{"value": validate_model(model.get("value")), "label": validate_model(model.get("value"))}
+            models = [{"value": validate_model(model.get("value")), "label": safe_model_label(model.get("label"), validate_model(model.get("value")))}
                 for model in catalog["models"]]
             if len({model["value"] for model in models}) != len(models):
                 raise ValueError("Duplicate saved model identities")
@@ -441,9 +453,11 @@ class ProviderStore:
                 **catalog["model_capabilities"].get(model["value"], {}),
                 "compatibility": "unverified", "reasoning_summary_supported": None}) for model in models}
             default_model = catalog.get("default_model") or ""
-            if default_model and default_model not in capabilities:
-                raise ValueError("Invalid saved default model")
-            result = {"models": models, "model_capabilities": capabilities, "default_model": default_model}
+            if default_model:
+                default_model = validate_model(default_model)
+            legacy = catalog.get("legacy_default_model")
+            result = {"models": models, "model_capabilities": capabilities, "default_model": default_model,
+                      "legacy_default_model": validate_model(legacy) if legacy else None}
             self._saved_catalogs[identifier] = result
             return result
         except Exception:
@@ -720,56 +734,80 @@ class _NoModelRedirects(HTTPRedirectHandler):
         return None
 
 
-def discover_models(selected: dict, native_models: dict | None = None) -> dict:
-    """One bounded operator-requested listing; never forward a key on redirect."""
-    request = URLRequest(selected["base_url"] + "/models", headers={
-        "Authorization": "Bearer " + selected["api_key"], "Accept": "application/json"})
+def safe_model_label(label, model):
+    return label.strip() if isinstance(label, str) and label.strip() and len(label) <= 160 and all(ord(c) >= 32 and ord(c) != 127 for c in label) else model
+
+
+def endpoint_model_catalog(selected: dict, *, protocol="responses") -> dict:
+    """Read only this endpoint's inventory. Never use CLI models or infer a default.
+
+    Pagination stays on the original URL; arbitrary next links are never followed.
+    Discovery is not an inference/credential verification or a compatibility test.
+    """
+    base = selected["base_url"].rstrip("/")
+    parsed = urlsplit(base)
+    router = parsed.scheme == "https" and parsed.netloc in {"openrouter.ai", "eu.openrouter.ai"} and parsed.path in {"/api", "/api/v1"}
+    target = (base.removesuffix("/v1") + "/v1/models/user") if router else base + (
+        "/v1/models" if protocol == "anthropic" and not base.endswith("/v1") else "/models")
+    headers = {"Accept": "application/json", "anthropic-version": "2023-06-01"}
+    header = selected.get("auth_header", "bearer")
+    headers["x-api-key" if header == "x-api-key" else "Authorization"] = selected["api_key"] if header == "x-api-key" else "Bearer " + selected["api_key"]
+    options, capabilities, seen_cursors = [], {}, set()
+    total_bytes, deadline, after = 0, time.monotonic() + 10, None
+    def result(status):
+        return {"models": options, "model_capabilities": capabilities, "discovery_status": status,
+                "default_model": selected.get("model") or "", "efforts": [], "default_effort": ""}
     try:
-        with build_opener(ProxyHandler({}), _NoModelRedirects()).open(request, timeout=15) as response:
-            raw = response.read(1024 * 1024 + 1)
-            if len(raw) > 1024 * 1024:
-                raise ValueError("model response too large")
-            payload = json.loads(raw)
-        entries = payload.get("data") if isinstance(payload, dict) else None
-        if not isinstance(entries, list):
-            raise ValueError("invalid model list")
-        models = []
-        capabilities = {}
-        seen = set()
-        for entry in entries[:2000]:
-            if not isinstance(entry, dict):
-                continue
-            try:
-                value = validate_model(entry.get("id"))
-            except HTTPException:
-                continue
-            capability = discovered_model_capability(entry, value, native_models)
-            if capability is None:
-                continue
-            if value not in seen:
-                seen.add(value)
-                models.append({"value": value, "label": value})
-                capabilities[value] = capability
-            if len(models) == 512:
-                break
-        return {"ok": True, "status": "ready",
-            "message": "The endpoint returned its model list. Model compatibility remains unverified until tested.",
-            "models": models, "efforts": [],
+        with httpx.Client(timeout=3, follow_redirects=False, trust_env=False) as client:
+            for page in range(5):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0: return result("partial")
+                params = {"limit": 1000} if protocol == "anthropic" and not router else {}
+                if after: params["after_id" if protocol == "anthropic" and not router else "after"] = after
+                with client.stream("GET", target, headers=headers, params=params, timeout=min(3, remaining)) as response:
+                    if response.status_code != 200:
+                        if response.status_code in {401, 403}:
+                            options.clear(); capabilities.clear()
+                            return result("authentication_failed")
+                        return result("partial" if options else "unavailable")
+                    raw = bytearray()
+                    for chunk in response.iter_bytes():
+                        total_bytes += len(chunk)
+                        if total_bytes > 8 * 1024 * 1024 or time.monotonic() > deadline: return result("partial" if options else "unavailable")
+                        raw.extend(chunk)
+                payload = json.loads(raw)
+                entries = payload.get("data") if isinstance(payload, dict) else None
+                if not isinstance(entries, list): return result("partial" if options else "unavailable")
+                for item in entries[:2000]:
+                    if not isinstance(item, dict): continue
+                    try: model = validate_model(item.get("id"))
+                    except HTTPException: continue
+                    capability = discovered_model_capability(item, model)
+                    if capability is None or model in capabilities: continue
+                    declared = item.get("capabilities") if isinstance(item.get("capabilities"), dict) else {}
+                    if declared.get("tools") is False or item.get("supports_tools") is False: continue
+                    params_supported = item.get("supported_parameters")
+                    if isinstance(params_supported, list) and params_supported and "tools" not in params_supported: continue
+                    label = safe_model_label(item.get("display_name") or item.get("name"), model)
+                    options.append({"value": model, "label": label})
+                    capabilities[model] = capability
+                    if len(options) >= 512: return result("partial")
+                if payload.get("has_more") is not True: return result("ready" if options else "empty")
+                cursor = payload.get("last_id") or (entries[-1].get("id") if entries and isinstance(entries[-1], dict) else None)
+                if not isinstance(cursor, str) or not 1 <= len(cursor) <= 256 or cursor in seen_cursors: return result("partial")
+                seen_cursors.add(cursor); after = cursor
+        return result("partial")
+    except (httpx.HTTPError, ValueError, TypeError, RecursionError):
+        return result("partial" if options else "unavailable")
+
+
+def discover_models(selected: dict, native_models: dict | None = None) -> dict:
+    result = endpoint_model_catalog(selected)
+    ready = result["discovery_status"] in {"ready", "partial", "empty"}
+    return {**result, "ok": ready, "status": "ready" if ready else "authentication_failed" if result["discovery_status"] == "authentication_failed" else "failed",
+            "message": "Endpoint model inventory; model compatibility remains unverified until tested.",
             "model_efforts": {model: [option for option in EFFORT_OPTIONS if option["value"] in capability["reasoning_efforts"]]
-                for model, capability in capabilities.items()},
-            "model_capabilities": capabilities,
-            "default_model": models[0]["value"] if models else "", "default_effort": ""}
-    except HTTPError as exc:
-        if exc.code in (401, 403):
-            return test_result("authentication_failed")
-        if exc.code in (404, 405):
-            return {**test_result("unsupported"),
-                "message": "The endpoint does not provide model discovery. Save it and enter a model ID in the chat."}
-        return test_result("failed")
-    except (URLError, TimeoutError, ConnectionError):
-        return test_result("connection_failed")
-    except Exception:
-        return test_result("failed")
+                for model, capability in result["model_capabilities"].items()}}
 
 
 def test_result(status: str) -> dict:
@@ -1036,16 +1074,8 @@ def create_router(*, authorize, store: ProviderStore, mutate, probe, available, 
             raise HTTPException(503, "Custom providers require native Codex app-server transport.")
 
     async def catalog(selected):
-        # Native metadata is local and credential-free; endpoint discovery stays
-        # explicit and supplies the identity/ownership fence for any fallback.
-        if native_models is not None:
-            try:
-                native = await native_models()
-            except (HTTPException, OSError, ValueError):
-                native = None
-            result = await asyncio.to_thread(discover, selected, native_models=native)
-        else:
-            result = await asyncio.to_thread(discover, selected)
+        # Custom inventories must not depend on CLI login or its native catalog.
+        result = await asyncio.to_thread(discover, selected)
         if result.get("ok") is True:
             store.cache_catalog(selected, result)
             return {**result, **store.cached_catalog(selected)}

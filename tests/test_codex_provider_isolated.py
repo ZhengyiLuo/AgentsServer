@@ -419,7 +419,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         response = self.client.put("/api/admin/codex/provider", headers=NATIVE, json=selected)
         self.assertEqual(response.status_code, 200, response.text)
         self.assertIsNone(response.json()["model"])
-        self.assertEqual(self.store.catalog(available=True)["default_model"], "first/model")
+        self.assertEqual(self.store.catalog(available=True)["default_model"], "")
         self.assertEqual(self.discover.call_count, 1)
         response = self.client.get("/api/admin/codex/provider/models", headers=NATIVE)
         self.assertEqual(response.status_code, 200, response.text)

@@ -10,7 +10,7 @@ Cursor consumer subscription. Never paste a real key into chat or a screenshot.
 One option covering three runtimes is [OpenRouter](https://openrouter.ai).
 Create an account, create a key in [Keys](https://openrouter.ai/settings/keys),
 set a spending limit and add credits if your selected model requires them.
-Choose an exact model ID from its catalog. Only send data to a gateway you
+Choose a model from its catalog after connecting. Only send data to a gateway you
 trust; it and its upstream provider receive the requests you submit.
 
 | Runtime | Base URL | Protocol / key |
@@ -80,6 +80,32 @@ not authentication proof. The saved verification flag is server-written and
 bound to the exact credential revision, not inferred from native login or
 public model discovery. Legacy saved keys remain usable but are shown as
 saved/unverified until explicitly checked again with the key.
+
+### Model selection
+
+CLI Login keeps the native runtime's model catalog. Custom API independently
+queries the saved endpoint using its own key: OpenAI-compatible `/models`,
+Anthropic `/v1/models` with pagination, or OpenRouter's user-filtered
+`/api/v1/models/user`. Opening a connected Custom API card reads its inventory;
+**Reload models** refreshes it. No inference runs during discovery.
+
+Choose **Default API model → Save default** once to reuse that choice for new
+chats, without entering the key again. We do not randomly pick a model or treat
+the first inventory row as a default. If discovery is unsupported, empty or
+incomplete, **Enter model ID manually** remains available. Friendly names are
+shown alongside exact IDs; confirmed non-chat/non-tool models are filtered out.
+Inventory presence is not proof of permission, billing or agent-tool compatibility.
+
+Saving a default retains the previous credential-check timestamp and creates a
+new settings revision. Existing chats retain their original credentials/model;
+refreshing their catalog uses their own saved binding, not the new global key.
+Cursor does not expose this generic custom-endpoint flow.
+
+The native-only `/api/admin/provider-models/{codex|claude|opencode}` route supports
+GET for inventory (optional `session_id`) and PUT with only `model` and
+`expected_revision` to change the default. Lists are bounded to five pages,
+512 models, 8 MiB and a ten-second discovery deadline. Pagination stays on the
+original endpoint; redirects and arbitrary next-page URLs are never followed.
 
 Unconfigured custom APIs do not appear in new-chat/composer provider menus.
 Removing a current endpoint does not switch existing custom chats

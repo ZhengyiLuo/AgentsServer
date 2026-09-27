@@ -1,28 +1,22 @@
-"""Read Claude Code's native model picker without sending a user/model turn.
+"""Passive Claude model metadata from real SDK connections.
 
-This is the SDK's initialize control exchange (supportedModels in TypeScript,
-get_server_info in Python). Keep only model identifiers and display labels:
-the rest of the response can contain private account and command metadata.
+Catalog reads never start a CLI, renew credentials, or terminate a process.
+Only bounded model IDs/labels are retained; account/command data is discarded.
 """
-
 from __future__ import annotations
 
+from collections import OrderedDict
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
-import selectors
-import signal
-import subprocess
-import tempfile
+import shutil
 import threading
 import time
 import unicodedata
-from contextlib import suppress
 from typing import Any
 
-
-MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_MODELS = 512
 MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/\-\[\]]{0,255}")
 VERSIONED_ID = re.compile(
@@ -32,23 +26,6 @@ NATIVE_DESCRIPTION = re.compile(
     r"(?:Claude )?((?:Opus|Sonnet|Haiku|Fable|Mythos) \d+(?:\.\d+)*)"
     r"(?: with (\w+) context)?(?:\s*[·|—]|$)"
 )
-_PROBE_LOCK = threading.Lock()
-# Candidates, not advertised options. Claude's own picker must accept each
-# one before it reaches our catalog. The native default lineup omits supported
-# older versions. Keep this seed aligned with Claude's supported-model docs;
-# API-key installs can supply the account's Models API IDs instead.
-SUPPORTED_MODEL_CANDIDATES = (
-    "claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-5",
-    "claude-haiku-4-5-20251001", "claude-opus-5", "claude-fable-5",
-    "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
-    "claude-sonnet-4-6", "claude-opus-4-5-20251101",
-    "claude-sonnet-4-5-20250929",
-    "claude-opus-5[1m]", "claude-opus-4-8[1m]",
-    "claude-opus-4-7[1m]", "claude-opus-4-6[1m]",
-    "claude-sonnet-4-6[1m]",
-)
-
-
 class ClaudeModelCatalogUnavailable(RuntimeError):
     """A metadata probe failed; never include provider output in this error."""
 
@@ -117,199 +94,107 @@ def parse_native_models(info: Any) -> list[dict[str, str]]:
     return options
 
 
-def _expansion_settings(effective: Any, env: dict[str, str], candidates: tuple[str, ...]) -> dict[str, Any] | None:
-    """Build a process-only picker; never replace enforcement or credentials.
 
-    Reading the effective settings through the CLI retains its full managed
-    settings precedence. Unknown schemas and third-party endpoints fail closed.
-    """
-    if not isinstance(effective, dict):
-        return None
-    settings_env = effective.get("env", {})
-    if not isinstance(settings_env, dict):
-        return None
-    runtime_env = {**env, **settings_env}
-    base = runtime_env.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com"
-    if not isinstance(base, str) or base.rstrip("/") not in (
-        "https://api.anthropic.com", "https://api.anthropic.com/v1",
-    ):
-        return None
-    if any(runtime_env.get(key) for key in (
-        "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
-    )):
-        return None
-    picker = effective.get("modelPicker", {"options": []})
-    if not isinstance(picker, dict) or picker.get("replaceBuiltInOptions"):
-        return None  # Respect an explicitly curated replacement lineup.
-    options = picker.get("options")
-    if not isinstance(options, list) or len(options) > MAX_MODELS:
-        return None
-    if any(not isinstance(row, dict) or not isinstance(row.get("model"), str) for row in options):
-        return None
-    seen = {row["model"] for row in options}
-    additional = [{"model": value} for value in candidates
-                  if isinstance(value, str) and MODEL_ID.fullmatch(value) and value not in seen]
-    if not additional or len(options) + len(additional) > MAX_MODELS:
-        return None
-    settings = {"disableAllHooks": True,
-                "modelPicker": {**picker, "options": [*options, *additional]}}
-    if len(json.dumps(settings).encode("utf-8")) > 65536:
-        return None
-    return settings
+CACHE_TTL_SECONDS = 300.0
+CACHE_LIMIT = 16
+_CACHE_LOCK = threading.Lock()
+_CACHE: OrderedDict[str, tuple[float, list[dict[str, str]]]] = OrderedDict()
 
 
-def _read_initialization(
-    process: subprocess.Popen, request_id: str, deadline: float,
-    *, env: dict[str, str], candidates: tuple[str, ...] | None,
-) -> tuple[list[dict[str, str]], dict[str, Any] | None]:
-    buffer = bytearray()
-    total = 0
-    models = None
-    first_party = False
-    effective = None
-    settings_received = False
-    assert process.stdout is not None
-    with selectors.DefaultSelector() as selector:
-        selector.register(process.stdout, selectors.EVENT_READ)
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                if models is not None:
-                    return models, None
-                raise ClaudeModelCatalogUnavailable("Native model discovery timed out")
-            if not selector.select(remaining):
-                continue
-            chunk = os.read(process.stdout.fileno(), 65536)
-            if not chunk:
-                if models is not None:
-                    return models, None
-                raise ClaudeModelCatalogUnavailable("Native model discovery ended without metadata")
-            total += len(chunk)
-            if total > MAX_OUTPUT_BYTES:
-                raise ClaudeModelCatalogUnavailable("Native model metadata exceeds its limit")
-            buffer.extend(chunk)
-            while b"\n" in buffer:
-                line, _, buffer = buffer.partition(b"\n")
-                try:
-                    event = json.loads(line)
-                except (ValueError, UnicodeDecodeError):
-                    continue
-                if not isinstance(event, dict) or event.get("type") != "control_response":
-                    continue
-                response = event.get("response")
-                if not isinstance(response, dict):
-                    continue
-                if response.get("request_id") == request_id:
-                    if response.get("subtype") != "success":
-                        raise ClaudeModelCatalogUnavailable("Native model discovery was rejected")
-                    info = response.get("response")
-                    models = parse_native_models(info)
-                    account = info.get("account")
-                    first_party = isinstance(account, dict) and account.get("apiProvider") == "firstParty"
-                    if not models or not first_party or candidates is None:
-                        return models, None
-                elif candidates is not None and response.get("request_id") == request_id + "-settings":
-                    settings_received = True
-                    info = response.get("response")
-                    if response.get("subtype") == "success" and isinstance(info, dict):
-                        effective = info.get("effective")
-                if models is not None and settings_received:
-                    return models, _expansion_settings(effective, env, candidates) if first_party else None
-
-
-def probe_native_models(
-    executable: str, *, env: dict[str, str], timeout: float,
-    candidates: tuple[str, ...] | None = None,
-) -> list[dict[str, str]]:
-    """Bound one private, tool-free metadata process on supported server OSes.
-
-    No prompt, resume ID, model request, or account information is returned.
-    The caller supplies the same scrubbed runtime environment as real turns.
-    A failed probe is optional discovery, not an authentication failure.
-    """
-    if os.name != "posix":
-        raise ClaudeModelCatalogUnavailable("Native model discovery is unavailable on this platform")
-    deadline = time.monotonic() + timeout
-    # Multiple devices refreshing must not launch a herd of Claude processes.
-    if timeout <= 0 or not _PROBE_LOCK.acquire(timeout=timeout):
-        raise ClaudeModelCatalogUnavailable("Native model discovery is busy")
+def _file_revision(path: Path) -> tuple:
     try:
-        if time.monotonic() >= deadline:
-            raise ClaudeModelCatalogUnavailable("Native model discovery timed out")
-        # Resolve relative executable paths before moving to a disposable cwd.
-        if os.sep in executable:
-            executable = str(Path(executable).absolute())
-        args = [
-            executable, "--print", "--input-format", "stream-json",
-            "--output-format", "stream-json", "--verbose",
-            "--no-session-persistence", "--strict-mcp-config",
-            "--mcp-config", '{"mcpServers":{}}', "--tools", "",
-            "--setting-sources", "user", "--settings", '{"disableAllHooks":true}',
-        ]
-        request_id = "agentsdock-model-catalog"
-        request = {"type": "control_request", "request_id": request_id,
-                   "request": {"subtype": "initialize", "hooks": {}, "agents": {}, "skills": []}}
-        settings_request = {"type": "control_request", "request_id": request_id + "-settings",
-                            "request": {"subtype": "get_settings"}}
-        # Reading the catalog must not silently upgrade the user's runtime.
-        child_env = {**env, "DISABLE_AUTOUPDATER": "1"}
-
-        def run_probe(settings=None):
-            probe_args = list(args)
-            if settings is not None:
-                probe_args[-1] = json.dumps(settings)
-            requests = [request] if settings is not None else [request, settings_request]
-            return _run_probe(probe_args, requests, child_env, request_id, deadline,
-                              candidates=None if settings is not None else (
-                                  SUPPORTED_MODEL_CANDIDATES if candidates is None else candidates))
-
-        models, expansion = run_probe()
-        if expansion is not None and time.monotonic() < deadline:
-            try:
-                expanded, _ = run_probe(expansion)
-            except (ClaudeModelCatalogUnavailable, OSError, subprocess.SubprocessError):
-                return models  # Optional expansion must not lose native choices.
-            # Only append requested candidates that survived the native picker;
-            # never union the seed directly or change existing alias/default IDs.
-            allowed = {row["model"] for row in expansion["modelPicker"]["options"]}
-            allowed.update(row["value"] for row in models)
-            # The second result also wins if policy changed between probes:
-            # don't resurrect a baseline row the native picker now excludes.
-            models = [row for row in expanded if row["value"] in allowed]
-        return models
-    finally:
-        _PROBE_LOCK.release()
+        stat = path.stat()
+        return (str(path.resolve()), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    except FileNotFoundError:
+        return (str(path.absolute()), None)
 
 
-def _run_probe(args, requests, child_env, request_id, deadline, *, candidates):
-    with tempfile.TemporaryDirectory(prefix="agentsdock-model-catalog-") as cwd:
-        process = subprocess.Popen(
-            args, cwd=cwd, env=child_env, stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True,
-        )
+def _account_identity(config: Path, home: Path) -> list:
+    # Claude writes counters and picker caches to .claude.json on every
+    # startup. Its mtime is not a settings revision. Only fingerprint the
+    # account identity; never retain email, tokens or the whole document.
+    paths = {home / ".claude.json", config / ".claude.json"}
+    result = []
+    for path in sorted(paths):
         try:
-            assert process.stdin is not None
-            process.stdin.write("".join(json.dumps(request) + "\n" for request in requests).encode())
-            process.stdin.close()
-            return _read_initialization(process, request_id, deadline, env=child_env, candidates=candidates)
-        finally:
-            try:
-                # Only this fresh probe's process group; never a live chat.
-                # Kill/reap even after a response so unexpected descendants
-                # cannot outlive a catalog HTTP request or hold its pipes.
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                except PermissionError:
-                    # macOS can return EPERM for an already-exited group.
-                    # If the child is still alive, explicitly kill it; do
-                    # not let cleanup turn into an unbounded wait.
-                    if process.poll() is None:
-                        process.kill()
-                process.wait(timeout=1.0)
-            finally:
-                for stream in (process.stdin, process.stdout):
-                    if stream is not None:
-                        with suppress(OSError):
-                            stream.close()
+            with path.open("rb") as stream:
+                raw = stream.read(2 * 1024 * 1024 + 1)
+            if len(raw) > 2 * 1024 * 1024:
+                raise ValueError("Native identity metadata exceeds its limit")
+            value = json.loads(raw)
+        except FileNotFoundError:
+            value = {}
+        account = value.get("oauthAccount", {}) if isinstance(value, dict) else {}
+        result.append([str(path), *(
+            str(account.get(field) or "")[:256] if isinstance(account, dict) else ""
+            for field in ("accountUuid", "organizationUuid")
+        )])
+    return result
+
+
+def native_catalog_key(executable: str, env: dict[str, str]) -> str:
+    """Fingerprint runtime/config identity without reading native credentials.
+
+    Environment credentials are hashed, never retained in plaintext. Native
+    credential rotation alone is not evidence of login or logout; this cache
+    is short lived and is never used as authentication/authorization evidence.
+    """
+    home = Path(env.get("HOME") or str(Path.home()))
+    config = Path(env.get("CLAUDE_CONFIG_DIR") or home / ".claude")
+    relevant = {key: value for key, value in env.items()
+                if key.startswith(("ANTHROPIC_", "CLAUDE_")) or key == "HOME"}
+    resolved = shutil.which(executable, path=env.get("PATH")) or executable
+    revisions = [_file_revision(Path(resolved)), *(
+        _file_revision(path) for path in (
+            config / "settings.json", config / ".credentials.json",
+            Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
+            Path("/etc/claude-code/managed-settings.json"),
+        )
+    )]
+    return hashlib.sha256(json.dumps([relevant, revisions, _account_identity(config, home)], sort_keys=True).encode()).hexdigest()
+
+
+def _has_project_settings(cwd: str, env: dict[str, str]) -> bool:
+    """Do not promote a workspace-specific picker to the server-wide catalog."""
+    root = Path(cwd).resolve()
+    config = Path(env.get("CLAUDE_CONFIG_DIR") or Path(env.get("HOME") or str(Path.home())) / ".claude").resolve()
+    for parent in (root, *root.parents):
+        folder = parent / ".claude"
+        for name in ("settings.json", "settings.local.json"):
+            path = folder / name
+            if name == "settings.json" and folder.resolve() == config:
+                continue  # This is the fingerprinted user config, not project config.
+            if path.exists():
+                return True
+    return False
+
+
+def remember_native_models(info: Any, *, key: str, executable: str,
+                           env: dict[str, str], cwd: str) -> None:
+    # Recheck the pre-connect revision: a slow/old connection must not publish
+    # a model list under a newer CLI, provider, or user-settings configuration.
+    if key != native_catalog_key(executable, env) or _has_project_settings(cwd, env):
+        return
+    models = parse_native_models(info)
+    with _CACHE_LOCK:
+        _CACHE[key] = (time.monotonic(), models)
+        _CACHE.move_to_end(key)
+        while len(_CACHE) > CACHE_LIMIT:
+            _CACHE.popitem(last=False)
+
+
+def cached_native_models(executable: str, *, env: dict[str, str]) -> list[dict[str, str]] | None:
+    key = native_catalog_key(executable, env)
+    with _CACHE_LOCK:
+        entry = _CACHE.get(key)
+        if entry is None:
+            return None
+        if time.monotonic() - entry[0] >= CACHE_TTL_SECONDS:
+            del _CACHE[key]
+            return None
+        return [dict(row) for row in entry[1]]
+
+
+def clear_native_models() -> None:
+    with _CACHE_LOCK:
+        _CACHE.clear()

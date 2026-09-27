@@ -129,7 +129,7 @@ class InstallerContractTests(unittest.TestCase):
         self.assert_smoke_check_imports(
             INSTALLER.read_text(),
             {"codex_auth", "codex_provider", "side_questions", "codex_side_question",
-             "claude_side_question", "agentsdock_team_hub", "cursor_agent_client",
+             "claude_side_question", "agentsdock_team_hub", "cursor_agent_client", "cursor_provider_mcp",
              "cursor_process_guard", "secure_peer_delivery", "secure_peer_runtime"},
         )
         self.assertIn("from agentsdock_team_hub import secure_peer, secure_peer_hub", INSTALLER.read_text())
@@ -763,6 +763,7 @@ exit 0
         self.assertIn('"$SCRIPT_DIR/claude_sdk_client.py"', source)
         self.assertIn('"$SCRIPT_DIR/codex_app_server.py"', source)
         self.assertIn('"$SCRIPT_DIR/cursor_agent_client.py"', source)
+        self.assertIn('"$SCRIPT_DIR/cursor_provider_mcp.py"', source)
         self.assertIn('"$SCRIPT_DIR/opencode_agent_client.py"', source)
         self.assertIn('"$SCRIPT_DIR/team_hub_host.py"', source)
         self.assertIn('"$SCRIPT_DIR/agentsdock_team_hub/"', source)
@@ -1423,7 +1424,7 @@ exit 0
         self.assertIsNotNone(release_files_match)
         release_files = release_files_match.group(1).split()
         for filename in (
-            "activation_transaction.py agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py chat_mailbox.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py provider_commands.py claude_sdk_client.py claude_background_reconciliation.py codex_app_server.py cursor_agent_client.py opencode_agent_client.py cursor_process_guard.py"
+            "activation_transaction.py agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py chat_mailbox.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py provider_commands.py claude_sdk_client.py claude_background_reconciliation.py codex_app_server.py cursor_agent_client.py cursor_provider_mcp.py opencode_agent_client.py cursor_process_guard.py"
         ).split():
             self.assertIn(filename, release_files)
         self.assertIn('"$STAGE_DIR/activation_transaction.py"', installer_source)
@@ -1438,11 +1439,12 @@ exit 0
         self.assertIn('"$STAGE_DIR/claude_sdk_client.py"', installer_source)
         self.assertIn('"$STAGE_DIR/codex_app_server.py"', installer_source)
         self.assertIn('"$STAGE_DIR/cursor_agent_client.py"', installer_source)
+        self.assertIn('"$STAGE_DIR/cursor_provider_mcp.py"', installer_source)
         self.assertIn('"$STAGE_DIR/opencode_agent_client.py"', installer_source)
         self.assert_smoke_check_imports(
             installer_source,
             {"codex_auth", "codex_provider", "side_questions", "codex_side_question",
-             "claude_side_question", "agentsdock_team_hub", "cursor_agent_client",
+             "claude_side_question", "agentsdock_team_hub", "cursor_agent_client", "cursor_provider_mcp",
              "cursor_process_guard", "secure_peer_delivery", "agentsdock_team",
              "claude_history_repair", "chat_mailbox", "provider_commands", "opencode_agent_client"},
         )
@@ -1518,6 +1520,7 @@ exit 0
                 members,
             )
             self.assertIn(f"agents-server-{version}/provider_usage.py", members)
+            self.assertIn(f"agents-server-{version}/cursor_provider_mcp.py", members)
             self.assertIn(
                 f"agents-server-{version}/codex_app_server.py",
                 members,

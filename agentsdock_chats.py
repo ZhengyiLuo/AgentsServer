@@ -1096,7 +1096,8 @@ def parser() -> argparse.ArgumentParser:
     command.set_defaults(handler=send)
     ask_command = commands.add_parser(
         "ask",
-        help="ask a same-server agent and wait until it answers or is stopped",
+        help=("send one request; async_route_v1 returns a durable delivery receipt without waiting for a reply; "
+              "legacy routes wait until answered or stopped"),
         allow_abbrev=False,
     )
     ask_destination = ask_command.add_mutually_exclusive_group(required=True)

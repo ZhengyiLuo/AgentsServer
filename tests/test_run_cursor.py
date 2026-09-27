@@ -15,7 +15,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import agent_server
 
@@ -279,6 +279,56 @@ class RunCursorTests(unittest.IsolatedAsyncioTestCase):
             for event in self._read_events()
             if event.get("run_id") == run_id
         ]
+
+    async def test_run_scoped_mcp_uses_live_owner_and_revokes_after_native_exit(self):
+        run_id = "run-cursor-1"
+        capability = {
+            "source_session_id": self.session_id, "source_run_id": run_id,
+            "authority_path": str(agent_server.CROSS_CHAT_AUTHORITY_ROOT / (run_id + "-" + "0" * 32 + ".json")),
+            "provider_runtime_env": {},
+        }
+        probe = Path(self.tempdir.name) / "endpoint.json"
+        body = r'''#!/usr/bin/env python3
+import json, os, pathlib, subprocess, sys
+prompt = sys.stdin.read()
+assert "--force" not in sys.argv and "--approve-mcps" not in sys.argv
+assert "--disable-project-configs" in sys.argv
+plugin = pathlib.Path(sys.argv[sys.argv.index("--plugin-dir") + 1])
+config = json.loads((plugin / "mcp.json").read_text())["mcpServers"]["provider"]
+assert config["env"]["AGENTSDOCK_CURSOR_TOOL_SECRET"] not in prompt
+print(json.dumps({"type":"system","subtype":"init","session_id":"native-mcp","cwd":os.getcwd()}), flush=True)
+child = subprocess.Popen([config["command"], *config["args"]], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env={**os.environ, **config["env"]})
+try:
+    for _ in range(2):
+        child.stdin.write(json.dumps({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run","arguments":{"helper":"chats","arguments":["inbox"]}}}) + "\n")
+        child.stdin.flush()
+        response = json.loads(child.stdout.readline())
+        assert response["result"]["isError"] is False, response
+finally:
+    child.stdin.close()
+    child.wait(timeout=5)
+pathlib.Path(PROBE).write_text(json.dumps({"port":config["env"]["AGENTSDOCK_CURSOR_TOOL_PORT"], "plugin":str(plugin)}))
+print(json.dumps({"type":"result","subtype":"success","session_id":"native-mcp","is_error":False,"result":"MCP_OK"}), flush=True)
+'''.replace("PROBE", repr(str(probe)))
+        executor = AsyncMock(return_value=("inbox-empty", False))
+        with patch.object(agent_server, "CROSS_CHAT_CAPABILITIES", {"fake": capability}), patch.object(
+            agent_server, "execute_provider_tool", executor
+        ):
+            events = await self._run_script(body)
+        terminal = [e for e in events if e.get("type") == "turn_finished"]
+        self.assertEqual(len(terminal), 1, events)
+        self.assertFalse(terminal[0]["is_error"], events)
+        self.assertEqual(terminal[0]["result_text"], "MCP_OK")
+        self.assertEqual(executor.await_count, 1)  # same MCP request ID replays
+        kwargs = executor.await_args.kwargs
+        self.assertEqual(kwargs["backend"], agent_server.BACKEND_CURSOR)
+        self.assertTrue(kwargs["cursor_owner_token"])
+        recorded = json.loads(probe.read_text())
+        self.assertFalse(Path(recorded["plugin"]).exists())
+        with self.assertRaises(OSError):
+            await asyncio.open_connection("127.0.0.1", int(recorded["port"]))
+        with self.assertRaises(agent_server.ProviderToolError):
+            await agent_server.provider_tool_capability_snapshot(self.session_id, run_id, **kwargs)
 
     async def test_full_turn_emits_tool_and_assistant_and_terminal_events(self) -> None:
         script = _write_fake_cli(Path(self.tempdir.name), FAKE_AGENT_CLI)
@@ -1913,12 +1963,9 @@ class CursorFileDeliveryInstructionTests(unittest.TestCase):
         self.assertIn('{"files":["/absolute/path.ext"]}', instructions)
         self.assertIn("needs no shell", instructions)
         self.assertIn("generated images", instructions)
-        self.assertNotIn(
-            agent_server.CLAUDE_PROVIDER_MCP_TOOL_NAME,
-            instructions,
-        )
+        self.assertIn("run on MCP server plugin-agentsdock-internal-9f3a2c71-provider", instructions)
         self.assertNotIn("Use the `agentsdock` provider tool", instructions)
-        self.assertIn("generated per-turn authority block", instructions)
+        self.assertNotIn("generated per-turn authority block", instructions)
 
         authority = agent_server.cross_chat_provider_authority_block(
             [],
@@ -1953,7 +2000,7 @@ class CursorFileDeliveryInstructionTests(unittest.TestCase):
             )
         current = agent_server.cursor_instruction_hash("chat-x", {}, manifest)
 
-        self.assertEqual(agent_server.CURSOR_PROMPT_POLICY_VERSION, "5")
+        self.assertEqual(agent_server.CURSOR_PROMPT_POLICY_VERSION, "6")
         self.assertNotEqual(previous, current)
 
 

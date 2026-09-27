@@ -757,7 +757,7 @@ class RuntimeDiagnosticTests(unittest.TestCase):
             {"value": "opus[1m]", "label": "Opus 5.5 (1M context)"},
             {"value": "sonnet", "label": "Sonnet 5"},
         ])
-        self.assertEqual(result["model_source"], "Claude SDK initialize")
+        self.assertEqual(result["model_source"], "Cached Claude SDK initialize")
         self.assertEqual(result["default_model"], "sonnet")
         api.assert_called_once_with(timeout_seconds=2.0)
 
@@ -768,10 +768,10 @@ class RuntimeDiagnosticTests(unittest.TestCase):
         ), patch.object(agent_server, "discover_claude_provider_models", return_value=([], "unavailable")) as api:
             result = agent_server.parse_claude_help_catalog()
         self.assertEqual([option["value"] for option in result["models"]], [""])
-        self.assertEqual(result["model_source"], "Claude SDK initialize")
+        self.assertEqual(result["model_source"], "Cached Claude SDK initialize")
         api.assert_called_once_with(timeout_seconds=2.0)
 
-    def test_claude_api_models_are_candidates_for_native_permission_filtering(self) -> None:
+    def test_claude_api_models_do_not_expand_cached_native_permissions(self) -> None:
         self.native_models.return_value = ([
             {"value": "opus", "label": "Opus 5.5"},
             {"value": "claude-opus-5", "label": "Opus 5"},
@@ -783,7 +783,7 @@ class RuntimeDiagnosticTests(unittest.TestCase):
             {"value": "claude-org-blocked", "label": "Blocked"},
         ], "success")):
             result = agent_server.parse_claude_help_catalog()
-        self.native_models.assert_called_once_with(candidates=("claude-opus-5", "claude-org-blocked"))
+        self.native_models.assert_called_once_with()
         self.assertIn({"value": "claude-opus-5", "label": "Opus 5"}, result["models"])
         self.assertNotIn("claude-org-blocked", [row["value"] for row in result["models"]])
 
@@ -1367,22 +1367,22 @@ class SessionRuntimeValidationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class NativeModelDiscoveryIntegrationTests(unittest.TestCase):
-    def test_native_probe_uses_runtime_environment_and_bounded_budget(self):
+    def test_native_cache_uses_runtime_environment_without_a_process(self):
         with patch.object(agent_server, "runner_env", return_value={"SAFE": "1"}), patch.object(
             agent_server, "RUNTIME_CATALOG_TIMEOUT_SECONDS", 2.0,
         ), patch(
-            "claude_model_catalog.probe_native_models",
+            "claude_model_catalog.cached_native_models",
             return_value=[{"value": "opus", "label": "Opus 5.5"}],
         ) as probe:
             models, status = agent_server.discover_claude_native_models()
         self.assertEqual(status, "success")
         self.assertEqual(models[0]["label"], "Opus 5.5")
-        probe.assert_called_once_with(agent_server.CLAUDE_BIN, env={"SAFE": "1"}, timeout=2.0, candidates=None)
+        probe.assert_called_once_with(agent_server.CLAUDE_BIN, env={"SAFE": "1"})
 
     def test_native_probe_failure_does_not_leak_or_poison_readiness(self):
         ready = {"status": "ready"}
         with patch.dict(agent_server.RUNTIME_DIAGNOSTICS, {"claude": ready}, clear=True), patch(
-            "claude_model_catalog.probe_native_models", side_effect=RuntimeError("private@example.com secret"),
+            "claude_model_catalog.cached_native_models", side_effect=RuntimeError("private@example.com secret"),
         ), self.assertLogs(agent_server.logger, level="DEBUG") as logs:
             self.assertEqual(agent_server.discover_claude_native_models(), ([], "unavailable"))
             self.assertEqual(agent_server.RUNTIME_DIAGNOSTICS["claude"], ready)

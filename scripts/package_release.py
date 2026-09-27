@@ -65,6 +65,7 @@ FILES = (
     "codex_side_question.py",
     "claude_side_question.py",
     "cursor_agent_client.py",
+    "cursor_provider_mcp.py",
     "opencode_agent_client.py",
     "cursor_process_guard.py",
     "claude_history_repair.py",

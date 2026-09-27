@@ -183,6 +183,7 @@ class ServerOpsSecurityTests(unittest.IsolatedAsyncioTestCase):
     async def test_provider_tool_cached_result_never_outlives_live_authority(self):
         value = {"helper": "jobs", "arguments": ["list"]}
         for backend, owner_kwargs in (
+            (agent_server.BACKEND_CURSOR, {"cursor_owner_token": "owner-live"}),
             (
                 agent_server.BACKEND_CODEX,
                 {

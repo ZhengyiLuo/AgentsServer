@@ -77,6 +77,7 @@ import chat_mailbox
 import workspace_git
 import codex_auth
 import codex_provider
+import provider_connections
 import server_instances
 import local_session_ownership
 import cursor_history
@@ -406,6 +407,7 @@ SERVER_RESTART_STATUS_FILE = SERVER_ADMIN_ROOT / "server-restart.json"
 TEAM_HUB_HOST_CONTROL_STATUS_FILE = SERVER_ADMIN_ROOT / "team-hub-host.json"
 CODEX_SETTINGS_FILE = SERVER_ADMIN_ROOT / "codex-settings.json"
 CODEX_PROVIDER_STORE = codex_provider.ProviderStore(SERVER_ADMIN_ROOT / "codex-provider")
+PROVIDER_CONNECTION_STORE = provider_connections.ConnectionStore(SERVER_ADMIN_ROOT / "provider-connections")
 ABANDONED_FORK_THREADS_FILE = SERVER_ADMIN_ROOT / "abandoned-fork-threads.json"
 # Process-group ids of provider children this server spawned in their own
 # session (``start_new_session=True``). A SIGKILL of the server cannot reach
@@ -79015,6 +79017,8 @@ async def require_agent_token(request: Request, call_next):
         "/api/admin/codex/auth", "/api/admin/codex/auth/api-key",
         "/api/admin/codex/provider", "/api/admin/codex/provider/test",
         "/api/admin/codex/provider/models",
+        "/api/admin/provider-connections/claude", "/api/admin/provider-connections/claude/check",
+        "/api/admin/provider-connections/opencode", "/api/admin/provider-connections/opencode/check",
     }
     public_chat_shares_admin_route = (
         request.url.path == "/api/admin/chat-shares"
@@ -79214,10 +79218,12 @@ async def require_agent_token(request: Request, call_next):
             if body_error is not None:
                 status_code, detail = body_error
                 return JSONResponse({"detail": detail}, status_code=status_code)
-        elif request.url.path in {"/api/admin/codex/provider", "/api/admin/codex/provider/test", "/api/admin/codex/provider/models"} and request.method.upper() in {"PUT", "POST"}:
+        elif (request.url.path in {"/api/admin/codex/provider", "/api/admin/codex/provider/test", "/api/admin/codex/provider/models"}
+              and request.method.upper() in {"PUT", "POST"}) or (request.url.path.startswith("/api/admin/provider-connections/")
+              and request.method.upper() in {"PUT", "POST", "DELETE"}):
             declared_size, transport_error = privileged_native_json_transport(
                 request, max_body_bytes=codex_provider.MAX_BODY_BYTES,
-                label="Codex endpoint", require_content_length=True,
+                label="Provider endpoint", require_content_length=True,
             )
             if transport_error is not None:
                 status_code, detail = transport_error
@@ -82976,6 +82982,10 @@ async def custom_codex_discovery_native_models() -> dict:
     )
     return await asyncio.to_thread(lambda: json.loads(Path(path).read_text(encoding="utf-8")))
 
+
+app.include_router(provider_connections.create_router(
+    authorize=require_native_admin_control, store=PROVIDER_CONNECTION_STORE,
+))
 
 app.include_router(codex_provider.create_router(
     authorize=require_native_admin_control,

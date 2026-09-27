@@ -81386,6 +81386,11 @@ async def codex_provider_mcp(request: Request) -> Response:
         return codex_provider_mcp_jsonrpc_error(request_id, -32602, "Subagent tool calls are forbidden")
     thread_id = str(turn_meta.get("thread_id") or "")
     turn_id = str(turn_meta.get("turn_id") or "")
+    if any(
+        turn_meta.get(name) is not None and not isinstance(turn_meta[name], dict)
+        for name in ("responsesapi_client_metadata", "responsesapiClientMetadata")
+    ):
+        return codex_provider_mcp_jsonrpc_error(request_id, -32602, "Incomplete turn metadata")
     client_meta = turn_meta.get("responsesapi_client_metadata")
     if not isinstance(client_meta, dict):
         client_meta = turn_meta.get("responsesapiClientMetadata")
@@ -81393,14 +81398,30 @@ async def codex_provider_mcp(request: Request) -> Response:
         client_meta = turn_meta
     run_id = str(client_meta.get("agentsdock_run_id") or "")
     proof = str(client_meta.get("agentsdock_run_proof") or "")
+    # Codex's automatic continuations retain native thread/turn/call identity
+    # but can omit the optional client metadata from the original turn/start.
+    # Only genuinely absent fields use native ownership; malformed or stale
+    # supplied metadata must never downgrade to that path.
+    has_run_metadata = any(
+        name in candidate
+        for candidate in (
+            turn_meta,
+            turn_meta.get("responsesapi_client_metadata"),
+            turn_meta.get("responsesapiClientMetadata"),
+        )
+        if isinstance(candidate, dict)
+        for name in ("agentsdock_run_id", "agentsdock_run_proof")
+    )
     core_call_id = str(meta.get("callId") or "")
     if (
         not thread_id
         or len(thread_id) > 256
         or not turn_id
         or len(turn_id) > 256
-        or re.fullmatch(r"run_[A-Za-z0-9_-]{1,128}", run_id) is None
-        or re.fullmatch(r"[0-9a-f]{64}", proof) is None
+        or (has_run_metadata and (
+            re.fullmatch(r"run_[A-Za-z0-9_-]{1,128}", run_id) is None
+            or re.fullmatch(r"[0-9a-f]{64}", proof) is None
+        ))
         or not core_call_id
     ):
         return codex_provider_mcp_jsonrpc_error(request_id, -32602, "Incomplete turn metadata")
@@ -81415,11 +81436,23 @@ async def codex_provider_mcp(request: Request) -> Response:
                 active.get("backend") == BACKEND_CODEX
                 and active.get("transport") == CODEX_TRANSPORT_APP_SERVER
                 and str(active.get("provider_thread_id") or "") == thread_id
-                and str(active.get("run_id") or "") == run_id
                 and session_id in BUSY_SESSIONS
+                and (
+                    str(active.get("run_id") or "") == run_id
+                    if has_run_metadata
+                    else provider_tool_active_matches(
+                        session_id,
+                        str(active.get("run_id") or ""),
+                        backend=BACKEND_CODEX,
+                        provider_thread_id=thread_id,
+                        provider_turn_id=turn_id,
+                    )[0]
+                )
             )
         ]
         if len(owners) == 1:
+            if not has_run_metadata:
+                run_id = str(ACTIVE[owners[0]].get("run_id") or "")
             standalone_active_owner = bool(
                 (ACTIVE.get(owners[0]) or {}).get(
                     "standalone_provider_context"
@@ -81441,9 +81474,10 @@ async def codex_provider_mcp(request: Request) -> Response:
         not stored_owners and standalone_active_owner
     ):
         return codex_provider_mcp_jsonrpc_error(request_id, -32602, "Ambiguous thread owner")
-    expected_proof = codex_provider_mcp_run_proof(session_id, thread_id, run_id)
-    if not hmac.compare_digest(proof, expected_proof):
-        return codex_provider_mcp_jsonrpc_error(request_id, -32602, "Invalid turn proof")
+    if has_run_metadata:
+        expected_proof = codex_provider_mcp_run_proof(session_id, thread_id, run_id)
+        if not hmac.compare_digest(proof, expected_proof):
+            return codex_provider_mcp_jsonrpc_error(request_id, -32602, "Invalid turn proof")
     try:
         text, is_error = await execute_provider_tool_once(
             session_id,
@@ -96521,7 +96555,6 @@ async def active_artifact_publication_run(
             or not isinstance(active, dict)
             or not run_id
             or str(active.get("run_id") or "").strip() != run_id
-            or active.get("codex_native_operation") is True
             or active.get("stop_requested") is True
             or run_id in STOPPED_RUNS
         ):

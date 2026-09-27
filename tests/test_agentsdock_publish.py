@@ -476,6 +476,46 @@ class ArtifactPublisherServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(Path(event["artifact"]["path"]).is_file())
             self.assertEqual(len(artifact_dirs), 1)
 
+    async def test_retained_native_goal_publishes_with_real_run_bound_authority(self) -> None:
+        authorize = agent_server.authorize_provider_action
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "continuation.mp4"
+            source.write_bytes(b"synthetic video bytes")
+            model = agent_server.PublishArtifactsRequest(
+                publication_id="pub_native_goal", files=[str(source)])
+            with self.runtime_patches(root), patch.object(
+                agent_server, "authorize_provider_action", authorize,
+            ), patch.object(agent_server, "server_identity", return_value="synthetic-server"):
+                agent_server.ACTIVE["sess"].update(
+                    codex_native_operation=True, codex_native_operation_kind="goal_resume",
+                    provider_thread_id="synthetic-thread", provider_turn_id="native-continuation",
+                    provider_turn_ready=True,
+                )
+                key = hashlib.sha256(b"provider-secret").hexdigest()
+                capability = {**agent_server.CROSS_CHAT_CAPABILITIES[key],
+                    "server_identity": "synthetic-server"}
+                for token, changes in (("", {}), ("wrong", {}),
+                        ("provider-secret", {"source_session_id": "another-chat"}),
+                        ("provider-secret", {"source_run_id": "run_previous"}),
+                        ("provider-secret", {"actions": set()})):
+                    with self.subTest(token=token, changes=changes):
+                        agent_server.CROSS_CHAT_CAPABILITIES[key] = {**capability, **changes}
+                        with self.assertRaises(agent_server.HTTPException) as rejected:
+                            await agent_server.publish_agent_artifacts(
+                                request_for(provider_token=token), "sess", model)
+                        self.assertEqual(rejected.exception.status_code, 403)
+                        self.assertEqual(list((root / "files").glob("art_*")), [])
+                agent_server.CROSS_CHAT_CAPABILITIES[key] = capability
+                result = await agent_server.publish_agent_artifacts(request_for(), "sess", model)
+                events = [json.loads(line) for line in agent_server.events_path("sess").read_text().splitlines()]
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["run_id"], "run_active")
+                self.assertEqual(len(result["receipts"]), 1)
+                self.assertEqual(len(events), 1)
+                self.assertEqual(Path(events[0]["artifact"]["path"]).read_bytes(), source.read_bytes())
+                self.assertTrue(agent_server.ACTIVE["sess"]["codex_native_operation"])
+
     async def test_retry_recovers_lost_sidecar_after_source_and_turn_are_gone(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

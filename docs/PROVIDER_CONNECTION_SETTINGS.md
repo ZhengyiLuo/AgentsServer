@@ -1,4 +1,4 @@
-# Custom endpoints in AI Providers settings
+# Custom endpoints in My Agents settings
 
 An endpoint is the base URL of an API service. You do not need to host one:
 an API vendor or company gateway can provide the URL, API key and model ID.
@@ -21,7 +21,7 @@ trust; it and its upstream provider receive the requests you submit.
 | Cursor | Not a generic OpenRouter endpoint | Native Cursor login / Cursor-issued CLI key |
 
 Claude Code and OpenCode custom APIs can now be selected **per chat**. Select the
-intended server, open **Settings → AI Providers → Configure API**, enter the
+intended server, open **Settings → My Agents → Configure API**, enter the
 URL and key, and choose **Connect**. Protocol, authentication header and an
 optional model ID live in **Advanced**. Saving does not alter native login or
 reroute existing chats. Choose the separate custom-endpoint option in a new

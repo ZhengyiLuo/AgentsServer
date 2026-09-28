@@ -289,7 +289,7 @@ class ProviderStore:
                     current = self._read("credential-" + current_id + ".json") if isinstance(current_id, str) and re.fullmatch(r"[0-9a-f]{32}", current_id) else None
                     if not (current and metadata.get("connection_verified") is True
                             and selected["base_url"] == metadata.get("base_url") and key == current.get("api_key")):
-                        raise HTTPException(409, "This chat's API connection is disconnected. Reconnect its original endpoint and API key in AI Providers, then retry.")
+                        raise HTTPException(409, "This chat's API connection is disconnected. Reconnect its original endpoint and API key in My Agents, then retry.")
                 self._public_selections[identifier] = {**selected, "credential_id": identifier}
                 self._revision_catalog_keys[identifier] = catalog_key({**selected, "api_key": key})
                 if include_key:

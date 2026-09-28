@@ -27,6 +27,14 @@ on:
         description: Exact npm and app version, matching tag without v; supply all three npm inputs together
         required: false
         type: string
+      accept_existing_run:
+        description: Optional prior signed artifact run to repeat native acceptance without rebuilding or publishing
+        required: false
+        type: string
+      accept_source_sha:
+        description: Exact standalone source of those previously signed artifacts; required with accept_existing_run
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -44,6 +52,8 @@ jobs:
           NPM_SOURCE_REF: ${{ inputs.npm_source_ref }}
           NPM_VERSION: ${{ inputs.npm_version }}
           RELEASE_TAG: ${{ inputs.tag }}
+          ACCEPT_EXISTING_RUN: ${{ inputs.accept_existing_run }}
+          ACCEPT_SOURCE_SHA: ${{ inputs.accept_source_sha }}
         shell: bash
         run: |
           if [[ -n "$NPM_SOURCE_SHA" || -n "$NPM_SOURCE_REF" || -n "$NPM_VERSION" ]]; then
@@ -54,8 +64,15 @@ jobs:
             [[ "$NPM_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-beta\.[1-9][0-9]*)?$ ]] || exit 1
             test "$RELEASE_TAG" = "v$NPM_VERSION"
           fi
+          if [[ -n "$ACCEPT_EXISTING_RUN" || -n "$ACCEPT_SOURCE_SHA" ]]; then
+            test "$PREPARE_ONLY" = true
+            test -n "$NPM_SOURCE_SHA"
+            [[ "$ACCEPT_EXISTING_RUN" =~ ^[1-9][0-9]*$ ]]
+            [[ "$ACCEPT_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          fi
   test:
     needs: validate-inputs
+    if: inputs.accept_existing_run == ''
     name: Tests (${{ matrix.shard }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -90,16 +107,18 @@ jobs:
     secrets:
       AGENTS_SERVER_RELEASE_PRIVATE_KEY_B64: ${{ secrets.AGENTS_SERVER_RELEASE_PRIVATE_KEY_B64 }}
   native-acceptance:
-    needs: [release, npm-candidate]
-    if: inputs.prepare_only && inputs.npm_source_sha != ''
+    needs: [validate-inputs, release, npm-candidate]
+    if: >-
+      always() && needs.validate-inputs.result == 'success' && inputs.prepare_only && inputs.npm_source_sha != '' &&
+      (inputs.accept_existing_run != '' || (needs.release.result == 'success' && needs.npm-candidate.result == 'success'))
     permissions:
       contents: read
       actions: read
     uses: ./.github/workflows/server-native-acceptance.yml
     with:
-      artifact_name: server-release-${{ github.sha }}
-      artifact_run_id: ${{ github.run_id }}
-      source_sha: ${{ github.sha }}
+      artifact_name: server-release-${{ inputs.accept_source_sha || github.sha }}
+      artifact_run_id: ${{ inputs.accept_existing_run || github.run_id }}
+      source_sha: ${{ inputs.accept_source_sha || github.sha }}
       release_tag: ${{ inputs.tag }}
       npm_artifact_name: signed-npm-server-${{ inputs.npm_version }}-${{ inputs.npm_source_sha }}
       npm_source_sha: ${{ inputs.npm_source_sha }}

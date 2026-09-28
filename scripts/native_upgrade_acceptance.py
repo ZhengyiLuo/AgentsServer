@@ -32,6 +32,7 @@ from native_release_replay import replay_signed_npm_archive
 ROOT = Path(__file__).resolve().parents[1]
 PHASE = "host-validation"
 INSTALLER_FAILURE_DIAGNOSTICS: dict | None = None
+TRANSPORT_DIAGNOSTICS: dict | None = None
 SELECTORS = ("AGENTS_SERVER_INSTALL_DIR", "AGENTS_SERVER_CONFIG_DIR", "AGENTS_SERVER_STATE_DIR",
              "AGENTSDOCK_STATE_DIR", "ZENITHBOT_AGENT_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
              "AGENTS_SERVER_INSTANCE", "CODEX_HOME", "CLAUDE_CONFIG_DIR")
@@ -114,8 +115,10 @@ def guard(args: argparse.Namespace) -> Path:
     need(not args.work.exists() and not args.report.exists(), "Use fresh work and report paths.")
     need(re.fullmatch(r"[0-9a-f]{40}", args.source_sha) is not None, "Exact source SHA is required.")
     need(re.fullmatch(r"[0-9a-f]{40}", args.npm_source_sha) is not None, "Exact npm source SHA is required.")
-    need(command(["git", "-C", str(ROOT), "rev-parse", "HEAD"]).stdout.decode().strip() == args.source_sha,
-         "Harness checkout differs from the signed candidate source.")
+    need(re.fullmatch(r"[0-9a-f]{40}", env.get("GITHUB_SHA", "")) is not None,
+         "Exact dispatched harness source SHA is required.")
+    need(command(["git", "-C", str(ROOT), "rev-parse", "HEAD"]).stdout.decode().strip() == env["GITHUB_SHA"],
+         "Harness checkout differs from the dispatched source.")
     return home
 
 
@@ -325,17 +328,37 @@ def request(port: int, secret: str, path: str, body: dict | None = None, *, time
 def update_diagnostics(home: Path, secret: str, status: dict, *, error: bytes = b"") -> None:
     global INSTALLER_FAILURE_DIAGNOSTICS
     selected = {name: status.get(name) for name in
-                ("phase", "stage", "message", "error_code", "error_action", "installed_version", "version", "reconciliation")}
-    log = home / ".agentsdock/admin/server-update.log"
-    log_tail = b""
-    if log.is_file() and not log.is_symlink() and log.stat().st_uid == os.getuid():
-        with log.open("rb") as stream:
-            stream.seek(max(0, log.stat().st_size - 32768))
-            log_tail = stream.read(32768)
+                ("phase", "stage", "message", "error_code", "error_action", "installed_version", "version",
+                 "reconciliation", "preparation_id", "preparation_phase")}
+
+    def owned_tail(path: Path) -> bytes:
+        try:
+            # Reject linked ancestors as well as linked leaf files. Only the
+            # disposable account's private bounded log bytes may be exposed.
+            if path.resolve(strict=True) != path or not path.is_relative_to(home):
+                return b"[owned log unavailable]"
+            with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
+                info = os.fstat(stream.fileno())
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                        or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) & 0o077):
+                    return b"[owned private log unavailable]"
+                stream.seek(max(0, info.st_size - 32768))
+                return stream.read(32768)
+        except OSError:
+            return b"[owned log absent]"
+
+    log_tail = owned_tail(home / ".agentsdock/admin/server-update.log")
     INSTALLER_FAILURE_DIAGNOSTICS = {
         "kind": "sanitized-managed-update-failure", "phase": PHASE,
         "tail": sanitized_installer_tail(json.dumps(selected).encode() + b"\n" + error[:32768], log_tail, [secret]),
     }
+    preparation_id = status.get("preparation_id")
+    if isinstance(preparation_id, str) and re.fullmatch(r"[0-9a-f]{32}", preparation_id):
+        preparation_log = home / ".local/share/agents-server/.update-preparations" / preparation_id / "prepare.log"
+        INSTALLER_FAILURE_DIAGNOSTICS["preparation"] = {
+            "id": preparation_id, "phase": status.get("preparation_phase"),
+            "tail": sanitized_installer_tail(b"", owned_tail(preparation_log), [secret]),
+        }
     print(json.dumps(INSTALLER_FAILURE_DIAGNOSTICS), flush=True)
 
 
@@ -464,7 +487,7 @@ def verify_runtime(install: Path, candidate: dict) -> int:
 
 
 def run(args: argparse.Namespace) -> dict:
-    global PHASE
+    global PHASE, TRANSPORT_DIAGNOSTICS
     home = guard(args)
     clean_host(home)
     args.work.mkdir(mode=0o700)
@@ -489,6 +512,9 @@ def run(args: argparse.Namespace) -> dict:
     PHASE = "native-transport-fixture-setup"
     with replay_signed_npm_archive(npm["archive"], archive["url"], args.work / "https-replay",
                                    expected_sha256=archive["sha256"], expected_size=archive["size"]) as replay:
+        # This mutable receipt is completed by the replay context even when the
+        # managed update fails, distinguishing TLS/download from preparation.
+        TRANSPORT_DIAGNOSTICS = replay.receipt
         with native_trust_environment(replay.environment, env):
             env.update(replay.environment)
             PHASE = "baseline-install"
@@ -563,6 +589,7 @@ def run(args: argparse.Namespace) -> dict:
     need(path.read_bytes().startswith(persisted), "Restart changed persisted synthetic history.")
     PHASE = "complete"
     return {"schema": 1, "kind": "signed-native-managed-upgrade", "status": "passed",
+            "harness_source_sha": os.environ["GITHUB_SHA"],
             "source_sha": args.source_sha, "npm_source_sha": args.npm_source_sha, "baseline_version": args.baseline_version, "version": args.version,
             "platform": platform.system(), "run_id": os.environ["GITHUB_RUN_ID"],
             "baseline_install_root_mode": args.legacy_root_mode,
@@ -599,6 +626,8 @@ def main() -> None:
             result["reason"] = str(error)  # Only fixed messages from need()/health().
         if INSTALLER_FAILURE_DIAGNOSTICS is not None:
             result["installer_diagnostics"] = INSTALLER_FAILURE_DIAGNOSTICS
+        if TRANSPORT_DIAGNOSTICS is not None:
+            result["transport_fixture"] = TRANSPORT_DIAGNOSTICS
         # PHASE only advances after guard(), clean_host() and creation of the
         # disposable work directory. A rejected host never writes a report.
         if PHASE != "host-validation":

@@ -50,7 +50,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.source_sha }}
+          # A fixture-only correction can recheck already signed package bytes.
+          # Package identities remain bound to the explicit source inputs.
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/setup-node@v4
         with:
@@ -64,7 +66,7 @@ jobs:
         run: |
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$RELEASE_TAG" =~ ^v1\.0\.7-beta\.[1-9][0-9]*$ ]]
-          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test "v$(cat VERSION)" = "$RELEASE_TAG"
           test "$ARTIFACT_NAME" = "server-release-$SOURCE_SHA"
           [[ "$NPM_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]

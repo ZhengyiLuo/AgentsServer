@@ -1521,5 +1521,120 @@ class WorkspaceFilesTests(unittest.TestCase):
             self.assertEqual(opened["content"], "backslash\n")
 
 
+class WorkspaceSearchPrivacyTests(unittest.TestCase):
+    """Never touch real macOS privacy directories to exercise this policy."""
+
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.base = Path(temporary.name).resolve()
+        self.home = self.base / "home"
+        self.home.mkdir()
+        for relative in (
+            "Library/Containers/com.apple.Music/Data/probe.txt",
+            "Library/Containers/com.apple.podcasts/Data/probe.txt",
+            "Library/Group Containers/example/probe.txt",
+            "Music/library/probe.txt", "Pictures/library/probe.txt",
+            "Movies/probe.txt", "Desktop/probe.txt", "Documents/probe.txt",
+            "Downloads/probe.txt", ".Trash/probe.txt",
+            "project/Library/Containers/example/probe.txt",
+            "project/Music/probe.txt", "project/Documents/probe.txt",
+        ):
+            path = self.home / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("synthetic fixture\n")
+        self.sessions = {"privacy": {"id": "privacy", "cwd": str(self.home)}}
+        for patcher in (
+            patch.object(agent_server.STORE, "sessions", self.sessions),
+            patch.object(agent_server.sys, "platform", "darwin"),
+            patch.object(agent_server.Path, "home", return_value=self.home),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_home_search_never_opens_private_roots_for_empty_match_or_miss(self) -> None:
+        for query in ("", "probe", "no-match", "Library/Containers"):
+            with self.subTest(query=query), patch.object(
+                agent_server, "open_workspace_directory_fd",
+                wraps=agent_server.open_workspace_directory_fd,
+            ) as opened, patch.object(agent_server, "search_git_workspace_files", return_value=None) as git:
+                result = agent_server.search_workspace_files_sync("privacy", query, 100)
+                paths = [entry["path"] for entry in result["entries"]]
+                self.assertTrue(all(path.startswith("project/") for path in paths))
+                if query in ("", "probe"):
+                    self.assertEqual(len(paths), 3)
+                self.assertFalse(result["truncated"])
+                self.assertTrue(all(len(call.args) < 2 or not call.args[1]
+                                    or call.args[1].startswith("project")
+                                    for call in opened.call_args_list))
+                git.assert_not_called()  # ls-files --others can scan before filtering results.
+
+    def test_ancestor_scope_also_excludes_private_roots(self) -> None:
+        self.sessions["privacy"]["cwd"] = str(self.base)
+        result = agent_server.search_workspace_files_sync("privacy", "probe", 100)
+        self.assertEqual(len(result["entries"]), 3)
+        self.assertTrue(all(entry["path"].startswith("home/project/") for entry in result["entries"]))
+
+    def test_macos_path_case_aliases_do_not_bypass_privacy_scope(self) -> None:
+        self.assertIn("library", agent_server.workspace_search_private_roots(Path(str(self.home).upper())))
+        self.assertEqual(agent_server.workspace_search_private_roots(self.home / "project"), ())
+
+    def test_home_alias_is_resolved_without_following_private_tree_links(self) -> None:
+        alias = self.base / "home-alias"
+        alias.symlink_to(self.home, target_is_directory=True)
+        with patch.object(agent_server.Path, "home", return_value=alias):
+            result = agent_server.search_workspace_files_sync("privacy", "", 100)
+        self.assertEqual(len(result["entries"]), 3)
+
+    def test_explicit_project_keeps_same_named_folders_and_git_fallback(self) -> None:
+        self.sessions["privacy"]["cwd"] = str(self.home / "project")
+        with patch.object(agent_server, "search_git_workspace_files", return_value={
+            "entries": [], "truncated": False,
+        }) as git:
+            result = agent_server.search_workspace_files_sync("privacy", "probe", 100)
+        git.assert_called_once()
+        self.assertEqual({entry["path"] for entry in result["entries"]}, {
+            "Library/Containers/example/probe.txt", "Music/probe.txt", "Documents/probe.txt",
+        })
+
+    def test_explicit_workspace_inside_private_root_remains_searchable(self) -> None:
+        for relative in ("Documents", "Library/Containers/com.apple.Music/Data"):
+            with self.subTest(root=relative):
+                self.sessions["privacy"]["cwd"] = str(self.home / relative)
+                result = agent_server.search_workspace_files_sync("privacy", "probe", 100)
+                self.assertEqual([entry["path"] for entry in result["entries"]], ["probe.txt"])
+
+    def test_explicit_listing_and_read_remain_available(self) -> None:
+        relative = "Library/Containers/com.apple.Music/Data"
+        listed = agent_server.list_workspace_entries_sync("privacy", relative, 0, 100)
+        self.assertEqual([entry["name"] for entry in listed["entries"]], ["probe.txt"])
+        self.assertEqual(agent_server.read_workspace_file_sync("privacy", relative + "/probe.txt")["content"],
+                         "synthetic fixture\n")
+
+    def test_explicit_permission_failure_still_reports_denied(self) -> None:
+        self.sessions["privacy"]["cwd"] = str(self.home / "Documents")
+        real_open = agent_server.os.open
+        def denied(path, *args, **kwargs):
+            if str(path) == self.sessions["privacy"]["cwd"]:
+                raise PermissionError(errno.EACCES, "synthetic denied")
+            return real_open(path, *args, **kwargs)
+        with patch.object(agent_server.os, "open", side_effect=denied):
+            for operation in (
+                lambda: agent_server.search_workspace_files_sync("privacy", "", 100),
+                lambda: agent_server.list_workspace_entries_sync("privacy", "", 0, 100),
+            ):
+                with self.assertRaises(HTTPException) as error:
+                    operation()
+                self.assertEqual(error.exception.status_code, 403)
+                self.assertEqual(error.exception.detail["code"], "workspace_permission_denied")
+
+    def test_linux_scope_is_unchanged_and_symlinks_are_never_followed(self) -> None:
+        (self.home / "project" / "alias").symlink_to(self.home / "Library", target_is_directory=True)
+        with patch.object(agent_server.sys, "platform", "linux"):
+            result = agent_server.search_workspace_files_sync("privacy", "", 100)
+        self.assertEqual(len(result["entries"]), 13)
+        self.assertFalse(any("alias/" in entry["path"] for entry in result["entries"]))
+
+
 if __name__ == "__main__":
     unittest.main()

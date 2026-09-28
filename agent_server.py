@@ -4054,6 +4054,24 @@ def workspace_search_rank(path: str, query: str) -> tuple[int, int, str]:
     return (score, len(path), lower)
 
 
+def workspace_search_private_roots(root: Path) -> tuple[str, ...]:
+    """Don't discover private macOS data incidentally from a broad workspace.
+
+    These are locations under the actual user's home, not directory names to
+    suppress in every project. A workspace at/inside one of these locations is
+    an explicit scope; direct file opens and directory browsing are unchanged.
+    Only resolve HOME, not the private locations (which may themselves prompt).
+    The directory walker still refuses symlinks, including aliases into them.
+    """
+    if sys.platform != "darwin":
+        return ()
+    home = Path(str(Path.home().resolve()).casefold())
+    scope = Path(str(root).casefold())
+    locations = ("Library", "Music", "Pictures", "Movies", "Desktop", "Documents", "Downloads", ".Trash")
+    return tuple(str(private.relative_to(scope)) for name in locations
+                 if (private := home / name.casefold()) != scope and private.is_relative_to(scope))
+
+
 def search_git_workspace_files(
     sess: dict[str, Any],
     root: Path,
@@ -4155,7 +4173,10 @@ def search_git_workspace_files(
 def search_workspace_files_sync(session_id: str, query: str, limit: int) -> dict[str, Any]:
     sess, root = session_workspace_root(session_id)
     clean_query = str(query or "").strip().casefold()
-    if clean_query:
+    private_roots = workspace_search_private_roots(root)
+    # ls-files --others can enumerate excluded trees before we filter its
+    # output. Use the guarded walker for broad scopes, even for a Git HOME.
+    if clean_query and not private_roots:
         indexed = search_git_workspace_files(sess, root, clean_query, limit)
         # Git is a fast candidate index, not an authoritative view of the
         # workspace: ``--exclude-standard`` intentionally omits ignored files
@@ -4184,6 +4205,9 @@ def search_workspace_files_sync(session_id: str, query: str, limit: int) -> dict
         try:
             names = sorted(os.listdir(directory_fd), key=lambda value: (value.casefold(), value))
             for name in names:
+                path = f"{directory}/{name}" if directory else name
+                if path.casefold() in private_roots:
+                    continue
                 try:
                     item_stat = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
                 except OSError:
@@ -4197,7 +4221,6 @@ def search_workspace_files_sync(session_id: str, query: str, limit: int) -> dict
                     truncated = True
                     queue.clear()
                     break
-                path = f"{directory}/{name}" if directory else name
                 if stat.S_ISDIR(item_stat.st_mode):
                     if name not in WORKSPACE_SEARCH_IGNORED_DIRECTORIES and not stat.S_ISLNK(item_stat.st_mode):
                         queue.append(path)

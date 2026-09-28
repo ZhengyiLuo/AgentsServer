@@ -1337,6 +1337,16 @@ host lacks secure no-follow file APIs. Configure the text limit with
 `AGENTSDOCK_WORKSPACE_TEXT_MAX_BYTES`; a positive value selects a bounded
 transport ceiling, while an explicit zero disables the AgentsServer ceiling.
 
+On macOS, recursive file search from Home (or a parent of Home) skips that
+user's `Library`, `Music`, `Pictures`, `Movies`, `Desktop`, `Documents`,
+`Downloads` and `.Trash` trees. Opening the file picker or entering a search
+term must not incidentally request access to other apps' data. This applies to
+both empty searches and Git/fallback discovery. It is a search policy, not a
+filesystem permission change: explicitly opening a path, browsing a directory,
+or setting a chat's working directory to a project within one of these trees
+still works subject to the OS permissions and existing symlink guards. Project
+subdirectories merely named `Library` or `Music` are not excluded.
+
 Workspace-files capability v2 adds an opaque `revision` to every explorer and
 search entry. Rename accepts `{path, new_name, expected_revision}`, is limited
 to the same parent directory, and uses the host's atomic no-replace primitive,

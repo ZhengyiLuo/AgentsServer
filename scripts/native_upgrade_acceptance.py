@@ -27,6 +27,7 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 PHASE = "host-validation"
+INSTALLER_FAILURE_DIAGNOSTICS: dict | None = None
 SELECTORS = ("AGENTS_SERVER_INSTALL_DIR", "AGENTS_SERVER_CONFIG_DIR", "AGENTS_SERVER_STATE_DIR",
              "AGENTSDOCK_STATE_DIR", "ZENITHBOT_AGENT_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
              "AGENTS_SERVER_INSTANCE", "CODEX_HOME", "CLAUDE_CONFIG_DIR")
@@ -41,11 +42,44 @@ def digest(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def sanitized_installer_tail(stdout: bytes, stderr: bytes, secrets: list[str]) -> list[str]:
+    """Return bounded fixture-only diagnostics without credential-bearing lines."""
+    raw = (stdout[-32768:] + b"\n" + stderr[-32768:]).decode("utf-8", errors="replace")
+    for secret in secrets:
+        if secret:
+            raw = raw.replace(secret, "[REDACTED]")
+    safe = []
+    for line in raw.splitlines():
+        # Never echo environment dumps, auth headers, token-related lines or
+        # potentially credential-bearing URLs, including installer-generated
+        # onboarding links. Only fixed diagnostic text and owned paths remain.
+        if re.search(r"(?i)authorization|bearer\s|token|password|secret|credential|api[_ -]?key|"
+                     r"https?://|\b[A-Z_][A-Z0-9_]*=", line):
+            safe.append("[credential, environment, or URL line withheld]")
+            continue
+        # Remove terminal control characters and bound pathological lines.
+        safe.append("".join(char for char in line if char == "\t" or ord(char) >= 32)[:2000])
+    return safe[-40:]
+
+
 def command(arguments: list[str], *, timeout: int = 60, env: dict | None = None,
-            allowed: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess:
+            allowed: tuple[int, ...] = (0,), diagnostic_home: Path | None = None) -> subprocess.CompletedProcess:
     # Installer and service output can contain the disposable token. Never
     # publish raw command output, even on a failed acceptance run.
     result = subprocess.run(arguments, capture_output=True, timeout=timeout, env=env)
+    if result.returncode not in allowed and diagnostic_home is not None:
+        global INSTALLER_FAILURE_DIAGNOSTICS
+        secrets = []
+        try:
+            secrets.append(token(diagnostic_home))
+        except (OSError, ValueError, RuntimeError):
+            pass
+        INSTALLER_FAILURE_DIAGNOSTICS = {
+            "kind": "sanitized-disposable-installer-failure", "phase": PHASE,
+            "exit_status": result.returncode,
+            "tail": sanitized_installer_tail(result.stdout, result.stderr, secrets),
+        }
+        print(json.dumps(INSTALLER_FAILURE_DIAGNOSTICS), flush=True)
     need(result.returncode in allowed,
          f"Native command failed ({Path(arguments[0]).name}, status {result.returncode}); output withheld.")
     return result
@@ -273,7 +307,8 @@ def run(args: argparse.Namespace) -> dict:
         port = sock.getsockname()[1]
     def install_package(package: dict) -> None:
         command(["/bin/bash", str(package["source"] / "install.sh"), "--release-version", package["version"],
-                 "--port", str(port), "--bind", "127.0.0.1", "--non-interactive"], env=env, timeout=1500)
+                 "--port", str(port), "--bind", "127.0.0.1", "--non-interactive"], env=env, timeout=1500,
+                diagnostic_home=home)
     PHASE = "baseline-install"
     install_package(baseline)
     secret = token(home)
@@ -373,6 +408,13 @@ def main() -> None:
         result = {"status": "failed", "phase": PHASE, "error_type": type(error).__name__}
         if type(error) is RuntimeError:
             result["reason"] = str(error)  # Only fixed messages from need()/health().
+        if INSTALLER_FAILURE_DIAGNOSTICS is not None:
+            result["installer_diagnostics"] = INSTALLER_FAILURE_DIAGNOSTICS
+        # PHASE only advances after guard(), clean_host() and creation of the
+        # disposable work directory. A rejected host never writes a report.
+        if PHASE != "host-validation":
+            args.report.parent.mkdir(parents=True, exist_ok=True)
+            args.report.write_text(json.dumps(result, indent=2) + "\n")
         print(json.dumps(result))
         raise SystemExit(1) from None
     args.report.parent.mkdir(parents=True, exist_ok=True)

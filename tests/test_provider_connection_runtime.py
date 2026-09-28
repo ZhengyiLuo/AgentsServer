@@ -22,13 +22,33 @@ class RuntimeBindingTests(unittest.TestCase):
         selected = self.store.bind(session)
         return {**session, "provider_connection_revision": selected["credential_id"], "model": selected["model"]}
 
-    def test_binding_survives_replacement_and_forget_without_native_fallback(self):
+    def test_binding_survives_replacement_but_forget_revokes_without_native_fallback(self):
         chat = self.chat()
         self.store.write("claude", 1, {**self.input, "expected_revision": 1, "api_key": "synthetic-second-key"}, "verified")
         self.assertEqual(self.store.for_session(chat)["api_key"], "synthetic-first-key")
         self.store.write("claude", 2, None)
-        self.assertEqual(self.store.for_session(chat)["api_key"], "synthetic-first-key")
+        with self.assertRaisesRegex(HTTPException, "forgotten"): self.store.for_session(chat)
         with self.assertRaises(HTTPException): self.store.bind({"backend": "claude", "provider_connection": "custom"})
+        self.store.write("claude", 3, {**self.input, "expected_revision": 3}, "verified")
+        reloaded = connections.ConnectionStore(self.store.root)
+        with self.assertRaisesRegex(HTTPException, "forgotten"): reloaded.for_session(chat)
+        self.assertFalse(reloaded.catalog("claude", session=chat)["available"])
+        self.assertTrue(reloaded.bind({"backend": "claude", "provider_connection": "custom"}))
+
+    def test_legacy_forget_revokes_and_inflight_output_still_redacts(self):
+        for backend in ("claude", "opencode"):
+            chat = self.chat(backend)
+            (self.store.root / f"{backend}.json").write_text(json.dumps({"revision": 2, "configured": False}))
+            with self.assertRaisesRegex(HTTPException, "forgotten"): self.store.for_session(chat)
+            self.assertEqual(self.store.redact(chat, {"text": "reply synthetic-first-key"}), {"text": "reply <api-key>"})
+            self.store.write(backend, 2, {**self.input, "expected_revision": 2}, "verified")
+            with self.assertRaisesRegex(HTTPException, "forgotten"): self.store.for_session(chat)
+
+    def test_failed_forget_keeps_original_connection(self):
+        chat = self.chat()
+        with patch.object(connections.os, "replace", side_effect=OSError("synthetic disk failure")):
+            with self.assertRaises(HTTPException): self.store.write("claude", 1, None)
+        self.assertEqual(self.store.for_session(chat)["api_key"], "synthetic-first-key")
 
     def test_missing_invalid_cross_backend_and_symlink_bindings_fail_closed(self):
         chat = self.chat()

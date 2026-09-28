@@ -99,8 +99,12 @@ shown alongside exact IDs; confirmed non-chat/non-tool models are filtered out.
 Inventory presence is not proof of permission, billing or agent-tool compatibility.
 
 Connected Custom API cards offer **⋯ → Forget endpoint**, with confirmation.
-This removes the saved selection for new chats, not native CLI login. Existing
-custom chats keep their pinned credentials. CLI Login has no Disconnect or
+This revokes this instance's existing custom-chat bindings as well as its saved
+selection for new chats. History remains readable; new/queued runs, forks and
+model checks cannot use forgotten credentials or fall back to native login.
+Already-started requests may finish. Reconfiguring creates a new connection for
+new chats; it does not silently revive or reroute revoked chats.
+CLI Login has no Disconnect or
 global logout action, so other server instances and terminal logins are untouched.
 
 Saving a default retains the previous credential-check timestamp and creates a
@@ -115,11 +119,13 @@ GET for inventory (optional `session_id`) and PUT with only `model` and
 original endpoint; redirects and arbitrary next-page URLs are never followed.
 
 Unconfigured custom APIs do not appear in new-chat/composer provider menus.
-Removing a current endpoint does not switch existing custom chats
-to native Codex or erase the immutable credentials those chats already use.
+Removing a current endpoint never switches existing custom chats to native login.
+Private historical credential records remain for in-flight redaction and history
+identity, but durable revocation prevents using them for new requests, including
+after restart. Legacy empty settings from an earlier Forget are also revoked.
 
-Claude/OpenCode bindings are private immutable snapshots, retained across
-profile replacement or removal. Endpoint changes require a new chat after the
+Claude/OpenCode/Cursor bindings are private immutable snapshots, retained across
+profile replacement but revoked by removal. Endpoint changes require a new chat after the
 first turn. Forks inherit the original binding. Importing a native conversation
 directly into a custom API is rejected. Claude uses chat-local process env and a
 private flag-settings file; OpenCode uses a dedicated custom provider namespace,
@@ -139,6 +145,11 @@ Cursor CLI's `--endpoint` configures a Cursor service API, not an arbitrary
 OpenAI-compatible model endpoint. Its API key is issued by Cursor. Cursor
 desktop BYOK is a separate feature; this does not certify CLI BYOK. The Cursor
 card explains the limitation and links to native authentication instructions.
+On CLI 2026.09.26, a disposable loopback probe of `--endpoint` requested
+`POST /auth/exchange_user_api_key`, not a model completion route. The bundled
+hidden `--base-url`/`--authless` options require a separate `agent-cli-local`
+entry point; the installed official CLI rejects that mode. They are not a
+supported generic-URL contract for this integration.
 
 ## Storage and boundary
 

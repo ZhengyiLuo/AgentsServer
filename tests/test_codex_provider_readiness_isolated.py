@@ -8,12 +8,14 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
 from fastapi import HTTPException
 import codex_provider
+import provider_connections
 
 SOURCE = (Path(__file__).resolve().parents[1] / "agent_server.py")
 NAMES = {"probe_runtime", "runtime_diagnostic_payload", "safe_runtime_version", "auth_failure_text",
@@ -34,6 +36,8 @@ class CodexProviderReadinessTests(unittest.IsolatedAsyncioTestCase):
         self.command = Mock(return_value=subprocess.CompletedProcess([], 0, "Codex 0.153.3", ""))
         self.ns = {"Any": object, "Path": Path, "re": re, "time": time, "json": json, "subprocess": subprocess,
             "asyncio": asyncio, "HTTPException": HTTPException, "codex_provider": codex_provider,
+            "provider_connections": SimpleNamespace(native_credentials_present=lambda *args: False),
+            "PROVIDER_CONNECTION_STORE": SimpleNamespace(catalog=lambda *args, **kwargs: {}),
             "BACKEND_CODEX": "codex", "BACKEND_CLAUDE": "claude", "BACKEND_CURSOR": "cursor",
             "BACKEND_OPENCODE": "opencode", "VALID_BACKENDS": {"claude", "codex", "cursor", "opencode"},
             "ThreadPoolExecutor": ThreadPoolExecutor, "copy_context": copy_context,
@@ -80,6 +84,32 @@ class CodexProviderReadinessTests(unittest.IsolatedAsyncioTestCase):
         self.ns["runtime_diagnostic"].return_value = {"status": "missing", "installed": False}
         with self.assertRaises(HTTPException):
             await self.ns["ensure_runtime_available"]("codex", session={"codex_provider": "custom"})
+
+    async def test_forgotten_bindings_block_admission_even_with_ready_native_login(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = provider_connections.ConnectionStore(Path(temporary) / "generic")
+            codex = codex_provider.ProviderStore(Path(temporary) / "codex")
+            self.ns.update(PROVIDER_CONNECTION_STORE=store, CODEX_PROVIDER_STORE=codex,
+                           provider_connections=provider_connections)
+            self.ns["runtime_diagnostic"].return_value = {"status": "ready", "installed": True}
+            for backend in ("claude", "opencode", "cursor", "codex"):
+                session = {"backend": backend, "model": "fixture/model"}
+                if backend == "codex":
+                    codex.save({"base_url": "https://synthetic.invalid/v1", "api_key": "synthetic", "model": "fixture/model"})
+                    session.update(codex_provider="custom", codex_provider_revision=codex.revision())
+                    codex.reset()
+                else:
+                    value = {"base_url": "https://api2.cursor.sh" if backend == "cursor" else "https://synthetic.invalid/v1",
+                             "protocol": "cursor" if backend == "cursor" else "anthropic", "auth_header": "bearer",
+                             "api_key": "synthetic", "model": "fixture/model", "expected_revision": 0}
+                    store.write(backend, 0, value, "verified")
+                    session["provider_connection"] = "custom"
+                    session["provider_connection_revision"] = store.bind(session)["credential_id"]
+                    store.write(backend, 1, None)
+                with self.assertRaisesRegex(HTTPException, "forgotten") as caught:
+                    await self.ns["ensure_runtime_available"](backend, session=session)
+                self.assertEqual(caught.exception.status_code, 409)
+            self.command.assert_not_called()
 
     def test_catalog_adds_custom_metadata_without_replacing_normal_models_or_readiness(self):
         normal = {"models": [{"value": "ordinary-codex-model", "label": "Normal"}], "default_model": "ordinary-codex-model"}

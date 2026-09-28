@@ -49,6 +49,29 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.selection(revision=old, include_key=True)["api_key"], KEY)
         self.store.reset()
         self.assertFalse(self.store.status()["configured"])
+        with self.assertRaisesRegex(HTTPException, "forgotten"): self.store.selection(revision=old, include_key=True)
+        self.store.save(SELECTION)
+        reloaded = provider.ProviderStore(self.store.root)
+        with self.assertRaisesRegex(HTTPException, "forgotten"): reloaded.selection(revision=old, include_key=True)
+        self.assertTrue(reloaded.status()["configured"])
+
+    def test_legacy_empty_settings_revoke_old_credentials(self):
+        self.store.save(SELECTION)
+        identifier = self.store.revision()
+        self.store._atomic("credential-" + identifier + ".json", {**SELECTION, "binding": provider.binding(SELECTION)})
+        self.store._atomic("settings.json", {})
+        reloaded = provider.ProviderStore(self.store.root)
+        with self.assertRaisesRegex(HTTPException, "forgotten"): reloaded.selection(revision=identifier)
+        reloaded.save(SELECTION)
+        with self.assertRaisesRegex(HTTPException, "forgotten"): reloaded.selection(revision=identifier)
+
+    def test_failed_forget_keeps_cached_and_persisted_binding(self):
+        self.store.save(SELECTION)
+        chat = {"codex_provider": "custom", "codex_provider_revision": self.store.revision()}
+        self.assertTrue(self.store.catalog(available=True, session=chat)["available"])
+        with patch.object(self.store, "_atomic", side_effect=OSError("synthetic disk failure")):
+            with self.assertRaises(OSError): self.store.reset()
+        self.assertEqual(self.store.for_session(chat, include_key=True)["api_key"], KEY)
 
     def test_thread_binding_prevents_cross_endpoint_and_default_history(self):
         self.store.save(SELECTION)
@@ -137,7 +160,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(catalog["model_capabilities"][selected["model"]]["compatibility"], "unverified")
         self.assertEqual(provider.runtime_summary({**selected, "model": "unverified/other"}, catalog), "none")
 
-    def test_summary_evidence_is_revision_scoped_and_fresh_rejection_survives_reset(self):
+    def test_summary_evidence_is_revision_scoped_and_forget_revokes(self):
         self.store.save(SELECTION)
         original = self.store.registration(include_key=True)
         self.store.cache_model_capability(original, {"reasoning_summary_supported": True})
@@ -152,10 +175,8 @@ class StoreTests(unittest.TestCase):
         self.store.reset()
         reloaded = provider.ProviderStore(self.store.root)
         self.assertFalse(reloaded.status()["configured"])
-        retained = reloaded.selection(include_key=True, revision=original["credential_id"])
-        capability = reloaded.cached_catalog(retained)["model_capabilities"][retained["model"]]
-        self.assertIs(capability["reasoning_summary_supported"], False)
-        self.assertEqual(provider.runtime_summary(retained, reloaded.cached_catalog(retained)), "none")
+        with self.assertRaisesRegex(HTTPException, "forgotten"):
+            reloaded.selection(include_key=True, revision=original["credential_id"])
 
     def test_unsaved_probe_cannot_persist_or_override_saved_summary_evidence(self):
         self.store.save(SELECTION)
@@ -209,18 +230,22 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(len(catalog["model_capabilities"]), 512)
         self.assertNotIn("model/0", catalog["model_capabilities"])
 
-    def test_legacy_binding_migrates_without_key_reentry_and_survives_reset(self):
+    def test_legacy_binding_migrates_without_key_reentry_and_is_revoked_on_reset(self):
         self.store.save(SELECTION)
         revision = self.store.revision()
+        metadata = self.store._read("settings.json")
+        metadata.pop("connection_epoch")
+        self.store._atomic("settings.json", metadata)
         self.store._atomic("credential-" + revision + ".json", {"api_key": KEY, "binding": provider.legacy_binding(SELECTION)})
         self.store._atomic(self.store._binding_name("legacy-thread"), {"binding": provider.legacy_binding(SELECTION)})
         selected = self.store.for_session({"codex_provider": "custom", "codex_provider_binding": provider.legacy_binding(SELECTION), "model": "another-model"})
         self.store.require_thread("legacy-thread", selected)
         self.store.save({"base_url": "https://next.example.invalid/v1", "api_key": "new-synthetic"})
-        self.store.reset()
         retained = self.store.for_thread("legacy-thread", include_key=True)
         self.assertEqual((retained["credential_id"], retained["api_key"]), (revision, KEY))
         self.store.require_thread("legacy-thread", {**retained, "model": "third-model"})
+        self.store.reset()
+        with self.assertRaisesRegex(HTTPException, "forgotten"): self.store.for_thread("legacy-thread", include_key=True)
 
     def test_failure_before_metadata_commit_retains_old_key(self):
         self.store.save(SELECTION)
@@ -427,11 +452,10 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         self.store.save({**selected, "api_key": "different-synthetic"})
         self.assertEqual(self.store.catalog(available=True)["models"], [])
 
-    def test_model_refresh_uses_retained_chat_credentials_after_reset(self):
+    def test_model_refresh_rejects_retained_chat_credentials_after_reset(self):
         self.store.save(SELECTION)
         session = {"codex_provider": "custom", "codex_provider_revision": self.store.revision(), "model": "chat/model"}
         self.ns["STORE"].sessions["chat"] = session
-        self.store.reset()
         received = []
         def discover(selected):
             received.append(dict(selected))
@@ -443,12 +467,18 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(KEY, response.text)
         self.assertEqual(self.store.catalog(available=True, session=session)["models"][0]["value"], "retained/model")
         self.assertTrue(self.store.catalog(available=True, session=session)["available"])
-        self.assertFalse(self.store.catalog(available=True)["available"])
+        self.assertTrue(self.store.catalog(available=True)["available"])
         with patch.object(self.store, "_read", side_effect=AssertionError("projection must not read credentials")):
             summary = self.store.catalog(available=True, session=session, summary=True)
             self.assertTrue(summary["available"])
             self.assertNotIn("models", summary)
             self.assertNotIn(KEY, json.dumps(summary))
+        self.store.reset()
+        self.discover.reset_mock()
+        response = self.client.get("/api/admin/codex/provider/models?session_id=chat", headers=NATIVE)
+        self.assertEqual(response.status_code, 409, response.text)
+        self.discover.assert_not_called()
+        self.assertFalse(self.store.catalog(available=True, session=session)["available"])
 
     def test_reset_with_missing_credential_never_initializes_a_provider(self):
         self.store.save(SELECTION)

@@ -101,6 +101,8 @@ class ConnectionStore:
                         raise ValueError("oversized record")
                 value = json.loads(raw)
                 revision(value["revision"])
+                if "revoked_through" in value:
+                    revision(value["revoked_through"])
                 if type(value.get("configured")) is not bool:
                     raise ValueError("invalid record")
                 if value["configured"]:
@@ -120,9 +122,14 @@ class ConnectionStore:
 
     def write(self, backend: str, expected: int, selected: dict | None, result: str | None = None, *, checked_at: str | None = None) -> dict:
         with self.lock:
-            if self.read(backend)["revision"] != revision(expected):
+            previous = self.read(backend)
+            if previous["revision"] != revision(expected):
                 raise HTTPException(409, "Endpoint settings changed. Refresh and try again.")
-            value = {"revision": expected + 1, "configured": selected is not None}
+            # An atomic tombstone revokes every prior binding, including copies
+            # retained by older servers. Saving another key must not revive them.
+            revoked = self._revoked_through(previous)
+            value = {"revision": expected + 1, "configured": selected is not None,
+                     "revoked_through": max(revoked, expected) if selected is None else revoked}
             if selected is not None:
                 if result not in RESULTS:
                     raise ValueError("invalid check result")
@@ -147,14 +154,24 @@ class ConnectionStore:
                 raise HTTPException(503, "Could not save endpoint settings.") from None
             return self.public(backend)
 
+    @staticmethod
+    def _revoked_through(current: dict) -> int:
+        # Legacy Forget wrote an empty, revisioned current record.
+        return max(current.get("revoked_through", 0),
+                   current["revision"] if not current["configured"] else 0)
+
     def bind(self, session: dict) -> dict:
-        """Pin once. A later settings replacement/forget cannot change a chat."""
+        """Pin once; replacement preserves identity, Forget revokes it."""
         if session.get("provider_connection") != "custom":
             return {}
         backend = backend_name(session.get("backend"))
         with self.lock:
             credential_id = session.get("provider_connection_revision")
             value = self.read(backend, credential_id)
+            if credential_id:
+                current = self.read(backend)
+                if not current["configured"] or value["revision"] <= self._revoked_through(current):
+                    raise HTTPException(409, "This chat's API connection was forgotten. Its history is preserved; configure an API connection and start a new chat.")
             if not value.get("configured") or value.get("last_result") != "verified":
                 raise HTTPException(409, "Connect this custom API in AI Providers before creating a chat.")
             if not credential_id:
@@ -260,8 +277,13 @@ class ConnectionStore:
         if session.get("provider_connection") != "custom":
             return value
         try:
-            key = self.for_session(session)["api_key"]
-        except HTTPException:
+            # Revocation blocks new work, not safe rendering of an already
+            # running request. The private original key remains redaction-only.
+            identifier = session.get("provider_connection_revision")
+            if not identifier:
+                raise KeyError("missing binding")
+            key = self.read(backend_name(session.get("backend")), identifier)["api_key"]
+        except (HTTPException, KeyError):
             return "Custom API output unavailable." if isinstance(value, str) else {"message": "Custom API output unavailable."}
         def clean(item):
             if isinstance(item, str): return item.replace(key, "<api-key>")

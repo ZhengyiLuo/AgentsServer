@@ -279,20 +279,20 @@ class PerChatTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("codex_provider_binding", custom)
         self.assertNotIn("codex_provider_revision", custom)
 
-    async def test_internal_fork_creation_retains_parent_provider_after_reset(self):
+    async def test_internal_fork_cannot_resurrect_parent_provider_after_reset(self):
         self.advertise_efforts("parent-model", "ultra")
         parent = await self.create(codex_provider="custom", model="parent-model", effort="ultra")
         source = self.ns["STORE"].sessions[parent["id"]]
         original_revision = source["codex_provider_revision"]
         self.ns["CODEX_PROVIDER_STORE"].reset()
         public = self.ns["public_session"](source, summary=True)
-        self.assertTrue(public["codex_provider_catalog"]["available"])
+        self.assertFalse(public["codex_provider_catalog"]["available"])
         self.assertNotIn(self.selection["api_key"], json.dumps(public))
-        child = await self.ns["STORE"].create(self.ns["CreateSessionRequest"](
-            codex_provider="custom", model="parent-model", effort="ultra"),
-            parent_id=parent["id"], initializing_fork=True)
-        self.assertEqual(child["codex_provider_revision"], original_revision)
-        self.assertEqual(self.ns["codex_runtime_settings"](child), ("parent-model", "ultra", ""))
+        with self.assertRaisesRegex(HTTPException, "forgotten"):
+            await self.ns["STORE"].create(self.ns["CreateSessionRequest"](
+                codex_provider="custom", model="parent-model", effort="ultra"),
+                parent_id=parent["id"], initializing_fork=True)
+        self.assertEqual(source["codex_provider_revision"], original_revision)
 
     def test_custom_native_results_do_not_change_default_diagnostic_or_fall_back_to_exec(self):
         runner = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_codex_app_server")

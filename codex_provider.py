@@ -269,13 +269,15 @@ class ProviderStore:
             try:
                 metadata = self._read("settings.json") or {}
                 identifier = revision or metadata.get("credential_id")
-                if not identifier and not metadata:
+                if not identifier:
                     return None
                 if not isinstance(identifier, str) or not re.fullmatch(r"[0-9a-f]{32}", identifier):
                     raise ValueError("invalid credential identity")
                 credential = self._read("credential-" + identifier + ".json")
                 if not credential:
                     raise ValueError("missing credential")
+                if self._epoch(credential) < self._epoch(metadata, settings=True):
+                    raise HTTPException(409, "This chat's API connection was forgotten. Its history is preserved; configure an API connection and start a new chat.")
                 source = metadata if identifier == metadata.get("credential_id") else credential
                 selected = validate_selection({name: source[name] for name in ("base_url", "model") if name in source}, require_key=False)
                 legacy_model = credential.get("legacy_model") or source.get("model")
@@ -293,8 +295,21 @@ class ProviderStore:
                 if not include_revision and revision is None:
                     selected.pop("legacy_model", None)
                 return selected
+            except HTTPException as exc:
+                if exc.status_code == 409:
+                    raise
+                raise HTTPException(503, "Saved provider settings or credentials are unavailable.") from None
             except Exception:
                 raise HTTPException(503, "Saved provider settings or credentials are unavailable.") from None
+
+    @staticmethod
+    def _epoch(record: dict, *, settings=False) -> int:
+        # Empty legacy settings mean Forget already happened. Existing legacy
+        # credential files belong to epoch zero and cannot be resurrected.
+        value = record.get("connection_epoch", 1 if settings and not record.get("credential_id") else 0)
+        if type(value) is not int or not 0 <= value < 2**53 - 1:
+            raise ValueError("invalid connection epoch")
+        return value
 
     def status(self, *, available=True) -> dict:
         with self.lock:
@@ -574,8 +589,9 @@ class ProviderStore:
         """Make the current generation independently readable before replacement."""
         selected = self.selection(include_key=True, include_revision=True)
         if selected:
+            previous = self._read("credential-" + selected["credential_id"] + ".json") or {}
             self._atomic("credential-" + selected["credential_id"] + ".json",
-                {**selected, "binding": binding(selected)})
+                {**selected, "binding": binding(selected), "connection_epoch": self._epoch(previous)})
             for path in self.root.glob("thread-*.json"):
                 previous = self._read(path.name) or {}
                 if not previous.get("credential_id") and previous.get("binding") and previous["binding"] in (binding(selected), legacy_binding(selected)):
@@ -592,10 +608,11 @@ class ProviderStore:
                 pass
             identifier = uuid.uuid4().hex
             credential_name = "credential-" + identifier + ".json"
-            self._atomic(credential_name, {**selected, "binding": binding(selected)})
+            epoch = self._epoch(self._read("settings.json") or {}, settings=True)
+            self._atomic(credential_name, {**selected, "binding": binding(selected), "connection_epoch": epoch})
             try:
                 self._atomic("settings.json", {name: value for name, value in
-                    {**selected, "credential_id": identifier}.items() if name != "api_key"})
+                    {**selected, "credential_id": identifier, "connection_epoch": epoch}.items() if name != "api_key"})
             except BaseException:
                 with suppress(OSError):
                     os.unlink(self.root / credential_name)
@@ -607,7 +624,9 @@ class ProviderStore:
                 self.retain_current()
             except (HTTPException, ValueError, UnicodeError):
                 pass
-            self._atomic("settings.json", {})
+            epoch = self._epoch(self._read("settings.json") or {}, settings=True)
+            self._atomic("settings.json", {"connection_epoch": epoch + 1})
+            self._public_selections.clear()
 
 
 def native_config(selected: dict) -> dict:

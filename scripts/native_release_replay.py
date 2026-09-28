@@ -115,6 +115,20 @@ def replace_hosts(expected: bytes, replacement: bytes):
         command("/usr/bin/killall", "-HUP", "mDNSResponder")
 
 
+def public_ca_roots():
+    context = ssl.create_default_context()
+    roots = context.get_ca_certs(binary_form=True)
+    if not roots:
+        # Standalone Python builds may use a lazy capath without an eager
+        # cafile. Export the runner's existing OS roots into our local bundle.
+        bundle = {"Linux": "/etc/ssl/certs/ca-certificates.crt", "Darwin": "/etc/ssl/cert.pem"}.get(platform.system())
+        if bundle and Path(bundle).is_file():
+            context.load_verify_locations(cafile=bundle)
+            roots = context.get_ca_certs(binary_form=True)
+    need(roots, "Default public TLS roots are required alongside the fixture CA.")
+    return roots
+
+
 def certificates(work: Path):
     write_private(work / "ca.cnf", b"[req]\ndistinguished_name=dn\nx509_extensions=ca\nprompt=no\n[dn]\nCN=AgentsDock fixture CA\n[ca]\nbasicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always\n")
     write_private(work / "leaf.cnf", b"[req]\ndistinguished_name=dn\nprompt=no\n[dn]\nCN=registry.npmjs.org\n")
@@ -127,8 +141,7 @@ def certificates(work: Path):
     finally:
         os.umask(previous)
     command("openssl", "verify", "-CAfile", str(work / "ca.pem"), "-purpose", "sslserver", "-verify_hostname", HOST, str(work / "leaf.pem"))
-    roots = ssl.create_default_context().get_ca_certs(binary_form=True)
-    need(roots, "Default public TLS roots are required alongside the fixture CA.")
+    roots = public_ca_roots()
     write_private(work / "trust-bundle.pem", "".join(ssl.DER_cert_to_PEM_cert(cert) for cert in roots).encode() + regular(work / "ca.pem"))
 
 

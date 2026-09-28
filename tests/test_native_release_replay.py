@@ -56,6 +56,26 @@ class NativeReleaseReplayTests(unittest.TestCase):
         self.assertGreater(bundle.count(b'BEGIN CERTIFICATE'), 1)
         self.assertEqual((self.work / 'leaf.key').stat().st_mode & 0o777, 0o600)
 
+    def test_empty_default_trust_store_loads_existing_os_roots_without_disabling_verification(self):
+        # Reproduce uv Python's empty enumeration using a real empty store.
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        self.assertEqual(context.get_ca_certs(binary_form=True), [])
+        with patch.object(replay.ssl, 'create_default_context', return_value=context):
+            roots = replay.public_ca_roots()
+        self.assertGreater(len(roots), 1)
+        self.assertEqual(roots, context.get_ca_certs(binary_form=True))
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+
+    def test_missing_public_roots_still_fails_instead_of_trusting_only_fixture(self):
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        with patch.object(replay.ssl, 'create_default_context', return_value=context), \
+                patch.object(replay.Path, 'is_file', return_value=False):
+            with self.assertRaisesRegex(RuntimeError, 'Default public TLS roots'):
+                replay.public_ca_roots()
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+
     def test_https_responds_only_to_exact_origin_route_and_never_counts_head_as_download(self):
         payload = b'exact signed fixture archive bytes' * 128
         path = '/@agentsdock/server/-/server-1.0.7-beta.21.tgz'

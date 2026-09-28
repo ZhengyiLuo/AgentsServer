@@ -200,10 +200,15 @@ class ConnectionStore:
             raise HTTPException(409, "This chat has no saved custom API binding; create a new chat.")
         return self.bind(session)
 
-    def catalog(self, backend: str, *, installed: bool = True, session: dict | None = None) -> dict:
+    def catalog(self, backend: str, *, installed: bool = True, session: dict | None = None, summary: bool = False) -> dict:
         try:
             value = self.for_session(session) if session else self.read(backend)
             configured = value.get("configured") is True and value.get("last_result") == "verified"
+            if summary:
+                # Large endpoint inventories belong to detail/settings reads,
+                # not repeated once for every row of a session-list response.
+                return {"configured": configured, "available": configured and installed,
+                        "model": value.get("model"), "base_url": value.get("base_url")}
             models = []
             if configured:
                 cache_key = (backend, value["revision"])
@@ -616,7 +621,8 @@ def create_router(*, authorize, store: ConnectionStore, check=probe, account=nat
         backend_name(backend)
         return reply(await asyncio.to_thread(store.public, backend))
 
-    @router.api_route("/api/admin/provider-connections/{backend}", methods=["PUT", "DELETE"])
+    @router.put("/api/admin/provider-connections/{backend}")
+    @router.delete("/api/admin/provider-connections/{backend}")
     @router.post("/api/admin/provider-connections/{backend}/check")
     async def change(backend: str, request: Request):
         authorize(request)

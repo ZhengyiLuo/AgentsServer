@@ -51495,9 +51495,13 @@ def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, 
     # UI still needs the authoritative first-turn backend fence.
     public["backend_locked"] = session_backend_locked(sess)
     public["codex_provider"] = codex_provider.session_choice(sess.get("codex_provider"))
-    public["provider_connection"] = sess.get("provider_connection") or "default"
-    if public["provider_connection"] == "custom":
-        public["provider_connection_catalog"] = PROVIDER_CONNECTION_STORE.catalog(sess["backend"], session=sess)
+    connection = sess.get("provider_connection") or "default"
+    # Keep legacy native summaries sparse, but retain a stored default as the
+    # tombstone that clears a previously selected custom API in client caches.
+    if not summary or "provider_connection" in sess:
+        public["provider_connection"] = connection
+    if connection == "custom":
+        public["provider_connection_catalog"] = PROVIDER_CONNECTION_STORE.catalog(sess["backend"], session=sess, summary=summary)
     public.pop("provider_connection_revision", None)
     if public["codex_provider"] == "custom":
         public["codex_provider_catalog"] = CODEX_PROVIDER_STORE.catalog(

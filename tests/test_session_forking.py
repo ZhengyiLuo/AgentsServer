@@ -718,6 +718,7 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
                 "cwd",
                 "backend",
                 "codex_provider",
+                "provider_connection",
                 "model",
                 "effort",
                 "system_prompt",

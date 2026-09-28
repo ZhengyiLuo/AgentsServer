@@ -114,6 +114,18 @@ class RuntimeBindingTests(unittest.TestCase):
         self.assertEqual(self.store.opencode_overrides({"backend": "opencode"}, {}), {})
         self.assertFalse(self.store.root.exists())
 
+    def test_summary_never_duplicates_cached_endpoint_inventory_or_probes(self):
+        chat = self.chat()
+        inventory = [{"value": f"vendor/model-{i}", "label": "Large catalog label" * 30} for i in range(500)]
+        self.store.catalog_cache[("claude", 1)] = (connections.time.monotonic(), inventory)
+        with patch.object(connections, "discover_models", side_effect=AssertionError("No discovery on summary")):
+            summary = self.store.catalog("claude", session=chat, summary=True)
+            self.assertTrue(summary["configured"])
+            self.assertEqual(summary["model"], chat["model"])
+            self.assertNotIn("models", summary)
+            self.assertLess(len(json.dumps(summary)), 250)
+            self.assertGreater(len(self.store.catalog("claude", session=chat)["models"]), 499)
+
     def test_custom_api_key_is_removed_from_error_and_event_projection(self):
         chat = self.chat()
         self.assertEqual(self.store.redact(chat, {"error": "rejected synthetic-first-key", "blocks": ["synthetic-first-key"]}),

@@ -34,6 +34,12 @@ class SessionSummaryTests(unittest.TestCase):
         self.assertEqual(full["codex_thread_id"], "provider-codex")
         self.assertIsNone(full["emergency_alert"])
         self.assertEqual(full["unacknowledged_emergency_count"], 0)
+        self.assertNotIn("provider_connection", summary)
+        self.assertEqual(full["provider_connection"], "default")
+
+    def test_explicit_native_connection_survives_summary_as_a_cache_tombstone(self):
+        summary = public_session({"id": "changed-chat", "backend": "cursor", "provider_connection": "default"}, summary=True)
+        self.assertEqual(summary["provider_connection"], "default")
 
     def test_summary_keeps_large_session_lists_bounded(self):
         raw_sessions = [

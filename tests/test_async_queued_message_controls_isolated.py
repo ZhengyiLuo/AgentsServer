@@ -58,6 +58,7 @@ def namespace():
         "sanitized_provider_route_label": lambda value: str(value or "Untitled chat"),
         "cross_chat_counterpart_label": lambda value, **kwargs: str(value),
         "QUEUE_LOCK": asyncio.Lock(), "ACTIVE_LOCK": asyncio.Lock(),
+        "request_queue_recovery": Mock(return_value=None),
         "QUEUED_TURNS": {}, "RUN_NOW_TURNS": {}, "ACTIVE": {}, "CURRENT_TURNS": {},
         "STEERING_SESSIONS": set(), "STEERING_WAIT_TASKS": {}, "BUSY_SESSIONS": set(),
         "DEFAULT_BACKEND": "claude", "BACKEND_CLAUDE": "claude", "BACKEND_CODEX": "codex",

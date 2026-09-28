@@ -589,40 +589,38 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(update.await_args.kwargs["status"], "failed")
 
-    async def test_legacy_reconcile_never_submits_and_preserves_live_owner(self) -> None:
-        ready = {
-            "id": "handoff_ready",
-            "kind": "instruction",
-            "authorization_kind": "explicit_prompt",
-            "idempotency_key": "direct:0:target-private-id",
-            "status": "ready",
-            "target_session_id": "target-private-id",
-        }
-        running = {**ready, "id": "handoff_running", "status": "running"}
-        failed = {**ready, "status": "failed"}
-        submit = AsyncMock()
-        update = AsyncMock(side_effect=[failed, running])
-        with (
-            patch.object(agent_server, "CHAT_MAILBOX_PENDING", set()),
-            patch.object(agent_server.CROSS_CHAT, "mailbox_call", AsyncMock(return_value=[])),
-            patch.object(agent_server.CROSS_CHAT, "mailbox_envelopes", AsyncMock(return_value=[])),
-            patch.object(agent_server.CROSS_CHAT, "pending_terminal_lifecycle", AsyncMock(return_value=[])),
-            patch.object(agent_server.CROSS_CHAT, "recoverable", AsyncMock(return_value=[ready, running])),
-            patch.object(agent_server.CROSS_CHAT, "update", update),
-            patch.object(agent_server.CROSS_CHAT, "get", AsyncMock(return_value=running)),
-            patch.object(agent_server, "append_cross_chat_terminal_lifecycle", AsyncMock()),
-            patch.object(
-                agent_server,
-                "live_cross_chat_delivery_state",
-                AsyncMock(return_value={"status": "running", "target_run_id": "run_target"}),
-            ),
-            patch.object(agent_server, "submit_cross_chat_delivery", submit),
-        ):
-            recovered = await agent_server.reconcile_cross_chat_handoffs()
-        self.assertEqual(recovered, 2)
-        submit.assert_not_awaited()
-        self.assertEqual(update.await_args_list[0].kwargs["status"], "failed")
-        self.assertEqual(update.await_args_list[1].kwargs["status"], "running")
+    async def test_legacy_reconcile_retires_waiting_work_and_preserves_live_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = agent_server.CrossChatStore(Path(temporary) / "cross-chat.sqlite3")
+            await ledger.initialize()
+            for identifier in ("handoff_ready", "handoff_running"):
+                await ledger.create_instruction(
+                    envelope_id=identifier, source_session_id="source-private-id",
+                    source_run_id="run_source", target_session_id="target-private-id",
+                    body="Preserve the authored body", idempotency_key=identifier,
+                )
+            await ledger.update("handoff_running", expected={"ready"}, status="running",
+                                target_run_id="run_target")
+            owner = {"run_id": "run_target", "cross_chat_envelope_id": "handoff_running"}
+            with (
+                patch.object(agent_server, "CROSS_CHAT", ledger),
+                patch.object(agent_server, "CHAT_MAILBOX_PENDING", set()),
+                patch.object(agent_server, "CURRENT_TURNS", {"target-private-id": owner}),
+                patch.object(agent_server, "append_cross_chat_terminal_lifecycle", AsyncMock()),
+                patch.object(agent_server, "start_turn_durably", AsyncMock()) as provider,
+            ):
+                recovered = await agent_server.reconcile_cross_chat_handoffs()
+                self.assertEqual(agent_server.CURRENT_TURNS["target-private-id"], owner)
+            self.assertEqual(recovered, 2)
+            retired = await ledger.get("handoff_ready")
+            self.assertEqual(retired["status"], "cancelled")
+            self.assertIn("legacy_route_disabled", retired["error"])
+            running = await ledger.get("handoff_running")
+            self.assertEqual(running["status"], "running")
+            self.assertEqual(running["target_run_id"], "run_target")
+            for row in (retired, running):
+                self.assertEqual(row["body"], "Preserve the authored body")
+            provider.assert_not_awaited()
 
     async def test_direct_dispatch_waits_until_source_lock_is_released(self) -> None:
         source_id = "source-private-id"
@@ -913,7 +911,7 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
                 original_tasks_by_envelope
             )
 
-    async def test_unavailable_endpoint_check_cannot_overwrite_terminal_cas(self) -> None:
+    async def test_retirement_cannot_overwrite_terminal_cas(self) -> None:
         original_cross_chat = agent_server.CROSS_CHAT
         original_cache = agent_server.CROSS_CHAT_EVENT_TYPE_CACHE
         with tempfile.TemporaryDirectory() as temporary:
@@ -942,11 +940,16 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
                         "sessions",
                         {"target-private-id": self.sessions["target-private-id"]},
                     ),
-                    self.assertRaises(HTTPException),
+                    patch.object(agent_server, "append_cross_chat_terminal_lifecycle", AsyncMock()),
+                    patch.object(agent_server, "start_turn_durably", AsyncMock()) as provider,
                 ):
-                    await agent_server.submit_cross_chat_delivery(stale)
+                    result = await agent_server.submit_cross_chat_delivery(stale)
                 refreshed = await agent_server.CROSS_CHAT.get(str(stale["id"]))
+                self.assertEqual(result["status"], "cancelled")
                 self.assertEqual(refreshed["status"], "cancelled")
+                self.assertEqual(refreshed["body"], "already cancelled")
+                self.assertFalse(refreshed.get("error"))
+                provider.assert_not_awaited()
             finally:
                 agent_server.CROSS_CHAT = original_cross_chat
                 agent_server.CROSS_CHAT_EVENT_TYPE_CACHE = original_cache
@@ -961,7 +964,7 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
             ),
         ):
             capability = agent_server.cross_chat_handoffs_capability()
-        self.assertEqual(capability["version"], 13)
+        self.assertEqual(capability["version"], 14)
         self.assertEqual(capability["default_action"], "route")
         self.assertNotIn("direct_message", capability["actions"])
         self.assertIn("route", capability["actions"])
@@ -969,17 +972,18 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(capability["features"]["direct_message_mentions"])
         self.assertTrue(capability["features"]["durable_route_grants"])
         self.assertTrue(capability["features"]["agent_cross_chat_routes"])
-        self.assertTrue(
+        self.assertTrue(capability["features"]["chat_mailbox_v1"])
+        self.assertFalse(
             capability["features"]["configured_route_async_request_reply"]
         )
-        self.assertTrue(
+        self.assertFalse(
             capability["features"]["configured_route_live_request_reply"]
         )
         self.assertEqual(
             capability["features"]["configured_route_request_reply_default"],
-            "live",
+            "mailbox",
         )
-        self.assertTrue(
+        self.assertFalse(
             capability["features"]["live_same_server_request_reply"]
         )
         self.assertFalse(

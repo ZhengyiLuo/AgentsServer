@@ -524,7 +524,7 @@ class ChatPairTests(unittest.IsolatedAsyncioTestCase):
     async def test_restart_recovery_checks_permission_before_replaying_unsent_work(self):
         await self.grant()
         route = self.routes("a")[0]
-        message = self.delivery(route)
+        message = {**self.delivery(route), "delivery_mode": "mailbox"}
         await self.call("delete_agent_handoff_route", "a", route["route_id"], route["revision"])
         self.retired.reset_mock()
         self.namespace["CHAT_MAILBOX_PENDING"] = set()
@@ -537,9 +537,15 @@ class ChatPairTests(unittest.IsolatedAsyncioTestCase):
                                                 "requester_session_id": "a", "responder_session_id": "b", "initial_action": "instruction"}),
         )
         self.namespace["cross_chat_exchange_leg_admission"] = self.lifecycle
+        retire_legacy_leg = AsyncMock()
+        self.namespace["_submit_cross_chat_exchange_leg_locked"] = retire_legacy_leg
         self.assertEqual(await self.call("reconcile_cross_chat_handoffs"), 1)
         self.assertEqual(await self.call("reconcile_cross_chat_exchange_leg", {"id": "leg"}), 1)
-        self.assertEqual(self.retired.await_count, 2)
+        # Current mailbox sends still require their live pair. Historical
+        # request/reply legs independently go through the retired transport.
+        self.retired.assert_awaited_once()
+        retire_legacy_leg.assert_awaited_once()
+        self.assertEqual(retire_legacy_leg.await_args.args[1]["id"], "leg")
 
     async def test_legacy_route_revocation_survives_reload_and_only_blocks_exact_route(self):
         await self.grant()

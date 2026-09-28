@@ -89,6 +89,18 @@ jobs:
       version: ${{ inputs.npm_version }}
     secrets:
       AGENTS_SERVER_RELEASE_PRIVATE_KEY_B64: ${{ secrets.AGENTS_SERVER_RELEASE_PRIVATE_KEY_B64 }}
+  native-acceptance:
+    needs: release
+    if: inputs.prepare_only
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/server-native-acceptance.yml
+    with:
+      artifact_name: server-release-${{ github.sha }}
+      artifact_run_id: ${{ github.run_id }}
+      source_sha: ${{ github.sha }}
+      release_tag: ${{ inputs.tag }}
   release:
     needs: test
     runs-on: ubuntu-latest

@@ -181,10 +181,10 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
             [predecessor_reference],
         )
         predecessor_token = self.token_for_path(predecessor_path)
-        predecessor_handle = self.direct_handle_for_token(
-            predecessor_token,
-            target_session_id="neighbor",
-        )
+        # Same-server one-use handles are retired. A stale client handle must
+        # still fail the exact live-run boundary before any route operation.
+        self.assertFalse(self.record_for_token(predecessor_token)["provider_direct_grants"])
+        predecessor_handle = "grant_" + "a" * 64
         transition_nonce = "1" * 32
         transition_ready = asyncio.Event()
         agent_server.CURRENT_TURNS = {
@@ -262,6 +262,7 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 ),
             )
         self.assertEqual(cross_chat_denied.exception.status_code, 403)
+        self.assertIn("live source turn", cross_chat_denied.exception.detail)
         await self.assert_denied(
             candidate_token,
             action="agent_cross_chat_routes",

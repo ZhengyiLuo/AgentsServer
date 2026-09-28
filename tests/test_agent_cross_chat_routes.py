@@ -238,6 +238,62 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
         token = json.loads(authority.read_text())["provider_capability"]
         return token, self.provider_request(token)
 
+    async def mailbox_pair(self, *, action="instruction", source_instruction=""):
+        """Create a real persisted pair and a run-scoped capability, without I/O mocks."""
+        route = {**self.route("a", actions=[action]), "pair_id": "pair_" + "c" * 32}
+        reverse = {**self.route("b", target="source", actions=[action]), "pair_id": route["pair_id"]}
+        route["paired_route_id"] = reverse["route_id"]
+        reverse["paired_route_id"] = route["route_id"]
+        agent_server.STORE.sessions["source"]["provider_cross_chat_routes"] = [route]
+        agent_server.STORE.sessions["target"]["provider_cross_chat_routes"] = [reverse]
+        agent_server.CURRENT_TURNS["source"] = {"run_id": "run_mailbox"}
+        references = [self.grant_reference(start=source_instruction.index("@Target"))] if source_instruction else []
+        authority = await agent_server.issue_cross_chat_capability(
+            "source", "run_mailbox", references, source_user_instruction=source_instruction,
+            source_is_user_turn=bool(source_instruction), actions={"agent_cross_chat_routes"},
+            provider_route_snapshot=[route], async_route_v1=True,
+        )
+        token = json.loads(authority.read_text())["provider_capability"]
+        return route, self.provider_request(token, method="POST"), authority
+
+    def mailbox_publication(self):
+        stack = self.native_transports()
+        # Transport publication is covered by the mailbox integration suite;
+        # these cases use the real capability validator and SQLite acceptance.
+        stack.enter_context(patch.object(agent_server, "publish_chat_mailbox_message", AsyncMock(return_value="unread")))
+        stack.enter_context(patch.object(agent_server, "schedule_chat_mailbox_wake"))
+        stack.enter_context(patch.object(agent_server, "start_turn_durably", AsyncMock(side_effect=AssertionError("mail must not launch a provider"))))
+        stack.enter_context(patch.object(agent_server.CROSS_CHAT, "create_route_exchange_request", AsyncMock(side_effect=AssertionError("mail must not create an exchange"))))
+        return stack
+
+    async def assert_legacy_response_rejected(self, *, body="Done.", request_response=False, failed=False):
+        exchange, leg, _request = await self.configured_delivery("e")
+        if failed:
+            await agent_server.CROSS_CHAT.cancel_exchange(exchange["id"], status="failed", error_code="private_reason", error="private cause")
+        agent_server.CURRENT_TURNS["target"] = {"run_id": "run_legacy_owner"}
+        authority = await agent_server.issue_cross_chat_capability(
+            "target", "run_legacy_owner", [], actions={"cross_chat_response"},
+            exchange_response_grants={(exchange["id"], leg["id"])},
+        )
+        token = json.loads(authority.read_text())["provider_capability"]
+        cap = agent_server.CROSS_CHAT_CAPABILITIES[agent_server.hashlib.sha256(token.encode()).hexdigest()]
+        self.assertFalse(cap["exchange_response_grants"])
+        before = await agent_server.CROSS_CHAT.exchange_legs(exchange["id"])
+        errors = []
+        with patch.object(agent_server.CROSS_CHAT, "commit_exchange_response", AsyncMock()) as commit:
+            for _ in range(2):
+                with self.assertRaises(HTTPException) as error:
+                    await agent_server.submit_authorized_cross_chat_exchange_response(
+                        exchange["id"], agent_server.CrossChatExchangeResponseRequest(
+                            inbound_leg_id=leg["id"], body=body, request_response=request_response,
+                            idempotency_key="retired-response"), self.provider_request(token, method="POST"))
+                self.assertEqual(error.exception.status_code, 403)
+                self.assertNotIn("private", str(error.exception.detail))
+                errors.append(error.exception.detail)
+        self.assertEqual(errors[0], errors[1])
+        self.assertEqual(await agent_server.CROSS_CHAT.exchange_legs(exchange["id"]), before)
+        commit.assert_not_awaited()
+
     async def configured_delivery(
         self,
         suffix: str,
@@ -1923,101 +1979,25 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
                 )
         self.assertEqual(capped.exception.status_code, 403)
 
-    async def test_route_instruction_response_is_minimal_and_origin_is_durable(self) -> None:
-        route = self.route("a")
-        agent_server.STORE.sessions["source"]["provider_cross_chat_routes"] = [route]
-        _token, request = await self.issue("run_origin", [route])
-        with (
-            self.native_transports(),
-            patch.object(
-                agent_server,
-                "append_cross_chat_exchange_registered",
-                AsyncMock(),
-            ),
-            patch.object(
-                agent_server,
-                "append_cross_chat_exchange_leg_lifecycle",
-                AsyncMock(),
-            ),
-            patch.object(
-                agent_server,
-                "submit_cross_chat_exchange_leg",
-                AsyncMock(side_effect=lambda exchange, leg: (
-                    exchange,
-                    {**leg, "status": "queued"},
-                )),
-            ),
-        ):
-            handoff = agent_server.AgentRouteHandoffRequest(
-                body="Please update mobile",
-                idempotency_key="origin-key",
-            )
-            response = await agent_server.submit_provider_route_handoff(
-                route["route_id"], handoff, request,
-            )
-            retry = await agent_server.submit_provider_route_handoff(
-                route["route_id"], handoff, request,
-            )
-        self.assertEqual(
-            response,
-            {
-                "ok": True,
-                "route_id": route["route_id"],
-                "action": "instruction",
-                "accepted": True,
-            },
-        )
-        self.assertEqual(retry, response)
-        self.assertEqual(
-            await agent_server.CROSS_CHAT.for_source_run("run_origin"),
-            [],
-        )
-        exchanges = await agent_server.CROSS_CHAT.exchanges_for_authorization_run(
-            "run_origin"
-        )
-        self.assertEqual(len(exchanges), 1)
-        exchange = exchanges[0]
-        legs = await agent_server.CROSS_CHAT.exchange_legs(exchange["id"])
-        self.assertEqual(len(legs), 1)
-        leg = legs[0]
-        self.assertEqual(exchange["authorization_kind"], "configured_route")
-
-        self.assertEqual(exchange["authorization_route_id"], route["route_id"])
-        self.assertEqual(exchange["initial_action"], "instruction")
-        self.assertEqual(exchange["max_legs"], 2)
-        self.assertEqual(exchange["used_legs"], 1)
-        self.assertEqual(leg["kind"], "request")
-        self.assertFalse(bool(leg["expects_reply"]))
-        self.assertEqual(leg["response_state"], "open")
-        prompt = agent_server.cross_chat_exchange_delivery_prompt(exchange, leg)
-        # Context diet: the envelope is a compact header; provenance prose
-        # lives in the thread instructions.
-        self.assertIn("[AgentsDock delivery kind=instruction leg=1/2 origin=route", prompt)
-        self.assertIn(
-            "optional one-time terminal reply via Chats respond-current",
-            prompt,
-        )
-        self.assertIn("never add --request-response", prompt)
-        self.assertNotIn(exchange["id"], prompt)
-        self.assertNotIn(leg["id"], prompt)
-        self.assertNotIn(route["route_id"], prompt)
-        self.assertNotIn("Source chat ID:", prompt)
-        fields = agent_server.cross_chat_exchange_lifecycle_fields(
-            exchange,
-            leg,
-            session_id="target",
-        )
-        self.assertEqual(fields["exchange_authorization_kind"], "configured_route")
-        self.assertEqual(fields["exchange_initial_action"], "instruction")
-        public = await agent_server.public_cross_chat_exchange(exchange)
-        self.assertEqual(public["initial_action"], "instruction")
-        self.assertEqual(public["remaining_legs"], 1)
-
+    async def test_route_instruction_receipt_is_minimal_and_mailbox_origin_is_durable(self):
+        route, request, _authority = await self.mailbox_pair()
+        handoff = agent_server.AgentRouteHandoffRequest(body="Please update mobile", idempotency_key="origin-key")
+        with self.mailbox_publication():
+            response = await agent_server.submit_provider_route_handoff(route["route_id"], handoff, request)
+            retry = await agent_server.submit_provider_route_handoff(route["route_id"], handoff, request)
+        self.assertEqual(set(response), {"ok", "route_id", "action", "accepted", "mode", "delivery_mode", "message_id", "duplicate", "state", "execution_started"})
+        self.assertEqual(response["delivery_mode"], "mailbox")
+        self.assertFalse(response["execution_started"])
+        self.assertFalse(response["duplicate"])
+        self.assertEqual(retry, {**response, "duplicate": True})
+        self.assertEqual(await agent_server.CROSS_CHAT.exchanges_for_authorization_run("run_mailbox"), [])
         reopened = agent_server.CrossChatStore(agent_server.CROSS_CHAT.path)
         await reopened.initialize()
-        persisted = await reopened.get_exchange(exchange["id"])
-        self.assertEqual(persisted["authorization_route_id"], route["route_id"])
-        self.assertEqual(persisted["initial_action"], "instruction")
+        record = await reopened.get(response["message_id"])
+        self.assertEqual(record["body"], handoff.body)
+        self.assertEqual(record["authorization_route_id"], route["route_id"])
+        self.assertEqual(record["authorization_pair_id"], route["pair_id"])
+        self.assertEqual(record["delivery_mode"], "mailbox")
 
     async def test_route_request_cancel_waits_for_acceptance_child(self) -> None:
         route = self.route("a")
@@ -2033,7 +2013,7 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(
             agent_server,
-            "reserve_provider_route_handoff",
+            "reserve_async_provider_route_message",
             side_effect=delayed_reservation,
         ):
             task = asyncio.create_task(
@@ -2046,7 +2026,7 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
                     request,
                 )
             )
-            await entered.wait()
+            await asyncio.wait_for(entered.wait(), timeout=1)
             task.cancel()
             await asyncio.sleep(0)
             task.cancel()
@@ -2056,183 +2036,36 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await task
 
-    async def test_route_send_binds_exact_user_instruction_without_provider_authority(self) -> None:
-        route = self.route("a")
-        agent_server.STORE.sessions["source"]["provider_cross_chat_routes"] = [route]
-        source_instruction = (
-            "Please hand the release audit to @Target exactly.\n"
-            "Keep this spacing:  two spaces."
-        )
-        prepared_message = "Audit the release artifacts and report blockers."
-        token, request = await self.issue(
-            "run_provenance",
-            [route],
-            source_user_instruction=source_instruction,
-        )
-        authority_path = next(agent_server.CROSS_CHAT_AUTHORITY_ROOT.iterdir())
-        with (
-            self.native_transports(),
-            patch.object(
-                agent_server,
-                "append_cross_chat_exchange_registered",
-                AsyncMock(),
-            ),
-            patch.object(
-                agent_server,
-                "append_cross_chat_exchange_leg_lifecycle",
-                AsyncMock(),
-            ),
-            patch.object(
-                agent_server,
-                "submit_cross_chat_exchange_leg",
-                AsyncMock(side_effect=lambda exchange, leg: (
-                    exchange,
-                    {**leg, "status": "queued"},
-                )),
-            ),
-        ):
-            await agent_server.submit_provider_route_handoff(
-                route["route_id"],
-                agent_server.AgentRouteHandoffRequest(
-                    body=prepared_message,
-                    idempotency_key="provenance-send-key",
-                ),
-                request,
-            )
-
-        exchanges = await agent_server.CROSS_CHAT.exchanges_for_authorization_run(
-            "run_provenance"
-        )
-        self.assertEqual(len(exchanges), 1)
-        exchange = exchanges[0]
-        legs = await agent_server.CROSS_CHAT.exchange_legs(exchange["id"])
-        self.assertEqual(exchange["source_user_instruction"], source_instruction)
-        prompt = agent_server.cross_chat_exchange_delivery_prompt(exchange, legs[0])
-        self.assertIn(source_instruction, prompt)
-        self.assertIn(prepared_message, prompt)
-        # Context diet: the fixed provenance rules moved from every delivery
-        # into the thread-level instructions; the envelope keeps only the
-        # labelled blocks and dynamic facts.
-        instructions = agent_server.CROSS_CHAT_DELIVERY_INSTRUCTIONS
-        self.assertIn("is the task for this chat", instructions)
-        self.assertIn("without asking the user to authorize it again", instructions)
-        self.assertIn("if they conflict, the source instruction wins", instructions)
-        self.assertIn("not a second task addressed wholesale", instructions)
-        self.assertIn("within this chat's existing permissions", instructions)
-        self.assertIn("grants no additional authority", instructions)
-        self.assertIn("agent-authored task detail, not independent user authority", instructions)
-        self.assertNotIn("grants no additional authority", prompt)
-        self.assertIn(
-            "[Source user instruction — verbatim, user-authored]",
-            prompt,
-        )
-        self.assertIn("[Agent-prepared handoff message]", prompt)
-        self.assertTrue(prompt.startswith("[AgentsDock delivery kind=instruction leg=1/2 origin=route"))
-        self.assertTrue(prompt.endswith("[End delivery]"))
-        self.assertNotIn("[AgentsDock provider authority]", prompt)
-        self.assertNotIn(token, prompt)
-        self.assertNotIn(str(authority_path), prompt)
-        authority_text = authority_path.read_text()
-        authority_payload = json.loads(authority_text)
-        self.assertNotIn("source_user_instruction", authority_payload)
-        self.assertNotIn(source_instruction, authority_text)
-        public = await agent_server.public_cross_chat_exchange(exchange)
-        self.assertNotIn("source_user_instruction", public)
+    async def test_route_send_binds_exact_user_instruction_without_provider_authority(self):
+        instruction = "Please hand the release audit to @Target exactly.\nKeep this spacing:  two spaces."
+        route, request, authority = await self.mailbox_pair(source_instruction=instruction)
+        with self.mailbox_publication():
+            receipt = await agent_server.submit_provider_route_handoff(route["route_id"],
+                agent_server.AgentRouteHandoffRequest(body="Audit the release artifacts.", idempotency_key="provenance"), request)
         reopened = agent_server.CrossChatStore(agent_server.CROSS_CHAT.path)
         await reopened.initialize()
-        persisted = await reopened.get_exchange(exchange["id"])
-        self.assertEqual(persisted["source_user_instruction"], source_instruction)
+        record = await reopened.get(receipt["message_id"])
+        self.assertEqual(record["source_user_instruction"], instruction)
+        self.assertEqual(record["source_user_delegation_action"], "route")
+        self.assertEqual(record["body"], "Audit the release artifacts.")
+        token = json.loads(authority.read_text())["provider_capability"]
+        self.assertNotIn(token, json.dumps(record))
+        self.assertNotIn(str(authority), json.dumps(record))
+        self.assertNotIn(instruction, authority.read_text())
+        self.assertNotIn("source_user_instruction", receipt)
 
-    async def test_route_ask_and_reply_keep_original_user_provenance(self) -> None:
-        route = self.route(
-            "b",
-            actions=["instruction", "request_reply"],
-        )
-        agent_server.STORE.sessions["source"]["provider_cross_chat_routes"] = [route]
-        source_instruction = "Ask @Target which migration is required, then use the answer."
-        _token, request = await self.issue(
-            "run_ask_provenance",
-            [route],
-            source_user_instruction=source_instruction,
-        )
-        with (
-            self.native_transports(),
-            patch.object(
-                agent_server,
-                "append_cross_chat_exchange_registered",
-                AsyncMock(),
-            ),
-            patch.object(
-                agent_server,
-                "append_cross_chat_exchange_leg_lifecycle",
-                AsyncMock(),
-            ),
-            patch.object(
-                agent_server,
-                "submit_cross_chat_exchange_leg",
-                AsyncMock(side_effect=lambda exchange, leg: (
-                    exchange,
-                    {**leg, "status": "queued"},
-                )),
-            ),
-        ):
-            await agent_server.submit_provider_route_handoff(
-                route["route_id"],
-                agent_server.AgentRouteHandoffRequest(
-                    action="request_reply",
-                    body="Determine the exact migration.",
-                    idempotency_key="provenance-ask-key",
-                ),
-                request,
-            )
-
-        exchange = (
-            await agent_server.CROSS_CHAT.exchanges_for_authorization_run(
-                "run_ask_provenance"
-            )
-        )[0]
-        initial_leg = (await agent_server.CROSS_CHAT.exchange_legs(exchange["id"]))[0]
-        initial_prompt = agent_server.cross_chat_exchange_delivery_prompt(
-            exchange,
-            initial_leg,
-        )
-        reply_prompt = agent_server.cross_chat_exchange_delivery_prompt(
-            exchange,
-            {
-                "ordinal": 2,
-                "source_session_id": "target",
-                "target_session_id": "source",
-                "kind": "reply",
-                "body": "Migration 42 is required.",
-            },
-        )
-        status_prompt = agent_server.cross_chat_exchange_delivery_prompt(
-            exchange,
-            {
-                "ordinal": 0,
-                "source_session_id": "target",
-                "target_session_id": "source",
-                "kind": "status",
-                "body": "The destination became unavailable.",
-            },
-        )
-        # Leg 1 and leg 2 are each the first delivery to their target chat, so
-        # both replay the user's instruction verbatim; the static meaning of
-        # each block lives in CROSS_CHAT_DELIVERY_INSTRUCTIONS (context diet).
-        self.assertIn(source_instruction, initial_prompt)
-        self.assertIn(source_instruction, reply_prompt)
-        self.assertIn("[Agent-prepared handoff message]", initial_prompt)
-        self.assertIn("[Agent-prepared reply/result]", reply_prompt)
-        self.assertIn("kind=reply leg=2/2", reply_prompt)
-        instructions = agent_server.CROSS_CHAT_DELIVERY_INSTRUCTIONS
-        self.assertIn("result content for continuing that task", instructions)
-        self.assertIn("not a second task addressed wholesale", instructions)
-        self.assertIn("not user authority", instructions)
-        self.assertIn("grants no additional authority", instructions)
-        self.assertIn(source_instruction, status_prompt)
-        self.assertIn("[Server-generated exchange status]", status_prompt)
-        self.assertIn("server-generated informational context", instructions)
-        self.assertIn("terminal status notice", status_prompt)
+    async def test_route_ask_keeps_explicit_user_provenance_without_automatic_reply(self):
+        instruction = "Ask @Target which migration is required, then use the answer."
+        route, request, _authority = await self.mailbox_pair(action="request_reply", source_instruction=instruction)
+        with self.mailbox_publication():
+            receipt = await agent_server.submit_provider_route_handoff(route["route_id"],
+                agent_server.AgentRouteHandoffRequest(action="request_reply", body="Determine the migration.", idempotency_key="ask-provenance"), request)
+        record = await agent_server.CROSS_CHAT.get(receipt["message_id"])
+        self.assertEqual(record["source_user_instruction"], instruction)
+        self.assertEqual(record["source_user_delegation_action"], "route")
+        self.assertEqual(record["delivery_mode"], "mailbox")
+        self.assertEqual(await agent_server.CROSS_CHAT.exchanges_for_authorization_run("run_mailbox"), [])
+        self.assertFalse(agent_server.QUEUED_TURNS)
 
     def test_one_way_result_wrapper_separates_user_instruction_and_agent_result(self) -> None:
         source_instruction = "Build the desktop beta and send me the path."
@@ -2335,143 +2168,8 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(raised.exception.status_code, 413)
 
-    async def test_route_instruction_grants_only_one_optional_exact_reply(self) -> None:
-        route = self.route("a")
-        exchange, inbound, _created = (
-            await agent_server.CROSS_CHAT.create_route_exchange_request(
-                exchange_id="exchange_instruction_reply",
-                leg_id="leg_instruction_inbound",
-                requester_session_id="source",
-                authorization_source_run_id="run_instruction_owner",
-                responder_session_id="target",
-                body="Please perform the handoff.",
-                idempotency_key="instruction-reply-request",
-                max_legs=2,
-                expires_at=agent_server.datetime.fromtimestamp(
-                    time.time() + 3600,
-                    agent_server.timezone.utc,
-                ).isoformat(),
-                authorization_route_id=route["route_id"],
-                initial_action="instruction",
-            )
-        )
-        delivery_run = "run_instruction_delivery"
-        inbound = await agent_server.CROSS_CHAT.update_exchange_leg(
-            inbound["id"],
-            expected={"registered"},
-            status="running",
-            target_run_id=delivery_run,
-        )
-        assert inbound is not None
-        self.assertFalse(bool(inbound["expects_reply"]))
-        agent_server.CURRENT_TURNS["target"] = {"run_id": delivery_run}
-        authority = await agent_server.issue_cross_chat_capability(
-            "target",
-            delivery_run,
-            [],
-            actions={"cross_chat_response"},
-            exchange_response_grants={(exchange["id"], inbound["id"])},
-        )
-        assert authority is not None
-        token = json.loads(authority.read_text())["provider_capability"]
-        token_hash = agent_server.hashlib.sha256(token.encode()).hexdigest()
-        capability = agent_server.CROSS_CHAT_CAPABILITIES[token_hash]
-        self.assertEqual(
-            capability["exchange_response_grants"],
-            {(exchange["id"], inbound["id"])},
-        )
-        self.assertEqual(capability["provider_route_grants"], {})
-        self.assertNotIn("agent_cross_chat_routes", capability["actions"])
-        self.assertEqual(
-            agent_server.STORE.sessions["target"]["provider_cross_chat_routes"],
-            [],
-        )
-        authority_copy = agent_server.cross_chat_provider_authority_block(
-            [],
-            authority,
-            "target",
-            {"cross_chat_response"},
-            exchange_response_grant=(exchange["id"], inbound["id"]),
-            exchange_response_followup_allowed=False,
-        )
-        self.assertIn("exactly one response", authority_copy)
-        self.assertIn("do not add `--request-response`", authority_copy)
-
-        request = self.provider_request(token, method="POST")
-        correction_key = "instruction-terminal-answer"
-        with self.assertRaises(HTTPException) as followup:
-            await agent_server.submit_authorized_cross_chat_exchange_response(
-                exchange["id"],
-                agent_server.CrossChatExchangeResponseRequest(
-                    inbound_leg_id=inbound["id"],
-                    body="Can you clarify?",
-                    request_response=True,
-                    idempotency_key=correction_key,
-                ),
-                request,
-            )
-        self.assertEqual(followup.exception.status_code, 400)
-        self.assertEqual(
-            followup.exception.detail,
-            "instruction replies are terminal and cannot request a follow-up",
-        )
-
-        response_request = agent_server.CrossChatExchangeResponseRequest(
-            inbound_leg_id=inbound["id"],
-            body="The handoff is complete.",
-            request_response=False,
-            idempotency_key=correction_key,
-        )
-        with (
-            patch.object(
-                agent_server,
-                "append_cross_chat_exchange_leg_lifecycle",
-                AsyncMock(),
-            ),
-            patch.object(
-                agent_server,
-                "submit_cross_chat_exchange_leg",
-                AsyncMock(side_effect=lambda current_exchange, leg: (
-                    current_exchange,
-                    {**leg, "status": "queued"},
-                )),
-            ),
-        ):
-            receipt = await agent_server.submit_authorized_cross_chat_exchange_response(
-                exchange["id"], response_request, request,
-            )
-            retry = await agent_server.submit_authorized_cross_chat_exchange_response(
-                exchange["id"], response_request, request,
-            )
-        self.assertEqual(
-            receipt,
-            {"ok": True, "action": "response", "accepted": True},
-        )
-        self.assertEqual(retry, receipt)
-        legs = await agent_server.CROSS_CHAT.exchange_legs(exchange["id"])
-        self.assertEqual(len(legs), 2)
-        outbound = legs[1]
-        self.assertEqual(outbound["parent_leg_id"], inbound["id"])
-        self.assertEqual(outbound["source_session_id"], "target")
-        self.assertEqual(outbound["target_session_id"], "source")
-        self.assertEqual(outbound["kind"], "reply")
-        self.assertFalse(bool(outbound["expects_reply"]))
-        self.assertEqual(
-            agent_server.STORE.sessions["target"]["provider_cross_chat_routes"],
-            [],
-        )
-        with self.assertRaises(HTTPException) as consumed:
-            await agent_server.submit_authorized_cross_chat_exchange_response(
-                exchange["id"],
-                agent_server.CrossChatExchangeResponseRequest(
-                    inbound_leg_id=inbound["id"],
-                    body="A different answer.",
-                    request_response=False,
-                    idempotency_key="different-answer-key",
-                ),
-                request,
-            )
-        self.assertEqual(consumed.exception.status_code, 403)
+    async def test_legacy_instruction_cannot_mint_an_optional_reply_grant(self):
+        await self.assert_legacy_response_rejected(request_response=True)
 
     async def test_instruction_exchange_registration_names_optional_reply(self) -> None:
         exchange, _leg, _created = (
@@ -2689,330 +2387,58 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("Exchange ID:", prompt)
             self.assertNotIn("Inbound leg ID:", prompt)
 
-    async def test_configured_instruction_target_copy_marks_source_display_label_untrusted(self) -> None:
-        route = self.route("a")
-        private_source_title = "PRIVATE SOURCE DISPLAY LABEL"
-        agent_server.STORE.sessions["source"]["title"] = private_source_title
-        record, _created = await agent_server.CROSS_CHAT.create_instruction(
-            envelope_id="handoff_private_source_title",
-            source_session_id="source",
-            source_run_id="run_private_source_title",
-            target_session_id="target",
-            body="Carry out the approved update.",
-            idempotency_key="private-source-title-instruction",
-            authorization_kind="configured_route",
-            authorization_route_id=route["route_id"],
-        )
-        append = AsyncMock()
-        start = AsyncMock(return_value={"queued": False})
+    async def test_retired_instruction_preserves_source_metadata_without_provider_prompt(self):
+        title = "PRIVATE SOURCE DISPLAY LABEL"
+        agent_server.STORE.sessions["source"]["title"] = title
+        record, _ = await agent_server.CROSS_CHAT.create_instruction(
+            envelope_id="old_instruction", source_session_id="source", source_run_id="old_source",
+            target_session_id="target", body="Carry out the approved update.", idempotency_key="old_instruction")
         with (
-            self.native_transports(),
-            patch.object(
-                agent_server,
-                "live_cross_chat_delivery_state",
-                AsyncMock(return_value=None),
-            ),
-            patch.object(agent_server, "cross_chat_delivery_state", return_value=None),
-            patch.object(
-                agent_server,
-                "cross_chat_event_exists_async",
-                AsyncMock(return_value=False),
-            ),
-            patch.object(agent_server, "append_durable_event", append),
-            patch.object(agent_server, "start_turn_durably", start),
+            patch.object(agent_server, "append_cross_chat_terminal_lifecycle", AsyncMock()) as lifecycle,
+            patch.object(agent_server, "start_turn_durably", AsyncMock()) as provider,
         ):
-            await agent_server.submit_cross_chat_delivery(record)
+            retired = await agent_server.submit_cross_chat_delivery(record)
+        self.assertEqual(retired["status"], "cancelled")
+        self.assertEqual(retired["body"], record["body"])
+        self.assertEqual(retired["source_session_id"], "source")
+        self.assertNotIn(title, lifecycle.await_args.args[1])
+        self.assertFalse(agent_server.QUEUED_TURNS)
+        provider.assert_not_awaited()
 
-        target_events = [
-            call.args[2]
-            for call in append.await_args_list
-            if call.args[0] == "target"
-        ]
-        self.assertEqual(len(target_events), 1)
-        self.assertEqual(
-            target_events[0]["message"],
-            "Received an agent-authored same-server handoff.",
-        )
-        self.assertNotIn(private_source_title, target_events[0]["message"])
-        # Durable lifecycle metadata remains available to the authenticated
-        # desktop audit UI; only the user-facing copy is deliberately generic.
-        self.assertEqual(target_events[0]["source_title"], private_source_title)
-        request = start.await_args.args[1]
-        self.assertEqual(
-            request.display_prompt,
-            "Agent-authored same-server handoff",
-        )
-        self.assertNotIn(private_source_title, request.display_prompt)
-        self.assertIn(
-            "origin=route from=PRIVATE SOURCE DISPLAY LABEL]",
-            request.prompt,
-        )
-
-    async def test_configured_ask_target_copy_marks_source_display_label_untrusted(self) -> None:
-        route = self.route("a", actions=["request_reply"])
-        private_source_title = "PRIVATE ASK SOURCE DISPLAY LABEL"
-        agent_server.STORE.sessions["source"]["title"] = private_source_title
-        exchange, leg, _created = (
-            await agent_server.CROSS_CHAT.create_route_exchange_request(
-                exchange_id="exchange_private_source_title",
-                leg_id="leg_private_source_title",
-                requester_session_id="source",
-                authorization_source_run_id="run_private_ask_source_title",
-                responder_session_id="target",
-                body="Please return one terminal answer.",
-                idempotency_key="private-source-title-ask",
-                max_legs=2,
-                expires_at=agent_server.datetime.fromtimestamp(
-                    time.time() + 3600,
-                    agent_server.timezone.utc,
-                ).isoformat(),
-                authorization_route_id=route["route_id"],
-            )
-        )
-        append = AsyncMock()
-        start = AsyncMock(return_value={"queued": False})
+    async def test_retired_ask_preserves_source_metadata_without_provider_prompt(self):
+        title = "PRIVATE ASK SOURCE DISPLAY LABEL"
+        agent_server.STORE.sessions["source"]["title"] = title
+        exchange, leg, _request = await self.configured_delivery("a")
         with (
-            self.native_transports(),
-            patch.object(
-                agent_server,
-                "live_cross_chat_exchange_leg_state",
-                AsyncMock(return_value=None),
-            ),
-            patch.object(
-                agent_server,
-                "cross_chat_exchange_event_exists_async",
-                AsyncMock(return_value=False),
-            ),
-            patch.object(agent_server, "append_durable_event", append),
-            patch.object(agent_server, "start_turn_durably", start),
+            patch.object(agent_server, "append_cross_chat_exchange_leg_terminal_lifecycle", AsyncMock()),
+            patch.object(agent_server, "append_cross_chat_exchange_terminal_lifecycle", AsyncMock()),
+            patch.object(agent_server, "start_turn_durably", AsyncMock()) as provider,
         ):
-            await agent_server.submit_cross_chat_exchange_leg(exchange, leg)
+            retired, retired_leg = await agent_server.submit_cross_chat_exchange_leg(exchange, leg)
+        self.assertEqual(retired["status"], "cancelled")
+        self.assertEqual(retired["error_code"], "legacy_route_disabled")
+        self.assertEqual(retired_leg["body"], leg["body"])
+        self.assertEqual(retired_leg["source_session_id"], "source")
+        self.assertNotIn(title, retired["error"])
+        self.assertFalse(agent_server.QUEUED_TURNS)
+        provider.assert_not_awaited()
 
-        target_events = [
-            call.args[2]
-            for call in append.await_args_list
-            if call.args[0] == "target"
-        ]
-        self.assertEqual(len(target_events), 1)
-        self.assertEqual(
-            target_events[0]["message"],
-            "Received an agent-authored same-server request.",
-        )
-        self.assertNotIn(private_source_title, target_events[0]["message"])
-        self.assertEqual(target_events[0]["requester_title"], private_source_title)
-        request = start.await_args.args[1]
-        self.assertEqual(
-            request.display_prompt,
-            "Agent-authored same-server request",
-        )
-        self.assertNotIn(private_source_title, request.display_prompt)
-        self.assertIn(
-            "origin=route from=PRIVATE ASK SOURCE DISPLAY LABEL]",
-            request.prompt,
-        )
+    async def test_route_ask_is_atomic_independent_mail_and_does_not_wait(self):
+        route, request, _authority = await self.mailbox_pair(action="request_reply")
+        with self.mailbox_publication():
+            receipts = await asyncio.wait_for(asyncio.gather(*(
+                agent_server.submit_provider_route_handoff(route["route_id"],
+                    agent_server.AgentRouteHandoffRequest(action="request_reply", body="Question", idempotency_key="same-question"), request)
+                for _ in range(2))), timeout=2)
+        self.assertEqual(receipts[0]["message_id"], receipts[1]["message_id"])
+        self.assertEqual(sorted(r["duplicate"] for r in receipts), [False, True])
+        self.assertTrue(all(r["delivery_mode"] == "mailbox" and not r["execution_started"] for r in receipts))
+        self.assertEqual(await agent_server.CROSS_CHAT.exchanges_for_authorization_run("run_mailbox"), [])
 
-    async def test_route_ask_is_atomic_async_and_terminal_reply_only(self) -> None:
-        route = self.route("a", actions=["request_reply"])
-        agent_server.STORE.sessions["source"]["provider_cross_chat_routes"] = [route]
-        _token, request = await self.issue("run_ask", [route])
-        with (
-            self.native_transports(),
-            patch.object(agent_server, "append_cross_chat_exchange_registered", AsyncMock()),
-            patch.object(agent_server, "append_cross_chat_exchange_leg_lifecycle", AsyncMock()),
-            patch.object(
-                agent_server,
-                "submit_cross_chat_exchange_leg",
-                AsyncMock(side_effect=lambda exchange, leg: (exchange, {**leg, "status": "queued"})),
-            ),
-        ):
-            response = await agent_server.submit_provider_route_handoff(
-                route["route_id"],
-                agent_server.AgentRouteHandoffRequest(
-                    action="request_reply",
-                    body="What must mobile change?",
-                    idempotency_key="ask-route-key",
-                ),
-                request,
-            )
-        self.assertEqual(set(response), {"ok", "route_id", "action", "accepted"})
-        exchanges = await agent_server.CROSS_CHAT.exchanges_for_authorization_run(
-            "run_ask"
-        )
-        self.assertEqual(len(exchanges), 1)
-        exchange = exchanges[0]
-        legs = await agent_server.CROSS_CHAT.exchange_legs(exchange["id"])
-        self.assertEqual(exchange["max_legs"], 2)
-        self.assertEqual(exchange["authorization_kind"], "configured_route")
-        self.assertEqual(exchange["authorization_route_id"], route["route_id"])
-        self.assertEqual(len(legs), 1)
-        prompt = agent_server.cross_chat_exchange_delivery_prompt(exchange, legs[0])
-        self.assertIn("exactly one terminal response remains", prompt)
-        self.assertNotIn(exchange["id"], prompt)
-        self.assertNotIn(legs[0]["id"], prompt)
-        self.assertNotIn(route["route_id"], prompt)
-        self.assertNotIn("Source chat ID:", prompt)
-        self.assertIn(
-            "[AgentsDock delivery kind=request leg=1/2 origin=route from=Source]",
-            prompt,
-        )
-        response_prompt = agent_server.cross_chat_exchange_delivery_prompt(
-            exchange,
-            {
-                "id": "leg_private_return_identifier",
-                "ordinal": 2,
-                "source_session_id": "target",
-                "target_session_id": "source",
-                "kind": "reply",
-                "body": "The mobile update is complete.",
-            },
-        )
-        self.assertIn(
-            "[AgentsDock delivery kind=reply leg=2/2 origin=route from=Target]",
-            response_prompt,
-        )
-        for private_value in (
-            exchange["id"],
-            "leg_private_return_identifier",
-            route["route_id"],
-        ):
-            self.assertNotIn(private_value, response_prompt)
-        authority_copy = agent_server.cross_chat_provider_authority_block(
-            [],
-            self.root / "authority.json",
-            "target",
-            {"cross_chat_response"},
-            exchange_response_grant=(exchange["id"], legs[0]["id"]),
-            exchange_response_followup_allowed=False,
-        )
-        self.assertIn("do not add `--request-response`", authority_copy)
-        source_copy = agent_server.cross_chat_provider_authority_block(
-            [], self.root / "source.json", "source",
-            {"agent_cross_chat_routes"},
-            provider_route_snapshot=[route],
-        )
-        self.assertIn("exchange-scoped terminal reply", source_copy)
-        self.assertIn("keeps this turn waiting", source_copy)
-        self.assertIn("until the destination answers", source_copy)
-        self.assertIn("explicitly stopped", source_copy)
-        self.assertIn("grants that recipient one durable route back", source_copy)
-        self.assertIn("never propagate another grant", source_copy)
-        self.assertNotIn("respond --exchange EXCHANGE_ID", source_copy)
-        await agent_server.CROSS_CHAT.update_exchange_leg(
-            legs[0]["id"],
-            expected={"registered"},
-            status="running",
-            target_run_id="run_route_target",
-        )
-        continued, followup, created = (
-            await agent_server.CROSS_CHAT.commit_exchange_response(
-                exchange_id=exchange["id"],
-                inbound_leg_id=legs[0]["id"],
-                source_session_id="target",
-                source_run_id="run_route_target",
-                body="The terminal answer",
-                request_response=False,
-                idempotency_key="route-terminal-key",
-                automatic=False,
-            )
-        )
-        self.assertTrue(created)
-        self.assertEqual(continued["max_legs"], 2)
-        self.assertEqual(continued["used_legs"], 2)
-        # The exchange closes when the terminal leg is delivered, not merely
-        # registered, so recovery can still account for that queued work.
-        self.assertEqual(continued["status"], "active")
-        self.assertFalse(bool(followup["expects_reply"]))
+    async def test_legacy_response_size_cannot_bypass_retired_authority(self):
+        await self.assert_legacy_response_rejected(body="x" * (agent_server.PROVIDER_CROSS_CHAT_ROUTE_BODY_MAX_CHARS + 1))
 
-    async def test_configured_route_response_receipt_is_strictly_minimal(self) -> None:
-        route = self.route("a", actions=["request_reply"])
-        exchange, inbound, _created = (
-            await agent_server.CROSS_CHAT.create_route_exchange_request(
-                exchange_id="exchange_private_identifier",
-                leg_id="leg_private_inbound_identifier",
-                requester_session_id="source",
-                authorization_source_run_id="run_route_owner",
-                responder_session_id="target",
-                body="Please report back.",
-                idempotency_key="configured-response-request",
-                max_legs=2,
-                expires_at=agent_server.datetime.fromtimestamp(
-                    time.time() + 3600,
-                    agent_server.timezone.utc,
-                ).isoformat(),
-                authorization_route_id=route["route_id"],
-            )
-        )
-        delivery_run = "run_configured_route_delivery"
-        inbound = await agent_server.CROSS_CHAT.update_exchange_leg(
-            inbound["id"],
-            expected={"registered"},
-            status="running",
-            target_run_id=delivery_run,
-        )
-        assert inbound is not None
-        agent_server.CURRENT_TURNS["target"] = {"run_id": delivery_run}
-        authority = await agent_server.issue_cross_chat_capability(
-            "target",
-            delivery_run,
-            [],
-            actions={"cross_chat_response"},
-            exchange_response_grants={(exchange["id"], inbound["id"])},
-        )
-        assert authority is not None
-        token = json.loads(authority.read_text())["provider_capability"]
-        request = self.provider_request(token, method="POST")
-        oversized_key = "configured-response-answer"
-        with self.assertRaises(HTTPException) as oversized:
-            await agent_server.submit_authorized_cross_chat_exchange_response(
-                exchange["id"],
-                agent_server.CrossChatExchangeResponseRequest(
-                    inbound_leg_id=inbound["id"],
-                    body=(
-                        "x"
-                        * (
-                            agent_server.PROVIDER_CROSS_CHAT_ROUTE_BODY_MAX_CHARS
-                            + 1
-                        )
-                    ),
-                    request_response=False,
-                    idempotency_key=oversized_key,
-                ),
-                request,
-            )
-        self.assertEqual(oversized.exception.status_code, 413)
-        with (
-            patch.object(
-                agent_server,
-                "append_cross_chat_exchange_leg_lifecycle",
-                AsyncMock(),
-            ),
-            patch.object(
-                agent_server,
-                "submit_cross_chat_exchange_leg",
-                AsyncMock(side_effect=lambda current_exchange, leg: (
-                    current_exchange,
-                    {**leg, "status": "queued"},
-                )),
-            ),
-        ):
-            receipt = (
-                await agent_server.submit_authorized_cross_chat_exchange_response(
-                    exchange["id"],
-                    agent_server.CrossChatExchangeResponseRequest(
-                        inbound_leg_id=inbound["id"],
-                        body="Done.",
-                        request_response=False,
-                        idempotency_key=oversized_key,
-                    ),
-                    request,
-                )
-            )
-        self.assertEqual(
-            receipt,
-            {"ok": True, "action": "response", "accepted": True},
-        )
-
-    async def test_configured_route_automatic_oversized_answer_fails_without_relay(self) -> None:
+    async def test_retired_route_automatic_oversized_answer_is_not_relayed(self) -> None:
         route = self.route("a", actions=["request_reply"])
         oversized_body = (
             "x" * (agent_server.PROVIDER_CROSS_CHAT_ROUTE_BODY_MAX_CHARS + 1)
@@ -3071,186 +2497,23 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             exchange["id"]
         )
         legs = await agent_server.CROSS_CHAT.exchange_legs(exchange["id"])
-        self.assertEqual(failed_exchange["status"], "failed")
-        self.assertEqual(legs[0]["status"], "failed")
-        self.assertEqual(legs[0]["error_code"], "response_too_large")
+        self.assertEqual(failed_exchange["status"], "cancelled")
+        self.assertEqual(legs[0]["status"], "delivered")
+        self.assertIsNone(legs[0]["error_code"])
         self.assertEqual(len(legs), 1)
         self.assertNotIn(oversized_body, [leg["body"] for leg in legs])
 
-    async def test_configured_route_response_terminal_retry_is_generic(self) -> None:
-        route = self.route("a", actions=["request_reply"])
-        exchange, inbound, _created = (
-            await agent_server.CROSS_CHAT.create_route_exchange_request(
-                exchange_id="exchange_private_failed_response",
-                leg_id="leg_private_failed_inbound",
-                requester_session_id="source",
-                authorization_source_run_id="run_route_owner_failure",
-                responder_session_id="target",
-                body="Please report back.",
-                idempotency_key="configured-failed-request",
-                max_legs=2,
-                expires_at=agent_server.datetime.fromtimestamp(
-                    time.time() + 3600,
-                    agent_server.timezone.utc,
-                ).isoformat(),
-                authorization_route_id=route["route_id"],
-            )
-        )
-        delivery_run = "run_configured_failed_delivery"
-        inbound = await agent_server.CROSS_CHAT.update_exchange_leg(
-            inbound["id"],
-            expected={"registered"},
-            status="running",
-            target_run_id=delivery_run,
-        )
-        assert inbound is not None
-        agent_server.CURRENT_TURNS["target"] = {"run_id": delivery_run}
-        authority = await agent_server.issue_cross_chat_capability(
-            "target",
-            delivery_run,
-            [],
-            actions={"cross_chat_response"},
-            exchange_response_grants={(exchange["id"], inbound["id"])},
-        )
-        assert authority is not None
-        token = json.loads(authority.read_text())["provider_capability"]
-        request = self.provider_request(token, method="POST")
-        response_request = agent_server.CrossChatExchangeResponseRequest(
-            inbound_leg_id=inbound["id"],
-            body="Done.",
-            request_response=False,
-            idempotency_key="configured-failed-answer",
-        )
+    async def test_legacy_response_terminal_retry_is_generic_and_has_no_effect(self):
+        await self.assert_legacy_response_rejected(failed=True)
 
-        async def fail_delivery(current_exchange, _leg):
-            failed = await agent_server.CROSS_CHAT.cancel_exchange(
-                current_exchange["id"],
-                status="failed",
-                error_code="participant_archived",
-                error="source archived",
-            )
-            assert failed is not None
-            return failed
-
-        errors = []
+    async def test_legacy_response_is_rejected_before_publication_or_delivery(self):
         with (
-            patch.object(
-                agent_server,
-                "append_cross_chat_exchange_leg_lifecycle",
-                AsyncMock(),
-            ),
-            patch.object(
-                agent_server,
-                "submit_cross_chat_exchange_leg",
-                AsyncMock(side_effect=fail_delivery),
-            ),
+            patch.object(agent_server, "append_cross_chat_exchange_leg_lifecycle", AsyncMock()) as lifecycle,
+            patch.object(agent_server, "submit_cross_chat_exchange_leg", AsyncMock()) as submit,
         ):
-            for _ in range(2):
-                with self.assertRaises(HTTPException) as failed:
-                    await agent_server.submit_authorized_cross_chat_exchange_response(
-                        exchange["id"],
-                        response_request,
-                        request,
-                    )
-                errors.append(
-                    (failed.exception.status_code, failed.exception.detail)
-                )
-        self.assertEqual(errors[0], errors[1])
-        self.assertEqual(
-            errors[0][1],
-            "agent cross-chat handoff could not be delivered",
-        )
-        self.assertNotIn("archived", errors[0][1])
-
-    async def test_configured_route_response_postaccept_exceptions_are_generic(self) -> None:
-        route = self.route("a", actions=["request_reply"])
-
-        async def setup(suffix: str):
-            exchange, inbound, _created = (
-                await agent_server.CROSS_CHAT.create_route_exchange_request(
-                    exchange_id=f"exchange_private_exception_{suffix}",
-                    leg_id=f"leg_private_exception_{suffix}",
-                    requester_session_id="source",
-                    authorization_source_run_id=f"run_route_owner_{suffix}",
-                    responder_session_id="target",
-                    body="Please report back.",
-                    idempotency_key=f"configured-request-{suffix}",
-                    max_legs=2,
-                    expires_at=agent_server.datetime.fromtimestamp(
-                        time.time() + 3600,
-                        agent_server.timezone.utc,
-                    ).isoformat(),
-                    authorization_route_id=route["route_id"],
-                )
-            )
-            delivery_run = f"run_configured_exception_{suffix}"
-            inbound = await agent_server.CROSS_CHAT.update_exchange_leg(
-                inbound["id"],
-                expected={"registered"},
-                status="running",
-                target_run_id=delivery_run,
-            )
-            assert inbound is not None
-            agent_server.CURRENT_TURNS["target"] = {"run_id": delivery_run}
-            authority = await agent_server.issue_cross_chat_capability(
-                "target",
-                delivery_run,
-                [],
-                actions={"cross_chat_response"},
-                exchange_response_grants={(exchange["id"], inbound["id"])},
-            )
-            assert authority is not None
-            token = json.loads(authority.read_text())["provider_capability"]
-            return exchange, inbound, self.provider_request(token, method="POST")
-
-        for phase in ("lifecycle", "submit"):
-            with self.subTest(phase=phase):
-                exchange, inbound, request = await setup(phase)
-                response_request = agent_server.CrossChatExchangeResponseRequest(
-                    inbound_leg_id=inbound["id"],
-                    body="Done.",
-                    request_response=False,
-                    idempotency_key=f"configured-answer-{phase}",
-                )
-                private_error = HTTPException(
-                    status_code=409,
-                    detail=f"{phase} exposed source archived",
-                )
-                lifecycle = AsyncMock(
-                    side_effect=private_error if phase == "lifecycle" else None
-                )
-                submit = AsyncMock(
-                    side_effect=private_error if phase == "submit" else None
-                )
-                errors = []
-                with (
-                    patch.object(
-                        agent_server,
-                        "append_cross_chat_exchange_leg_lifecycle",
-                        lifecycle,
-                    ),
-                    patch.object(
-                        agent_server,
-                        "submit_cross_chat_exchange_leg",
-                        submit,
-                    ),
-                ):
-                    for _ in range(2):
-                        with self.assertRaises(HTTPException) as failed:
-                            await agent_server.submit_authorized_cross_chat_exchange_response(
-                                exchange["id"],
-                                response_request,
-                                request,
-                            )
-                        errors.append(
-                            (failed.exception.status_code, failed.exception.detail)
-                        )
-                self.assertEqual(errors[0], errors[1])
-                self.assertEqual(
-                    errors[0][1],
-                    "agent cross-chat handoff could not be delivered",
-                )
-                self.assertNotIn("archived", errors[0][1])
+            await self.assert_legacy_response_rejected()
+        lifecycle.assert_not_awaited()
+        submit.assert_not_awaited()
 
     async def test_configured_route_messages_have_no_hourly_quota_after_restart(self) -> None:
         path = self.root / "rate.sqlite3"
@@ -3345,12 +2608,10 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(capability["provider_route_consumed"], {})
 
     async def test_sql_failure_reservation_cannot_bypass_later_revoke(self) -> None:
-        route = self.route("a")
-        agent_server.STORE.sessions["source"]["provider_cross_chat_routes"] = [route]
-        _token, request = await self.issue("run_sql_failure", [route])
+        route, request, _authority = await self.mailbox_pair()
         with self.native_transports(), patch.object(
             agent_server.CROSS_CHAT,
-            "create_route_exchange_request",
+            "create_instruction",
             AsyncMock(side_effect=RuntimeError("sqlite unavailable")),
         ):
             with self.assertRaises(RuntimeError):
@@ -3373,112 +2634,53 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
                 )
         self.assertEqual(revoked.exception.status_code, 403)
 
-    async def test_terminal_delivery_failure_and_retry_are_same_generic_error(self) -> None:
-        route = self.route("a")
-        agent_server.STORE.sessions["source"]["provider_cross_chat_routes"] = [route]
-        _token, request = await self.issue("run_terminal_retry", [route])
-
-        async def fail_delivery(exchange, _leg):
-            failed = await agent_server.CROSS_CHAT.cancel_exchange(
-                exchange["id"],
-                status="failed",
-                error_code="participant_archived",
-                error="target archived",
-            )
-            assert failed is not None
-            return failed
-
+    async def test_terminal_delivery_failure_and_retry_are_same_generic_error(self):
+        route, request, _authority = await self.mailbox_pair(action="instruction")
         errors = []
         with (
             self.native_transports(),
-            patch.object(
-                agent_server,
-                "append_cross_chat_exchange_registered",
-                AsyncMock(),
-            ),
-            patch.object(
-                agent_server,
-                "append_cross_chat_exchange_leg_lifecycle",
-                AsyncMock(),
-            ),
-            patch.object(
-                agent_server,
-                "submit_cross_chat_exchange_leg",
-                AsyncMock(side_effect=fail_delivery),
-            ),
+            patch.object(agent_server, "publish_chat_mailbox_message", AsyncMock(side_effect=RuntimeError("private target archived"))),
+            patch.object(agent_server, "schedule_chat_mailbox_wake") as wake,
         ):
             for _ in range(2):
-                with self.assertRaises(HTTPException) as failed:
-                    await agent_server.submit_provider_route_handoff(
-                        route["route_id"],
-                        agent_server.AgentRouteHandoffRequest(
-                            body="deliver", idempotency_key="terminal-retry-key"
-                        ),
-                        request,
-                    )
-                errors.append((failed.exception.status_code, failed.exception.detail))
+                with self.assertRaises(HTTPException) as error:
+                    await agent_server.submit_provider_route_handoff(route["route_id"],
+                        agent_server.AgentRouteHandoffRequest(action="instruction", body="deliver", idempotency_key="publication-retry"), request)
+                errors.append((error.exception.status_code, error.exception.detail))
         self.assertEqual(errors[0], errors[1])
         self.assertEqual(errors[0][1], "agent cross-chat handoff could not be delivered")
-        self.assertNotIn("archived", errors[0][1])
+        self.assertNotIn("private", str(errors))
+        records = await agent_server.CROSS_CHAT.for_source_run("run_mailbox")
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["body"], "deliver")
+        wake.assert_not_called()
 
-    async def test_terminal_ask_failure_and_retry_are_same_generic_error(self) -> None:
-        route = self.route("a", actions=["request_reply"])
-        agent_server.STORE.sessions["source"]["provider_cross_chat_routes"] = [route]
-        _token, request = await self.issue("run_terminal_ask_retry", [route])
-
-        async def fail_delivery(exchange, _leg):
-            failed = await agent_server.CROSS_CHAT.cancel_exchange(
-                exchange["id"],
-                status="failed",
-                error_code="participant_archived",
-                error="target archived",
-            )
-            assert failed is not None
-            return failed
-
+    async def test_terminal_ask_failure_and_retry_are_same_generic_error(self):
+        route, request, _authority = await self.mailbox_pair(action="request_reply")
         errors = []
         with (
             self.native_transports(),
-            patch.object(
-                agent_server,
-                "append_cross_chat_exchange_registered",
-                AsyncMock(),
-            ),
-            patch.object(
-                agent_server,
-                "append_cross_chat_exchange_leg_lifecycle",
-                AsyncMock(),
-            ),
-            patch.object(
-                agent_server,
-                "submit_cross_chat_exchange_leg",
-                AsyncMock(side_effect=fail_delivery),
-            ),
+            patch.object(agent_server, "publish_chat_mailbox_message", AsyncMock(side_effect=RuntimeError("private target archived"))),
+            patch.object(agent_server, "schedule_chat_mailbox_wake") as wake,
         ):
             for _ in range(2):
-                with self.assertRaises(HTTPException) as failed:
-                    await agent_server.submit_provider_route_handoff(
-                        route["route_id"],
-                        agent_server.AgentRouteHandoffRequest(
-                            action="request_reply",
-                            body="deliver",
-                            idempotency_key="terminal-ask-retry-key",
-                        ),
-                        request,
-                    )
-                errors.append(
-                    (failed.exception.status_code, failed.exception.detail)
-                )
+                with self.assertRaises(HTTPException) as error:
+                    await agent_server.submit_provider_route_handoff(route["route_id"],
+                        agent_server.AgentRouteHandoffRequest(action="request_reply", body="deliver", idempotency_key="publication-retry"), request)
+                errors.append((error.exception.status_code, error.exception.detail))
         self.assertEqual(errors[0], errors[1])
-        self.assertEqual(
-            errors[0][1],
-            "agent cross-chat handoff could not be delivered",
-        )
-        self.assertNotIn("archived", errors[0][1])
+        self.assertEqual(errors[0][1], "agent cross-chat handoff could not be delivered")
+        self.assertNotIn("private", str(errors))
+        records = await agent_server.CROSS_CHAT.for_source_run("run_mailbox")
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["body"], "deliver")
+        wake.assert_not_called()
 
     async def test_reciprocal_route_handoffs_do_not_deadlock(self) -> None:
-        route_a = self.route("a", alias="to_b", target="target")
-        route_b = self.route("b", alias="to_a", target="source")
+        route_a = {**self.route("a", alias="to_b", target="target"), "pair_id": "pair_" + "c" * 32}
+        route_b = {**self.route("b", alias="to_a", target="source"), "pair_id": route_a["pair_id"]}
+        route_a["paired_route_id"] = route_b["route_id"]
+        route_b["paired_route_id"] = route_a["route_id"]
         agent_server.STORE.sessions["source"]["provider_cross_chat_routes"] = [route_a]
         agent_server.STORE.sessions["target"]["provider_cross_chat_routes"] = [route_b]
         token_a, request_a = await self.issue("run_a", [route_a])
@@ -3490,24 +2692,7 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
         token_b = json.loads(authority_b.read_text())["provider_capability"]
         agent_server.CURRENT_TURNS["target"] = {"run_id": "run_b"}
         request_b = self.provider_request(token_b, method="POST")
-        with (
-            self.native_transports(),
-            patch.object(
-                agent_server,
-                "append_cross_chat_exchange_registered",
-                AsyncMock(),
-            ),
-            patch.object(
-                agent_server,
-                "append_cross_chat_exchange_leg_lifecycle",
-                AsyncMock(),
-            ),
-            patch.object(
-                agent_server,
-                "submit_cross_chat_exchange_leg",
-                AsyncMock(side_effect=lambda exchange, leg: (exchange, leg)),
-            ),
-        ):
+        with self.mailbox_publication():
             results = await asyncio.wait_for(
                 asyncio.gather(
                     agent_server.submit_provider_route_handoff(
@@ -3529,6 +2714,8 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual([result["accepted"] for result in results], [True, True])
         self.assertTrue(token_a)
+        self.assertTrue(all(result["delivery_mode"] == "mailbox" for result in results))
+        self.assertFalse(agent_server.QUEUED_TURNS)
 
     async def test_ordinary_turn_without_explicit_route_has_no_route_harness(
         self,
@@ -3680,198 +2867,43 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             [],
         )
 
-    async def test_configured_delivery_immediately_grants_exact_reverse_route(
-        self,
-    ) -> None:
-        exchange, _leg, request = await self.configured_delivery(
-            "c",
-            actions=["instruction"],
-        )
-        issued: dict[str, object] = {}
-        durable_events: list[tuple[str, dict]] = []
-
-        async def capture_issue(*_args, **kwargs):
-            issued.update(kwargs)
-            return self.root / "captured-authority.json"
-
-        async def capture_durable(
-            _session_id: str,
-            event_type: str,
-            payload: dict,
-        ) -> dict:
-            durable_events.append((event_type, dict(payload)))
-            return {"type": event_type, **payload}
-
+    async def test_legacy_delivery_cannot_start_or_mint_reverse_route(self):
+        exchange, leg, request = await self.configured_delivery("c")
+        user = {"queued_id": "real_user", "prompt": "Keep my work", "_paused_after_stop": True}
+        agent_server.QUEUED_TURNS["target"] = deque([user])
+        self.assertNotIn("target", agent_server.BUSY_SESSIONS)
         with (
             self.native_transports(),
-            patch.object(agent_server.STORE, "save", AsyncMock()),
-            patch.object(
-                agent_server,
-                "turn_start_blocker",
-                AsyncMock(return_value=None),
-            ),
-            patch.object(
-                agent_server,
-                "ensure_runtime_available",
-                AsyncMock(return_value={}),
-            ),
-            patch.object(
-                agent_server,
-                "codex_manifest_path",
-                return_value=self.root / "manifest.json",
-            ),
-            patch.object(
-                agent_server,
-                "build_turn_provider_prompt",
-                return_value="delivery prompt",
-            ),
-            patch.object(
-                agent_server,
-                "issue_cross_chat_capability",
-                side_effect=capture_issue,
-            ),
-            patch.object(
-                agent_server,
-                "provider_authority_runtime_env",
-                AsyncMock(return_value={}),
-            ),
-            patch.object(
-                agent_server,
-                "append_durable_event",
-                side_effect=capture_durable,
-            ),
-            patch.object(agent_server, "append_event", AsyncMock()),
-            patch.object(
-                agent_server,
-                "scrub_tmux_global_secret_environment",
-                side_effect=RuntimeError("stop before provider launch"),
-            ),
+            patch.object(agent_server, "append_durable_event", AsyncMock()) as durable,
+            patch.object(agent_server, "ensure_runtime_available", AsyncMock()) as provider,
         ):
-            with self.assertRaisesRegex(
-                RuntimeError,
-                "stop before provider launch",
-            ):
-                await agent_server._start_turn_locked(
-                    "target",
-                    request,
-                    queue_if_busy=False,
-                    provider_context_mode="chat",
-                    admission_backend="codex",
-                )
+            with self.assertRaises(HTTPException) as error:
+                await agent_server._start_turn_locked("target", request, queue_if_busy=False, provider_context_mode="chat", admission_backend="codex")
+        self.assertEqual(error.exception.status_code, 410)
+        self.assertEqual(error.exception.detail, "Legacy cross-chat exchanges are disabled; use paired chat mail.")
+        self.assertEqual(list(agent_server.QUEUED_TURNS["target"]), [user])
+        self.assertEqual(agent_server.provider_cross_chat_routes(agent_server.STORE.sessions["target"]), [])
+        self.assertFalse(any(call.args[1] in {"turn_started", "turn_queued"} for call in durable.await_args_list))
+        provider.assert_not_awaited()
 
-        routes = agent_server.provider_cross_chat_routes(
-            agent_server.STORE.sessions["target"]
-        )
-        self.assertEqual(len(routes), 1)
-        reverse = routes[0]
-        self.assertEqual(reverse["target_session_id"], "source")
-        self.assertEqual(reverse["actions"], ["instruction"])
-        self.assertEqual(
-            reverse["reciprocal_origin_effect_id"],
-            exchange["id"],
-        )
-        self.assertIn("agent_cross_chat_routes", issued["actions"])
-        self.assertFalse(issued["reciprocal_mint_allowed"])
-        self.assertEqual(issued["provider_route_snapshot"], [reverse])
-        started = next(
-            payload
-            for event_type, payload in durable_events
-            if event_type == "turn_started"
-        )
-        self.assertEqual(
-            started["provider_cross_chat_reciprocal_effect_id"],
-            exchange["id"],
-        )
-        self.assertEqual(
-            started["provider_cross_chat_reciprocal_route_id"],
-            reverse["route_id"],
-        )
-        self.assertEqual(
-            started["provider_cross_chat_reciprocal_actions"],
-            ["instruction"],
-        )
-        settled = await agent_server.CROSS_CHAT.get_exchange(exchange["id"])
-        self.assertEqual(settled["reciprocal_route_state"], "applied")
-        self.assertEqual(settled["reciprocal_route_id"], reverse["route_id"])
-
-    async def test_busy_configured_delivery_queues_reverse_route_snapshot(
-        self,
-    ) -> None:
-        exchange, _leg, request = await self.configured_delivery(
-            "d",
-            actions=["instruction", "request_reply"],
-        )
-        durable_events: list[tuple[str, dict]] = []
-
-        async def capture_durable(
-            _session_id: str,
-            event_type: str,
-            payload: dict,
-        ) -> dict:
-            durable_events.append((event_type, dict(payload)))
-            return {"type": event_type, **payload}
-
+    async def test_busy_legacy_delivery_cannot_queue_or_mint_reverse_route(self):
+        exchange, leg, request = await self.configured_delivery("d")
+        user = {"queued_id": "real_user", "prompt": "Keep my work", "_paused_after_stop": True}
+        agent_server.QUEUED_TURNS["target"] = deque([user])
         agent_server.BUSY_SESSIONS.add("target")
-        try:
-            with (
-                self.native_transports(),
-                patch.object(agent_server.STORE, "save", AsyncMock()),
-                patch.object(
-                    agent_server,
-                    "managed_server_update_blocker",
-                    return_value=None,
-                ),
-                patch.object(
-                    agent_server,
-                    "append_durable_event",
-                    side_effect=capture_durable,
-                ),
-            ):
-                accepted = await agent_server._start_turn_locked(
-                    "target",
-                    request,
-                    queue_if_busy=True,
-                    provider_context_mode="chat",
-                    admission_backend="codex",
-                )
-        finally:
-            agent_server.BUSY_SESSIONS.discard("target")
-
-        self.assertTrue(accepted["queued"])
-        queued = agent_server.QUEUED_TURNS["target"][0]
-        self.assertEqual(queued["queued_id"], accepted["queued_id"])
-        self.assertEqual(len(queued["provider_cross_chat_route_snapshot"]), 1)
-        reverse = queued["provider_cross_chat_route_snapshot"][0]
-        self.assertEqual(reverse["target_session_id"], "source")
-        self.assertEqual(
-            reverse["actions"],
-            ["instruction", "request_reply"],
-        )
-        queued_event = next(
-            payload
-            for event_type, payload in durable_events
-            if event_type == "turn_queued"
-        )
-        self.assertEqual(
-            queued_event["provider_cross_chat_route_snapshot"],
-            [reverse],
-        )
-        self.assertEqual(
-            queued_event["provider_cross_chat_reciprocal_effect_id"],
-            exchange["id"],
-        )
-        recovered = agent_server.queued_turn_from_event(
-            queued_event,
-            agent_server.STORE.sessions["target"],
-            1,
-        )
-        self.assertEqual(
-            recovered["provider_cross_chat_route_snapshot"],
-            [reverse],
-        )
-        settled = await agent_server.CROSS_CHAT.get_exchange(exchange["id"])
-        self.assertEqual(settled["reciprocal_route_state"], "applied")
-        self.assertEqual(settled["reciprocal_route_id"], reverse["route_id"])
+        with (
+            self.native_transports(),
+            patch.object(agent_server, "append_durable_event", AsyncMock()) as durable,
+            patch.object(agent_server, "ensure_runtime_available", AsyncMock()) as provider,
+        ):
+            with self.assertRaises(HTTPException) as error:
+                await agent_server._start_turn_locked("target", request, queue_if_busy=True, provider_context_mode="chat", admission_backend="codex")
+        self.assertEqual(error.exception.status_code, 410)
+        self.assertEqual(error.exception.detail, "Legacy cross-chat exchanges are disabled; use paired chat mail.")
+        self.assertEqual(list(agent_server.QUEUED_TURNS["target"]), [user])
+        self.assertEqual(agent_server.provider_cross_chat_routes(agent_server.STORE.sessions["target"]), [])
+        self.assertFalse(any(call.args[1] in {"turn_started", "turn_queued"} for call in durable.await_args_list))
+        provider.assert_not_awaited()
 
     async def test_existing_reverse_route_is_never_widened_by_reciprocity(
         self,
@@ -4250,7 +3282,7 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             agent_server.STORE.sessions["target"],
         )
 
-    async def test_queue_expiry_race_cannot_split_bind_from_acceptance(
+    async def test_legacy_retirement_race_cannot_split_bind_from_acceptance(
         self,
     ) -> None:
         exchange, leg, request = await self.configured_delivery("3")
@@ -4336,9 +3368,10 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(accepted["queued"])
         self.assertEqual(durable_types[0], "turn_queued")
         expired = await agent_server.CROSS_CHAT.get_exchange(exchange["id"])
-        self.assertEqual(expired["status"], "expired")
+        self.assertEqual(expired["status"], "cancelled")
+        self.assertEqual(expired["error_code"], "legacy_route_disabled")
         self.assertNotIn("target", agent_server.QUEUED_TURNS)
-        # The route belongs to the already accepted message. Expiry may close
+        # The route belongs to the already accepted message. Retirement may close
         # its queued owner only after that acceptance boundary, never before.
         routes = agent_server.provider_cross_chat_routes(
             agent_server.STORE.sessions["target"]

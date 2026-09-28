@@ -1,0 +1,107 @@
+name: Accept signed server installer on native hosts
+
+on:
+  workflow_call:
+    inputs:
+      artifact_name:
+        type: string
+        required: true
+      artifact_run_id:
+        type: string
+        required: true
+      source_sha:
+        type: string
+        required: true
+      release_tag:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  native-upgrade:
+    if: github.repository == 'ZhengyiLuo/AgentsServer'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            legacy_root_mode: '0755'
+          - runner: macos-15
+            legacy_root_mode: '0750'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      AGENTSDOCK_NATIVE_UPGRADE_ACCEPTANCE: 'true'
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      ARTIFACT_NAME: ${{ inputs.artifact_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.13'
+          enable-cache: false
+      - name: Validate exact source and signed artifact inputs
+        shell: bash
+        run: |
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_TAG" =~ ^v1\.0\.7-beta\.[1-9][0-9]*$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "v$(cat VERSION)" = "$RELEASE_TAG"
+          test "$ARTIFACT_NAME" = "server-release-$SOURCE_SHA"
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          run-id: ${{ inputs.artifact_run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/native-inputs/candidate
+      - name: Download unchanged public beta.11 baseline
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/native-inputs/baseline"
+          for asset in agents-server-1.0.7-beta.11.tar.gz agents-server-manifest.json agents-server-manifest.sig; do
+            curl --fail --location --silent --show-error --max-time 120 \
+              "https://github.com/ZhengyiLuo/AgentsServer/releases/download/v1.0.7-beta.11/$asset" \
+              --output "$RUNNER_TEMP/native-inputs/baseline/$asset"
+          done
+      - name: Prepare disposable native service prerequisites
+        shell: bash
+        run: |
+          uv python install 3.13
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            sudo apt-get update
+            sudo apt-get install -y tmux
+            sudo loginctl enable-linger "$(id -un)"
+            systemctl --user show-environment > /dev/null
+          else
+            command -v tmux || brew install tmux
+            /bin/launchctl print "gui/$(id -u)" > /dev/null
+          fi
+      - name: Exercise existing installation upgrade and native restart
+        shell: bash
+        run: |
+          umask 022
+          uv run --python 3.13 python scripts/native_upgrade_acceptance.py \
+            --baseline "$RUNNER_TEMP/native-inputs/baseline" \
+            --candidate "$RUNNER_TEMP/native-inputs/candidate" \
+            --work "$RUNNER_TEMP/agentsdock-native-upgrade" \
+            --report "$RUNNER_TEMP/native-public/upgrade.json" \
+            --source-sha "$SOURCE_SHA" --version "${RELEASE_TAG#v}" \
+            --legacy-root-mode '${{ matrix.legacy_root_mode }}'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-installer-upgrade-${{ matrix.runner }}-${{ inputs.source_sha }}
+          path: ${{ runner.temp }}/native-public/upgrade.json
+          if-no-files-found: warn
+          retention-days: 14

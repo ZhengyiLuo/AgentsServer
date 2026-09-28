@@ -1,8 +1,10 @@
 # OpenCode chat tools
 
 OpenCode uses a local stdio MCP bridge backed by the same private, run-bound
-broker as Cursor. The server advertises OpenCode cross-chat targets only when
-its cached runtime is ready. Native and custom API chats share this transport;
+broker as Cursor. The server advertises OpenCode cross-chat targets when
+its cached runtime is ready, or its CLI is installed and the selected server
+has a verified custom API connection. Per-chat admission still checks the
+target's actual selected connection. Native and custom API chats share this transport;
 the chosen model must support tools.
 
 Each helper-capable turn gets an unpredictable MCP name and a loopback bearer.

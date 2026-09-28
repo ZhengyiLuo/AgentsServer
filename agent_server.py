@@ -38449,21 +38449,22 @@ def cross_chat_supported_target_backends() -> list[str]:
         and claude_sdk_dependency_available()
     ):
         supported.append(BACKEND_CLAUDE)
-    # Cursor has no separately selectable transport: the compatibility and
-    # authentication probe is the transport gate.  Use only the cached probe
-    # here so /api/health never blocks on CLI subprocesses.  Startup and the
-    # runtime catalog refresh this diagnostic, while actual turn admission
-    # calls ensure_runtime_available() again before any provider launch.
-    with RUNTIME_DIAGNOSTICS_LOCK:
-        cursor_diagnostic = dict(
-            RUNTIME_DIAGNOSTICS.get(BACKEND_CURSOR) or {}
-        )
-    if cursor_diagnostic.get("status") == "ready":
-        supported.append(BACKEND_CURSOR)
-    with RUNTIME_DIAGNOSTICS_LOCK:
-        opencode_diagnostic = dict(RUNTIME_DIAGNOSTICS.get(BACKEND_OPENCODE) or {})
-    if opencode_diagnostic.get("status") == "ready":
-        supported.append(BACKEND_OPENCODE)
+    # Native login and an explicitly verified API connection are independent.
+    # Only cached diagnostics/private metadata are read here; health must not
+    # launch CLIs or authenticate remotely. Each target's actual turn admission
+    # still checks its own binding, CLI compatibility and selected login mode.
+    for backend in (BACKEND_CURSOR, BACKEND_OPENCODE):
+        with RUNTIME_DIAGNOSTICS_LOCK:
+            diagnostic = dict(RUNTIME_DIAGNOSTICS.get(backend) or {})
+        ready = diagnostic.get("status") == "ready"
+        if not ready and diagnostic.get("installed") is True:
+            try:
+                connection = PROVIDER_CONNECTION_STORE.public(backend)
+                ready = connection.get("configured") is True and connection.get("last_result") == "verified"
+            except HTTPException:
+                pass  # Unreadable/unverified API settings never grant readiness.
+        if ready:
+            supported.append(backend)
     return supported
 
 

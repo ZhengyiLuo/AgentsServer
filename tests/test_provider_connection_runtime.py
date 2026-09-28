@@ -1,11 +1,54 @@
 """Synthetic credentials only. No native login or model requests."""
 import json
+import ast
 import tempfile
+import threading
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from fastapi import HTTPException
 import provider_connections as connections
+
+
+class CrossChatConnectionTests(unittest.TestCase):
+    def setUp(self):
+        path = Path(__file__).resolve().parents[1] / "agent_server.py"
+        node = next(n for n in ast.parse(path.read_text()).body
+                    if isinstance(n, ast.FunctionDef) and n.name == "cross_chat_supported_target_backends")
+        self.store = Mock()
+        self.ns = {"CODEX_TRANSPORT": "app-server", "CODEX_TRANSPORT_EXEC": "exec",
+                   "CLAUDE_TRANSPORT": "agent-sdk", "CLAUDE_TRANSPORT_PRINT": "print",
+                   "claude_sdk_dependency_available": lambda: True,
+                   "BACKEND_CODEX": "codex", "BACKEND_CLAUDE": "claude",
+                   "BACKEND_CURSOR": "cursor", "BACKEND_OPENCODE": "opencode",
+                   "RUNTIME_DIAGNOSTICS": {}, "RUNTIME_DIAGNOSTICS_LOCK": threading.RLock(),
+                   "PROVIDER_CONNECTION_STORE": self.store, "HTTPException": HTTPException}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), self.ns)
+
+    def test_verified_api_supports_cross_chat_without_native_login(self):
+        self.store.public.return_value = {"configured": True, "last_result": "verified"}
+        for backend in ("cursor", "opencode"):
+            with self.subTest(backend=backend):
+                self.ns["RUNTIME_DIAGNOSTICS"] = {backend: {"status": "unauthenticated", "installed": True}}
+                self.assertIn(backend, self.ns["cross_chat_supported_target_backends"]())
+                self.assertEqual(self.ns["RUNTIME_DIAGNOSTICS"][backend]["status"], "unauthenticated")
+
+    def test_missing_cli_forgotten_or_unverified_api_cannot_enable_transport(self):
+        for backend in ("cursor", "opencode"):
+            for installed, configured, result in ((False, True, "verified"),
+                    (True, False, None), (True, True, "authentication_failed"), (True, True, None)):
+                with self.subTest(backend=backend, installed=installed, configured=configured, result=result):
+                    self.ns["RUNTIME_DIAGNOSTICS"] = {backend: {"status": "unauthenticated", "installed": installed}}
+                    self.store.public.return_value = {"configured": configured, "last_result": result}
+                    self.assertNotIn(backend, self.ns["cross_chat_supported_target_backends"]())
+
+    def test_native_readiness_needs_no_connection_read_and_bad_storage_fails_closed(self):
+        self.store.public.side_effect = HTTPException(503, "Unreadable settings")
+        for status, expected in (("ready", True), ("unauthenticated", False)):
+            self.ns["RUNTIME_DIAGNOSTICS"] = {"cursor": {"status": status, "installed": True}}
+            self.assertEqual("cursor" in self.ns["cross_chat_supported_target_backends"](), expected)
+            if expected:
+                self.store.public.assert_not_called()
 
 
 class RuntimeBindingTests(unittest.TestCase):

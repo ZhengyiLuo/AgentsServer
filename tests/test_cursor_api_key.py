@@ -60,14 +60,15 @@ class CursorKeyTests(unittest.IsolatedAsyncioTestCase):
             store.write("cursor", 1, None)
             self.assertFalse(store.catalog("cursor")["available"])
             self.assertFalse(other.public("cursor")["configured"])
-            with self.assertRaisesRegex(HTTPException, "forgotten"): store.cursor_overrides(session)
+            with self.assertRaisesRegex(HTTPException, "disconnected"): store.cursor_overrides(session)
             other.write("cursor", 0, INPUT, "verified")
             other_session = {"backend": "cursor", "provider_connection": "custom"}
             other_session["provider_connection_revision"] = other.bind(other_session)["credential_id"]
             self.assertEqual(other.cursor_overrides(other_session), env)
             store.write("cursor", 2, {**INPUT, "expected_revision": 2}, "verified")
-            with self.assertRaisesRegex(HTTPException, "forgotten"):
-                connections.ConnectionStore(store.root).cursor_overrides(session)
+            self.assertEqual(connections.ConnectionStore(store.root).cursor_overrides(session), env)
+            store.write("cursor", 3, {**INPUT, "expected_revision": 3, "api_key": "different-account-key"}, "verified")
+            with self.assertRaisesRegex(HTTPException, "disconnected"): store.cursor_overrides(session)
             self.assertEqual(store.cursor_overrides({"backend": "cursor"}), {})
             with self.assertRaises(HTTPException): store.cursor_overrides({**session, "provider_connection_revision": None})
             self.assertEqual(store.redact(session, INPUT["api_key"]), "<api-key>")

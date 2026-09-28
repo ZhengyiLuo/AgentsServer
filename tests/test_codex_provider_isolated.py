@@ -49,10 +49,10 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.selection(revision=old, include_key=True)["api_key"], KEY)
         self.store.reset()
         self.assertFalse(self.store.status()["configured"])
-        with self.assertRaisesRegex(HTTPException, "forgotten"): self.store.selection(revision=old, include_key=True)
+        with self.assertRaisesRegex(HTTPException, "disconnected"): self.store.selection(revision=old, include_key=True)
         self.store.save(SELECTION)
         reloaded = provider.ProviderStore(self.store.root)
-        with self.assertRaisesRegex(HTTPException, "forgotten"): reloaded.selection(revision=old, include_key=True)
+        with self.assertRaisesRegex(HTTPException, "disconnected"): reloaded.selection(revision=old, include_key=True)
         self.assertTrue(reloaded.status()["configured"])
 
     def test_legacy_empty_settings_revoke_old_credentials(self):
@@ -61,9 +61,9 @@ class StoreTests(unittest.TestCase):
         self.store._atomic("credential-" + identifier + ".json", {**SELECTION, "binding": provider.binding(SELECTION)})
         self.store._atomic("settings.json", {})
         reloaded = provider.ProviderStore(self.store.root)
-        with self.assertRaisesRegex(HTTPException, "forgotten"): reloaded.selection(revision=identifier)
+        with self.assertRaisesRegex(HTTPException, "disconnected"): reloaded.selection(revision=identifier)
         reloaded.save(SELECTION)
-        with self.assertRaisesRegex(HTTPException, "forgotten"): reloaded.selection(revision=identifier)
+        with self.assertRaisesRegex(HTTPException, "disconnected"): reloaded.selection(revision=identifier)
 
     def test_failed_forget_keeps_cached_and_persisted_binding(self):
         self.store.save(SELECTION)
@@ -72,6 +72,24 @@ class StoreTests(unittest.TestCase):
         with patch.object(self.store, "_atomic", side_effect=OSError("synthetic disk failure")):
             with self.assertRaises(OSError): self.store.reset()
         self.assertEqual(self.store.for_session(chat, include_key=True)["api_key"], KEY)
+
+    def test_verified_reconnection_restores_only_exact_original_identity(self):
+        self.store.save(SELECTION)
+        chat = {"codex_provider": "custom", "codex_provider_revision": self.store.revision()}
+        self.store.reset()
+        with self.assertRaisesRegex(HTTPException, "disconnected"): self.store.for_session(chat)
+        self.store.save({**SELECTION, "connection_verified": True})
+        self.assertEqual(self.store.for_session(chat, include_key=True)["api_key"], KEY)
+        self.assertTrue(self.store.catalog(available=True, session=chat)["available"])
+        self.assertEqual(provider.ProviderStore(self.store.root).for_session(chat, include_key=True)["api_key"], KEY)
+        for changed in ({"api_key": "different-account"}, {"base_url": "https://different.invalid/v1"}):
+            self.store.save({**SELECTION, **changed, "connection_verified": True})
+            with self.assertRaisesRegex(HTTPException, "disconnected"): self.store.for_session(chat)
+            self.assertFalse(self.store.catalog(available=True, session=chat)["available"])
+        self.store.save({**SELECTION, "connection_verified": True})
+        self.assertTrue(self.store.catalog(available=True, session=chat)["available"])
+        self.store.reset()
+        self.assertFalse(self.store.catalog(available=True, session=chat)["available"])
 
     def test_thread_binding_prevents_cross_endpoint_and_default_history(self):
         self.store.save(SELECTION)
@@ -175,7 +193,7 @@ class StoreTests(unittest.TestCase):
         self.store.reset()
         reloaded = provider.ProviderStore(self.store.root)
         self.assertFalse(reloaded.status()["configured"])
-        with self.assertRaisesRegex(HTTPException, "forgotten"):
+        with self.assertRaisesRegex(HTTPException, "disconnected"):
             reloaded.selection(include_key=True, revision=original["credential_id"])
 
     def test_unsaved_probe_cannot_persist_or_override_saved_summary_evidence(self):
@@ -245,7 +263,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual((retained["credential_id"], retained["api_key"]), (revision, KEY))
         self.store.require_thread("legacy-thread", {**retained, "model": "third-model"})
         self.store.reset()
-        with self.assertRaisesRegex(HTTPException, "forgotten"): self.store.for_thread("legacy-thread", include_key=True)
+        with self.assertRaisesRegex(HTTPException, "disconnected"): self.store.for_thread("legacy-thread", include_key=True)
 
     def test_failure_before_metadata_commit_retains_old_key(self):
         self.store.save(SELECTION)

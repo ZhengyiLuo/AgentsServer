@@ -106,7 +106,7 @@ class CodexProviderReadinessTests(unittest.IsolatedAsyncioTestCase):
                     session["provider_connection"] = "custom"
                     session["provider_connection_revision"] = store.bind(session)["credential_id"]
                     store.write(backend, 1, None)
-                with self.assertRaisesRegex(HTTPException, "forgotten") as caught:
+                with self.assertRaisesRegex(HTTPException, "disconnected") as caught:
                     await self.ns["ensure_runtime_available"](backend, session=session)
                 self.assertEqual(caught.exception.status_code, 409)
             self.command.assert_not_called()

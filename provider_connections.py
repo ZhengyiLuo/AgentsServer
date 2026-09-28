@@ -11,6 +11,7 @@ import stat
 import tempfile
 import threading
 import hashlib
+import hmac
 import re
 import time
 import uuid
@@ -171,7 +172,14 @@ class ConnectionStore:
             if credential_id:
                 current = self.read(backend)
                 if not current["configured"] or value["revision"] <= self._revoked_through(current):
-                    raise HTTPException(409, "This chat's API connection was forgotten. Its history is preserved; configure an API connection and start a new chat.")
+                    # Explicitly reconnecting the exact original connection
+                    # authorizes reuse, without moving history to another host
+                    # or account. No writes or remote auth probes on projection.
+                    restored = (current["configured"] and current.get("last_result") == "verified"
+                        and all(current.get(k) == value.get(k) for k in ("base_url", "protocol", "auth_header"))
+                        and hmac.compare_digest(current.get("api_key", "").encode(), value.get("api_key", "").encode()))
+                    if not restored:
+                        raise HTTPException(409, "This chat's API connection is disconnected. Reconnect its original endpoint and API key in AI Providers, then retry.")
             if not value.get("configured") or value.get("last_result") != "verified":
                 raise HTTPException(409, "Connect this custom API in AI Providers before creating a chat.")
             if not credential_id:

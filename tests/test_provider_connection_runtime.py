@@ -27,22 +27,28 @@ class RuntimeBindingTests(unittest.TestCase):
         self.store.write("claude", 1, {**self.input, "expected_revision": 1, "api_key": "synthetic-second-key"}, "verified")
         self.assertEqual(self.store.for_session(chat)["api_key"], "synthetic-first-key")
         self.store.write("claude", 2, None)
-        with self.assertRaisesRegex(HTTPException, "forgotten"): self.store.for_session(chat)
+        with self.assertRaisesRegex(HTTPException, "disconnected"): self.store.for_session(chat)
         with self.assertRaises(HTTPException): self.store.bind({"backend": "claude", "provider_connection": "custom"})
         self.store.write("claude", 3, {**self.input, "expected_revision": 3}, "verified")
         reloaded = connections.ConnectionStore(self.store.root)
-        with self.assertRaisesRegex(HTTPException, "forgotten"): reloaded.for_session(chat)
-        self.assertFalse(reloaded.catalog("claude", session=chat)["available"])
+        self.assertEqual(reloaded.for_session(chat)["api_key"], self.input["api_key"])
+        self.assertTrue(reloaded.catalog("claude", session=chat)["available"])
         self.assertTrue(reloaded.bind({"backend": "claude", "provider_connection": "custom"}))
+        reloaded.write("claude", 4, {**self.input, "api_key": "another-account", "expected_revision": 4}, "verified")
+        with self.assertRaisesRegex(HTTPException, "disconnected"): reloaded.for_session(chat)
+        reloaded.write("claude", 5, {**self.input, "base_url": "https://different.invalid", "expected_revision": 5}, "verified")
+        with self.assertRaisesRegex(HTTPException, "disconnected"): reloaded.for_session(chat)
 
     def test_legacy_forget_revokes_and_inflight_output_still_redacts(self):
         for backend in ("claude", "opencode"):
             chat = self.chat(backend)
             (self.store.root / f"{backend}.json").write_text(json.dumps({"revision": 2, "configured": False}))
-            with self.assertRaisesRegex(HTTPException, "forgotten"): self.store.for_session(chat)
+            with self.assertRaisesRegex(HTTPException, "disconnected"): self.store.for_session(chat)
             self.assertEqual(self.store.redact(chat, {"text": "reply synthetic-first-key"}), {"text": "reply <api-key>"})
             self.store.write(backend, 2, {**self.input, "expected_revision": 2}, "verified")
-            with self.assertRaisesRegex(HTTPException, "forgotten"): self.store.for_session(chat)
+            self.assertEqual(self.store.for_session(chat)["api_key"], self.input["api_key"])
+            self.store.write(backend, 3, None)
+            with self.assertRaisesRegex(HTTPException, "disconnected"): self.store.for_session(chat)
 
     def test_failed_forget_keeps_original_connection(self):
         chat = self.chat()

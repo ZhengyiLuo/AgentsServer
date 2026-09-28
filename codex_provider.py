@@ -276,8 +276,6 @@ class ProviderStore:
                 credential = self._read("credential-" + identifier + ".json")
                 if not credential:
                     raise ValueError("missing credential")
-                if self._epoch(credential) < self._epoch(metadata, settings=True):
-                    raise HTTPException(409, "This chat's API connection was forgotten. Its history is preserved; configure an API connection and start a new chat.")
                 source = metadata if identifier == metadata.get("credential_id") else credential
                 selected = validate_selection({name: source[name] for name in ("base_url", "model") if name in source}, require_key=False)
                 legacy_model = credential.get("legacy_model") or source.get("model")
@@ -286,6 +284,12 @@ class ProviderStore:
                 if not credential.get("binding") or credential.get("binding") not in (binding(selected), legacy_binding(selected)):
                     raise ValueError("credential binding mismatch")
                 key = validate_api_key({"api_key": credential.get("api_key")})
+                if self._epoch(credential) < self._epoch(metadata, settings=True):
+                    current_id = metadata.get("credential_id")
+                    current = self._read("credential-" + current_id + ".json") if isinstance(current_id, str) and re.fullmatch(r"[0-9a-f]{32}", current_id) else None
+                    if not (current and metadata.get("connection_verified") is True
+                            and selected["base_url"] == metadata.get("base_url") and key == current.get("api_key")):
+                        raise HTTPException(409, "This chat's API connection is disconnected. Reconnect its original endpoint and API key in AI Providers, then retry.")
                 self._public_selections[identifier] = {**selected, "credential_id": identifier}
                 self._revision_catalog_keys[identifier] = catalog_key({**selected, "api_key": key})
                 if include_key:
@@ -613,6 +617,9 @@ class ProviderStore:
             try:
                 self._atomic("settings.json", {name: value for name, value in
                     {**selected, "credential_id": identifier, "connection_epoch": epoch}.items() if name != "api_key"})
+                # Restored old revisions are authorized by the current verified
+                # identity; a later replacement must not reuse cached readiness.
+                self._public_selections.clear()
             except BaseException:
                 with suppress(OSError):
                     os.unlink(self.root / credential_name)

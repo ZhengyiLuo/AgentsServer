@@ -288,7 +288,7 @@ class PerChatTests(unittest.IsolatedAsyncioTestCase):
         public = self.ns["public_session"](source, summary=True)
         self.assertFalse(public["codex_provider_catalog"]["available"])
         self.assertNotIn(self.selection["api_key"], json.dumps(public))
-        with self.assertRaisesRegex(HTTPException, "forgotten"):
+        with self.assertRaisesRegex(HTTPException, "disconnected"):
             await self.ns["STORE"].create(self.ns["CreateSessionRequest"](
                 codex_provider="custom", model="parent-model", effort="ultra"),
                 parent_id=parent["id"], initializing_fork=True)

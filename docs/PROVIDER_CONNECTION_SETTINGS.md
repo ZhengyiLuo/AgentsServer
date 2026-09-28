@@ -102,8 +102,13 @@ Connected Custom API cards offer **⋯ → Forget endpoint**, with confirmation.
 This revokes this instance's existing custom-chat bindings as well as its saved
 selection for new chats. History remains readable; new/queued runs, forks and
 model checks cannot use forgotten credentials or fall back to native login.
-Already-started requests may finish. Reconfiguring creates a new connection for
-new chats; it does not silently revive or reroute revoked chats.
+Already-started requests may finish. Reconnecting and verifying the exact
+original URL, key, protocol and auth header allows its old chats to resume while
+that connection remains selected. A different URL or key cannot take over those
+chats. Restoring a connection never changes the original chat's model or history.
+The composer permits sending despite stale connection/readiness metadata;
+actual server admission and the provider request decide whether it works.
+Only a failed send/run shows the inline warning and Configure API action.
 CLI Login has no Disconnect or
 global logout action, so other server instances and terminal logins are untouched.
 

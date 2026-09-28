@@ -13012,11 +13012,10 @@ class JobStore:
                 job_id=jid,
                 job_title=str(job.get("title") or jid),
                 job_scheduled_run_at=scheduled_run_at,
-                client_capabilities=(
-                    [CROSS_CHAT_HANDOFFS_V2_CLIENT_CAPABILITY]
-                    if chat_references
-                    else []
-                ),
+                client_capabilities=[
+                    ASYNC_ROUTE_V1_CLIENT_CAPABILITY,
+                    *([CROSS_CHAT_HANDOFFS_V2_CLIENT_CAPABILITY] if chat_references else []),
+                ],
                 chat_references=chat_references,
                 team_references=team_references,
             )
@@ -19181,8 +19180,21 @@ def normalized_provider_cross_chat_route_snapshot(value: Any) -> list[dict[str, 
     seen_aliases: set[str] = set()
     seen_targets: set[str] = set()
     for raw in value:
-        if not isinstance(raw, dict) or raw.get("route_kind") not in ephemeral_kinds:
-            # Never combine an ephemeral ceiling with legacy configured grants.
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("route_kind") not in ephemeral_kinds:
+            # A job may name both paired and unpaired recipients. Keep exact
+            # permanent-pair snapshots alongside its run-local references;
+            # unrelated legacy configured grants still cannot enter this scope.
+            paired = normalized_provider_cross_chat_routes([raw]) if raw.get("pair_id") and raw.get("route_kind") is None else []
+            if paired:
+                route = paired[0]
+                if (route["route_id"] not in seen_ids and route["alias"] not in seen_aliases
+                        and route["target_session_id"] not in seen_targets):
+                    routes.append(route)
+                    seen_ids.add(route["route_id"])
+                    seen_aliases.add(route["alias"])
+                    seen_targets.add(route["target_session_id"])
             continue
         route_kind = str(raw.get("route_kind") or "")
         if (
@@ -19623,8 +19635,8 @@ def provider_cross_chat_route_snapshot_for_authority(
 
     Ordinary admissions persist validated v2 ``@`` hints before reaching this
     boundary and freeze only the source chat's durable directional grants.
-    Scheduled jobs intentionally start from an empty source ceiling and mint
-    only their own persisted exact references as run-local routes.
+    Scheduled jobs start from their own exact saved references. A live pair
+    retains its mailbox identity; other references remain run-local routes.
     """
 
     routes = normalized_provider_cross_chat_route_snapshot(value)
@@ -19660,6 +19672,8 @@ def provider_cross_chat_route_snapshot_for_authority(
 
     routes = []
     source = STORE.sessions.get(source_session_id) or {}
+    paired_routes = {str(route["target_session_id"]): route
+                     for route in provider_cross_chat_routes(source) if route.get("pair_id")}
     route_actions = ["instruction"]
     if cross_chat_target_backend_supported(
         str(source.get("backend") or DEFAULT_BACKEND)
@@ -19668,12 +19682,34 @@ def provider_cross_chat_route_snapshot_for_authority(
     used_route_ids = {str(route.get("route_id") or "") for route in routes}
     used_revisions = {str(route.get("revision") or "") for route in routes}
     used_aliases = {str(route.get("alias") or "") for route in routes}
+    used_aliases.update(str(paired_routes[reference.session_id]["alias"])
+                        for reference in references if reference.session_id in paired_routes)
     route_index = 0
     for reference in references:
         if (
             reference.target_kind is not None
             or reference.action not in {"direct_message", "route"}
         ):
+            continue
+        reference_actions = (
+            [reference.route_action]
+            if reference.route_action in route_actions
+            else ([] if reference.route_action is not None else list(route_actions))
+        )
+        if not reference_actions:
+            continue
+        paired = paired_routes.get(reference.session_id)
+        if paired is not None:
+            # Intersect the saved job's action ceiling with the exact current
+            # pair. Never fall back to a fresh unpaired grant after revocation.
+            live_pair = live_provider_cross_chat_route(source_session_id, paired)
+            allowed = [action for action in reference_actions
+                       if live_pair is not None and action in live_pair.get("actions", [])]
+            if allowed:
+                routes.append({**live_pair, "actions": allowed})
+                used_route_ids.add(str(live_pair["route_id"]))
+                used_revisions.add(str(live_pair["revision"]))
+                used_aliases.add(str(live_pair["alias"]))
             continue
         route_index += 1
         route_id = "route_" + secrets.token_hex(16)
@@ -19689,20 +19725,6 @@ def provider_cross_chat_route_snapshot_for_authority(
         used_route_ids.add(route_id)
         used_revisions.add(revision)
         used_aliases.add(alias)
-        reference_actions = (
-            [reference.route_action]
-            if reference.route_action in route_actions
-            else (
-                []
-                if reference.route_action is not None
-                else list(route_actions)
-            )
-        )
-        if not reference_actions:
-            # A persisted request/reply-only route must not silently widen to
-            # instruction when the current source backend can no longer issue
-            # request/reply exchanges.
-            continue
         routes.append({
             "route_id": route_id,
             "revision": revision,
@@ -44349,8 +44371,11 @@ async def reserve_async_provider_route_message(
         raise HTTPException(status_code=409, detail="async_route_v1 was not negotiated for this run")
     issued = dict((capability.get("provider_route_grants") or {}).get(route_id) or {})
     live = live_provider_cross_chat_route(source_session_id, issued)
+    # In paired async mode Ask and Send are independent mailbox messages.
+    # A saved question-only job grant therefore permits the same wire message
+    # without acquiring any legacy instruction/exchange permission.
     if (live is None or not live.get("pair_id")
-            or "instruction" not in (live.get("actions") or [])):
+            or not {"instruction", "request_reply"}.intersection(live.get("actions") or [])):
         raise HTTPException(status_code=403, detail="permanent chat pair is no longer authorized")
     source_run_id = str(capability.get("source_run_id") or "")
     if not provider_capability_is_attached_to_live_run(
@@ -73821,6 +73846,9 @@ async def _start_turn_locked(
             async_route_v1=(
                 is_async_route_message(delivery_record or {})
                 or mailbox_wake_claim is not None
+                # Jobs are server-originated; permanent routes use the mailbox
+                # even when an older saved job has no desktop capability flags.
+                or req.purpose == "scheduled_job"
                 or (req.purpose is None and ASYNC_ROUTE_V1_CLIENT_CAPABILITY in set(req.client_capabilities))
             ),
             async_route_response_route_id=(

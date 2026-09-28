@@ -7,6 +7,13 @@ mailbox. Busy recipients are never steered or interrupted; their existing tool
 checkpoint hint and eventual idle transition handle availability. Existing
 legacy exchanges retain their negotiated delivery behavior.
 
+Scheduled jobs use the mailbox for saved references whose exact recipient has
+a live permanent pair. The run retains only each saved reference's permitted
+actions, without adding the chat's other peers. A saved request/reply-only
+reference sends an independent mailbox question in this mode, with no live wait
+or queued delivery. References without a permanent pair retain their existing
+run-local exchange behavior, including in jobs with both kinds of recipient.
+
 ## Agent workflow
 
 - `chats inbox [--cursor …]` lists unread senders using the current run's existing

@@ -11,6 +11,7 @@ import logging
 import hashlib
 from pathlib import Path
 import re
+import secrets
 import sqlite3
 import time
 from types import SimpleNamespace
@@ -33,6 +34,7 @@ FUNCTIONS = {
     "commit_durable_provider_cross_chat_reference_grants", "provider_cross_chat_grant_admission_event",
     "reconcile_pending_provider_cross_chat_grant", "initial_provider_cross_chat_route_snapshot",
     "provider_cross_chat_route_snapshot_for_hints", "normalized_provider_cross_chat_route_snapshot",
+    "provider_cross_chat_route_snapshot_for_authority",
     "provider_cross_chat_pair_is_live", "live_provider_cross_chat_route",
     "provider_cross_chat_route_availability", "pending_admission_provider_cross_chat_route",
     "list_agent_handoff_routes", "create_agent_handoff_route", "delete_agent_handoff_route", "reject_unavailable_route_target",
@@ -104,7 +106,7 @@ class ChatPairTests(unittest.IsolatedAsyncioTestCase):
         self.retired = AsyncMock()
         self.namespace = {
             "team_mail_grants": team_mail_grants,
-            "asyncio": asyncio, "datetime": datetime, "re": re, "uuid": uuid,
+            "asyncio": asyncio, "datetime": datetime, "re": re, "uuid": uuid, "secrets": secrets,
             "unicodedata": unicodedata, "deque": deque, "suppress": suppress,
             "HTTPException": HTTPException, "STORE": self.store,
             "now_iso": lambda: "2026-09-10T00:00:00Z", "logger": logging.getLogger(__name__),
@@ -245,6 +247,37 @@ class ChatPairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({route["target_session_id"] for route in self.routes("a")}, {"b"})
         self.assertEqual({route["target_session_id"] for route in self.routes("c")}, {"b"})
         self.assertEqual(self.routes("fork"), [])
+
+    async def test_saved_job_keeps_paired_question_and_unpaired_reference_without_other_peers(self):
+        await self.grant('a', ('b', 'fork'))
+        paired = next(route for route in self.store.sessions['a']['provider_cross_chat_routes']
+                      if route['target_session_id'] == 'b')
+        paired['alias'] = 'mention1'
+        references = [SimpleNamespace(session_id=target, target_kind=None, action='route',
+                                      route_action='request_reply') for target in ('c', 'b')]
+        for ordered in (references, list(reversed(references))):
+            with self.subTest(order=[reference.session_id for reference in ordered]):
+                snapshot = self.call('provider_cross_chat_route_snapshot_for_authority', [], ordered,
+                                     source_session_id='a', per_job_reference_routes=True)
+                self.assertEqual({route['target_session_id'] for route in snapshot}, {'b', 'c'})
+                target_routes = {route['target_session_id']: route for route in snapshot}
+                self.assertEqual(target_routes['b']['pair_id'], paired['pair_id'])
+                self.assertEqual(target_routes['b']['route_id'], paired['route_id'])
+                self.assertEqual(target_routes['b']['actions'], ['request_reply'])
+                self.assertNotIn('route_kind', target_routes['b'])
+                self.assertEqual(target_routes['c']['actions'], ['request_reply'])
+                self.assertEqual(target_routes['c']['route_kind'], self.namespace['PROVIDER_CROSS_CHAT_ROUTE_KIND_REFERENCE'])
+                self.assertNotIn('pair_id', target_routes['c'])
+                self.assertNotEqual(target_routes['c']['alias'], paired['alias'])
+                self.assertEqual(self.call('normalized_provider_cross_chat_route_snapshot', snapshot), snapshot)
+
+    async def test_saved_job_does_not_replace_unavailable_pair_with_ephemeral_permission(self):
+        await self.grant()
+        route = self.routes('a')[0]
+        reference = SimpleNamespace(session_id='b', target_kind=None, action='route', route_action='request_reply')
+        self.store.sessions['a']['_revoked_provider_cross_chat_route_ids'] = [route['route_id']]
+        self.assertEqual(self.call('provider_cross_chat_route_snapshot_for_authority', [], [reference],
+                                   source_session_id='a', per_job_reference_routes=True), [])
 
     async def test_repeated_mention_reuses_exact_pair(self):
         await self.grant()
@@ -638,7 +671,7 @@ class ChatPairTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(recovered["backend"])
         self.assertEqual(self.call("queued_turn_run_metadata", recovered)["conversation_id"], message["authorization_pair_id"])
 
-    async def test_async_mode_issuance_is_negotiated_for_users_and_derived_for_deliveries(self):
+    async def test_async_mode_issuance_is_negotiated_for_users_and_derived_for_jobs_and_deliveries(self):
         function = next(node for node in TREE.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "_start_turn_locked")
         issuance = next(node for node in ast.walk(function) if isinstance(node, ast.Call)
                         and isinstance(node.func, ast.Name) and node.func.id == "issue_cross_chat_capability")
@@ -649,6 +682,10 @@ class ChatPairTests(unittest.IsolatedAsyncioTestCase):
         self.namespace["req"].client_capabilities = ["chat_conversation_async_route_v1"]
         self.assertTrue(eval(code, self.namespace))
         self.namespace["req"].purpose = "scheduled_job"
+        self.assertTrue(eval(code, self.namespace))
+        self.namespace["req"].client_capabilities = []
+        self.assertTrue(eval(code, self.namespace))
+        self.namespace["req"].purpose = "cross_chat_handoff_delivery"
         self.assertFalse(eval(code, self.namespace))
         await self.grant()
         self.namespace.update(delivery_record=self.delivery(self.routes("a")[0]), req=SimpleNamespace(purpose="cross_chat_handoff_delivery", client_capabilities=["backend-exact"]))

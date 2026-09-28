@@ -78,6 +78,7 @@ import workspace_git
 import codex_auth
 import codex_provider
 import provider_connections
+import cursor_api_key
 import server_instances
 import local_session_ownership
 import cursor_history
@@ -7184,7 +7185,7 @@ def preview_session_runtime_update(
 
     current_connection = sess.get("provider_connection") or "default"
     connection = (patch.get("provider_connection") or "default") if "provider_connection" in patch else "default" if backend_changed else current_connection
-    if connection not in {"default", "custom"} or connection == "custom" and prospective_backend not in {BACKEND_CLAUDE, BACKEND_OPENCODE}:
+    if connection not in {"default", "custom"} or connection == "custom" and prospective_backend not in {BACKEND_CLAUDE, BACKEND_OPENCODE, BACKEND_CURSOR}:
         raise HTTPException(400, "This backend does not support that API connection.")
     connection_changed = current_connection != connection
     if connection_changed and session_backend_locked(sess):
@@ -48039,7 +48040,8 @@ def active_generated_title_work_labels() -> list[str]:
 
 def title_runtime_key(sess: dict[str, Any]) -> tuple:
     return (sess.get("backend") or DEFAULT_BACKEND, session_provider_id(sess),
-            sess.get("model"), sess.get("codex_provider"), sess.get("codex_provider_revision"))
+            sess.get("model"), sess.get("codex_provider"), sess.get("codex_provider_revision"),
+            sess.get("provider_connection"), sess.get("provider_connection_revision"))
 
 
 def generated_title_eligible(sess: dict[str, Any], *, allow_attempted: bool = False) -> bool:
@@ -48103,6 +48105,9 @@ async def generate_session_title(session_id: str, snapshot: dict, reply: str) ->
             options["executable"] = resolve_cursor_executable()
             if not options["executable"]:
                 return
+            if snapshot.get("provider_connection") == "custom":
+                await cursor_api_key.require_isolation(options["executable"], options["env"])
+                options["env"].update(PROVIDER_CONNECTION_STORE.cursor_overrides(snapshot))
         result = await title_generation.generate_title(
             snapshot["backend"], snapshot["_title_seed"], reply, **options,
         )
@@ -58882,8 +58887,11 @@ async def ensure_runtime_available(backend: str, *, session: dict[str, Any] | No
     diagnostic = await asyncio.to_thread(runtime_diagnostic, backend)
     if (session or {}).get("provider_connection") == "custom":
         selected = PROVIDER_CONNECTION_STORE.for_session(session)
-        provider_connections.require_model(selected)
-        if backend not in {BACKEND_CLAUDE, BACKEND_OPENCODE} or diagnostic.get("installed") is not True:
+        if backend != BACKEND_CURSOR:
+            provider_connections.require_model(selected)
+        else:
+            await cursor_api_key.require_isolation(await asyncio.to_thread(resolve_cursor_executable), runner_env())
+        if backend not in {BACKEND_CLAUDE, BACKEND_OPENCODE, BACKEND_CURSOR} or diagnostic.get("installed") is not True:
             raise HTTPException(503, "Install this provider's native CLI to use its custom API.")
         diagnostic = {**diagnostic, "status": "ready", "authenticated": True}
     if (
@@ -59689,7 +59697,7 @@ def discover_runtime_backend_catalog(backend: str, *, force_runtime_probe: bool 
     catalog["diagnostic"] = public_runtime_diagnostic(diagnostic)
     catalog["available"] = ready
     catalog["native_credentials_present"] = provider_connections.native_credentials_present(backend, diagnostic)
-    if backend in {BACKEND_CLAUDE, BACKEND_OPENCODE}:
+    if backend in {BACKEND_CLAUDE, BACKEND_OPENCODE, BACKEND_CURSOR}:
         catalog["custom_provider"] = PROVIDER_CONNECTION_STORE.catalog(backend, installed=diagnostic.get("installed") is True)
     return catalog
 
@@ -67030,6 +67038,9 @@ async def run_cursor_process(
     await append_event(session_id, "process_started", {"run_id": run_id, "backend": BACKEND_CURSOR, "argv": public_cmd, "cwd": cwd})
     env = agent_runner_env(session_id)
     env.update(sess.get("_cursor_tool_env") or {})
+    # Last overlay: a saved key cannot inherit an auth-token override, write
+    # the shared CLI credential store, or be redirected by project direnv.
+    env.update(PROVIDER_CONNECTION_STORE.cursor_overrides(sess))
     cursor_dir = os.path.dirname(os.path.abspath(cursor_bin))
     if cursor_dir and cursor_dir not in env.get("PATH", "").split(os.pathsep):
         env["PATH"] = cursor_dir + os.pathsep + env.get("PATH", "")
@@ -67665,7 +67676,7 @@ async def run_cursor_process(
     )
     cursor_auth_state = (
         await asyncio.to_thread(cursor_auth_probe_state, cursor_bin)
-        if cursor_auth_signal
+        if cursor_auth_signal and sess.get("provider_connection") != "custom"
         else None
     )
     cursor_auth_failed = cursor_auth_state == "unauthenticated"
@@ -67752,7 +67763,7 @@ async def run_cursor_process(
             else None
         )
     )
-    if not stopped and (
+    if not stopped and sess.get("provider_connection") != "custom" and (
         timeout_error
         or stream_error
         or protocol_error
@@ -67770,7 +67781,7 @@ async def run_cursor_process(
             auth_failure=cursor_auth_failed,
             runtime_error=cursor_auth_validation_error,
         )
-    elif not stopped:
+    elif not stopped and sess.get("provider_connection") != "custom":
         record_runtime_success(BACKEND_CURSOR)
 
     successful_terminal = bool(
@@ -81730,7 +81741,7 @@ async def health() -> dict[str, Any]:
             "side_questions": side_questions.capability(),
             "codex_auth_v1": codex_auth.capability(available=bool(AGENT_TOKEN) and CODEX_TRANSPORT != CODEX_TRANSPORT_EXEC),
             "codex_provider_v1": {"available": bool(AGENT_TOKEN) and CODEX_TRANSPORT != CODEX_TRANSPORT_EXEC, "wire_api": "responses", "per_chat": True, "per_chat_models": True, "model_discovery": True, "model_compatibility": True},
-            "provider_connections_v1": {"available": bool(AGENT_TOKEN), "per_chat": True, "backends": [BACKEND_CLAUDE, BACKEND_OPENCODE]},
+            "provider_connections_v1": {"available": bool(AGENT_TOKEN), "per_chat": True, "backends": [BACKEND_CLAUDE, BACKEND_OPENCODE, BACKEND_CURSOR]},
             "team_mail_hints_v1": SECURE_PEER_RUNTIME.team_mail_hint_capability(),
             "team_mail_hints_v2": SECURE_PEER_RUNTIME.team_notification_hint_capability(),
             "websocket_auth_v1": {
@@ -83180,6 +83191,7 @@ async def set_codex_default_model(model: str | None, expected_revision):
 
 app.include_router(provider_connections.create_router(
     authorize=require_native_admin_control, store=PROVIDER_CONNECTION_STORE,
+    cursor_catalog=lambda selected: cursor_api_key.catalog(selected, executable=resolve_cursor_executable(), env=runner_env()),
     codex_store=CODEX_PROVIDER_STORE, codex_set_model=set_codex_default_model,
     session_lookup=lambda session_id: STORE.sessions.get(session_id),
     account=lambda backend: provider_connections.native_account_metadata(

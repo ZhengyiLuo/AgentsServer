@@ -242,6 +242,9 @@ def cursor_profile(root: Path, original_env: dict) -> tuple[Path, dict]:
                'NODE_EXTRA_CA_CERTS', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
                'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy', 'CURSOR_API_KEY', 'CURSOR_API_ENDPOINT'}
     env = {k: v for k, v in original_env.items() if k in allowed}
+    if original_env.get('AGENT_CLI_CREDENTIAL_STORE') == 'memory' and env.get('CURSOR_API_KEY'):
+        from cursor_api_key import overrides
+        env.update(overrides(env['CURSOR_API_KEY']))
     env.update(HOME=str(home), USERPROFILE=str(home), CURSOR_CONFIG_DIR=str(config),
                CURSOR_DATA_DIR=str(root / 'data'), XDG_CONFIG_HOME=str(home / '.config'),
                XDG_DATA_HOME=str(root / 'data'), XDG_CACHE_HOME=str(root / 'cache'),
@@ -298,7 +301,7 @@ async def cursor_keychain_snapshot(env: dict, isolated: dict, workspace: Path) -
 
 
 async def generate_cursor_title(prompt: str, *, executable: str, model: str | None, env: dict) -> str | None:
-    model = model or cursor_default_model(env)
+    model = model or ('auto' if env.get('AGENT_CLI_CREDENTIAL_STORE') == 'memory' else cursor_default_model(env))
     with tempfile.TemporaryDirectory(prefix='agentsdock-title-cursor-') as directory:
         workspace, isolated = cursor_profile(Path(directory), env)
         await cursor_keychain_snapshot(env, isolated, workspace)

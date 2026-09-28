@@ -30,6 +30,7 @@ class SettingsTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.temp.cleanup)
         self.store = connections.ConnectionStore(Path(self.temp.name) / "private")
         self.check = AsyncMock(return_value="verified")
+        self.cursor_catalog = AsyncMock(return_value={"models": [{"value": "auto", "label": "Auto"}], "discovery_status": "ready"})
         fixture = auth_fixture.CodexAuthTests()
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
@@ -37,7 +38,7 @@ class SettingsTests(unittest.IsolatedAsyncioTestCase):
         self.ns["codex_provider"] = codex_provider
         self.app = FastAPI()
         self.app.middleware("http")(self.ns["require_agent_token"])
-        self.app.include_router(connections.create_router(authorize=self.ns["require_native_admin_control"], store=self.store, check=self.check))
+        self.app.include_router(connections.create_router(authorize=self.ns["require_native_admin_control"], store=self.store, check=self.check, cursor_catalog=self.cursor_catalog))
         self.client = TestClient(self.app)
         self.addCleanup(self.client.close)
 
@@ -53,6 +54,26 @@ class SettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.root.stat().st_mode & 0o777, 0o700)
         self.assertFalse(self.store.public("opencode")["configured"])
         self.ns["codex_app_server_manager"].assert_not_awaited()
+
+    def test_cursor_route_checks_selected_key_only_and_forget_is_revision_fenced(self):
+        path = "/api/admin/provider-connections/cursor"
+        selected = {**INPUT, "base_url": "https://api2.cursor.sh", "protocol": "cursor", "auth_header": "bearer", "model": None}
+        self.assertEqual(self.client.put(path, headers={**NATIVE, "Origin": "https://browser.invalid"}, json=selected).status_code, 403)
+        self.cursor_catalog.assert_not_awaited()
+        reply = self.client.put(path, headers=NATIVE, json=selected)
+        self.assertTrue(reply.json()["ok"])
+        self.assertEqual(reply.json()["configuration"]["model"], "auto")
+        self.assertNotIn(KEY, reply.text)
+        self.check.assert_not_awaited()
+        self.assertEqual(self.cursor_catalog.await_count, 1)
+        self.assertEqual(self.client.get("/api/admin/provider-models/cursor", headers=NATIVE).json()["models"][0]["value"], "auto")
+        self.cursor_catalog.return_value = {"models": [], "discovery_status": "unavailable"}
+        reply = self.client.put(path, headers=NATIVE, json={**selected, "api_key": "invalid-fixture", "expected_revision": 1})
+        self.assertFalse(reply.json()["ok"])
+        self.assertEqual(self.store.read("cursor")["api_key"], KEY)
+        self.assertEqual(self.client.request("DELETE", path, headers=NATIVE, json={"expected_revision": 0}).status_code, 409)
+        self.assertFalse(self.client.request("DELETE", path, headers=NATIVE, json={"expected_revision": 1}).json()["configured"])
+        self.assertFalse(self.store.public("claude")["configured"])
 
     def test_account_metadata_requires_native_admin_and_never_changes_auth(self):
         path = "/api/admin/provider-accounts/opencode"

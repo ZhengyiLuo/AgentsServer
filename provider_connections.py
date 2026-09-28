@@ -24,8 +24,8 @@ from fastapi.responses import JSONResponse
 from codex_provider import validate_selection, validate_model, endpoint_model_catalog
 
 MAX_BODY_BYTES = 16 * 1024
-PROTOCOLS = {"claude": {"anthropic"}, "opencode": {"anthropic", "chat_completions", "responses"}}
-RESULTS = {"verified", "authentication_failed", "rate_limited", "unsupported", "connection_failed", "invalid_response", "model_required"}
+PROTOCOLS = {"claude": {"anthropic"}, "opencode": {"anthropic", "chat_completions", "responses"}, "cursor": {"cursor"}}
+RESULTS = {"verified", "authentication_failed", "rate_limited", "unsupported", "connection_failed", "invalid_response", "model_required", "cli_update_required"}
 
 
 def backend_name(value: str) -> str:
@@ -44,6 +44,10 @@ def selection(backend: str, value: object) -> dict:
     backend_name(backend)
     if not isinstance(value, dict) or set(value) != {"base_url", "api_key", "model", "protocol", "auth_header", "expected_revision"}:
         raise HTTPException(400, "Provide an endpoint, key, model, protocol and revision.")
+    if backend == "cursor":
+        from cursor_api_key import ENDPOINT
+        if value["base_url"] != ENDPOINT or value["protocol"] != "cursor" or value["auth_header"] != "bearer":
+            raise HTTPException(400, "Cursor API keys use Cursor's official service only.")
     if not isinstance(value["protocol"], str) or not isinstance(value["auth_header"], str) or value["protocol"] not in PROTOCOLS[backend] or value["auth_header"] not in {"bearer", "x-api-key"}:
         raise HTTPException(400, "Unsupported API protocol or authentication header.")
     if value["protocol"] != "anthropic" and value["auth_header"] != "bearer":
@@ -51,6 +55,8 @@ def selection(backend: str, value: object) -> dict:
     selected = validate_selection({"base_url": value["base_url"], "api_key": value["api_key"],
                                    "model": None if value["model"] == "" else value["model"]})
     selected.setdefault("model", None)
+    if backend == "cursor" and selected["model"] is None:
+        selected["model"] = "auto"
     if selected["base_url"].lower().endswith("/messages"):
         raise HTTPException(400, "Enter the base URL, without an API operation suffix.")
     return {**selected, "protocol": value["protocol"], "auth_header": value["auth_header"],
@@ -179,11 +185,13 @@ class ConnectionStore:
                 cached = self.catalog_cache.get(cache_key)
                 if cached and time.monotonic() - cached[0] < 300:
                     models = cached[1]
-                elif session is None:  # Public session projection never makes network calls.
+                elif session is None and backend != "cursor":  # Cursor discovery uses an async CLI probe.
                     models = discover_models(value)
                     self.catalog_cache[cache_key] = (time.monotonic(), models)
                     if len(self.catalog_cache) > 32:
                         self.catalog_cache.pop(next(iter(self.catalog_cache)))
+                if backend == "cursor" and not models:
+                    models = [{"value": "auto", "label": "Auto"}]
                 model = value.get("model")
                 if model and not any(item["value"] == model for item in models):
                     models = [{"value": model, "label": model}, *models]
@@ -224,7 +232,13 @@ class ConnectionStore:
             else:
                 with os.fdopen(fd, "w") as stream:
                     stream.write(content)
-            return env, str(path)
+        return env, str(path)
+
+    def cursor_overrides(self, session: dict) -> dict:
+        if session.get("backend") != "cursor" or session.get("provider_connection") != "custom":
+            return {}
+        from cursor_api_key import overrides
+        return overrides(self.for_session(session)["api_key"])
 
     def opencode_overrides(self, session: dict, env: dict) -> dict:
         value = self.for_session(session)
@@ -465,7 +479,7 @@ def native_account_metadata(backend: str, *, env=None, cursor_executable=None, c
 
 
 def create_router(*, authorize, store: ConnectionStore, check=probe, account=native_account_metadata,
-                  codex_store=None, codex_set_model=None, session_lookup=None) -> APIRouter:
+                  codex_store=None, codex_set_model=None, session_lookup=None, cursor_catalog=None) -> APIRouter:
     router = APIRouter()
     locks = {name: asyncio.Lock() for name in PROTOCOLS}
 
@@ -495,7 +509,7 @@ def create_router(*, authorize, store: ConnectionStore, check=probe, account=nat
         return JSONResponse(value, headers={"Cache-Control": "no-store"})
 
     async def model_selection(backend, session_id=None):
-        if backend not in {"codex", "claude", "opencode"}:
+        if backend not in {"codex", "claude", "opencode", "cursor"}:
             raise HTTPException(400, "Unsupported custom endpoint.")
         session = session_lookup(session_id) if session_id and session_lookup else None
         if session_id and (not session or session.get("backend") != backend):
@@ -513,7 +527,11 @@ def create_router(*, authorize, store: ConnectionStore, check=probe, account=nat
     async def models(backend: str, request: Request, session_id: str | None = None):
         authorize(request)
         selected = await model_selection(backend, session_id)
-        result = await asyncio.to_thread(endpoint_model_catalog, selected, protocol=selected.get("protocol", "responses"))
+        if backend == "cursor":
+            if cursor_catalog is None: raise HTTPException(501, "Cursor API keys are unavailable.")
+            result = await cursor_catalog(selected)
+        else:
+            result = await asyncio.to_thread(endpoint_model_catalog, selected, protocol=selected.get("protocol", "responses"))
         # Fence a settings read that raced replacement/forget. Session bindings
         # deliberately remain usable independently of the current settings.
         if not session_id:
@@ -591,10 +609,17 @@ def create_router(*, authorize, store: ConnectionStore, check=probe, account=nat
             if selected is None:
                 raise HTTPException(409, "Save an endpoint before checking it.")
             try:
-                result = await check(selected)
+                if backend == "cursor":
+                    if cursor_catalog is None: raise HTTPException(501, "Cursor API keys are unavailable.")
+                    discovered = await cursor_catalog(selected)
+                    result = "cli_update_required" if discovered.get("cli_update_required") else "verified" if discovered["discovery_status"] == "ready" and discovered["models"] else "connection_failed"
+                else:
+                    result = await check(selected)
                 if request.method == "PUT" and result != "verified":
                     return reply({"ok": False, "status": result})
                 configuration = await asyncio.to_thread(store.write, backend, expected, selected, result)
+                if backend == "cursor" and result == "verified":
+                    store.catalog_cache[(backend, configuration["revision"])] = (time.monotonic(), discovered["models"])
                 return reply({"ok": result == "verified", "status": result, "configuration": configuration})
             finally:
                 selected.clear()

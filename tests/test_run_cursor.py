@@ -330,6 +330,31 @@ print(json.dumps({"type":"result","subtype":"success","session_id":"native-mcp",
         with self.assertRaises(agent_server.ProviderToolError):
             await agent_server.provider_tool_capability_snapshot(self.session_id, run_id, **kwargs)
 
+    async def test_api_key_turn_uses_pinned_key_without_updating_native_login_status(self):
+        from tests.test_cursor_api_key import INPUT
+        store = agent_server.provider_connections.ConnectionStore(Path(self.tempdir.name) / "connections")
+        store.write("cursor", 0, INPUT, "verified")
+        self.session["provider_connection"] = "custom"
+        bound = store.bind(self.session)
+        self.session["provider_connection_revision"] = bound["credential_id"]
+        script = _write_fake_cli(Path(self.tempdir.name), FAKE_AGENT_CLI.replace(
+            'cwd = os.getcwd()', '''assert os.environ['CURSOR_API_KEY'] == 'synthetic-cursor-key'
+assert os.environ['CURSOR_AUTH_TOKEN'] == ''
+assert os.environ['AGENT_CLI_CREDENTIAL_STORE'] == 'memory'
+assert os.environ['CURSOR_API_ENDPOINT'] == 'https://api2.cursor.sh'
+assert os.environ['DIRENV_DISABLE'] == '1'
+assert 'synthetic-cursor-key' not in repr(sys.argv)
+cwd = os.getcwd()'''))
+        self.session["_cursor_executable"] = str(script)
+        with patch.object(agent_server, "PROVIDER_CONNECTION_STORE", store), patch.object(agent_server, "record_runtime_success") as success, patch.object(agent_server, "record_runtime_failure") as failure:
+            await agent_server.run_cursor(self.session_id, "run-cursor-1", "hello", dict(self.session), Path(self.tempdir.name) / "manifest.json")
+            success.assert_not_called()
+            failure.assert_not_called()
+            events = self._read_events()
+            terminal = next(e for e in events if e["type"] == "turn_finished")
+            self.assertEqual(terminal["exit_code"], 0)
+            self.assertNotIn(INPUT["api_key"], json.dumps(events))
+
     async def test_full_turn_emits_tool_and_assistant_and_terminal_events(self) -> None:
         script = _write_fake_cli(Path(self.tempdir.name), FAKE_AGENT_CLI)
         self.session["_cursor_executable"] = str(script)

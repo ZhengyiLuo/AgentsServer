@@ -1,5 +1,24 @@
 # Development and release log
 
+## 2026-09-27 — Apply saved Codex endpoints to existing chats — source acceptance
+
+- Saving an endpoint or key now moves existing custom Codex chats to that
+  saved configuration at the next safe idle boundary. Reload also recovers
+  chats pinned by older versions. Current turns and descendants retain their
+  credential owner until finished; ordinary account credentials stay intact.
+- Ordinary and custom Codex can use the same native chat identity. A scoped
+  native archive/unarchive handoff releases the old process writer while
+  preserving history and goals; interrupted unarchive has durable recovery.
+  Different upstreams can reject native encrypted history, which is preserved.
+- Validation: 93 focused server checks, followed by 14 refresh and recovery
+  checks after the final catalog-cache adjustment. Full isolated server with
+  real Codex 0.156.1 and a synthetic Responses endpoint reproduced the stale
+  key failure and verified recovery, repeated busy saves, Reload, provider
+  round trips, retained native identity/history and unchanged account config.
+  Native tests also retained an unrelated active turn across writer handoff.
+- Availability: tested server source; app acceptance and deployment are recorded
+  separately in the coordinated desktop development log.
+
 ## 2026-09-21 — Avoid redundant history scans on chat switches — source acceptance
 
 - Return unchanged timeline deltas before looking up fork provenance. For new

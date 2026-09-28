@@ -333,6 +333,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         self.manager.close = AsyncMock()
         self.ns.update({"codex_provider": provider, "CODEX_PROVIDER_STORE": self.store,
             "CODEX_PROVIDER_SETTINGS_LOCK": asyncio.Lock(),
+            "schedule_codex_subagent_limit_application": Mock(), "broadcast_codex_provider_changed": AsyncMock(),
             "STORE": SimpleNamespace(_lock=asyncio.Lock(), sessions={}, save=AsyncMock()),
             "session_codex_thread_id": lambda session: session.get("codex_thread_id", ""),
             "CODEX_APP_SERVER_MANAGER": self.manager, "CODEX_APP_SERVER_MANAGER_EPOCH": 1,

@@ -193,6 +193,19 @@ def session_choice(value) -> str:
     return choice
 
 
+RUNTIME_FIELDS = ("codex_provider", "codex_provider_revision", "codex_provider_binding", "model", "effort", "_codex_provider_removed")
+
+
+def requested_session(session: dict) -> dict:
+    """Desired runtime is separate from the owner of an in-flight turn."""
+    pending = session.get("_codex_provider_pending")
+    return {**session, **pending} if isinstance(pending, dict) else dict(session)
+
+
+def runtime_selection(session: dict) -> dict:
+    return {key: session.get(key) for key in RUNTIME_FIELDS}
+
+
 class ProviderStore:
     """Atomic metadata pointer plus private, endpoint-bound credential records."""
     def __init__(self, root: Path):
@@ -305,6 +318,8 @@ class ProviderStore:
     def for_session(self, session: dict, *, include_key=False) -> dict | None:
         if session_choice(session.get("codex_provider")) == "default":
             return None
+        if session.get("_codex_provider_removed"):
+            raise HTTPException(409, "Configure the custom Codex endpoint before using this chat.")
         revision = session.get("codex_provider_revision")
         selected = self.selection(include_key=include_key, revision=revision, include_revision=True)
         if selected is None:
@@ -315,6 +330,21 @@ class ProviderStore:
         if model:
             selected["model"] = validate_model(model)
         return selected
+
+    def control(self, session: dict) -> dict:
+        requested = requested_session(session)
+        def endpoint(value):
+            if session_choice(value.get("codex_provider")) != "custom" or value.get("_codex_provider_removed"):
+                return None
+            try:
+                selected = self._public_selections.get(value.get("codex_provider_revision")) or self.for_session(value)
+                return selected.get("base_url") if selected else None
+            except HTTPException:
+                return None
+        return {"pending": isinstance(session.get("_codex_provider_pending"), dict),
+            "requested_provider": session_choice(requested.get("codex_provider")),
+            "active_provider": session_choice(session.get("codex_provider")),
+            "requested_base_url": endpoint(requested), "active_base_url": endpoint(session)}
 
     def registration(self, *, include_key=False) -> dict | None:
         # A damaged optional endpoint must not prevent normal Codex startup.
@@ -543,6 +573,8 @@ class ProviderStore:
             if selected:
                 self._atomic(self._binding_name(thread_id), {"binding": binding(selected),
                     "credential_id": selected.get("credential_id")})
+            else:
+                self._atomic(self._binding_name(thread_id), {"binding": None, "credential_id": None})
 
     def for_thread(self, thread_id: str, *, include_key=False) -> dict | None:
         with self.lock:

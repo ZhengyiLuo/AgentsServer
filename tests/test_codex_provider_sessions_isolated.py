@@ -27,7 +27,7 @@ FUNCTIONS = {"preview_session_runtime_update", "session_backend_locked", "public
     "effective_opencode_permission_mode", "ensure_opencode_permission_mode_update_allowed",
     "session_subagent_limit_control", "validate_session_subagent_limit",
     "record_codex_subagent_limit_application", "broadcast_codex_subagent_limit", "codex_requested_subagent_limit", "codex_applied_subagent_limit",
-    "create_session", "create_session_with_history", "update_session", "ensure_backend_update_allowed", "codex_runtime_settings", "_fork_session_locked"}
+    "apply_codex_provider_when_idle", "broadcast_codex_provider_changed", "create_session", "create_session_with_history", "update_session", "ensure_backend_update_allowed", "codex_runtime_settings", "_fork_session_locked"}
 MODELS = {"CreateSessionRequest", "UpdateSessionRequest"}
 tree = ast.parse(SOURCE.read_text())
 nodes = []
@@ -60,6 +60,10 @@ def make_namespace(root: Path):
         "RUNTIME_DIAGNOSTICS_LOCK": threading.RLock(),
         "SERVER_INSTANCE_ID": "owned-server-instance",
         "existing_codex_app_server_manager": lambda session: None,
+        "SERVER_MAINTENANCE_SESSIONS": set(), "SIDE_QUESTIONS": SimpleNamespace(active_session_ids=lambda: set()),
+        "codex_session_has_live_subagents": Mock(return_value=False), "CODEX_GOAL_SYNC_GENERATIONS": {},
+        "release_idle_codex_manager_session": AsyncMock(return_value=True), "release_codex_provider_writers": AsyncMock(),
+        "CODEX_SUBAGENT_INDEX_LOCK": threading.RLock(), "CODEX_SUBAGENT_STATE": {}, "CODEX_NATIVE_ACTION_TASKS": {}, "codex_normal_model_provider": lambda: "openai",
         "schedule_codex_subagent_limit_application": Mock(), "broadcast_provider_runtime_changed": AsyncMock(),
         "HTTPException": HTTPException, "codex_provider": codex_provider,
         "MAX_SESSION_SYSTEM_PROMPT_CHARS": 10000, "DEFAULT_BACKEND": "codex",
@@ -111,7 +115,7 @@ def make_namespace(root: Path):
     store.sessions = {}
     store._lock = asyncio.Lock()
     store.top_order_for_section = lambda *args, **kwargs: 1000
-    async def save():
+    async def save(**kwargs):
         (root / "sessions.json").write_text(json.dumps(store.sessions))
     store.save = AsyncMock(side_effect=save)
     async def persist_restored_state(**kwargs):
@@ -167,7 +171,7 @@ class PerChatTests(unittest.IsolatedAsyncioTestCase):
         self.ns["read_native_session_title"].assert_called_once()
         self.ns["import_session_history"].assert_not_awaited()
 
-    async def test_changes_empty_chat_provider_with_implicit_model_reset_and_freezes_started_chat(self):
+    async def test_changes_provider_preserve_started_chat_and_reset_implicit_model(self):
         normal = await self.create(model="normal-model", effort="high")
         request = self.ns["UpdateSessionRequest"](codex_provider="custom")
         custom = (await self.ns["update_session"](normal["id"], request))["session"]
@@ -178,17 +182,16 @@ class PerChatTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(switched["model"])
         await self.ns["update_session"](normal["id"], request)
         self.ns["STORE"].sessions[normal["id"]]["backend_locked"] = True
-        with self.assertRaises(HTTPException) as caught:
-            await self.ns["update_session"](normal["id"], self.ns["UpdateSessionRequest"](codex_provider="default"))
-        self.assertEqual(caught.exception.status_code, 409)
-        self.assertEqual(self.ns["STORE"].sessions[normal["id"]]["codex_provider"], "custom")
+        await self.ns["update_session"](normal["id"], self.ns["UpdateSessionRequest"](codex_provider="default"))
+        self.assertEqual(self.ns["STORE"].sessions[normal["id"]]["codex_provider"], "default")
 
     async def test_active_first_turn_reservation_fences_provider_change_before_native_id(self):
         normal = await self.create()
         self.ns["BUSY_SESSIONS"].add(normal["id"])
-        with self.assertRaises(HTTPException) as caught:
-            await self.ns["update_session"](normal["id"], self.ns["UpdateSessionRequest"](codex_provider="custom"))
-        self.assertEqual(caught.exception.status_code, 409)
+        result = await self.ns["update_session"](normal["id"], self.ns["UpdateSessionRequest"](codex_provider="custom"))
+        self.assertEqual(result["session"]["codex_provider"], "default")
+        self.assertEqual(result["session"]["codex_provider_control"]["requested_provider"], "custom")
+        self.assertTrue(result["session"]["codex_provider_control"]["pending"])
 
     async def test_model_provider_params_and_history_binding_are_session_specific(self):
         normal = self.ns["STORE"].sessions[(await self.create())["id"]]

@@ -40,7 +40,7 @@ CONTROL_ACTIONS = frozenset({
     "job.delete", "job.toggle", "job.run", "approval.respond",
 })
 CONTROL_READ_ACTIONS = frozenset({"timeline.older", "timeline.around", "timeline.trace", "timeline.index", "jobs.runs", "runtime.catalog", "handoffs.get"})
-NATIVE_STATE_FIELDS = frozenset({"revision", "session", "events", "queue", "active", "goal", "jobs",
+NATIVE_STATE_FIELDS = frozenset({"revision", "session", "events", "queue", "queue_recovery", "active", "goal", "jobs",
     "codex_runtime", "claude_runtime", "health", "runtime_catalog", "hasMoreEvents", "nextTimelineBefore", "eventsTotal"})
 COOKIE = "__Secure-AgentsDock-Chat"
 HTTP_COOKIE = "AgentsDock-Chat"
@@ -206,11 +206,14 @@ def create_interactive_chat_share_router(*, storage_root, authorize, session_exi
         if not isinstance(value, dict) or not isinstance(value.get("revision"), str) or len(value["revision"]) > 128:
             raise HTTPException(503, "Shared conversation temporarily unavailable")
         if "session" in value:
-            if (set(value) - NATIVE_STATE_FIELDS or not isinstance(value["session"], dict)
+            if (not isinstance(value["session"], dict)
                     or value["session"].get("id") != grant["session_id"] or not isinstance(value.get("events"), list)
                     or any(not isinstance(item, dict) or item.get("session_id", grant["session_id"]) != grant["session_id"] for item in value["events"])):
                 raise HTTPException(503, "Shared conversation temporarily unavailable")
-            projected = {**value, "title": grant["title"]}
+            # Additive native metadata must neither break shared chats nor
+            # expose fields outside their explicit public projection.
+            projected = {key: value[key] for key in NATIVE_STATE_FIELDS if key in value}
+            projected["title"] = grant["title"]
         else:
             # Compatibility for the isolated text-projection adapter; the
             # deployed renderer receives native DTOs, never invented events.

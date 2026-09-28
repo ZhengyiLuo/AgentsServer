@@ -579,7 +579,8 @@ class InteractiveShareRouteTests(unittest.TestCase):
         request = SimpleNamespace(base_url=self.origin + "/", url=SimpleNamespace(query=""),
             headers={"cookie": COOKIE + "=" + cookie}, is_disconnected=mock.AsyncMock(return_value=False))
         endpoint = next(route.endpoint for route in self.router.routes if route.path.endswith("/{share_id}/events"))
-        idle = {"revision": "revision-idle", "session": {"id": "chat-one"}, "events": [], "active": False}
+        idle = {"revision": "revision-idle", "session": {"id": "chat-one"}, "events": [], "active": False,
+            "queue_recovery": {"status": "ready", "ready": True}}
         running = {**idle, "revision": "revision-running", "active": True}
         self.wait.return_value = True
         async def exercise(fail_initially):
@@ -599,6 +600,7 @@ class InteractiveShareRouteTests(unittest.TestCase):
             self.assertTrue(frame.startswith("event: state\n"))
             self.assertIn('"revision": "revision-running"', frame)
             self.assertIn('"active": true', frame)
+            self.assertIn('"queue_recovery": {"status": "ready", "ready": true}', frame)
             await restored.body_iterator.aclose()
         for initial in (True, False):
             with self.subTest(initial=initial):
@@ -664,17 +666,42 @@ class InteractiveShareRouteTests(unittest.TestCase):
         path, _ = self.redeem(self.create())
         native = {"revision": "native-1", "session": {"id": "chat-one"}, "events": [
             {"id": "native-event-one", "session_id": "chat-one", "seq": 9, "type": "assistant_text", "text": "Answer"}],
-            "queue": [], "active": False, "goal": None, "jobs": [], "codex_runtime": {}, "claude_runtime": {},
+            "queue": [], "queue_recovery": {"status": "ready", "ready": True},
+            "active": False, "goal": None, "jobs": [], "codex_runtime": {}, "claude_runtime": {},
             "health": {}, "runtime_catalog": {}, "hasMoreEvents": True, "nextTimelineBefore": 9, "eventsTotal": 9}
         self.load.return_value = native
         response = self.client.get(path + "/state")
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["events"], native["events"])
+        self.assertEqual(response.json()["queue_recovery"], native["queue_recovery"])
         self.assertNotIn("messages", response.json())
         self.load.return_value = {**native, "session": {"id": "other-chat"}}
         self.assertEqual(self.client.get(path + "/state").status_code, 503)
         self.load.return_value = {**native, "events": [{"session_id": "other-chat"}]}
         self.assertEqual(self.client.get(path + "/state").status_code, 503)
+
+    def test_native_additive_metadata_is_omitted_during_authenticated_read_and_resume(self):
+        share = self.create()
+        path, _ = self.redeem(share)
+        native = {"revision": "native-recovering", "session": {"id": "chat-one"}, "events": [],
+            "queue": [], "queue_recovery": {"status": "recovering", "ready": False},
+            "internal_metadata": {"private_path": "/synthetic/private", "secret": "synthetic-secret"}}
+        self.load.return_value = native
+        response = self.client.get(path + "/state")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["queue_recovery"], native["queue_recovery"])
+        self.assertNotIn("internal_metadata", response.json())
+        self.assertNotIn("synthetic-secret", response.text)
+        self.load.return_value = {**native, "revision": "native-ready",
+            "queue_recovery": {"status": "ready", "ready": True}}
+        # A reconnect reuses the authenticated cookie without redeeming again.
+        resumed = self.client.get(path + "/state")
+        self.assertEqual(resumed.status_code, 200, resumed.text)
+        self.assertEqual(resumed.json()["revision"], "native-ready")
+        self.assertEqual(resumed.json()["queue_recovery"], {"status": "ready", "ready": True})
+        self.assertNotIn("internal_metadata", resumed.json())
+        InteractiveChatShareStore.open_existing(self.root).revoke_share(share["id"], session_id="chat-one")
+        self.assertEqual(self.client.get(path + "/state").status_code, 404)
 
     def test_control_receipt_result_and_trusted_scope_replay_without_duplicate(self):
         share = self.create()

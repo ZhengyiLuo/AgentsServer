@@ -55551,6 +55551,31 @@ async def release_idle_codex_manager_session(manager: CodexAppServerManager, ses
     try:
         threads = [thread for thread in tuple(manager.client._loaded_threads)
                    if codex_session_id_for_thread(thread) == session_id]
+        # Native unsubscribe can clear our subscription while that process
+        # still owns the writer. Only native ownership may add such a thread:
+        # a persisted parent alone could belong to another process entirely.
+        if manager.ready and (threads or session_provider_id(STORE.sessions.get(session_id) or {})):
+            cursor = None
+            seen_cursors = set()
+            while True:
+                params = {"limit": 100}
+                if cursor is not None:
+                    params["cursor"] = cursor
+                page = await asyncio.wait_for(manager.request("thread/loaded/list", params),
+                    timeout=max(0.0, deadline - time.monotonic()))
+                if not isinstance(page, dict) or not isinstance(page.get("data"), list):
+                    raise RuntimeError("Codex returned invalid native thread ownership")
+                for thread in page["data"]:
+                    if not isinstance(thread, str):
+                        raise RuntimeError("Codex returned invalid native thread ownership")
+                    if codex_session_id_for_thread(thread) == session_id and thread not in threads:
+                        threads.append(thread)
+                cursor = page.get("nextCursor")
+                if cursor is None:
+                    break
+                if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+                    raise RuntimeError("Codex returned invalid native thread ownership cursor")
+                seen_cursors.add(cursor)
         for thread in threads:
             if time.monotonic() >= deadline:
                 return False
@@ -55575,12 +55600,17 @@ async def release_idle_codex_manager_session(manager: CodexAppServerManager, ses
             # request may now own the process even without a registered turn.
             if terminals or blocked(own_maintenance=True):
                 return False
-            evicted = await asyncio.wait_for(evict_codex_app_server_thread(manager, thread, reinsert_on_failure=True),
-                timeout=max(0.0, deadline - time.monotonic()))
-            if not evicted or manager.is_thread_loaded(thread):
-                return False
+            if manager.is_thread_loaded(thread):
+                evicted = await asyncio.wait_for(evict_codex_app_server_thread(manager, thread, reinsert_on_failure=True),
+                    timeout=max(0.0, deadline - time.monotonic()))
+                if not evicted or manager.is_thread_loaded(thread):
+                    return False
         if blocked(own_maintenance=True):
             return False
+        # Unsubscribe removes the client subscription, but native Codex keeps
+        # the native writer alive. Release it before another manager can own
+        # this chat; unrelated active chats keep their current process.
+        await release_codex_provider_writers(manager, session_id, threads)
         if CODEX_SESSION_APP_SERVER_MANAGERS.get(session_id) is manager:
             CODEX_SESSION_APP_SERVER_MANAGERS.pop(session_id, None)
             CODEX_GOAL_SYNC_GENERATIONS.pop(session_id, None)
@@ -83383,7 +83413,7 @@ async def broadcast_codex_provider_changed(session_id: str) -> None:
 async def release_codex_provider_writers(manager: CodexAppServerManager, session_id: str, threads: list[str]) -> None:
     """Native unsubscribe detaches listeners; archive/unarchive releases writers.
 
-    On Codex 0.156+, an unsubscribed thread can remain loaded in its old
+    An unsubscribed native Codex thread can remain loaded in its old
     process. The native archive lifecycle stops exactly that idle runtime and
     the matching unarchive preserves its ID, full history and native goal.
     The durable marker makes interruption recoverable without hiding a chat.
@@ -83457,15 +83487,8 @@ async def apply_codex_provider_when_idle(session_id: str, *, ignore_task=None) -
         return False
     manager = existing_codex_app_server_manager(session)
     if manager is not None:
-        thread_id = session_codex_thread_id(session)
-        with CODEX_SUBAGENT_INDEX_LOCK:
-            threads = [thread_id] if thread_id else []
-            threads += [child for child, state in CODEX_SUBAGENT_STATE.items()
-                        if state.get("session_id") == session_id and child != thread_id
-                        and manager.is_thread_loaded(child)]
         if not await release_idle_codex_manager_session(manager, session_id, ignore_task=ignore_task):
             return False
-        await release_codex_provider_writers(manager, session_id, threads)
     elif session.get("_codex_provider_unarchive_pending"):
         manager = await codex_app_server_manager(session)
         await release_codex_provider_writers(manager, session_id, [])
@@ -88286,6 +88309,19 @@ async def reload_session_provider(session_id: str) -> dict[str, Any]:
                     was_loaded = bool(manager.is_thread_loaded(provider_id))
                     if was_loaded:
                         try:
+                            native_goal = await manager.get_thread_goal(provider_id)
+                        except CodexAppServerRequestError as exc:
+                            if exc.code not in {-32600, -32601}:
+                                raise HTTPException(status_code=409,
+                                    detail="Codex goal state could not be inspected; reload was not attempted.") from exc
+                            native_goal = None
+                        except Exception as exc:
+                            raise HTTPException(status_code=409,
+                                detail="Codex goal state could not be inspected; reload was not attempted.") from exc
+                        if isinstance(native_goal, dict) and native_goal.get("status") == "active":
+                            raise HTTPException(status_code=409,
+                                detail="Pause or stop the active Codex goal before reloading this chat.")
+                        try:
                             terminals = await manager.list_background_terminals(
                                 provider_id
                             )
@@ -88328,6 +88364,7 @@ async def reload_session_provider(session_id: str) -> dict[str, Any]:
                                     "its provider lifecycle to become idle."
                                 ),
                             )
+                        await release_codex_provider_writers(manager, session_id, [provider_id])
                 runtime = await codex_runtime_snapshot(session_id)
 
             latest_session = STORE.sessions.get(session_id) or session

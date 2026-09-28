@@ -31,7 +31,10 @@ class RefreshTests(unittest.IsolatedAsyncioTestCase):
         self.loaded=True
         self.manager=SimpleNamespace(generation=1,_agentsdock_provider_revision=self.original_revision,is_thread_loaded=lambda tid:self.loaded,active_turn=lambda tid:None)
         self.ns['existing_codex_app_server_manager']=lambda sess:self.manager if self.loaded else None
-        async def release(*args,**kwargs):self.loaded=False;return True
+        async def release(manager, sid, **kwargs):
+            self.loaded=False
+            await self.ns['release_codex_provider_writers'](manager,sid,['thread-parent'])
+            return True
         self.release=AsyncMock(side_effect=release);self.ns['release_idle_codex_manager_session']=self.release
     async def asyncTearDown(self):
         tasks=tuple(self.ns['CODEX_SUBAGENT_LIMIT_TASKS'].values())
@@ -73,6 +76,20 @@ class RefreshTests(unittest.IsolatedAsyncioTestCase):
         result=await self.ns['reload_session_provider'](self.sid)
         self.assertTrue(result['reloaded']);self.assertEqual(self.actual()['api_key'],'historical-current')
         self.assertEqual(self.chat['session_id'],'thread-parent')
+    async def test_reload_recovers_pending_unarchive_before_reporting_unloaded(self):
+        self.chat['_codex_provider_unarchive_pending']=['thread-parent']
+        self.loaded=False
+        self.ns['codex_app_server_manager']=AsyncMock(return_value=self.manager)
+        self.manager.request=AsyncMock(return_value={})
+        self.ns['join_task_despite_caller_cancellation']=lambda task:task
+        node=next(n for n in TREE.body if isinstance(n,ast.AsyncFunctionDef) and n.name=='release_codex_provider_writers')
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[node],type_ignores=[])),'agent_server.py','exec',flags=__import__('__future__').annotations.compiler_flag),self.ns)
+        result=await self.ns['reload_session_provider'](self.sid)
+        self.assertTrue(result['reloaded'])
+        self.assertNotIn('_codex_provider_unarchive_pending',self.chat)
+        self.assertEqual([x.args[0] for x in self.manager.request.await_args_list],
+            ['thread/unarchive','thread/archive','thread/unarchive'])
+
     async def test_restart_applies_persisted_pending_without_loaded_owner(self):
         self.ns['BUSY_SESSIONS'].add(self.sid);await self.save();await self.settle();self.ns['BUSY_SESSIONS'].clear();self.loaded=False
         self.assertTrue(await self.ns['apply_codex_provider_when_idle'](self.sid));self.assertEqual(self.actual()['api_key'],'new-key')

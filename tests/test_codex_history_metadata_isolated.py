@@ -42,6 +42,9 @@ def projection():
     ), *selected], type_ignores=[]))
     ns.update({
         "os": os, "defaultdict": defaultdict,
+        # Queue checkpoint durability has its own full-writer tests; this
+        # AST fixture isolates preservation of imported history metadata.
+        "record_queue_projection_append": lambda *_args, **_kwargs: None,
         "HISTORY_SYNC_CURSOR_VERSION": 1, "HISTORY_SYNC_EVENT_SCAN_LIMIT": 400,
         "MAX_WORKSPACE_PATH_CHARS": 4096, "MAX_LOCAL_TRANSCRIPT_BYTES": 100_000_000,
         "MAX_LOCAL_TRANSCRIPT_LINE_BYTES": 4 * 1024 * 1024,

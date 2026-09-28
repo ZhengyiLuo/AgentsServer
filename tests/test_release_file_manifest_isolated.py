@@ -25,6 +25,7 @@ NEW_MODULES = {
     "title_generation.py",
     "server_instances.py",
     "chat_mailbox.py",
+    "queue_projection.py",
     "claude_background_reconciliation.py",
     "claude_model_catalog.py",
     "claude_goals.py",

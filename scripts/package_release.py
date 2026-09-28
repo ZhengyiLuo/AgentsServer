@@ -47,6 +47,7 @@ FILES = (
     "agentsdock_jobs.py",
     "agentsdock_chats.py",
     "chat_mailbox.py",
+    "queue_projection.py",
     "agentsdock_emergency.py",
     "agentsdock_publish.py",
     "agentsdock_mail.py",

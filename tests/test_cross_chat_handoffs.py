@@ -1236,6 +1236,7 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             agent_server,
             "schedule_next_queued_turn",
         ) as schedule:
+            agent_server.initialize_queue_recovery()
             rebuilt, scheduled = await agent_server.recover_queued_turns_after_start()
         self.assertEqual((rebuilt, scheduled), (1, 1))
         bound = await agent_server.CROSS_CHAT.get(record["id"])
@@ -9326,6 +9327,7 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             patch.object(agent_server, "append_durable_event", AsyncMock()),
             patch.object(agent_server, "schedule_next_queued_turn") as schedule,
         ):
+            agent_server.initialize_queue_recovery()
             rebuilt, scheduled = await agent_server.recover_queued_turns_after_start()
         self.assertEqual((rebuilt, scheduled), (1, 1))
         schedule.assert_called_once_with("target")

@@ -74,6 +74,7 @@ import uvicorn
 import websockets
 import team_mail_grants
 import chat_mailbox
+import queue_projection
 import workspace_git
 import codex_auth
 import codex_provider
@@ -5463,6 +5464,8 @@ def repair_event_log_tail(path: Path) -> int:
                 stream.truncate()
                 stream.flush()
                 os.fsync(stream.fileno())
+                with suppress(OSError):
+                    queue_projection.invalidate(path)
                 with suppress(OSError):
                     events_index_path(path).unlink()
                 return last_event_seq_from_file(path)
@@ -14021,13 +14024,13 @@ DETACHED_STOP_TASKS_BY_SESSION: dict[str, set[asyncio.Task[Any]]] = {}
 ACTIVE_LOCK = asyncio.Lock()
 QUEUED_TURNS: dict[str, deque[dict[str, Any]]] = {}
 RUN_NOW_TURNS: dict[str, dict[str, Any]] = {}
-# Startup rebuilds durable queue rows from append-only chat timelines. While
-# this task is present, every queue/start admission must wait for the same
-# generation (or fail retryably) so a new prompt cannot leapfrog an older row
-# that the scan has not discovered yet. A completed failed task intentionally
-# remains installed and keeps admission fail-closed.
+# Startup recovery owns each chat independently. The coordinator is background
+# work only; admission waits for the requested chat's task, never the sweep.
 QUEUE_RECOVERY_TASK: asyncio.Task[tuple[int, int]] | None = None
-QUEUE_RECOVERY_ADMISSION_WAIT_SECONDS = 2.0
+QUEUE_RECOVERY_PENDING: dict[str, dict[str, Any]] = {}
+QUEUE_RECOVERY_SESSION_TASKS: dict[str, asyncio.Task[tuple[int, int]]] = {}
+QUEUE_RECOVERY_ERRORS: dict[str, str] = {}
+QUEUE_RECOVERY_STOPPED: set[str] = set()
 STEERING_SESSIONS: set[str] = set()
 # A non-native Force Send keeps the steering fence while the interrupted
 # provider releases BUSY. Track that short-lived owner explicitly so a
@@ -16895,6 +16898,7 @@ async def append_event(
             with path.open("ab") as f:
                 line_offset = f.tell()
                 f.write((json.dumps(event, separators=(",", ":")) + "\n").encode("utf-8"))
+                line_end = f.tell()
         except BaseException:
             # A short/failed write may have left a non-newline fragment. Force
             # the next append through the repair path while keeping the
@@ -16905,6 +16909,7 @@ async def append_event(
                 consumed_high_water=seq,
             )
             raise
+        await asyncio.to_thread(record_queue_projection_append, path, session_id, line_offset, [event], line_end)
         if seq % EVENT_INDEX_STRIDE == 0:
             # Sparse catch-up checkpoint; a failure only costs a full scan.
             with suppress(Exception):
@@ -16940,6 +16945,7 @@ def append_imported_events_sync(
     """Write one rollback-capable imported JSONL batch off the event loop."""
     original_size = path.stat().st_size if path.exists() else 0
     last_seq = first_seq - 1
+    projection_events: list[dict[str, Any]] = []
     try:
         with path.open("a", encoding="utf-8") as stream:
             for event_type, payload in imported_events:
@@ -16961,8 +16967,11 @@ def append_imported_events_sync(
                     **stored_payload,
                 }
                 stream.write(json.dumps(event, separators=(",", ":")) + "\n")
+                if event.get("queued_id") or str(event.get("type") or "").startswith("turn_queue") or event.get("cross_chat_envelope_id"):
+                    projection_events.append(event)
             stream.flush()
             os.fsync(stream.fileno())
+            committed_end = stream.tell()
     except BaseException:
         with suppress(OSError):
             with path.open("r+b") as stream:
@@ -16970,6 +16979,7 @@ def append_imported_events_sync(
                 stream.flush()
                 os.fsync(stream.fileno())
         raise
+    record_queue_projection_append(path, session_id, original_size, projection_events, committed_end)
     return last_seq
 
 
@@ -17060,6 +17070,7 @@ def append_durable_event_batch_sync(
                 events.append(event)
             stream.flush()
             os.fsync(stream.fileno())
+            committed_end = stream.tell()
     except BaseException:
         with suppress(OSError):
             with path.open("r+b") as stream:
@@ -17067,6 +17078,7 @@ def append_durable_event_batch_sync(
                 stream.flush()
                 os.fsync(stream.fileno())
         raise
+    record_queue_projection_append(path, session_id, original_size, events, committed_end)
     return events
 
 
@@ -17415,51 +17427,122 @@ async def update_session_event_metadata(session_id: str, event: dict[str, Any]) 
         await STORE.save(flush=False)
 
 
-async def wait_for_queue_recovery_admission() -> None:
-    """Wait briefly for the one startup queue scan, then fail retryably.
+def initialize_queue_recovery() -> None:
+    """Register startup chats before schedulers or requests can admit work."""
+    QUEUE_RECOVERY_PENDING.clear()
+    QUEUE_RECOVERY_PENDING.update(
+        (session_id, dict(sess)) for session_id, sess in STORE.sessions.items()
+    )
+    QUEUE_RECOVERY_SESSION_TASKS.clear()
+    QUEUE_RECOVERY_ERRORS.clear()
+    QUEUE_RECOVERY_STOPPED.clear()
 
-    The shared recovery task is shielded because disconnecting one request
-    must never cancel the only owner of the durable queue rebuild. A failed
-    scan remains authoritative until process restart rather than opening an
-    ordering hole with only a partial in-memory queue.
+
+def queue_recovery_status(session_id: str | None = None) -> dict[str, Any]:
+    if session_id is not None:
+        task = QUEUE_RECOVERY_SESSION_TASKS.get(session_id)
+        status = (
+            "ready" if session_id not in QUEUE_RECOVERY_PENDING
+            else "recovering" if task is not None and not task.done()
+            else "failed" if session_id in QUEUE_RECOVERY_ERRORS
+            else "pending"
+        )
+        return {"status": status, "ready": status == "ready"}
+    pending = len(QUEUE_RECOVERY_PENDING)
+    recovering = sum(not task.done() for task in QUEUE_RECOVERY_SESSION_TASKS.values())
+    failed = sum(sid in QUEUE_RECOVERY_PENDING for sid in QUEUE_RECOVERY_ERRORS)
+    return {
+        "status": "ready" if not pending else "recovering" if recovering else "failed" if failed else "pending",
+        "all_chats_ready": not pending,
+        "pending_sessions": pending,
+        "recovering_sessions": recovering,
+        "failed_sessions": failed,
+    }
+
+
+def request_queue_recovery(session_id: str) -> asyncio.Task[tuple[int, int]] | None:
+    """Prioritize one chat and share its owner across readers and admissions."""
+    if session_id not in QUEUE_RECOVERY_PENDING or SERVER_SHUTTING_DOWN:
+        return None
+    task = QUEUE_RECOVERY_SESSION_TASKS.get(session_id)
+    if task is not None and not task.done():
+        return task
+    # A failed chat is retried only by a subsequent request, never by a timer.
+    # No await separates registration from ownership, so concurrent callers
+    # cannot create duplicate scan/install owners.
+    QUEUE_RECOVERY_ERRORS.pop(session_id, None)
+
+    async def recover() -> tuple[int, int]:
+        try:
+            result = await recover_queued_turns_for_session(session_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            QUEUE_RECOVERY_ERRORS[session_id] = concise_error_message(exc)
+            logger.exception("queued turn recovery failed session=%s; retry this chat", session_id)
+            raise
+        else:
+            QUEUE_RECOVERY_PENDING.pop(session_id, None)
+            QUEUE_RECOVERY_ERRORS.pop(session_id, None)
+            # Readers can open history while recovery runs. Notify them once
+            # the durable queue is authoritative, including an empty result.
+            if session_id in STORE.sessions and session_id not in DELETING_SESSIONS:
+                with suppress(Exception):
+                    rows = await queued_turns_snapshot(session_id)
+                    await HUB.broadcast(session_id, {
+                        "type": "queue_snapshot",
+                        "ephemeral": True,
+                        "session_id": session_id,
+                        "queued_turns": rows,
+                        "positions": [
+                            {"queued_id": row["queued_id"], "position": row["position"]}
+                            for row in rows
+                        ],
+                        "queue_recovery": queue_recovery_status(session_id),
+                    })
+            if result[1]:
+                schedule_next_queued_turn(session_id)
+            if session_id in CHAT_MAILBOX_PENDING:
+                schedule_chat_mailbox_wake(session_id)
+            return result
+
+    task = asyncio.create_task(recover(), name=f"queued-turn-recovery:{session_id}")
+    QUEUE_RECOVERY_SESSION_TASKS[session_id] = task
+
+    def finish(completed: asyncio.Task[tuple[int, int]]) -> None:
+        # Background/read-triggered failures are observable through status;
+        # retrieve the exception even when there is no admission waiter.
+        if not completed.cancelled():
+            completed.exception()
+        if QUEUE_RECOVERY_SESSION_TASKS.get(session_id) is completed:
+            QUEUE_RECOVERY_SESSION_TASKS.pop(session_id, None)
+
+    task.add_done_callback(finish)
+    return task
+
+
+async def wait_for_queue_recovery_admission(session_id: str) -> None:
+    """Wait only for this chat, without letting a disconnected caller cancel it.
+
+    Recovery never acquires the lifecycle lock: internal delivery can safely
+    enter here with that lock already held. The queue lock protects install.
     """
-
-    recovery = QUEUE_RECOVERY_TASK
+    recovery = request_queue_recovery(session_id)
     if recovery is None or recovery is asyncio.current_task():
         return
     try:
-        await asyncio.wait_for(
-            asyncio.shield(recovery),
-            timeout=max(0.0, QUEUE_RECOVERY_ADMISSION_WAIT_SECONDS),
-        )
-    except asyncio.TimeoutError as exc:
-        raise TransientAdmissionWait(
-            status_code=503,
-            detail=(
-                "queued turn recovery is still in progress; retry this "
-                "request shortly"
-            ),
-        ) from exc
+        await asyncio.shield(recovery)
     except asyncio.CancelledError:
-        # Caller cancellation propagates normally. If the shared task itself
-        # was cancelled outside shutdown, convert that failed recovery into a
-        # retryable fail-closed admission result.
         if recovery.cancelled() and not SERVER_SHUTTING_DOWN:
             raise TransientAdmissionWait(
                 status_code=503,
-                detail=(
-                    "queued turn recovery did not complete; restart or retry "
-                    "the managed server"
-                ),
+                detail="This chat's queued turn recovery did not complete; retry this request.",
             ) from None
         raise
     except Exception as exc:
         raise TransientAdmissionWait(
             status_code=503,
-            detail=(
-                "queued turn recovery did not complete; restart or retry the "
-                "managed server"
-            ),
+            detail="This chat's queued turn recovery did not complete; retry this request.",
         ) from exc
 
 
@@ -17472,7 +17555,7 @@ async def enqueue_turn(
     secure_peer_route_snapshots: list[dict[str, Any]] | None = None,
     reciprocal_route_grant: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    await wait_for_queue_recovery_admission()
+    await wait_for_queue_recovery_admission(session_id)
     if not routed_references_match_visible_prompt(
         req.prompt,
         req.display_prompt,
@@ -18009,7 +18092,7 @@ async def enqueue_turn(
 
 
 async def unqueue_turn(session_id: str, queued_id: str) -> dict[str, Any]:
-    await wait_for_queue_recovery_admission()
+    await wait_for_queue_recovery_admission(session_id)
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
 
@@ -22412,7 +22495,7 @@ def public_queued_turn(
 
 
 async def queued_turns_snapshot(session_id: str) -> list[dict[str, Any]]:
-    await wait_for_queue_recovery_admission()
+    request_queue_recovery(session_id)
     async with QUEUE_LOCK:
         queue = list(QUEUED_TURNS.get(session_id) or [])
         run_now = RUN_NOW_TURNS.get(session_id)
@@ -22472,7 +22555,7 @@ def reject_promoted_queue_mutation(session_id: str, queued_id: str) -> None:
 
 
 async def update_queued_turn(session_id: str, queued_id: str, req: UpdateQueuedTurnRequest) -> dict[str, Any]:
-    await wait_for_queue_recovery_admission()
+    await wait_for_queue_recovery_admission(session_id)
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
     async_result = await update_async_queued_message(session_id, queued_id, req)
@@ -22919,7 +23002,7 @@ async def update_queued_turn(session_id: str, queued_id: str, req: UpdateQueuedT
 
 
 async def move_queued_turn(session_id: str, queued_id: str, req: MoveQueuedTurnRequest) -> dict[str, Any]:
-    await wait_for_queue_recovery_admission()
+    await wait_for_queue_recovery_admission(session_id)
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
     direction = req.direction.strip().lower()
@@ -23434,7 +23517,7 @@ async def reconcile_idle_queued_turns(*, reason: str) -> int:
 
 async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]:
     """Coalesce duplicate Force Send requests without replaying a steer."""
-    await wait_for_queue_recovery_admission()
+    await wait_for_queue_recovery_admission(session_id)
     ensure_session_not_deleting(session_id)
     await reconcile_idle_queue_session(
         session_id,
@@ -24753,7 +24836,13 @@ async def pause_queued_turns_after_explicit_stop(session_id: str) -> int:
                 and items[0].get("purpose") in CROSS_CHAT_DELIVERY_PURPOSES
                 and not items[0].get("_paused_after_stop")
             )
-            if not queued_ids:
+            recovering = session_id in QUEUE_RECOVERY_PENDING
+            if recovering:
+                # Recovery may be reading an older exact file snapshot. The
+                # latch holds its unseen rows; the marker preserves that hold
+                # across a crash before the rows can be installed in memory.
+                QUEUE_RECOVERY_STOPPED.add(session_id)
+            if not queued_ids and not recovering:
                 if hidden_delivery_at_head:
                     asyncio.create_task(
                         start_internal_delivery_after_explicit_stop(session_id)
@@ -24766,6 +24855,7 @@ async def pause_queued_turns_after_explicit_stop(session_id: str) -> int:
             try:
                 await append_durable_event(session_id, "turn_queue_paused", {
                     "queued_ids": queued_ids,
+                    **({"all_pending": True} if recovering else {}),
                     "message": "Queued messages were kept after the parent turn stopped.",
                 })
             except Exception as exc:
@@ -25079,7 +25169,7 @@ def schedule_steered_turn_slot_waiter(
 
 
 async def start_next_queued_turn(session_id: str) -> None:
-    await wait_for_queue_recovery_admission()
+    await wait_for_queue_recovery_admission(session_id)
     await reconcile_idle_queue_session(
         session_id,
         schedule=False,
@@ -25745,196 +25835,210 @@ def record_mailbox_migration_evidence(evidence: dict[str, dict[str, Any]], event
         item["fenced_or_promoted"] = True
 
 
+def apply_queue_projection_event(
+    state: dict[str, Any], event: dict[str, Any], sess: dict[str, Any],
+) -> None:
+    """Shared replay reducer for checkpoint recovery and committed appends."""
+    pending = state["pending"]
+    order = state["order"]
+    envelope_id = str(event.get("cross_chat_envelope_id") or "")
+    if envelope_id:
+        evidence = state["mailbox"].setdefault(envelope_id, {})
+        record_mailbox_migration_evidence({envelope_id: evidence}, event)
+    queued_id = str(event.get("queued_id") or "")
+    event_type = str(event.get("type") or "")
+    if event_type == "turn_queue_run_now":
+        for superseded_id in event.get("superseded_queued_ids") or []:
+            superseded_id = str(superseded_id or "")
+            pending.pop(superseded_id, None)
+            if superseded_id in order:
+                order.remove(superseded_id)
+    if event_type == "turn_queue_paused":
+        paused_ids = event.get("queued_ids") or []
+        if event.get("all_pending") is True:
+            paused_ids = [qid for qid, item in pending.items()
+                          if item.get("purpose") not in CROSS_CHAT_DELIVERY_PURPOSES]
+        for paused_id in paused_ids:
+            paused_id = str(paused_id or "")
+            if paused_id in pending:
+                pending[paused_id]["_paused_after_stop"] = True
+        return
+    if event_type == "turn_queue_delivery_fenced" and queued_id:
+        if queued_id not in pending:
+            pending[queued_id] = queued_turn_from_event(
+                event,
+                sess,
+                len(order) + 1,
+            )
+            try:
+                fenced_index = max(
+                    0,
+                    min(
+                        int(
+                            event.get("position")
+                            or len(order) + 1
+                        ) - 1,
+                        len(order),
+                    ),
+                )
+            except (TypeError, ValueError):
+                fenced_index = len(order)
+            order.insert(fenced_index, queued_id)
+        pending[queued_id]["_paused_after_stop"] = True
+        pending[queued_id]["_native_delivery_fenced"] = True
+        return
+    if event_type == "turn_queued" and queued_id:
+        pending[queued_id] = queued_turn_from_event(event, sess, len(order) + 1)
+        if queued_id not in order:
+            order.append(queued_id)
+    elif event_type in {"turn_queue_updated", "turn_queue_run_now"} and queued_id in pending:
+        pending[queued_id].update(async_route_queue_fields({**pending[queued_id], **event}))
+        if event_type == "turn_queue_run_now" and event.get("native_goal_steer") is not True:
+            pending[queued_id]["_paused_after_stop"] = False
+            pending[queued_id].pop("_native_delivery_fenced", None)
+        # A goal follow-up continues an existing provider turn. Its
+        # run-now marker does not authorize another launch or clear an
+        # uncertain-delivery fence: only the accepted turn_steered
+        # marker below consumes it. Keep a truncated batch paused.
+        legacy_generated_replay = (
+            event_type == "turn_queue_run_now"
+            and event.get("replays_interrupted_message")
+            and not normalize_steering_lineage(event.get("steering_lineage"))
+        )
+        if legacy_generated_replay:
+            lineage = parse_legacy_steering_lineage(
+                str(event.get("request_prompt") or ""),
+                list(event.get("file_ids") or []),
+            )
+            pending[queued_id]["prompt"] = (
+                lineage[-1]["prompt"]
+                if lineage
+                else event.get("prompt") or ""
+            )
+            pending[queued_id]["steering_lineage"] = lineage
+        elif event.get("request_prompt") is not None:
+            pending[queued_id]["prompt"] = event.get("request_prompt") or ""
+        elif event.get("prompt") is not None:
+            pending[queued_id]["prompt"] = event.get("prompt") or ""
+        if event.get("display_prompt") is not None:
+            pending[queued_id]["display_prompt"] = event.get("display_prompt")
+        if event.get("file_ids") is not None:
+            pending[queued_id]["file_ids"] = list(event.get("file_ids") or [])
+        if event.get("display_file_ids") is not None:
+            pending[queued_id]["display_file_ids"] = list(event.get("display_file_ids") or [])
+        if event.get("chat_references") is not None:
+            pending[queued_id]["chat_references"] = list(event.get("chat_references") or [])
+        if event.get("team_references") is not None:
+            pending[queued_id]["team_references"] = list(event.get("team_references") or [])
+        if event.get("provider_team_mail_route_snapshot") is not None:
+            pending[queued_id]["provider_team_mail_route_snapshot"] = team_mail_grants.snapshot(event.get("provider_team_mail_route_snapshot"))
+        if event.get("cross_chat_obligation_ids") is not None:
+            pending[queued_id]["cross_chat_obligation_ids"] = list(
+                event.get("cross_chat_obligation_ids") or []
+            )
+        if event.get("cross_chat_exchange_ids") is not None:
+            pending[queued_id]["cross_chat_exchange_ids"] = list(
+                event.get("cross_chat_exchange_ids") or []
+            )
+        if event.get("client_capabilities") is not None:
+            updated_capabilities = list(event.get("client_capabilities") or [])
+            # Old queue edits also emitted an empty capability list.
+            # Retain only the pin synthesized from this legacy row's
+            # original immutable backend; explicit new pins win.
+            if updated_capabilities or not pending[queued_id].get("_migrated_digest_capabilities"):
+                pending[queued_id]["client_capabilities"] = updated_capabilities
+                pending[queued_id].pop("_migrated_digest_capabilities", None)
+        if "skill_selection" in event:
+            pending[queued_id]["skill_selection"] = event.get(
+                "skill_selection"
+            )
+        if event.get("provider_cross_chat_route_snapshot") is not None:
+            pending[queued_id]["provider_cross_chat_route_snapshot"] = (
+                normalized_provider_cross_chat_route_snapshot(
+                    event.get("provider_cross_chat_route_snapshot")
+                )
+            )
+        for exchange_key in (
+            "cross_chat_exchange_id",
+            "cross_chat_exchange_leg_id",
+            "cross_chat_exchange_status",
+        ):
+            if event.get(exchange_key) is not None:
+                pending[queued_id][exchange_key] = event.get(exchange_key)
+        if event.get("interrupted_run_id") is not None:
+            pending[queued_id]["steer_interrupted_run_id"] = event.get("interrupted_run_id")
+        if event.get("replays_interrupted_message") is not None:
+            pending[queued_id]["replays_interrupted_message"] = bool(event.get("replays_interrupted_message"))
+        if event.get("steering_lineage") is not None:
+            pending[queued_id]["steering_lineage"] = normalize_steering_lineage(event.get("steering_lineage"))
+        if event_type == "turn_queue_run_now" and queued_id in order:
+            order.remove(queued_id)
+            order.insert(0, queued_id)
+    elif event_type == "turn_queue_reordered":
+        positions = event.get("positions") or []
+        try:
+            ordered = sorted(
+                [item for item in positions if item.get("queued_id") in pending],
+                key=lambda item: int(item.get("position") or 0),
+            )
+            seen = [str(item.get("queued_id")) for item in ordered]
+            order = seen + [qid for qid in order if qid not in seen]
+        except Exception:
+            pass
+    elif queued_id and (
+        event_type in {"turn_started", "turn_unqueued"}
+        or is_native_goal_steer_event(event)
+    ):
+        pending.pop(queued_id, None)
+        if queued_id in order:
+            order.remove(queued_id)
+    state["order"] = order
+
+
+def queue_projection_context(sess: dict[str, Any]) -> dict[str, Any]:
+    return {key: sess.get(key) for key in ("id", "backend", "model", "effort")}
+
+
+def record_queue_projection_append(
+    path: Path, session_id: str, offset: int, events: list[dict[str, Any]],
+    end_offset: int | None = None,
+) -> None:
+    sess = STORE.sessions.get(session_id) or {}
+    queue_projection.record_append(
+        path, offset, events,
+        lambda state, event: apply_queue_projection_event(state, event, sess),
+        context=queue_projection_context(sess), end_offset=end_offset,
+    )
+
+
 def scan_queued_turns_from_events(
     sessions: list[tuple[str, dict[str, Any]]] | None = None,
     *, mailbox_evidence: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     recovered: dict[str, list[dict[str, Any]]] = {}
     session_items = sessions if sessions is not None else [
-        (session_id, dict(sess))
-        for session_id, sess in STORE.sessions.items()
+        (session_id, dict(sess)) for session_id, sess in STORE.sessions.items()
     ]
     for session_id, sess in session_items:
-        path = events_path(session_id)
         evidence = {key: value for key, value in (mailbox_evidence or {}).items()
                     if value.get("target_session_id") == session_id}
         for value in evidence.values():
             value["complete"] = False
-        if not path.exists():
-            continue
-        proof_stamp = path.stat() if evidence else None
-        proof_complete = True
-        pending: dict[str, dict[str, Any]] = {}
-        order: list[str] = []
-        for raw_line in (queued_event_lines(path, include_envelopes=True) if evidence else queued_event_lines(path)):
-            try:
-                event = json.loads(raw_line.decode("utf-8", "replace"))
-            except Exception:
-                proof_complete = False
-                continue
-            if evidence:
-                proof_complete = proof_complete and raw_line.endswith(b"\n")
-                if not isinstance(event, dict):
-                    proof_complete = False
-                    continue
-                record_mailbox_migration_evidence(evidence, event)
-            queued_id = str(event.get("queued_id") or "")
-            event_type = str(event.get("type") or "")
-            if event_type == "turn_queue_run_now":
-                for superseded_id in event.get("superseded_queued_ids") or []:
-                    superseded_id = str(superseded_id or "")
-                    pending.pop(superseded_id, None)
-                    if superseded_id in order:
-                        order.remove(superseded_id)
-            if event_type == "turn_queue_paused":
-                for paused_id in event.get("queued_ids") or []:
-                    paused_id = str(paused_id or "")
-                    if paused_id in pending:
-                        pending[paused_id]["_paused_after_stop"] = True
-                continue
-            if event_type == "turn_queue_delivery_fenced" and queued_id:
-                if queued_id not in pending:
-                    pending[queued_id] = queued_turn_from_event(
-                        event,
-                        sess,
-                        len(order) + 1,
-                    )
-                    try:
-                        fenced_index = max(
-                            0,
-                            min(
-                                int(
-                                    event.get("position")
-                                    or len(order) + 1
-                                ) - 1,
-                                len(order),
-                            ),
-                        )
-                    except (TypeError, ValueError):
-                        fenced_index = len(order)
-                    order.insert(fenced_index, queued_id)
-                pending[queued_id]["_paused_after_stop"] = True
-                pending[queued_id]["_native_delivery_fenced"] = True
-                continue
-            if event_type == "turn_queued" and queued_id:
-                pending[queued_id] = queued_turn_from_event(event, sess, len(order) + 1)
-                if queued_id not in order:
-                    order.append(queued_id)
-            elif event_type in {"turn_queue_updated", "turn_queue_run_now"} and queued_id in pending:
-                pending[queued_id].update(async_route_queue_fields({**pending[queued_id], **event}))
-                if event_type == "turn_queue_run_now" and event.get("native_goal_steer") is not True:
-                    pending[queued_id]["_paused_after_stop"] = False
-                    pending[queued_id].pop("_native_delivery_fenced", None)
-                # A goal follow-up continues an existing provider turn. Its
-                # run-now marker does not authorize another launch or clear an
-                # uncertain-delivery fence: only the accepted turn_steered
-                # marker below consumes it. Keep a truncated batch paused.
-                legacy_generated_replay = (
-                    event_type == "turn_queue_run_now"
-                    and event.get("replays_interrupted_message")
-                    and not normalize_steering_lineage(event.get("steering_lineage"))
-                )
-                if legacy_generated_replay:
-                    lineage = parse_legacy_steering_lineage(
-                        str(event.get("request_prompt") or ""),
-                        list(event.get("file_ids") or []),
-                    )
-                    pending[queued_id]["prompt"] = (
-                        lineage[-1]["prompt"]
-                        if lineage
-                        else event.get("prompt") or ""
-                    )
-                    pending[queued_id]["steering_lineage"] = lineage
-                elif event.get("request_prompt") is not None:
-                    pending[queued_id]["prompt"] = event.get("request_prompt") or ""
-                elif event.get("prompt") is not None:
-                    pending[queued_id]["prompt"] = event.get("prompt") or ""
-                if event.get("display_prompt") is not None:
-                    pending[queued_id]["display_prompt"] = event.get("display_prompt")
-                if event.get("file_ids") is not None:
-                    pending[queued_id]["file_ids"] = list(event.get("file_ids") or [])
-                if event.get("display_file_ids") is not None:
-                    pending[queued_id]["display_file_ids"] = list(event.get("display_file_ids") or [])
-                if event.get("chat_references") is not None:
-                    pending[queued_id]["chat_references"] = list(event.get("chat_references") or [])
-                if event.get("team_references") is not None:
-                    pending[queued_id]["team_references"] = list(event.get("team_references") or [])
-                if event.get("provider_team_mail_route_snapshot") is not None:
-                    pending[queued_id]["provider_team_mail_route_snapshot"] = team_mail_grants.snapshot(event.get("provider_team_mail_route_snapshot"))
-                if event.get("cross_chat_obligation_ids") is not None:
-                    pending[queued_id]["cross_chat_obligation_ids"] = list(
-                        event.get("cross_chat_obligation_ids") or []
-                    )
-                if event.get("cross_chat_exchange_ids") is not None:
-                    pending[queued_id]["cross_chat_exchange_ids"] = list(
-                        event.get("cross_chat_exchange_ids") or []
-                    )
-                if event.get("client_capabilities") is not None:
-                    updated_capabilities = list(event.get("client_capabilities") or [])
-                    # Old queue edits also emitted an empty capability list.
-                    # Retain only the pin synthesized from this legacy row's
-                    # original immutable backend; explicit new pins win.
-                    if updated_capabilities or not pending[queued_id].get("_migrated_digest_capabilities"):
-                        pending[queued_id]["client_capabilities"] = updated_capabilities
-                        pending[queued_id].pop("_migrated_digest_capabilities", None)
-                if "skill_selection" in event:
-                    pending[queued_id]["skill_selection"] = event.get(
-                        "skill_selection"
-                    )
-                if event.get("provider_cross_chat_route_snapshot") is not None:
-                    pending[queued_id]["provider_cross_chat_route_snapshot"] = (
-                        normalized_provider_cross_chat_route_snapshot(
-                            event.get("provider_cross_chat_route_snapshot")
-                        )
-                    )
-                for exchange_key in (
-                    "cross_chat_exchange_id",
-                    "cross_chat_exchange_leg_id",
-                    "cross_chat_exchange_status",
-                ):
-                    if event.get(exchange_key) is not None:
-                        pending[queued_id][exchange_key] = event.get(exchange_key)
-                if event.get("interrupted_run_id") is not None:
-                    pending[queued_id]["steer_interrupted_run_id"] = event.get("interrupted_run_id")
-                if event.get("replays_interrupted_message") is not None:
-                    pending[queued_id]["replays_interrupted_message"] = bool(event.get("replays_interrupted_message"))
-                if event.get("steering_lineage") is not None:
-                    pending[queued_id]["steering_lineage"] = normalize_steering_lineage(event.get("steering_lineage"))
-                if event_type == "turn_queue_run_now" and queued_id in order:
-                    order.remove(queued_id)
-                    order.insert(0, queued_id)
-            elif event_type == "turn_queue_reordered":
-                positions = event.get("positions") or []
-                try:
-                    ordered = sorted(
-                        [item for item in positions if item.get("queued_id") in pending],
-                        key=lambda item: int(item.get("position") or 0),
-                    )
-                    seen = [str(item.get("queued_id")) for item in ordered]
-                    order = seen + [qid for qid in order if qid not in seen]
-                except Exception:
-                    pass
-            elif queued_id and (
-                event_type in {"turn_started", "turn_unqueued"}
-                or is_native_goal_steer_event(event)
-            ):
-                pending.pop(queued_id, None)
-                if queued_id in order:
-                    order.remove(queued_id)
-        if proof_stamp is not None:
-            after = path.stat()
-            unchanged = ((proof_stamp.st_dev, proof_stamp.st_ino, proof_stamp.st_size, proof_stamp.st_mtime_ns)
-                         == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns))
-            for value in evidence.values():
-                value["complete"] = proof_complete and unchanged
-        items = [
-            pending[qid]
-            for qid in order
-            if qid in pending and (
-                str(pending[qid].get("prompt") or "").strip()
-                or bool(pending[qid].get("file_ids"))
+        try:
+            state = queue_projection.read_projection(
+                events_path(session_id),
+                lambda state, event: apply_queue_projection_event(state, event, sess),
+                context=queue_projection_context(sess),
             )
-        ]
+        except FileNotFoundError:
+            continue
+        for envelope_id, value in evidence.items():
+            value.update(state["mailbox"].get(envelope_id, {}))
+            value["complete"] = state["complete"]
+        pending = state["pending"]
+        items = [pending[qid] for qid in state["order"] if qid in pending and (
+            str(pending[qid].get("prompt") or "").strip() or bool(pending[qid].get("file_ids"))
+        )]
         if items:
             recovered[session_id] = items
     return recovered
@@ -26100,23 +26204,29 @@ async def migrate_unstarted_chat_mailbox_backlog(
     return migrated
 
 
-async def recover_queued_turns_after_start() -> tuple[int, int]:
+async def recover_queued_turns_for_session(session_id: str) -> tuple[int, int]:
     started = time.monotonic()
-    session_items = [
-        (session_id, dict(sess))
-        for session_id, sess in STORE.sessions.items()
+    sess = STORE.sessions.get(session_id)
+    if sess is None or session_id in DELETING_SESSIONS:
+        return 0, 0
+    session_items = [(session_id, dict(sess))]
+    migration_candidates = [
+        record for record in await CROSS_CHAT.pending_mailbox_migration_candidates()
+        if str(record.get("target_session_id") or "") == session_id
     ]
-    migration_candidates = await CROSS_CHAT.pending_mailbox_migration_candidates()
     mailbox_evidence = {str(record["id"]): {"target_session_id": record["target_session_id"]}
                        for record in migration_candidates if is_async_route_message(record)}
     recovered = await asyncio.to_thread(scan_queued_turns_from_events, session_items,
                                         mailbox_evidence=mailbox_evidence)
+    recovered = {session_id: recovered.get(session_id, [])}
     await migrate_unstarted_chat_mailbox_backlog(migration_candidates, mailbox_evidence, recovered)
     scheduled_session_ids: list[str] = []
     discarded_cross_chat: list[tuple[str, dict[str, Any]]] = []
     rebuilt = 0
     async with QUEUE_LOCK:
         for session_id, recovered_items in recovered.items():
+            if session_id not in STORE.sessions or session_id in DELETING_SESSIONS:
+                continue
             existing_items = list(QUEUED_TURNS.get(session_id) or ())
             existing_ids = {
                 str(item.get("queued_id") or "")
@@ -26158,14 +26268,35 @@ async def recover_queued_turns_after_start() -> tuple[int, int]:
                     })
                     continue
                 restored.append(bound)
+            if session_id not in STORE.sessions or session_id in DELETING_SESSIONS:
+                continue
             if not restored:
+                # A previous attempt may have installed rows before failing
+                # later ledger cleanup. A successful retry must wake those
+                # existing rows too, without duplicating them.
+                if existing_items and not existing_items[0].get("_paused_after_stop"):
+                    scheduled_session_ids.append(session_id)
+                continue
+            if session_id in QUEUE_RECOVERY_STOPPED:
+                stopped_ids = []
+                for item in restored:
+                    if item.get("purpose") not in CROSS_CHAT_DELIVERY_PURPOSES:
+                        item["_paused_after_stop"] = True
+                        stopped_ids.append(str(item.get("queued_id") or ""))
+                if stopped_ids:
+                    # The first Stop marker may have failed to persist, or may
+                    # lie after the scanner's captured prefix. Commit the exact
+                    # restored IDs before admitting any work in this chat.
+                    await append_durable_event(session_id, "turn_queue_paused", {
+                        "queued_ids": stopped_ids,
+                        "message": "Queued messages were kept after the parent turn stopped.",
+                    })
+            if session_id not in STORE.sessions or session_id in DELETING_SESSIONS:
                 continue
             QUEUED_TURNS[session_id] = deque([*restored, *existing_items])
             rebuilt += len(restored)
             if not QUEUED_TURNS[session_id][0].get("_paused_after_stop"):
                 scheduled_session_ids.append(session_id)
-    for session_id in scheduled_session_ids:
-        schedule_next_queued_turn(session_id)
     for _session_id, item in discarded_cross_chat:
         if item.get("purpose") == "secure_peer_handoff_delivery":
             envelope_id = str(item.get("secure_peer_envelope_id") or "")
@@ -26199,11 +26330,34 @@ async def recover_queued_turns_after_start() -> tuple[int, int]:
             )
     scheduled = len(scheduled_session_ids)
     logger.info(
-        "queued turn recovery complete rebuilt=%d scheduled_sessions=%d elapsed=%.2fs",
+        "queued turn recovery complete session=%s rebuilt=%d scheduled_sessions=%d elapsed=%.2fs",
+        session_id,
         rebuilt,
         scheduled,
         time.monotonic() - started,
     )
+    return rebuilt, scheduled
+
+
+async def recover_queued_turns_after_start() -> tuple[int, int]:
+    """Sweep startup chats; a selected chat starts independently of this order."""
+    rebuilt = scheduled = 0
+    for session_id in tuple(QUEUE_RECOVERY_PENDING):
+        # A request may already have completed or failed this chat. Preserve
+        # that failure until an explicit subsequent access asks to retry.
+        if session_id in QUEUE_RECOVERY_ERRORS:
+            continue
+        recovery = request_queue_recovery(session_id)
+        if recovery is None:
+            continue
+        try:
+            restored_count, scheduled_count = await asyncio.shield(recovery)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            continue
+        rebuilt += restored_count
+        scheduled += scheduled_count
     return rebuilt, scheduled
 
 
@@ -26777,6 +26931,8 @@ def prune_duplicate_imported_history_sync(
         ):
             raise RuntimeError("event log changed while duplicate history was pruned")
         os.replace(replacement_path, path)
+        with suppress(OSError):
+            queue_projection.invalidate(path)
         # The sparse timeline index is inode-bound and would be ignored, but
         # remove it now so recovery never mistakes dead metadata for state.
         with suppress(OSError):
@@ -71512,7 +71668,7 @@ async def start_turn(
     scheduled_job_revision: str | None = None,
     scheduled_job_manual_run: bool = False,
 ) -> dict[str, Any]:
-    await wait_for_queue_recovery_admission()
+    await wait_for_queue_recovery_admission(session_id)
     if queue_if_busy and provider_context_mode == "chat":
         await reconcile_idle_queue_session(
             session_id,
@@ -71585,7 +71741,7 @@ async def _start_turn_locked(
     # Internal delivery paths can enter with the lifecycle lock already held
     # and intentionally bypass ``start_turn``. They still must not start or
     # queue ahead of an undiscovered durable startup row.
-    await wait_for_queue_recovery_admission()
+    await wait_for_queue_recovery_admission(session_id)
     if (
         req.purpose == SECURE_PEER_DELIVERY_PURPOSE
         and not SECURE_PEER_AGENT_RELAY_ENABLED
@@ -77041,6 +77197,7 @@ async def lifespan(app: FastAPI):
     recovered_scheduled_run_count = (
         await JOBS.reconcile_admitted_runs_after_restart()
     )
+    initialize_queue_recovery()
     JOBS.start_scheduler()
     async def recover_queue_before_admission() -> tuple[int, int]:
         global QUEUE_RECOVERY_TASK
@@ -77052,11 +77209,7 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             raise
         except Exception:
-            # Keep the failed task installed as a fail-closed admission fence;
-            # health and administrative recovery remain available.
-            logger.exception(
-                "queued turn startup recovery failed; turn admission remains closed"
-            )
+            logger.exception("queued turn background recovery sweep failed")
             raise
         finally:
             owner = asyncio.current_task()
@@ -77235,6 +77388,9 @@ async def lifespan(app: FastAPI):
         cross_chat_expiry_task.cancel()
         digest_recovery_task.cancel()
         queue_recovery_task.cancel()
+        session_queue_recovery_tasks = tuple(QUEUE_RECOVERY_SESSION_TASKS.values())
+        for recovery in session_queue_recovery_tasks:
+            recovery.cancel()
         server_update_pending_waiter_task.cancel()
         await bounded_shutdown_phase(
             "startup-reconciliation",
@@ -77243,6 +77399,7 @@ async def lifespan(app: FastAPI):
                 cross_chat_expiry_task,
                 digest_recovery_task,
                 queue_recovery_task,
+                *session_queue_recovery_tasks,
                 server_update_pending_waiter_task,
                 *(
                     (health_queue_reconcile_task,)
@@ -80578,6 +80735,7 @@ async def health() -> dict[str, Any]:
     return {
         "ok": True,
         "server_version": SERVER_VERSION,
+        "queue_recovery": queue_recovery_status(),
         "api_contract_version": API_CONTRACT_VERSION,
         "server_identity": server_identity(),
         "server_instance_id": SERVER_INSTANCE_ID,
@@ -82654,6 +82812,7 @@ async def interactive_chat_native_snapshot(session_id: str) -> dict[str, Any]:
     model, effort = str(session.get("model") or ""), str(session.get("effort") or "")
     snapshot = shared_native_value({
         "session": public, "events": page["events"], "queue": queue, "active": active,
+        "queue_recovery": queue_recovery_status(session_id),
         "hasMoreEvents": page["has_more"], "nextTimelineBefore": page.get("next_before"),
         "eventsTotal": page.get("semantic_total"), "goal": goal,
         "jobs": (await list_session_jobs(session_id))["jobs"],
@@ -86054,6 +86213,7 @@ async def get_session(
         "session": public_session(sess),
         "events": events,
         "queued_turns": await queued_turns_snapshot(session_id),
+        "queue_recovery": queue_recovery_status(session_id),
         "events_omitted_before": omitted_before,
         "events_omitted_after": omitted_after,
         "latest_seq": latest_seq,
@@ -88264,7 +88424,7 @@ async def _put_codex_goal_locked(
     if req.status == "active":
         if (STORE.sessions.get(session_id) or {}).get("archived"):
             raise HTTPException(status_code=409, detail="archived chats cannot resume goals")
-        await wait_for_queue_recovery_admission()
+        await wait_for_queue_recovery_admission(session_id)
     manager, thread_id, control_session = await acquire_codex_control_thread(
         session_id,
         reserve_session=req.status == "active",

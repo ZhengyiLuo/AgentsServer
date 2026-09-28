@@ -1,6 +1,7 @@
 import asyncio
 import json
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import ExitStack
@@ -29,6 +30,7 @@ class ConsumedGoalQueueRecoveryTests(unittest.IsolatedAsyncioTestCase):
             BUSY_SESSIONS=set(), STEERING_SESSIONS=set(), STEERING_WAIT_TASKS={},
             RUN_NOW_REQUESTS={}, QUEUE_START_TASKS={}, SESSION_TURN_TASKS={},
             SESSION_LIFECYCLE_LOCKS={}, QUEUE_RECOVERY_TASK=None,
+            QUEUE_RECOVERY_PENDING={}, QUEUE_RECOVERY_SESSION_TASKS={}, QUEUE_RECOVERY_ERRORS={}, QUEUE_RECOVERY_STOPPED=set(),
             RUN_NOW_IDLE_OWNER_TIMEOUT_SECONDS=1,
             ACTIVE_LOCK=asyncio.Lock(), QUEUE_LOCK=asyncio.Lock(),
             RUN_NOW_REQUEST_LOCK=asyncio.Lock(),
@@ -54,6 +56,10 @@ class ConsumedGoalQueueRecoveryTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(*tasks)
 
     async def asyncTearDown(self) -> None:
+        # Queue reads intentionally start recovery without waiting for it.
+        # Join those owners before removing this test's synthetic timelines.
+        await asyncio.gather(*tuple(agent_server.QUEUE_RECOVERY_SESSION_TASKS.values()),
+                             return_exceptions=True)
         await self.settle()
 
     def incident_events(self) -> list[dict]:
@@ -72,6 +78,7 @@ class ConsumedGoalQueueRecoveryTests(unittest.IsolatedAsyncioTestCase):
         ]
 
     def write_events(self, events: list[dict]) -> None:
+        agent_server.initialize_queue_recovery()
         self.path.write_text("".join(json.dumps({
             "id": f"event-{seq}", "seq": seq, "session_id": self.session_id,
             "ts": "2026-09-21T23:57:15Z", **event,
@@ -150,6 +157,74 @@ class ConsumedGoalQueueRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(queued[0]["queued_id"], self.queued_id)
                 self.assertTrue(queued[0]["paused"])
                 self.assertEqual(queued[0]["pause_reason"], "delivery_uncertain")
+
+    async def test_stop_during_snapshot_scan_holds_undiscovered_rows_across_restart(self) -> None:
+        self.write_events([{"type": "turn_queued", "queued_id": "before-stop",
+                            "prompt": "Waiting before Stop", "backend": "codex", "file_ids": []}])
+        snapshot_captured = asyncio.Event()
+        release = threading.Event()
+        loop = asyncio.get_running_loop()
+        actual_scan = agent_server.scan_queued_turns_from_events
+
+        def blocked_scan(*args, **kwargs):
+            result = actual_scan(*args, **kwargs)
+            loop.call_soon_threadsafe(snapshot_captured.set)
+            release.wait()
+            return result
+
+        async def persist(_session_id, event_type, fields):
+            event = {"type": event_type, **fields}
+            with self.path.open("a") as target:
+                target.write(json.dumps(event) + "\n")
+            return event
+
+        with patch.object(agent_server, "scan_queued_turns_from_events", side_effect=blocked_scan), patch.object(
+            agent_server, "append_durable_event", side_effect=persist
+        ) as append:
+            recovery = asyncio.create_task(agent_server.wait_for_queue_recovery_admission(self.session_id))
+            try:
+                await snapshot_captured.wait()
+                self.assertEqual(await agent_server.pause_queued_turns_after_explicit_stop(self.session_id), 0)
+                self.assertTrue(append.await_args.args[2]["all_pending"])
+            finally:
+                release.set()
+                await recovery
+            self.assertTrue(agent_server.QUEUED_TURNS[self.session_id][0]["_paused_after_stop"])
+            self.launch.assert_not_awaited()
+            # Simulate a process restart; replay includes the marker even if
+            # the first scan's exact prefix predated the Stop request.
+            agent_server.QUEUED_TURNS.clear()
+            agent_server.initialize_queue_recovery()
+        self.assertEqual(await agent_server.recover_queued_turns_after_start(), (1, 0))
+        await self.settle()
+        self.assertTrue((await agent_server.queued_turns_snapshot(self.session_id))[0]["paused"])
+        self.launch.assert_not_awaited()
+
+    async def test_deleted_chat_is_not_restored_when_its_snapshot_scan_finishes(self) -> None:
+        self.write_events([{"type": "turn_queued", "queued_id": "deleted-row",
+                            "prompt": "Must not return", "backend": "codex", "file_ids": []}])
+        snapshot_captured = asyncio.Event()
+        release = threading.Event()
+        loop = asyncio.get_running_loop()
+        actual_scan = agent_server.scan_queued_turns_from_events
+
+        def blocked_scan(*args, **kwargs):
+            result = actual_scan(*args, **kwargs)
+            loop.call_soon_threadsafe(snapshot_captured.set)
+            release.wait()
+            return result
+
+        with patch.object(agent_server, "scan_queued_turns_from_events", side_effect=blocked_scan):
+            recovery = asyncio.create_task(agent_server.wait_for_queue_recovery_admission(self.session_id))
+            try:
+                await snapshot_captured.wait()
+                agent_server.STORE.sessions.pop(self.session_id)
+            finally:
+                release.set()
+                await recovery
+        await self.settle()
+        self.assertNotIn(self.session_id, agent_server.QUEUED_TURNS)
+        self.launch.assert_not_awaited()
 
     async def test_ordinary_steer_event_does_not_consume_a_waiting_queue_row(self) -> None:
         events = self.incident_events()

@@ -12,13 +12,17 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock
 
+import queue_projection
+
 from tests.test_chat_mailbox_runtime_isolated import isolated_source, TREE, PAIR, ROUTE, NOW
 
 
 def migration_source():
     ns = isolated_source()
     names = {"queued_event_lines", "record_mailbox_migration_evidence", "scan_queued_turns_from_events",
-             "migrate_unstarted_chat_mailbox_backlog", "recover_queued_turns_after_start", "is_async_route_message"}
+             "migrate_unstarted_chat_mailbox_backlog", "recover_queued_turns_after_start", "is_async_route_message",
+             "initialize_queue_recovery", "queue_recovery_status", "request_queue_recovery",
+             "recover_queued_turns_for_session", "apply_queue_projection_event", "queue_projection_context"}
     ledger = next(node for node in TREE.body if isinstance(node, ast.ClassDef) and node.name == "CrossChatStore")
     methods = {"pending_mailbox_migration_candidates", "migrate_pending_mailbox_message"}
     nodes = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
@@ -26,7 +30,7 @@ def migration_source():
               if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
     nodes += [deepcopy(node) for node in ledger.body
               if isinstance(node, ast.AsyncFunctionDef) and node.name in methods]
-    ns.update(json=json, deque=deque)
+    ns.update(json=json, deque=deque, queue_projection=queue_projection)
     exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])),
                  "<isolated-mailbox-migration>", "exec"), ns)
     for name in methods:
@@ -53,9 +57,15 @@ class ChatMailboxMigrationTests(unittest.IsolatedAsyncioTestCase):
             "bind_recovered_cross_chat_queue_item": AsyncMock(side_effect=lambda _sid, item: item),
             "append_cross_chat_terminal_lifecycle": AsyncMock(),
             "CrossChatStore": self.ns["Ledger"],
+            "QUEUE_RECOVERY_PENDING": {}, "QUEUE_RECOVERY_SESSION_TASKS": {},
+            "QUEUE_RECOVERY_ERRORS": {}, "QUEUE_RECOVERY_STOPPED": set(), "SERVER_SHUTTING_DOWN": False,
+            "HUB": SimpleNamespace(broadcast=AsyncMock()),
+            "queued_turns_snapshot": AsyncMock(return_value=[]),
+            "CHAT_MAILBOX_PENDING": set(),
         })
         (self.root / "sender.jsonl").write_text("")
         (self.root / "recipient.jsonl").write_text("")
+        self.ns["initialize_queue_recovery"]()
 
     async def envelope(self, name="message", status="queued", **overrides):
         record, _ = await self.ledger.create_instruction(
@@ -101,6 +111,7 @@ class ChatMailboxMigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.ledger.get("message"))["lifecycle_status"], "mailbox_migration_pending")
         self.events([self.queue_event(record)])
         for _ in range(2):
+            self.ns["initialize_queue_recovery"]()
             self.assertEqual(await self.ns["recover_queued_turns_after_start"](), (0, 0))
             self.assertEqual((await self.ledger.get("message"))["status"], "stored")
             self.assertEqual((await self.ledger.get("message"))["lifecycle_status"], "mailbox_migration_pending")

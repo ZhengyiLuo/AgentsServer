@@ -521,6 +521,30 @@ This only reads the existing configuration and exits; it makes no changes.
 
 ## Managed server restart
 
+### Queue recovery after startup
+
+Queue recovery runs independently for each chat. Opening a chat returns its
+history while its queue is recovered; sending waits only for that chat's
+existing queue to be restored. New chats and already recovered chats remain
+usable while other chats are recovering. A recovery failure affects only its
+chat, and accessing that chat again retries recovery without a server restart.
+
+Each chat keeps an optional `events.queue.json` checkpoint alongside its
+authoritative event log. Queue changes update this checkpoint after the event
+write; ordinary streaming traffic advances it periodically by bytes written.
+Restarts replay the remaining suffix. Old installations build the checkpoint
+once per chat. Missing, invalid or stale checkpoints fall back to that chat's
+log without blocking unrelated chats. Checkpoints can be discarded without
+deleting messages or changing their order.
+
+`GET /api/health` includes `queue_recovery` with `all_chats_ready` and counts
+of pending, recovering and failed chats. Chat history and interactive snapshots
+include their own `queue_recovery` status. Health's `ok` describes the running
+service; it does not mean every old chat has finished recovery. Clients receive
+a queue snapshot when a chat's recovery finishes.
+
+### Restart API
+
 Authenticated clients can discover restart support through the additive
 `capabilities.server_restart` v1 health capability and the top-level
 `server_instance_id`. Restart is available only when AgentsServer proves that

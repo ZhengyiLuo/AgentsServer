@@ -2679,6 +2679,7 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(agent_server, "scan_queued_turns_from_events", return_value=recovered), \
              patch.object(agent_server, "schedule_next_queued_turn") as schedule:
+            agent_server.initialize_queue_recovery()
             rebuilt, scheduled = await agent_server.recover_queued_turns_after_start()
 
         self.assertEqual(rebuilt, 1)
@@ -2703,6 +2704,7 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(agent_server, "scan_queued_turns_from_events", return_value=recovered), \
              patch.object(agent_server, "schedule_next_queued_turn") as schedule:
+            agent_server.initialize_queue_recovery()
             rebuilt, scheduled = await agent_server.recover_queued_turns_after_start()
 
         self.assertEqual((rebuilt, scheduled), (1, 0))
@@ -4176,98 +4178,143 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
 
 
 class StartupQueueRecoveryAdmissionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_new_submission_cannot_leapfrog_undiscovered_durable_row(
-        self,
-    ) -> None:
-        original_sessions = agent_server.STORE.sessions
-        original_queue = agent_server.QUEUED_TURNS
-        original_recovery = agent_server.QUEUE_RECOVERY_TASK
-        release_recovery = asyncio.Event()
-        recovery_started = asyncio.Event()
-        old = {
-            "queued_id": "queued-before-restart",
-            "prompt": "Older durable prompt",
-            "file_ids": [],
-            "backend": "codex",
-            "_durable": True,
-        }
+    async def asyncSetUp(self) -> None:
+        self.patches = [
+            patch.object(agent_server.STORE, "sessions", {
+                "blocked": {"id": "blocked", "backend": "codex"},
+                "selected": {"id": "selected", "backend": "codex"},
+            }),
+            patch.multiple(agent_server, QUEUE_RECOVERY_PENDING={},
+                           QUEUE_RECOVERY_SESSION_TASKS={}, QUEUE_RECOVERY_ERRORS={}, QUEUE_RECOVERY_STOPPED=set(),
+                           QUEUED_TURNS={}, QUEUE_LOCK=asyncio.Lock(),
+                           SESSION_LIFECYCLE_LOCKS={}, SERVER_SHUTTING_DOWN=False,
+                           DELETING_SESSIONS=set()),
+            patch.object(agent_server.HUB, "broadcast", new_callable=AsyncMock),
+            patch.object(agent_server, "schedule_next_queued_turn"),
+        ]
+        for item in self.patches:
+            item.start()
+        agent_server.initialize_queue_recovery()
 
-        async def delayed_recovery() -> tuple[int, int]:
-            recovery_started.set()
-            await release_recovery.wait()
+    async def asyncTearDown(self) -> None:
+        tasks = tuple(agent_server.QUEUE_RECOVERY_SESSION_TASKS.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for item in reversed(self.patches):
+            item.stop()
+
+    async def test_blocked_chat_does_not_block_selected_or_new_chat_and_reads_return(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+
+        async def recover(session_id):
+            calls.append(session_id)
+            if session_id == "blocked":
+                started.set()
+                await release.wait()
+            return 0, 0
+
+        with patch.object(agent_server, "recover_queued_turns_for_session", side_effect=recover):
+            coordinator = asyncio.create_task(agent_server.recover_queued_turns_after_start())
+            try:
+                await started.wait()
+                self.assertEqual(await agent_server.queued_turns_snapshot("blocked"), [])
+                self.assertEqual(agent_server.queue_recovery_status("blocked")["status"], "recovering")
+                await asyncio.wait_for(agent_server.wait_for_queue_recovery_admission("selected"), 1)
+                agent_server.STORE.sessions["new"] = {"id": "new", "backend": "codex"}
+                await asyncio.wait_for(agent_server.wait_for_queue_recovery_admission("new"), 1)
+                self.assertEqual(calls, ["blocked", "selected"])
+                self.assertFalse(coordinator.done())
+                self.assertTrue(agent_server.queue_recovery_status("selected")["ready"])
+            finally:
+                release.set()
+                await coordinator
+
+    async def test_cancelled_waiter_does_not_cancel_scan_or_duplicate_ownership(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def recover(_session_id):
+            started.set()
+            await release.wait()
+            return 0, 0
+
+        with patch.object(agent_server, "recover_queued_turns_for_session", side_effect=recover) as scanner:
+            first = asyncio.create_task(agent_server.wait_for_queue_recovery_admission("selected"))
+            second = asyncio.create_task(agent_server.wait_for_queue_recovery_admission("selected"))
+            await started.wait()
+            first.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await first
+            self.assertFalse(agent_server.QUEUE_RECOVERY_SESSION_TASKS["selected"].cancelled())
+            release.set()
+            await second
+            await agent_server.wait_for_queue_recovery_admission("selected")
+            scanner.assert_awaited_once_with("selected")
+
+    async def test_failed_chat_is_retryable_without_restart_and_other_chat_is_ready(self) -> None:
+        attempts = 0
+
+        async def recover(session_id):
+            nonlocal attempts
+            if session_id == "blocked":
+                attempts += 1
+                if attempts == 1:
+                    raise OSError("timeline unreadable")
+            return 0, 0
+
+        with patch.object(agent_server, "recover_queued_turns_for_session", side_effect=recover):
+            with self.assertRaises(agent_server.TransientAdmissionWait):
+                await agent_server.wait_for_queue_recovery_admission("blocked")
+            self.assertEqual(agent_server.queue_recovery_status("blocked")["status"], "failed")
+            await agent_server.wait_for_queue_recovery_admission("selected")
+            await agent_server.wait_for_queue_recovery_admission("blocked")
+            self.assertEqual(attempts, 2)
+            self.assertTrue(agent_server.queue_recovery_status("blocked")["ready"])
+
+    async def test_old_queue_installed_before_new_submission_inside_lifecycle_lock(self) -> None:
+        old = {"queued_id": "old", "prompt": "Older durable prompt", "file_ids": [],
+               "backend": "codex", "_durable": True}
+
+        async def recover(session_id):
             async with agent_server.QUEUE_LOCK:
-                agent_server.QUEUED_TURNS["chat-recovery"] = deque([old])
-            return 1, 1
+                agent_server.QUEUED_TURNS[session_id] = deque([old])
+            return 1, 0
 
-        recovery = asyncio.create_task(delayed_recovery())
-        try:
-            agent_server.STORE.sessions = {
-                "chat-recovery": {
-                    "id": "chat-recovery",
-                    "backend": "codex",
-                }
-            }
-            agent_server.QUEUED_TURNS = {}
-            agent_server.QUEUE_RECOVERY_TASK = recovery
-            await recovery_started.wait()
-            request = agent_server.TurnRequest(prompt="New prompt")
-            with patch.object(
-                agent_server,
-                "QUEUE_RECOVERY_ADMISSION_WAIT_SECONDS",
-                0.01,
-            ):
-                with self.assertRaises(agent_server.TransientAdmissionWait) as raised:
-                    await agent_server.start_turn("chat-recovery", request)
-            self.assertEqual(raised.exception.status_code, 503)
-            self.assertNotIn("chat-recovery", agent_server.QUEUED_TURNS)
-
-            release_recovery.set()
-            await recovery
-            with patch.object(
-                agent_server,
-                "append_durable_event",
-                new_callable=AsyncMock,
-                return_value={"type": "turn_queued"},
-            ), patch.object(agent_server, "schedule_next_queued_turn"):
+        async def admit():
+            async with agent_server.session_lifecycle_lock("selected"):
                 await agent_server.enqueue_turn(
-                    "chat-recovery",
-                    request,
-                    agent_server.STORE.sessions["chat-recovery"],
+                    "selected", agent_server.TurnRequest(prompt="New prompt"),
+                    agent_server.STORE.sessions["selected"],
                 )
 
-            prompts = [
-                item["prompt"]
-                for item in agent_server.QUEUED_TURNS["chat-recovery"]
-            ]
-            self.assertEqual(prompts, ["Older durable prompt", "New prompt"])
-        finally:
-            release_recovery.set()
-            await asyncio.gather(recovery, return_exceptions=True)
-            agent_server.STORE.sessions = original_sessions
-            agent_server.QUEUED_TURNS = original_queue
-            agent_server.QUEUE_RECOVERY_TASK = original_recovery
+        with patch.object(agent_server, "recover_queued_turns_for_session", side_effect=recover), patch.object(
+            agent_server, "append_durable_event", AsyncMock(return_value={"type": "turn_queued"})
+        ), patch.object(agent_server, "managed_server_update_blocker", return_value=None):
+            await asyncio.wait_for(admit(), 1)
+        self.assertEqual([row["prompt"] for row in agent_server.QUEUED_TURNS["selected"]],
+                         ["Older durable prompt", "New prompt"])
 
-    async def test_failed_recovery_keeps_internal_start_admission_fail_closed(
-        self,
-    ) -> None:
-        original_recovery = agent_server.QUEUE_RECOVERY_TASK
+    async def test_internal_start_can_await_recovery_with_lifecycle_lock_held(self) -> None:
+        async def recover(_session_id):
+            # Restore uses QUEUE_LOCK, not the already held lifecycle lock.
+            async with agent_server.QUEUE_LOCK:
+                return 0, 0
 
-        async def failed_recovery() -> tuple[int, int]:
-            raise OSError("timeline unreadable")
-
-        recovery = asyncio.create_task(failed_recovery())
-        await asyncio.gather(recovery, return_exceptions=True)
-        try:
-            agent_server.QUEUE_RECOVERY_TASK = recovery
-            with self.assertRaises(agent_server.TransientAdmissionWait) as raised:
-                await agent_server._start_turn_locked(
-                    "chat-recovery",
-                    agent_server.TurnRequest(prompt="Must not start"),
+        async def internal_start():
+            async with agent_server.session_lifecycle_lock("selected"):
+                return await agent_server._start_turn_locked(
+                    "selected", agent_server.TurnRequest(prompt="Must not run archived chat"),
                 )
-            self.assertEqual(raised.exception.status_code, 503)
-            self.assertIn("did not complete", str(raised.exception.detail))
-        finally:
-            agent_server.QUEUE_RECOVERY_TASK = original_recovery
+
+        agent_server.STORE.sessions["selected"]["archived"] = True
+        with patch.object(agent_server, "recover_queued_turns_for_session", side_effect=recover):
+            with self.assertRaises(agent_server.HTTPException) as raised:
+                await asyncio.wait_for(internal_start(), 1)
+            self.assertEqual(raised.exception.status_code, 409)
+            self.assertTrue(agent_server.queue_recovery_status("selected")["ready"])
 
 
 class ClaudeResultDiagnosticTests(unittest.TestCase):

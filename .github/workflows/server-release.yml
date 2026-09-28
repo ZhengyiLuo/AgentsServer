@@ -90,8 +90,8 @@ jobs:
     secrets:
       AGENTS_SERVER_RELEASE_PRIVATE_KEY_B64: ${{ secrets.AGENTS_SERVER_RELEASE_PRIVATE_KEY_B64 }}
   native-acceptance:
-    needs: release
-    if: inputs.prepare_only
+    needs: [release, npm-candidate]
+    if: inputs.prepare_only && inputs.npm_source_sha != ''
     permissions:
       contents: read
       actions: read
@@ -101,6 +101,8 @@ jobs:
       artifact_run_id: ${{ github.run_id }}
       source_sha: ${{ github.sha }}
       release_tag: ${{ inputs.tag }}
+      npm_artifact_name: signed-npm-server-${{ inputs.npm_version }}-${{ inputs.npm_source_sha }}
+      npm_source_sha: ${{ inputs.npm_source_sha }}
   release:
     needs: test
     runs-on: ubuntu-latest

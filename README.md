@@ -27,8 +27,8 @@ Use a Linux or Apple silicon macOS host with
 Install and authenticate the agent CLI you want to use on that host.
 `tmux` is optional for terminal access and managed updates.
 
-AgentsDock desktop can guide you through **Set up AgentsServer**. To install
-from this repository instead:
+AgentsDock desktop can guide you through **Set up AgentsServer**. For a first
+installation from this repository instead:
 
 ```bash
 git clone https://github.com/ZhengyiLuo/AgentsDock.git
@@ -84,15 +84,12 @@ named instances to avoid taking over the default gateway.
 
 ## Updating
 
-For the default server installed from a checkout:
+Update an existing server through AgentsDock Settings, including a server first
+installed from a checkout. The managed updater installs the signed release when
+the server is idle and preserves its token and chat history.
 
-```bash
-git pull --ff-only
-./install.sh
-```
-
-Updates preserve its token and chat history. AgentsDock Settings also supports
-signed server updates. See the [update guide](https://agentsdock.net/update.html).
+For automation, use the [managed npm update command](npm/README.md#managed-updates).
+See the [update guide](https://agentsdock.net/update.html) for the app workflow.
 
 ## Documentation and support
 

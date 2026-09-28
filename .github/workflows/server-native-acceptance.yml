@@ -15,6 +15,12 @@ on:
       release_tag:
         type: string
         required: true
+      npm_artifact_name:
+        type: string
+        required: true
+      npm_source_sha:
+        type: string
+        required: true
 
 permissions:
   contents: read
@@ -39,6 +45,8 @@ jobs:
       SOURCE_SHA: ${{ inputs.source_sha }}
       RELEASE_TAG: ${{ inputs.release_tag }}
       ARTIFACT_NAME: ${{ inputs.artifact_name }}
+      NPM_ARTIFACT_NAME: ${{ inputs.npm_artifact_name }}
+      NPM_SOURCE_SHA: ${{ inputs.npm_source_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -59,12 +67,20 @@ jobs:
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test "v$(cat VERSION)" = "$RELEASE_TAG"
           test "$ARTIFACT_NAME" = "server-release-$SOURCE_SHA"
+          [[ "$NPM_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$NPM_ARTIFACT_NAME" = "signed-npm-server-${RELEASE_TAG#v}-$NPM_SOURCE_SHA"
       - uses: actions/download-artifact@v4
         with:
           name: ${{ inputs.artifact_name }}
           run-id: ${{ inputs.artifact_run_id }}
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/native-inputs/candidate
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.npm_artifact_name }}
+          run-id: ${{ inputs.artifact_run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/native-inputs/npm
       - name: Download unchanged public beta.11 baseline
         shell: bash
         run: |
@@ -94,6 +110,7 @@ jobs:
           uv run --python 3.13 python scripts/native_upgrade_acceptance.py \
             --baseline "$RUNNER_TEMP/native-inputs/baseline" \
             --candidate "$RUNNER_TEMP/native-inputs/candidate" \
+            --npm "$RUNNER_TEMP/native-inputs/npm" --npm-source-sha "$NPM_SOURCE_SHA" \
             --work "$RUNNER_TEMP/agentsdock-native-upgrade" \
             --report "$RUNNER_TEMP/native-public/upgrade.json" \
             --source-sha "$SOURCE_SHA" --version "${RELEASE_TAG#v}" \

@@ -9,6 +9,9 @@ startup queue recovery, and inter-chat messages.
 - Recover chat queues independently at startup. Opening one chat no longer waits
   for every other transcript to be scanned. Persist queue checkpoints so later
   restarts read only new events, while retaining message order and Stop pauses.
+- Fix shared chats showing “Shared conversation temporarily unavailable” after
+  successful token entry. Keep shared-chat reads and reconnects working when
+  the server adds queue-recovery metadata.
 - Use the asynchronous mailbox for same-server inter-chat delivery, including
   older paired Send and Ask callers. Disable legacy request/reply execution and
   automatic final-reply turns. Keep existing conversations and mailbox access.

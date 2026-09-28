@@ -60,6 +60,7 @@ class CodexSubagentIdentityTests(unittest.IsolatedAsyncioTestCase):
             "native_session_title": Mock(return_value=None),
             "session_codex_thread_id": lambda session: session.get("codex_thread_id", ""),
             "logger": Mock(), "concise_error_message": str,
+            "schedule_codex_subagent_limit_application": Mock(),
             "codex_session_has_active_run": AsyncMock(side_effect=AssertionError("identity must not inspect/wake execution")),
         }
         self.ns["existing_codex_app_server_manager"] = lambda session=None: self.ns["CODEX_APP_SERVER_MANAGER"]

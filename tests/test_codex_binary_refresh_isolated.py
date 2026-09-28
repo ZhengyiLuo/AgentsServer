@@ -82,7 +82,7 @@ class BinaryRefreshTests(unittest.IsolatedAsyncioTestCase):
             "TransientAdmissionWait": HTTPException,
             "CODEX_APP_SERVER_MANAGER_EPOCH": 0, "CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH": None,
             "CODEX_MANAGER_DRAIN_TASK": None, "CODEX_MANAGER_DRAIN_REQUESTED": False,
-            "CODEX_MANAGER_CLOSING": False,
+            "CODEX_MANAGER_CLOSING": False, "CODEX_SUBAGENT_LIMIT_TASKS": {}, "CODEX_SUBAGENT_LIMIT_REQUESTED": set(),
             "CODEX_TRANSPORT": "app-server", "CODEX_TRANSPORT_EXEC": "exec",
             "CODEX_GOALS_ENABLED": True, "CODEX_GOALS_RECONFIGURING": False,
             "CODEX_BIN": "/fixture/codex", "DEFAULT_CWD": "/fixture", "SERVER_VERSION": "test",

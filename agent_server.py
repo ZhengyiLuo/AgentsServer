@@ -54378,15 +54378,83 @@ def codex_manager_session_busy(manager: CodexAppServerManager, session_id: str, 
     )
 
 
+def watch_codex_provider_handoff_blockers(
+    manager: CodexAppServerManager, session_id: str, *, ignore_task=None,
+) -> int:
+    """Retry a saved selection when its observed runtime borrowers finish.
+
+    Manager retirement and one chat's endpoint selection have different wakeup
+    owners. The manager need not be retired for this chat to have a pending
+    selection. Subscribe only to currently unfinished work, never to our own
+    metadata requests or to a timer.
+    """
+    session = STORE.sessions.get(session_id) or {}
+    if not isinstance(session.get("_codex_provider_pending"), dict):
+        return 0
+    blockers = set(manager.client._callback_tasks)
+    blockers.update(manager.client._server_request_tasks.values())
+    blockers.update(value[1] for value in manager.client._pending.values())
+    blockers.update(
+        task for task, owner in tuple(getattr(manager, "_agentsdock_callers", {}).items())
+        if not owner or owner == session_id
+    )
+    blockers.update(SESSION_TURN_TASKS.get(session_id) or ())
+    blockers.update(CODEX_INTERACTION_HANDLER_TASKS.get(session_id) or ())
+    blockers.update(task for (sid, _), task in CODEX_NATIVE_ACTION_TASKS.items() if sid == session_id)
+    subscribed = 0
+    for blocker in blockers:
+        if blocker is ignore_task or blocker.done():
+            continue
+        watched = getattr(blocker, "_agentsdock_provider_handoff_watch", set())
+        if session_id in watched:
+            continue
+        blocker._agentsdock_provider_handoff_watch = {*watched, session_id}
+        subscribed += 1
+
+        def settled(completed, sid=session_id):
+            watched = getattr(completed, "_agentsdock_provider_handoff_watch", set())
+            watched.discard(sid)
+            if isinstance((STORE.sessions.get(sid) or {}).get("_codex_provider_pending"), dict):
+                schedule_codex_subagent_limit_application(sid)
+
+        blocker.add_done_callback(settled)
+    return subscribed
+
+
 async def release_idle_codex_manager_session(manager: CodexAppServerManager, session_id: str, *, ignore_task=None) -> bool:
     """Called under the session lifecycle lock; retain ownership on any doubt."""
     def blocked(*, own_maintenance=False):
         return (codex_manager_session_busy(manager, session_id, ignore_task=ignore_task,
                     ignore_maintenance=own_maintenance)
-                or bool(manager.client._pending or manager.client._server_request_tasks))
+                # The response Future can finish before its RPC coroutine
+                # removes the registry entry. Treat that settled response as
+                # complete so its wakeup cannot get lost during unwinding.
+                or any(not value[1].done() for value in manager.client._pending.values())
+                or any(not task.done() for task in manager.client._server_request_tasks.values()))
+
+    def defer(reason: str, *, error_type: str = "") -> bool:
+        session = STORE.sessions.get(session_id) or {}
+        if isinstance(session.get("_codex_provider_pending"), dict):
+            # A failed ownership/goal request can itself emit callbacks.
+            # Only verified transient borrowers own a completion retry; an
+            # error notification must not repeatedly retry the failing RPC.
+            watched = (
+                watch_codex_provider_handoff_blockers(manager, session_id, ignore_task=ignore_task)
+                if reason in {"runtime_borrowers", "runtime_borrowers_after_metadata", "runtime_borrowers_after_unsubscribe"}
+                else 0
+            )
+            logger.info(
+                "Codex provider selection deferred session=%s reason=%s watched=%d callbacks=%d rpcs=%d requests=%d error_type=%s",
+                session_id, reason, watched,
+                sum(not task.done() for task in manager.client._callback_tasks),
+                sum(not value[1].done() for value in manager.client._pending.values()),
+                sum(not task.done() for task in manager.client._server_request_tasks.values()),
+                error_type,
+            )
+        return False
 
     if blocked():
-        return False
+        return defer("runtime_borrowers")
     deadline = time.monotonic() + 8.0
     SERVER_MAINTENANCE_SESSIONS.add(session_id)
     try:
@@ -54419,10 +54487,10 @@ async def release_idle_codex_manager_session(manager: CodexAppServerManager, ses
                 seen_cursors.add(cursor)
         for thread in threads:
             if time.monotonic() >= deadline:
-                return False
+                return defer("ownership_deadline")
             if (thread in CODEX_APP_SERVER_PINNED_THREADS or thread in CODEX_INTERACTIVE_CONTROL_THREADS
                     or manager.active_turn(thread) is not None):
-                return False
+                return defer("native_thread_in_use")
             try:
                 goal = await asyncio.wait_for(manager.get_thread_goal(thread), timeout=min(3.0, deadline - time.monotonic()))
             except CodexAppServerRequestError as exc:
@@ -54430,7 +54498,7 @@ async def release_idle_codex_manager_session(manager: CodexAppServerManager, ses
                     raise
                 goal = None
             if isinstance(goal, dict) and goal.get("status") == "active":
-                return False
+                return defer("native_goal_active")
             try:
                 terminals = await asyncio.wait_for(manager.list_background_terminals(thread), timeout=min(3.0, deadline - time.monotonic()))
             except CodexAppServerRequestError as exc:
@@ -54439,15 +54507,17 @@ async def release_idle_codex_manager_session(manager: CodexAppServerManager, ses
                 terminals = []
             # Those metadata requests yielded. A new borrower or native
             # request may now own the process even without a registered turn.
-            if terminals or blocked(own_maintenance=True):
-                return False
+            if terminals:
+                return defer("background_terminals")
+            if blocked(own_maintenance=True):
+                return defer("runtime_borrowers_after_metadata")
             if manager.is_thread_loaded(thread):
                 evicted = await asyncio.wait_for(evict_codex_app_server_thread(manager, thread, reinsert_on_failure=True),
                     timeout=max(0.0, deadline - time.monotonic()))
                 if not evicted or manager.is_thread_loaded(thread):
-                    return False
+                    return defer("native_unsubscribe_incomplete")
         if blocked(own_maintenance=True):
-            return False
+            return defer("runtime_borrowers_after_unsubscribe")
         # Unsubscribe removes the client subscription, but native Codex keeps
         # the native writer alive. Release it before another manager can own
         # this chat; unrelated active chats keep their current process.
@@ -54456,9 +54526,9 @@ async def release_idle_codex_manager_session(manager: CodexAppServerManager, ses
             CODEX_SESSION_APP_SERVER_MANAGERS.pop(session_id, None)
             CODEX_GOAL_SYNC_GENERATIONS.pop(session_id, None)
         return True
-    except Exception:
+    except Exception as exc:
         logger.debug("Codex handoff retained an unverified idle owner", exc_info=True)
-        return False
+        return defer("ownership_unverified", error_type=type(exc).__name__)
     finally:
         SERVER_MAINTENANCE_SESSIONS.discard(session_id)
 
@@ -82234,12 +82304,17 @@ async def apply_codex_provider_when_idle(session_id: str, *, ignore_task=None) -
             await STORE.save(durable=True)
     tasks = set(SESSION_TURN_TASKS.get(session_id) or ())
     tasks.update(task for (sid, _), task in CODEX_NATIVE_ACTION_TASKS.items() if sid == session_id)
-    if (any(task is not ignore_task and not task.done() for task in tasks)
-            or session_id in BUSY_SESSIONS or ACTIVE.get(session_id) is not None
-            or session_id in SERVER_MAINTENANCE_SESSIONS
-            or (session.get("codex_goal") or {}).get("status") == "active"
-            or session_id in SIDE_QUESTIONS.active_session_ids()
-            or codex_session_has_live_subagents(session_id)):
+    reason = (
+        "turn_tasks" if any(task is not ignore_task and not task.done() for task in tasks)
+        else "active_turn" if session_id in BUSY_SESSIONS or ACTIVE.get(session_id) is not None
+        else "maintenance" if session_id in SERVER_MAINTENANCE_SESSIONS
+        else "active_goal" if (session.get("codex_goal") or {}).get("status") == "active"
+        else "side_question" if session_id in SIDE_QUESTIONS.active_session_ids()
+        else "live_subagents" if codex_session_has_live_subagents(session_id)
+        else None
+    )
+    if reason is not None:
+        logger.info("Codex provider selection deferred session=%s reason=%s", session_id, reason)
         return False
     manager = existing_codex_app_server_manager(session)
     if manager is not None:

@@ -127,8 +127,14 @@ class ProviderRouteDiscoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_legacy_metadata_and_invalid_queries(self):
         self.capability["async_route_v1"] = False
         result = await self.page(route_id=self.route_id(1))
-        self.assertEqual(result["max_handoffs_per_run"], 4)
-        self.assertNotIn("mode", result["routes"][0])
+        self.assertIsNone(result["max_handoffs_per_run"])
+        self.assertEqual(result["routes"][0]["mode"], "async_route_v1")
+        self.assertEqual(result["routes"][0]["delivery_mode"], "mailbox")
+        self.routes[self.route_id(1)].pop("pair_id")
+        unsupported = (await self.page(route_id=self.route_id(1)))["routes"][0]
+        self.assertFalse(unsupported["available"])
+        self.assertEqual(unsupported["reason"], "legacy_cross_chat_disabled")
+        self.assertNotIn("mode", unsupported)
         for query in ({"cursor": "bad"}, {"cursor": self.route_id(999)},
                       {"route_id": "bad"}, {"route_id": self.route_id(1), "cursor": self.route_id(0)}):
             with self.subTest(query=query), self.assertRaises(HTTPException) as invalid:

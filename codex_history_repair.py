@@ -715,15 +715,35 @@ class _AsyncDeliveryIndex:
     starts: dict = field(default_factory=dict)
     ends: dict = field(default_factory=dict)
     receipts: dict = field(default_factory=dict)
+    status_queues: dict = field(default_factory=dict)
+    status_body_keys: set = field(default_factory=set)
     steered: set = field(default_factory=set)
     count: int = 0
 
     def observe(self, event: dict) -> None:
         event_type = event.get("type")
-        if (event_type not in {"turn_started", "turn_finished", "turn_steered", "turn_stopped", "turn_queue_run_now",
+        if (event_type not in {"turn_queued", "turn_started", "turn_finished", "turn_steered", "turn_stopped", "turn_queue_run_now",
                               "chat_conversation_message_received", "chat_conversation_message_started", "chat_conversation_message_delivered"}
             or event.get("imported") is True or event.get("forked") is True
             or event.get("backend") not in (None, "codex")):
+            return
+        if event_type == "turn_queued":
+            # The private durable request is exact provider input. Public display
+            # labels and wrapper-looking text are never evidence by themselves.
+            queued_id, body = event.get("queued_id"), event.get("request_prompt")
+            if (event.get("purpose") == "cross_chat_handoff_delivery"
+                and event.get("cross_chat_exchange_status") is True
+                and not _runtime_human_provenance(event)
+                and isinstance(queued_id, str) and 0 < len(queued_id) <= 256
+                and isinstance(body, str) and 0 < len(body) <= NATIVE_PROOF_LINE_BYTES):
+                record = {key: event.get(key) for key in ("seq", "cross_chat_exchange_id",
+                    "cross_chat_exchange_leg_id", "source_session_id", "target_session_id")}
+                record["body_key"] = _text_key(body)
+                self.status_queues.setdefault(queued_id, []).append(record)
+                self.status_body_keys.add(record["body_key"])
+                self.count += 1
+                if self.count > MAX_KEYS:
+                    raise _Unproven()
             return
         run = (event.get("interrupted_run_id") or event.get("run_id")) if event_type == "turn_queue_run_now" else event.get("run_id")
         if (event_type in {"turn_steered", "turn_stopped"} or event.get("native_steer") is True):
@@ -742,7 +762,8 @@ class _AsyncDeliveryIndex:
             "provider_thread_id", "provider_turn_id", "cross_chat_envelope_id", "handoff_id", "message_id",
             "source_session_id", "target_session_id", "source_title", "target_run_id", "conversation_mode",
             "kind", "action", "handoff_action", "handoff_body_chars", "handoff_body_sha256",
-            "message_revision", "message_edited_by_user", "exchange_id", "cross_chat_exchange_id")
+            "message_revision", "message_edited_by_user", "exchange_id", "cross_chat_exchange_id",
+            "cross_chat_exchange_leg_id", "cross_chat_exchange_status", "queued_id")
         record = {key: event.get(key) for key in fields
                   if event.get(key) is None or type(event.get(key)) in (int, bool)
                   or isinstance(event.get(key), str) and len(event[key]) <= 512}
@@ -766,11 +787,36 @@ class _AsyncDeliveryIndex:
             raise _Unproven()
 
     def match(self, session_id: str, provider_id: str, run: str, origin: dict,
-              body: tuple[str, str, int] | None, source_ids: set) -> dict | None:
+              body: tuple[str, str, int] | None, source_ids: set, body_key: str = "") -> dict | None:
         starts, ends = self.starts.get(run, []), self.ends.get(run, [])
-        if body is None or len(starts) != 1 or len(ends) != 1 or run in self.steered:
+        if len(starts) != 1 or len(ends) != 1 or run in self.steered:
             return None
         start, end = starts[0], ends[0]
+        if start.get("cross_chat_exchange_status") is True:
+            queued = self.status_queues.get(start.get("queued_id"), [])
+            if len(queued) != 1:
+                return None
+            receipt = queued[0]
+            identity = ("cross_chat_exchange_id", "cross_chat_exchange_leg_id",
+                        "source_session_id", "target_session_id")
+            if (start.get("malformed") or end.get("malformed") or not start.get("body_key")
+                or any(not isinstance(start.get(key), str) or not start[key]
+                       or receipt.get(key) != start[key] or end.get(key) != start[key] for key in identity)
+                or start.get("target_session_id") != session_id or start.get("source_session_id") == session_id
+                or start.get("backend") != "codex" or end.get("backend") != "codex"
+                or end.get("cross_chat_exchange_status") is not True or end.get("transport") != "app-server"
+                or end.get("provider_thread_id") != provider_id or end.get("provider_turn_id") != origin.get("turn_id")
+                or receipt["body_key"] != body_key or source_ids != {origin.get("event_id")} or not origin.get("event_id")
+                or any(type(record.get("seq")) is not int for record in (receipt, start, end))
+                or not receipt["seq"] < start["seq"] < end["seq"]
+                or not isinstance(start.get("id"), str) or not start["id"]):
+                return None
+            times = [_delivery_timestamp(value) for value in (start.get("ts"), origin.get("timestamp"), end.get("ts"))]
+            if any(value is None for value in times) or not times[0] <= times[1] <= times[2]:
+                return None
+            return _native_event_identity(start)
+        if body is None:
+            return None
         envelope = start.get("cross_chat_envelope_id")
         if (start.get("malformed") or end.get("malformed")
             or not isinstance(envelope, str) or not envelope or start.get("backend") != "codex"
@@ -1111,7 +1157,7 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
         native_matches = native.get((native_run, kind, body_key), [])
         if not native_matches and kind == "user":
             delivery = deliveries.match(session_id, thread, native_run, source_origin,
-                                        delivery_bodies.get(key), delivery_source_ids.get(key[0], set()))
+                                        delivery_bodies.get(key), delivery_source_ids.get(key[0], set()), body_key)
             if delivery is not None:
                 native_matches = [delivery]
         if not native_matches and kind == "assistant":
@@ -1222,7 +1268,7 @@ def _prove_pending_async_deliveries(session_id: str, provider_id: str, items: li
         if (item.get("kind") != "user" or not isinstance(item.get("text"), str)
             or not isinstance(origin, dict) or origin.get("provider") != "codex" or origin.get("kind") != "user"
             or origin.get("session_id", provider_id) != provider_id or item.get("source_text_sha256") is not None
-            or not _async_delivery_body(item["text"])):
+            or not (_async_delivery_body(item["text"]) or _text_key(item["text"]) in deliveries.status_body_keys)):
             continue
         candidate = _replay_target({"seq": previous_seq + index + 2, "id": f"pending:{index}", "run_id": run,
             "type": "turn_started", "backend": "codex", "imported": True, "prompt": item["text"],
@@ -1272,8 +1318,7 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
         deliveries = _AsyncDeliveryIndex()
         prove_deliveries = (source_path is not None and root is not None
             and isinstance(sync_checkpoint, dict) and callable(parse_item)
-            and any(item.get("kind") == "user" and isinstance(item.get("text"), str)
-                    and _async_delivery_body(item["text"]) for item in items))
+            and any(item.get("kind") == "user" and isinstance(item.get("text"), str) for item in items))
         previous_seq, owner_count = 0, 0
         for event, _offset, _line in _native_records(events, stamp, budget):
             seq = event.get("seq")

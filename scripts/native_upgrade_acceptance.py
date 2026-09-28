@@ -33,6 +33,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PHASE = "host-validation"
 INSTALLER_FAILURE_DIAGNOSTICS: dict | None = None
 TRANSPORT_DIAGNOSTICS: dict | None = None
+TLS_PROBE_DIAGNOSTICS: dict | None = None
 SELECTORS = ("AGENTS_SERVER_INSTALL_DIR", "AGENTS_SERVER_CONFIG_DIR", "AGENTS_SERVER_STATE_DIR",
              "AGENTSDOCK_STATE_DIR", "ZENITHBOT_AGENT_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
              "AGENTS_SERVER_INSTANCE", "CODEX_HOME", "CLAUDE_CONFIG_DIR")
@@ -399,6 +400,66 @@ def managed_upgrade(home: Path, install: Path, port: int, secret: str, before: d
     raise RuntimeError("The real managed updater did not complete within its acceptance deadline.")
 
 
+def detached_tls_probe(install: Path, work: Path, signed_url: str, expected_bundle: str) -> dict:
+    """Observe HEAD using the installed interpreter and actual tmux environment."""
+    script, output = work / "tls-head-probe.py", work / "tls-head-probe.json"
+    script.write_text('''import json, os, socket, ssl, sys, urllib.error, urllib.request
+from pathlib import Path
+url, expected, output = sys.argv[1:]
+value = {"kind": "detached-tmux-tls-head-probe", "method": "HEAD"}
+bundle = os.environ.get("SSL_CERT_FILE", "")
+value["expected_bundle_selected"] = bundle == expected
+value["bundle_readable"] = bool(bundle and os.access(bundle, os.R_OK))
+value["registry_proxy_bypassed"] = urllib.request.proxy_bypass("registry.npmjs.org")
+try:
+    value["resolved_addresses"] = sorted({row[4][0] for row in socket.getaddrinfo("registry.npmjs.org", 443, type=socket.SOCK_STREAM)})
+    value["ca_count"] = len(ssl.create_default_context().get_ca_certs())
+    request = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "AgentsDock-Native-TLS-Probe/1"})
+    with urllib.request.urlopen(request, timeout=12) as response:
+        value["http_status"] = response.status
+except Exception as error:
+    reason = getattr(error, "reason", error)
+    value["error_type"] = type(error).__name__
+    value["reason_type"] = type(reason).__name__
+    value["reason"] = str(reason)[:700]
+    if isinstance(error, urllib.error.HTTPError):
+        value["http_status"] = error.code
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        value["verify_code"] = reason.verify_code
+        value["verify_message"] = reason.verify_message
+fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+with os.fdopen(fd, "w") as stream:
+    json.dump(value, stream)
+''')
+    script.chmod(0o600)
+    name = "agentsdock_native_tls_head_probe"
+    try:
+        shell = shlex.join([str(install / "current/.venv/bin/python"), "-B", str(script),
+                            signed_url, expected_bundle, str(output)])
+        command(["tmux", "new-session", "-d", "-s", name, shell])
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline:
+            if output.is_file() and not output.is_symlink():
+                try:
+                    value = json.loads(output.read_bytes()[:8192])
+                    for key in ("reason", "verify_message"):
+                        if key in value:
+                            value[key] = " ".join(sanitized_installer_tail(str(value[key]).encode(), b"", []))
+                    print(json.dumps(value), flush=True)
+                    return value
+                except ValueError:
+                    pass
+            time.sleep(0.2)
+        return {"kind": "detached-tmux-tls-head-probe", "error_type": "ProbeDeadlineExceeded"}
+    except (OSError, subprocess.SubprocessError, RuntimeError) as error:
+        return {"kind": "detached-tmux-tls-head-probe", "error_type": type(error).__name__}
+    finally:
+        try:
+            command(["tmux", "kill-session", "-t", name], allowed=(0, 1))
+        except (OSError, subprocess.SubprocessError, RuntimeError):
+            pass  # The owned daemon is still joined by fixture teardown.
+
+
 def health(port: int, secret: str, version: str) -> dict:
     deadline = time.monotonic() + 180
     while time.monotonic() < deadline:
@@ -487,7 +548,7 @@ def verify_runtime(install: Path, candidate: dict) -> int:
 
 
 def run(args: argparse.Namespace) -> dict:
-    global PHASE, TRANSPORT_DIAGNOSTICS
+    global PHASE, TRANSPORT_DIAGNOSTICS, TLS_PROBE_DIAGNOSTICS
     home = guard(args)
     clean_host(home)
     args.work.mkdir(mode=0o700)
@@ -554,6 +615,7 @@ def run(args: argparse.Namespace) -> dict:
             install.chmod(int(args.legacy_root_mode, 8))
             need(stat.S_IMODE(install.stat().st_mode) == int(args.legacy_root_mode, 8), "Baseline root mode was not applied.")
             PHASE = "existing-installation-upgrade"
+            TLS_PROBE_DIAGNOSTICS = detached_tls_probe(install, args.work, archive["url"], replay.environment["SSL_CERT_FILE"])
             managed_upgrade(home, install, port, secret, before, npm, args.version)
             PHASE = "candidate-state-verification"
             after = health(port, secret, args.version)
@@ -596,6 +658,7 @@ def run(args: argparse.Namespace) -> dict:
             "candidate_manifest_sha256": candidate["manifest_sha256"], "candidate_archive_sha256": candidate["archive_sha256"],
             "baseline_archive_sha256": baseline["archive_sha256"], "runtime_files_compared": runtime_count,
             "npm_manifest_sha256": npm["manifest_sha256"], "transport_fixture": replay.receipt,
+            "tls_head_probe": TLS_PROBE_DIAGNOSTICS,
             "observations": ["production-signatures-verified", "real-default-native-installation",
                              "authenticated-managed-update-api", "real-native-admission-and-replacement",
                              "fixture-trust-and-host-mapping-restored", "existing-installation-upgraded", "identity-and-token-preserved",
@@ -628,6 +691,8 @@ def main() -> None:
             result["installer_diagnostics"] = INSTALLER_FAILURE_DIAGNOSTICS
         if TRANSPORT_DIAGNOSTICS is not None:
             result["transport_fixture"] = TRANSPORT_DIAGNOSTICS
+        if TLS_PROBE_DIAGNOSTICS is not None:
+            result["tls_head_probe"] = TLS_PROBE_DIAGNOSTICS
         # PHASE only advances after guard(), clean_host() and creation of the
         # disposable work directory. A rejected host never writes a report.
         if PHASE != "host-validation":

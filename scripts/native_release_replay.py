@@ -132,7 +132,7 @@ def public_ca_roots():
 def certificates(work: Path):
     write_private(work / "ca.cnf", b"[req]\ndistinguished_name=dn\nx509_extensions=ca\nprompt=no\n[dn]\nCN=AgentsDock fixture CA\n[ca]\nbasicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always\n")
     write_private(work / "leaf.cnf", b"[req]\ndistinguished_name=dn\nprompt=no\n[dn]\nCN=registry.npmjs.org\n")
-    write_private(work / "leaf.ext", b"basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:registry.npmjs.org\n")
+    write_private(work / "leaf.ext", b"basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:registry.npmjs.org\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n")
     previous = os.umask(0o077)
     try:
         command("openssl", "req", "-config", str(work / "ca.cnf"), "-x509", "-newkey", "rsa:2048", "-nodes", "-sha256", "-days", "1", "-keyout", str(work / "ca.key"), "-out", str(work / "ca.pem"))

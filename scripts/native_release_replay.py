@@ -267,7 +267,7 @@ def replay_signed_npm_archive(archive: Path, signed_url: str, work: Path, *, exp
             "NODE_EXTRA_CA_CERTS": str(work / "ca.pem"), "NO_PROXY": no_proxy, "no_proxy": no_proxy}
         command_env = {key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL", "TMPDIR") if key in os.environ}
         arguments = ["sudo", "-n", "/usr/bin/env", *(f"{key}={os.environ[key]}" for key in CI_KEYS if key in os.environ),
-            sys.executable, "-I", str(Path(__file__).resolve()), "--serve", str(work)]
+            sys.executable, "-I", "-B", str(Path(__file__).resolve()), "--serve", str(work)]
         with (work / "listener.stderr").open("wb") as errors:
             process = subprocess.Popen(arguments, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors, env=command_env)
         with selectors.DefaultSelector() as selector:

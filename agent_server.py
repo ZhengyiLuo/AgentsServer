@@ -90025,8 +90025,68 @@ async def acknowledge_session_emergency(
         return {"session": public_session(sess), "acknowledged": True}
 
 
+async def ensure_discardable_empty_session(session_id: str, expected_updated_at: str) -> None:
+    """Fail closed while the caller holds the lifecycle lock/deletion fence.
+
+    Automatic placeholder cleanup must never behave like an explicit Delete:
+    it may not interrupt a turn, cancel queued work or remove uploaded content.
+    Local drafts are additionally checked by the originating desktop client.
+    """
+    def untouched() -> bool:
+        session = STORE.sessions.get(session_id)
+        return bool(
+            session and expected_updated_at
+            and session.get("updated_at") == expected_updated_at
+            and session.get("title") == "New chat"
+            and not session_backend_locked(session)
+            and not any(session.get(key) for key in (
+                "parent_id", "pinned", "archived", "manual_unread",
+                "codex_goal", "claude_goal", "emergency_alert",
+            ))
+            and session_id not in ACTIVE and session_id not in BUSY_SESSIONS
+            and session_id not in CURRENT_TURNS
+            and not QUEUED_TURNS.get(session_id)
+            and session_id not in RUN_NOW_TURNS
+            and session_id not in RUN_NOW_REQUESTS
+            and not any(not task.done() for task in SESSION_TURN_TASKS.get(session_id, ()))
+            and not any(job.get("session_id") == session_id for job in JOBS.jobs.values())
+            and not PORT_TUNNELS._sockets.get(session_id)
+        )
+
+    def only_creation_event() -> bool:
+        # Unlike timeline projection, do not skip malformed/hidden records.
+        # Any extra byte or uncertain history preserves the chat.
+        with events_path(session_id).open("rb") as stream:
+            line = stream.readline(65537)
+            if not line or len(line) > 65536 or stream.read(1):
+                return False
+        try:
+            event = json.loads(line)
+        except (ValueError, UnicodeError):
+            return False
+        return isinstance(event, dict) and event.get("type") == "session_created" and event.get("seq") == 1
+
+    if not untouched():
+        raise HTTPException(status_code=409, detail="Chat is no longer an unused placeholder; it was preserved.")
+    history_empty, files, terminal = await asyncio.gather(
+        asyncio.to_thread(only_creation_event),
+        asyncio.to_thread(list_session_file_records, session_id),
+        asyncio.to_thread(terminal_windows_snapshot, session_id),
+    )
+    if not untouched() or not history_empty or files or terminal.get("exists"):
+        raise HTTPException(status_code=409, detail="Chat has content or resources; it was preserved.")
+
+
+@app.post("/api/sessions/{session_id}/discard-empty")
+async def discard_empty_session(session_id: str, expected_updated_at: str) -> dict[str, Any]:
+    # A separate route makes old servers fail safely with 404, rather than
+    # ignoring a conditional DELETE query and deleting a real conversation.
+    await wait_for_queue_recovery_admission()
+    return await delete_session(session_id, discard_updated_at=expected_updated_at)
+
+
 @app.delete("/api/sessions/{session_id}")
-async def delete_session(session_id: str) -> dict[str, Any]:
+async def delete_session(session_id: str, discard_updated_at: str | None = None) -> dict[str, Any]:
     async with session_lifecycle_lock(session_id):
         ensure_session_not_initializing(session_id)
         if session_id in DELETED_SESSION_TOMBSTONES:
@@ -90061,9 +90121,11 @@ async def delete_session(session_id: str) -> dict[str, Any]:
                 ),
             )
         DELETING_SESSIONS.add(session_id)
-        cancel_generated_session_title(session_id)
         deleted = False
         try:
+            if discard_updated_at is not None:
+                await ensure_discardable_empty_session(session_id, discard_updated_at)
+            cancel_generated_session_title(session_id)
             if (
                 session_id in CLAUDE_STOP_FENCE_SESSIONS
                 or session_id in CLAUDE_STOP_FENCE_RETRY_TASKS
@@ -90321,6 +90383,8 @@ async def delete_session(session_id: str) -> dict[str, Any]:
                             "the session was not deleted. Retry shortly."
                         ),
                     )
+            if discard_updated_at is not None:
+                await ensure_discardable_empty_session(session_id, discard_updated_at)
             await fence_secure_peer_chat_retirement(session_id)
             try:
                 await asyncio.to_thread(
@@ -90404,6 +90468,8 @@ async def delete_session(session_id: str) -> dict[str, Any]:
                 await asyncio.to_thread(kill_terminal_session, session_id)
             async def finish_committed_delete() -> dict[str, Any]:
                 async with event_delivery_lock(session_id):
+                    if discard_updated_at is not None:
+                        await ensure_discardable_empty_session(session_id, discard_updated_at)
                     committed_deleted = await STORE.delete(session_id)
                     DELETED_SESSION_TOMBSTONES.add(session_id)
                     DELETING_SESSIONS.discard(session_id)

@@ -13,6 +13,7 @@ import re
 import tempfile
 import unittest
 from unittest.mock import AsyncMock, Mock
+from types import SimpleNamespace
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -59,6 +60,7 @@ class CodexSubagentsAdminTests(unittest.IsolatedAsyncioTestCase):
             "Field": Field, "Request": Request, "HTTPException": HTTPException,
             "JSONResponse": JSONResponse, "CODEX_SETTINGS_FILE": self.settings,
             "CODEX_TRANSPORT": "app-server", "CODEX_TRANSPORT_EXEC": "exec",
+            "STORE": SimpleNamespace(sessions={}), "broadcast_codex_subagent_limit": AsyncMock(), "DEFAULT_BACKEND": "codex", "BACKEND_CODEX": "codex", "schedule_codex_subagent_limit_application": Mock(),
             "CODEX_GOALS_CONFIG_LOCK": asyncio.Lock(), "CODEX_GOALS_ENABLED": True,
             "CODEX_GOALS_DEFAULT_ENABLED": True, "CODEX_GOALS_RECONFIGURING": False,
             "update_utc_now": lambda: "2030-01-01T00:00:00Z",
@@ -101,7 +103,7 @@ class CodexSubagentsAdminTests(unittest.IsolatedAsyncioTestCase):
         result = await self.ns["get_codex_subagents_admin"]()
         self.assertIsNone(result["max_concurrent_threads_per_session"])
         self.assertTrue(result["configurable"])
-        self.assertEqual(result["applies_to"], "new_or_reloaded_threads")
+        self.assertEqual(result["applies_to"], "automatically_when_idle")
         self.assertEqual(result["provider_config_key"], "agents.max_concurrent_threads_per_session")
         self.assertFalse(self.settings.exists())
         self.ns["close_codex_app_server_manager"].assert_not_called()

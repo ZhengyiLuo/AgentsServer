@@ -42,6 +42,9 @@ class FakeCodexAppServerManager:
     ) -> None:
         self.inject_calls.append((thread_id, items))
 
+    async def list_background_terminals(self, thread_id: str) -> list[object]:
+        return []
+
     async def unsubscribe_thread(self, thread_id: str) -> str:
         self.unsubscribe_calls.append(thread_id)
         self.loaded.discard(thread_id)
@@ -281,7 +284,7 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
             [{"type": "input_text", "text": resume_policy}],
         )
 
-    async def test_saved_subagent_limit_waits_for_reload_and_clear_inherits_configuration(self) -> None:
+    async def test_saved_subagent_limit_automatically_reloads_and_clear_inherits_configuration(self) -> None:
         session = self.session(session_id="thread-existing", codex_thread_id="thread-existing")
         manager = FakeCodexAppServerManager(loaded={"thread-existing"})
         with patch.object(agent_server, "codex_user_developer_instructions", return_value=""), patch.object(
@@ -290,13 +293,10 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
             session["codex_instruction_hash"] = agent_server.codex_thread_instruction_hash("chat-1", session)
             session["subagent_limit"] = 3
             await agent_server.ensure_codex_app_server_thread(manager, "chat-1", session, "/repo")
-            self.assertEqual(manager.resume_calls, [])
-            self.assertEqual(manager.unsubscribe_calls, [])
-            manager.loaded.clear()  # The existing explicit Reload provider action.
-            await agent_server.ensure_codex_app_server_thread(manager, "chat-1", session, "/repo")
+            self.assertEqual(len(manager.resume_calls), 1)
+            self.assertEqual(manager.unsubscribe_calls, ["thread-existing"])
             self.assertEqual(manager.resume_calls[-1][1]["config"]["agents.max_concurrent_threads_per_session"], 3)
             session["subagent_limit"] = None
-            manager.loaded.clear()
             await agent_server.ensure_codex_app_server_thread(manager, "chat-1", session, "/repo")
             self.assertNotIn("agents.max_concurrent_threads_per_session", manager.resume_calls[-1][1]["config"])
             self.assertEqual(manager.inject_calls, [])
@@ -330,7 +330,7 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(task, return_exceptions=True)
         self.assertIsNone(session["subagent_limit"])
         self.assertEqual(session["_codex_subagent_limit_applied"]["limit"], 3)
-        self.assertEqual(session["_codex_subagent_limit_reset_pending"], session["_codex_subagent_limit_applied"]["process"])
+        self.assertNotIn("_codex_subagent_limit_reset_pending", session)
 
     async def test_native_fork_is_rebound_to_child_chat_policy(self) -> None:
         manager = FakeCodexAppServerManager(loaded={"thread-fork"})

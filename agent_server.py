@@ -10877,11 +10877,6 @@ class SessionStore:
                 sess["codex_permission_profile"] = profile or None
             if "subagent_limit" in patch:
                 sess.pop("_codex_subagent_limit_reset_pending", None)
-                if patch["subagent_limit"] is None and sess.get("backend") == BACKEND_CODEX:
-                    inherited = codex_effective_thread_config({**sess, "subagent_limit": None}).get("agents", {}).get("max_concurrent_threads_per_session")
-                    applied = sess.get("_codex_subagent_limit_applied") or {}
-                    if applied.get("process") and not _codex_config_positive_int(inherited):
-                        sess["_codex_subagent_limit_reset_pending"] = applied["process"]
                 sess["subagent_limit"] = patch["subagent_limit"]
             if "system_prompt" in patch:
                 sess["system_prompt"] = clean_session_system_prompt(patch["system_prompt"])
@@ -14130,6 +14125,8 @@ CODEX_SUBAGENT_STATE: dict[str, dict[str, Any]] = {}
 # that work survived an AgentsServer/app-server restart.
 CODEX_SUBAGENT_LIVE_GENERATIONS: dict[str, int] = {}
 CODEX_SUBAGENT_LIVE_MANAGERS: dict[str, Any] = {}
+CODEX_SUBAGENT_LIMIT_TASKS: dict[str, asyncio.Task[Any]] = {}
+CODEX_SUBAGENT_LIMIT_REQUESTED: set[str] = set()
 # Timeline indexes are built in worker threads while provider notifications
 # update these maps on the event loop. Protect compound mutations and snapshots
 # so a semantic-page rebuild never iterates a dictionary that is changing.
@@ -29868,6 +29865,7 @@ async def release_turn_slot(
         BUSY_SESSIONS.discard(session_id)
         CURRENT_TURNS.pop(session_id, None)
         STOP_REQUESTS.discard(session_id)
+        schedule_codex_subagent_limit_application(session_id)
         return True
 
 
@@ -31149,6 +31147,8 @@ async def _emit_codex_subagent_state_once(
             CODEX_SUBAGENT_SESSION_INDEX[child_thread_id] = session_id
             if reconcile_expected_state is not ...:
                 CODEX_SUBAGENT_STATE[child_thread_id] = previous
+        if normalized not in {"starting", "running"}:
+            schedule_codex_subagent_limit_application(session_id)
         return previous
 
     if not persist_event:
@@ -31161,6 +31161,8 @@ async def _emit_codex_subagent_state_once(
         with CODEX_SUBAGENT_INDEX_LOCK:
             CODEX_SUBAGENT_SESSION_INDEX[child_thread_id] = session_id
             CODEX_SUBAGENT_STATE[child_thread_id] = stored
+        if normalized not in {"starting", "running"}:
+            schedule_codex_subagent_limit_application(session_id)
         return stored
 
     event = await append_event(session_id, "subagent_state", payload)
@@ -31192,6 +31194,8 @@ async def _emit_codex_subagent_state_once(
                 indexed = dict(reversed(ordered))
             session["codex_subagents"] = indexed
             await STORE.save()
+    if normalized not in {"starting", "running"}:
+        schedule_codex_subagent_limit_application(session_id)
     return stored
 
 
@@ -51486,15 +51490,8 @@ def session_subagent_limit_control(sess: dict[str, Any]) -> dict[str, Any]:
     if backend == BACKEND_CODEX:
         if CODEX_TRANSPORT == CODEX_TRANSPORT_EXEC:
             reason = "unsupported_transport"
-        applies_to = "new_or_reloaded_threads"
-        message = "Applies to new or reloaded Codex threads. Reload provider when this chat is idle; saving does not interrupt current work."
-        pending = sess.get("_codex_subagent_limit_reset_pending")
-        if sess.get("subagent_limit") is None and isinstance(pending, list) and len(pending) == 3 and pending[0] == SERVER_INSTANCE_ID:
-            manager = existing_codex_app_server_manager(sess)
-            inherited = codex_effective_thread_config(sess).get("agents", {}).get("max_concurrent_threads_per_session")
-            if manager is not None and manager.ready and pending[1:] == [getattr(manager, "_subagent_limit_instance", None), manager.generation] and not _codex_config_positive_int(inherited):
-                applies_to = "next_provider_process_start"
-                message = "The saved override is cleared. This loaded Codex process can retain its previous limit until a fresh provider process starts; Reload provider alone cannot clear the native default. Current work is not interrupted."
+        applies_to = "automatically_when_idle"
+        message = "Saved changes apply automatically when this chat and its subagents are idle. Current work continues with its existing limit."
     elif backend == BACKEND_CLAUDE:
         with RUNTIME_DIAGNOSTICS_LOCK:
             version = str((RUNTIME_DIAGNOSTICS.get(BACKEND_CLAUDE) or {}).get("version") or "")
@@ -51511,8 +51508,17 @@ def session_subagent_limit_control(sess: dict[str, Any]) -> dict[str, Any]:
         message = "This provider does not support a per-chat subagent limit."
     if reason and backend == BACKEND_CLAUDE:
         message = "Per-chat subagent limits require a detected Claude Code version of 2.1.217 or newer. Refresh provider status after updating Claude."
-    return {"supported": reason is None, "scope": "chat", "mode": "native_concurrent",
-            "applies_to": applies_to, "reason": reason, "message": message}
+    control = {"supported": reason is None, "scope": "chat", "mode": "native_concurrent",
+               "applies_to": applies_to, "reason": reason, "message": message}
+    if backend == BACKEND_CODEX and reason is None:
+        requested = codex_requested_subagent_limit(sess)
+        manager = existing_codex_app_server_manager(sess)
+        thread_id = str(session_provider_id(sess) or "")
+        loaded = bool(manager is not None and thread_id and manager.is_thread_loaded(thread_id))
+        applied = codex_applied_subagent_limit(manager, sess) if loaded else None
+        control.update(requested_limit=requested, effective_limit=applied.get("limit") if applied is not None else None,
+                       application_state=("next_start" if not loaded else "applied" if applied is not None and applied.get("limit") == requested else "pending"))
+    return control
 
 
 def validate_session_subagent_limit(sess: dict[str, Any], value: Any) -> None:
@@ -51559,8 +51565,15 @@ def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, 
     control = session_subagent_limit_control(sess)
     if summary:
         public["subagent_limit_control"] = {"supported": control["supported"]}
-        if control["applies_to"] != "new_or_reloaded_threads":
+        if control["applies_to"] not in {"new_or_reloaded_threads", "automatically_when_idle"}:
             public["subagent_limit_control"]["applies_to"] = control["applies_to"]
+        if "application_state" in control and (
+            "subagent_limit" in sess or control.get("requested_limit") is not None
+            or "_codex_subagent_limit_applied" in sess
+        ):
+            public["subagent_limit_control"].update({key: control[key] for key in (
+                "applies_to", "application_state", "requested_limit", "effective_limit",
+            )})
         if not control["supported"]:
             public["subagent_limit_control"].update(reason=control["reason"], message=control["message"])
     else:
@@ -54972,6 +54985,8 @@ async def project_codex_notification(notification: dict[str, Any]) -> None:
                     "message": codex_thread_status_message(status),
                 },
             )
+        if status.get("type") != "active":
+            schedule_codex_subagent_limit_application(session_id)
         return
 
     if method == "thread/goal/updated":
@@ -54994,6 +55009,8 @@ async def project_codex_notification(notification: dict[str, Any]) -> None:
                 # reorder the chat list.
                 await STORE.save()
         await append_event(session_id, "codex_goal_updated", {"goal": goal})
+        if str(goal.get("status") or "") != "active":
+            schedule_codex_subagent_limit_application(session_id)
         return
 
     if method == "thread/goal/cleared":
@@ -55007,6 +55024,7 @@ async def project_codex_notification(notification: dict[str, Any]) -> None:
                 # lifecycle notification is omitted from semantic history.
                 await STORE.save()
         await append_event(session_id, "codex_goal_cleared", {})
+        schedule_codex_subagent_limit_application(session_id)
         return
 
     if method == "thread/tokenUsage/updated":
@@ -56252,6 +56270,13 @@ async def close_codex_app_server_manager() -> None:
         if drain_task is not None and not drain_task.done():
             drain_task.cancel()
             await asyncio.gather(drain_task, return_exceptions=True)
+        limit_tasks = [task for task in tuple(CODEX_SUBAGENT_LIMIT_TASKS.values())
+                       if task is not asyncio.current_task() and not task.done()]
+        CODEX_SUBAGENT_LIMIT_REQUESTED.clear()
+        for task in limit_tasks:
+            task.cancel()
+        if limit_tasks:
+            await asyncio.gather(*limit_tasks, return_exceptions=True)
         await cancel_codex_interactions(resolution="server_closed")
         await cancel_codex_native_actions()
         async with CODEX_APP_SERVER_MANAGER_LOCK:
@@ -56599,6 +56624,7 @@ async def release_codex_control_thread(
                 session_idle = session_id not in BUSY_SESSIONS
             if schedule_queue and session_idle:
                 schedule_next_queued_turn(session_id)
+    schedule_codex_subagent_limit_application(session_id)
     return released if reserved_session else session_idle
 
 
@@ -60318,6 +60344,12 @@ async def ensure_codex_app_server_thread(
     instruction_hash = codex_thread_instruction_hash(session_id, sess)
     stored_hash = str(sess.get("codex_instruction_hash") or "")
     policy_changed = stored_hash != instruction_hash
+    applied_limit: int | None = None
+    def captured_thread_params(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal applied_limit
+        params = codex_thread_params(*args, **kwargs)
+        applied_limit = params.get("config", {}).get("agents.max_concurrent_threads_per_session")
+        return params
     pinned = False
     try:
         if provider_id:
@@ -60327,10 +60359,14 @@ async def ensure_codex_app_server_thread(
             provider_id and manager.is_thread_loaded(provider_id)
         )
 
+        if already_loaded and not policy_changed:
+            await apply_codex_subagent_limit_when_idle(manager, session_id, native_settings, cwd)
+            already_loaded = manager.is_thread_loaded(provider_id)
+
         if not provider_id:
             provider_id = await manager.start_thread(
                 {
-                    **codex_thread_params(
+                    **captured_thread_params(
                         native_settings,
                         cwd,
                         developer_instructions=instructions,
@@ -60350,7 +60386,7 @@ async def ensure_codex_app_server_thread(
             provider_id = await manager.resume_thread(
                 provider_id,
                 {
-                    **codex_thread_params(
+                    **captured_thread_params(
                         native_settings,
                         cwd,
                         developer_instructions=instructions,
@@ -60360,7 +60396,7 @@ async def ensure_codex_app_server_thread(
             )
         elif not already_loaded:
             resume_params = {
-                **codex_thread_params(
+                **captured_thread_params(
                     native_settings,
                     cwd,
                     developer_instructions=(
@@ -60372,7 +60408,7 @@ async def ensure_codex_app_server_thread(
             provider_id = await manager.resume_thread(provider_id, resume_params)
 
         if not already_loaded or policy_changed:
-            await record_codex_subagent_limit_application(manager, session_id, native_settings)
+            await record_codex_subagent_limit_application(manager, session_id, native_settings, thread_id=provider_id, applied_limit=applied_limit)
 
         await reconcile_codex_thread_goal(
             manager,
@@ -60447,44 +60483,196 @@ async def ensure_codex_app_server_thread(
         raise
 
 
+def codex_requested_subagent_limit(sess: dict[str, Any]) -> int | None:
+    value = codex_effective_thread_config(sess).get("agents", {}).get("max_concurrent_threads_per_session")
+    return value if _codex_config_positive_int(value) else None
+
+
+def codex_applied_subagent_limit(manager: Any, sess: dict[str, Any]) -> dict[str, Any] | None:
+    applied = sess.get("_codex_subagent_limit_applied")
+    if not isinstance(applied, dict) or manager is None:
+        return None
+    process = [SERVER_INSTANCE_ID, getattr(manager, "_subagent_limit_instance", None), manager.generation]
+    thread_id = str(session_provider_id(sess) or "")
+    if applied.get("process") != process or applied.get("thread_id", thread_id) != thread_id:
+        return None
+    return applied
+
+
+async def broadcast_codex_subagent_limit(session_id: str) -> None:
+    current = STORE.sessions.get(session_id)
+    if current is None or str(current.get("backend") or DEFAULT_BACKEND) != BACKEND_CODEX:
+        return
+    await broadcast_provider_runtime_changed(session_id, {
+        "type": "provider_runtime_changed", "runtime": "subagent_limit",
+        "ephemeral": True, "backend": BACKEND_CODEX,
+        "subagent_limit": current.get("subagent_limit"),
+        "subagent_limit_control": session_subagent_limit_control(current),
+    })
+
+
 async def record_codex_subagent_limit_application(
     manager: CodexAppServerManager, session_id: str, requested: dict[str, Any],
+    *, thread_id: str | None = None, applied_limit: Any = ...,
 ) -> None:
-    """Track only this setting's application; never retire a shared process."""
-    if not any(key in requested for key in (
-        "_codex_subagent_limit_applied", "_codex_subagent_limit_reset_pending",
-    )) and not _codex_config_positive_int(requested.get("subagent_limit")):
-        return
+    """Record the acknowledged request, even when a newer Save raced its RPC."""
     manager_identity = getattr(manager, "_subagent_limit_instance", None)
     if manager_identity is None:
         manager_identity = uuid.uuid4().hex
         manager._subagent_limit_instance = manager_identity
     process = [SERVER_INSTANCE_ID, manager_identity, manager.generation]
-    inherited = codex_effective_thread_config({**requested, "subagent_limit": None}).get("agents", {}).get("max_concurrent_threads_per_session")
+    limit = codex_requested_subagent_limit(requested) if applied_limit is ... else applied_limit
+    applied = {"process": process, "thread_id": str(thread_id or session_provider_id(requested) or ""), "limit": limit}
+    changed = False
     async with STORE._lock:
         current = STORE.sessions.get(session_id)
         if current is None:
             return
-        before = (current.get("_codex_subagent_limit_applied"), current.get("_codex_subagent_limit_reset_pending"))
-        pending = current.get("_codex_subagent_limit_reset_pending")
-        applied = current.get("_codex_subagent_limit_applied") or {}
-        if not _codex_config_positive_int(requested.get("subagent_limit")) and (
-            applied.get("process") != process or _codex_config_positive_int(inherited)
-        ):
-            current.pop("_codex_subagent_limit_applied", None)
-        if pending and (pending != process or _codex_config_positive_int(inherited)):
+        if thread_id and str(session_provider_id(current) or "") not in {"", thread_id}:
+            return
+        if current.get("_codex_subagent_limit_applied") != applied or "_codex_subagent_limit_reset_pending" in current:
+            current["_codex_subagent_limit_applied"] = applied
             current.pop("_codex_subagent_limit_reset_pending", None)
-            current.pop("_codex_subagent_limit_applied", None)
-        limit = requested.get("subagent_limit")
-        if _codex_config_positive_int(limit):
-            current["_codex_subagent_limit_applied"] = {"process": process, "limit": limit}
-            # Saving null while start/resume awaited cannot change the captured
-            # native request. Preserve that pending reset instead of claiming it applied.
-            if current.get("subagent_limit") is None and not _codex_config_positive_int(inherited):
-                current["_codex_subagent_limit_reset_pending"] = process
-        after = (current.get("_codex_subagent_limit_applied"), current.get("_codex_subagent_limit_reset_pending"))
-        if before != after:
+            current.pop("_codex_subagent_limit_refresh_requested", None)
             await STORE.save()
+            changed = True
+    if changed:
+        await broadcast_codex_subagent_limit(session_id)
+
+
+async def apply_codex_subagent_limit_when_idle(
+    manager: CodexAppServerManager, session_id: str, sess: dict[str, Any], cwd: str,
+) -> bool:
+    """Refresh one idle native thread; never retire its process or descendants.
+
+    The caller owns this chat's lifecycle/admission boundary. Native resume on
+    an already-loaded thread ignores a changed cap. Unsubscribe resets its
+    budget, so even an idle parent must retain it while children still run.
+    """
+    thread_id = str(session_provider_id(sess) or "")
+    requested = codex_requested_subagent_limit(sess)
+    applied = codex_applied_subagent_limit(manager, sess)
+    if not thread_id or not manager.is_thread_loaded(thread_id) or (applied is not None and applied.get("limit") == requested):
+        return False
+    if applied is None and requested is None and "subagent_limit" not in sess and not sess.get("_codex_subagent_limit_refresh_requested"):
+        return False
+    def idle() -> bool:
+        with CODEX_SUBAGENT_INDEX_LOCK:
+            children = [child for child, state in CODEX_SUBAGENT_STATE.items()
+                        if state.get("session_id") == session_id and child != thread_id]
+        return bool(
+            manager.is_thread_loaded(thread_id)
+            and all(manager.active_turn(child) is None for child in children)
+            and str(((STORE.sessions.get(session_id) or sess).get("codex_goal") or {}).get("status") or "") != "active"
+            and manager.active_turn(thread_id) is None
+            and not codex_session_has_live_subagents(session_id)
+            and str(session_provider_id(STORE.sessions.get(session_id) or sess) or "") == thread_id
+        )
+    if not idle():
+        return False
+    generation = manager.generation
+    try:
+        with CODEX_SUBAGENT_INDEX_LOCK:
+            descendants = [child for child, state in CODEX_SUBAGENT_STATE.items()
+                           if state.get("session_id") == session_id and child != thread_id
+                           and manager.is_thread_loaded(child)]
+        for owner_thread in [thread_id, *descendants]:
+            try:
+                terminals = await manager.list_background_terminals(owner_thread)
+            except CodexAppServerRequestError as exc:
+                if exc.code not in {-32600, -32601}:
+                    raise
+                terminals = []
+            if terminals or manager.generation != generation or not idle():
+                return False
+        # Build the exact request before the first mutation. Omitting the cap
+        # on a fully unloaded thread restores Codex's inherited default.
+        params = {**codex_thread_params(dict(sess), cwd), "excludeTurns": True}
+        requested = params.get("config", {}).get("agents.max_concurrent_threads_per_session")
+        await manager.unsubscribe_thread(thread_id)
+        await manager.resume_thread(thread_id, params)
+        if manager.generation != generation:
+            return False
+        await record_codex_subagent_limit_application(
+            manager, session_id, sess, thread_id=thread_id, applied_limit=requested,
+        )
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        # Saving a setting must not reject a user message. An unloaded thread
+        # is resumed by ordinary admission; an unchanged loaded owner retries
+        # on its next lifecycle event.
+        logger.warning("could not apply saved Codex subagent limit session=%s: %s", session_id, concise_error_message(exc))
+        return False
+
+
+def schedule_codex_subagent_limit_application(session_id: str) -> None:
+    if CODEX_MANAGER_CLOSING:
+        return
+    sess = STORE.sessions.get(session_id)
+    if not sess or str(sess.get("backend") or DEFAULT_BACKEND) != BACKEND_CODEX or CODEX_TRANSPORT == CODEX_TRANSPORT_EXEC:
+        return
+    task = CODEX_SUBAGENT_LIMIT_TASKS.get(session_id)
+    if task is not None and not task.done():
+        # The loaded state/old acknowledged cap is stale while its reload is
+        # awaiting. A Save back to that old value still needs another pass.
+        CODEX_SUBAGENT_LIMIT_REQUESTED.add(session_id)
+        return
+    manager = existing_codex_app_server_manager(sess)
+    thread_id = str(session_provider_id(sess) or "")
+    if manager is None or not thread_id or not manager.is_thread_loaded(thread_id):
+        return
+    applied = codex_applied_subagent_limit(manager, sess)
+    if applied is not None and applied.get("limit") == codex_requested_subagent_limit(sess):
+        return
+    CODEX_SUBAGENT_LIMIT_REQUESTED.add(session_id)
+    task = CODEX_SUBAGENT_LIMIT_TASKS.get(session_id)
+    if task is None or task.done():
+        CODEX_SUBAGENT_LIMIT_TASKS[session_id] = asyncio.create_task(apply_pending_codex_subagent_limit(session_id))
+
+
+async def apply_pending_codex_subagent_limit(session_id: str) -> None:
+    try:
+        while session_id in CODEX_SUBAGENT_LIMIT_REQUESTED:
+            CODEX_SUBAGENT_LIMIT_REQUESTED.discard(session_id)
+            async with session_lifecycle_lock(session_id):
+                sess = STORE.sessions.get(session_id)
+                if not sess or sess.get("archived") or session_id in DELETING_SESSIONS:
+                    return
+                tasks = set(SESSION_TURN_TASKS.get(session_id) or ())
+                tasks.update(task for (sid, _), task in CODEX_NATIVE_ACTION_TASKS.items() if sid == session_id)
+                tasks = {task for task in tasks if not task.done() and task is not asyncio.current_task()}
+                if session_id in BUSY_SESSIONS or ACTIVE.get(session_id) is not None or session_id in SERVER_MAINTENANCE_SESSIONS or tasks:
+                    # The finalizer releases its admission before its task
+                    # completes. Subscribe once to that boundary, never poll.
+                    for task in tasks:
+                        watched = getattr(task, "_codex_subagent_limit_watch", set())
+                        if not task.done() and session_id not in watched:
+                            task._codex_subagent_limit_watch = {*watched, session_id}
+                            task.add_done_callback(lambda _task, sid=session_id: schedule_codex_subagent_limit_application(sid))
+                    return
+                manager = existing_codex_app_server_manager(sess)
+                if manager is None:
+                    return
+                retain_codex_manager_caller(manager, session_id)
+                thread_id = str(session_provider_id(sess) or "")
+                if not thread_id:
+                    return
+                await pin_codex_app_server_thread(thread_id, manager)
+                try:
+                    await apply_codex_subagent_limit_when_idle(
+                        manager, session_id, sess, existing_cwd(str(sess.get("cwd") or DEFAULT_CWD)),
+                    )
+                finally:
+                    await unpin_codex_app_server_thread(manager, thread_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("could not refresh saved Codex subagent setting session=%s: %s", session_id, concise_error_message(exc))
+    finally:
+        if CODEX_SUBAGENT_LIMIT_TASKS.get(session_id) is asyncio.current_task():
+            CODEX_SUBAGENT_LIMIT_TASKS.pop(session_id, None)
 
 
 async def start_standalone_codex_app_server_thread(
@@ -62024,17 +62212,11 @@ async def bind_forked_codex_thread(
     try:
         if manager.is_thread_loaded(thread_id):
             await manager.unsubscribe_thread(thread_id)
-        resumed_thread_id = await manager.resume_thread(
-            thread_id,
-            {
-                **codex_thread_params(
-                    native_settings,
-                    cwd,
-                    developer_instructions=instructions,
-                ),
-                "excludeTurns": True,
-            },
-        )
+        resume_params = {
+            **codex_thread_params(native_settings, cwd, developer_instructions=instructions),
+            "excludeTurns": True,
+        }
+        resumed_thread_id = await manager.resume_thread(thread_id, resume_params)
         if resumed_thread_id != thread_id:
             raise CodexAppServerProtocolError(
                 "thread/resume changed the forked thread identity",
@@ -62066,7 +62248,10 @@ async def bind_forked_codex_thread(
             require_goal_support=require_goal_support,
             expected_goal=expected_goal,
         )
-        await record_codex_subagent_limit_application(manager, session_id, native_settings)
+        await record_codex_subagent_limit_application(
+            manager, session_id, native_settings, thread_id=bound_thread_id,
+            applied_limit=resume_params.get("config", {}).get("agents.max_concurrent_threads_per_session"),
+        )
         await touch_codex_app_server_thread(manager, bound_thread_id)
         return bound_thread_id, instruction_hash
     except Exception:
@@ -82217,10 +82402,10 @@ def codex_subagents_admin_status() -> dict[str, Any]:
         "reason": "unsupported_transport" if CODEX_TRANSPORT == CODEX_TRANSPORT_EXEC else None,
         "scope": "server",
         "provider_config_key": "agents.max_concurrent_threads_per_session",
-        "applies_to": "new_or_reloaded_threads",
+        "applies_to": "automatically_when_idle",
         "message": (
-            "Applies to new or reloaded Codex threads. Existing chats need Reload provider "
-            "when idle. A chat-specific override takes precedence. No override means "
+            "Saved changes apply automatically when each chat and its subagents are idle. "
+            "A chat-specific override takes precedence. No override means "
             "Codex chooses its default, not unlimited."
         ),
     }
@@ -82261,7 +82446,14 @@ async def put_codex_subagents_admin(req: CodexSubagentsAdminRequest) -> dict[str
             atomic_update_json(CODEX_SETTINGS_FILE, settings)
         except OSError as exc:
             raise HTTPException(status_code=503, detail="Codex settings could not be saved") from exc
-        return codex_subagents_admin_status()
+    for session_id, session in tuple(STORE.sessions.items()):
+        if str(session.get("backend") or DEFAULT_BACKEND) == BACKEND_CODEX:
+            # Include older already-loaded threads with no application receipt
+            # when clearing a previously saved server-wide override.
+            session["_codex_subagent_limit_refresh_requested"] = True
+            await broadcast_codex_subagent_limit(session_id)
+            schedule_codex_subagent_limit_application(session_id)
+    return codex_subagents_admin_status()
 
 
 def queued_turn_backend(session_id: str, item: dict[str, Any]) -> str:
@@ -87494,6 +87686,9 @@ async def update_session(session_id: str, req: UpdateSessionRequest) -> dict[str
             # Archiving is already durable at this point. Terminal cleanup is
             # best-effort and must not turn a successful archive into a 500.
             logger.warning("could not clean up terminal for archived session %s: %s", session_id, exc)
+    if "subagent_limit" in patch:
+        await broadcast_codex_subagent_limit(session_id)
+        schedule_codex_subagent_limit_application(session_id)
     # Settings edits can complete without a timeline event. Notify only an
     # already-open shared view; this performs no I/O or background refresh.
     live_shares = globals().get("INTERACTIVE_CHAT_LIVE")

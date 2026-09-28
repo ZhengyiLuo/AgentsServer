@@ -29,7 +29,14 @@ class GeneratedTitleLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.store.sessions = {'title-chat': self.sess}
         self.tasks = {}
         self.generator = AsyncMock(return_value='Song About Two Cats')
-        self.provider_store = SimpleNamespace(for_session=Mock(return_value=None), require_thread=Mock())
+        self.provider_control = {
+            'pending': False, 'requested_provider': 'default', 'active_provider': 'default',
+            'requested_base_url': None, 'active_base_url': None,
+        }
+        self.provider_store = SimpleNamespace(
+            for_session=Mock(return_value=None), require_thread=Mock(),
+            control=Mock(return_value=self.provider_control),
+        )
         for target, value in (
             ('STORE', self.store), ('GENERATED_TITLE_TASKS', self.tasks),
             ('GENERATED_TITLE_SLOTS', asyncio.Semaphore(2)), ('SERVER_SHUTTING_DOWN', False),
@@ -315,6 +322,9 @@ print(json.dumps({{'type': 'result', 'subtype': 'success', 'result': 'Song About
 
     @unittest.skipUnless(os.name == 'posix', 'owned process groups require POSIX')
     async def test_actual_title_process_defers_update_and_restart_until_completion(self):
+        # Exercise the legacy idle-update lifecycle independently of the
+        # developer machine's managed-install preparation environment.
+        self.enterContext(patch.dict(os.environ, {'AGENTS_SERVER_INSTALL_DIR': ''}))
         root = self.real_title_process()
         for target, value in (
             ('SERVER_VERSION', '1.0.0'), ('SERVER_UPDATE_STATUS_FILE', root / 'status.json'),
@@ -325,6 +335,12 @@ print(json.dumps({{'type': 'result', 'subtype': 'success', 'result': 'Song About
             ('BUSY_SESSIONS', set()), ('SERVER_MAINTENANCE_SESSIONS', set()),
             ('QUEUED_TURNS', {}), ('RUN_NOW_TURNS', {}), ('CLAUDE_SDK_MANAGER', None),
             ('CODEX_APP_SERVER_MANAGER', None), ('CODEX_CUSTOM_APP_SERVER_MANAGERS', {}),
+            ('TEAM_HUB_RUNTIME', SimpleNamespace(
+                capability=Mock(return_value={'designated_host': False, 'available': False}),
+                prepare_maintenance=AsyncMock(return_value=None),
+                clear_maintenance=AsyncMock(), reopen_admission=AsyncMock(),
+                reopen_admission_sync=Mock(),
+            )),
         ):
             self.enterContext(patch.object(server, target, value))
         self.enterContext(patch.object(server, 'managed_server_update_scheduled_job_blocker', REAL_AUTONOMOUS_ADMISSION))
@@ -428,6 +444,8 @@ print(json.dumps({{'type': 'result', 'subtype': 'success', 'result': 'Song About
                 created = await self.store.create(server.CreateSessionRequest(
                     cwd='/tmp', backend='codex', auto_title_enabled=enabled))
                 self.assertEqual(created['auto_title_enabled'], enabled is not False)
+                self.assertEqual(server.public_session(created)['codex_provider_control'], self.provider_control)
+                self.assertEqual(self.provider_store.control.call_args.args[0]['id'], created['id'])
 
 
 if __name__ == '__main__':

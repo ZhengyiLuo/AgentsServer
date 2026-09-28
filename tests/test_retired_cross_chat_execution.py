@@ -5,7 +5,7 @@ from collections import deque
 from unittest.mock import AsyncMock, Mock, patch
 
 import agent_server
-import test_cross_chat_handoffs as fixtures
+from tests import test_cross_chat_handoffs as fixtures
 
 
 class RetiredCrossChatExecutionTests(unittest.IsolatedAsyncioTestCase):

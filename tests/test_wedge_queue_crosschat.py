@@ -3,7 +3,9 @@ delivery rows that could never pass the immutability check, silent retry
 loops that appended a turn_deferred event on every attempt, and unbounded
 retries for hidden delivery rows."""
 
+import tempfile
 import unittest
+from pathlib import Path
 from collections import deque
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -111,7 +113,18 @@ class RebuiltDeliveryRowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item["effort"], "medium")
 
     async def start_delivery(self, req: agent_server.TurnRequest) -> None:
+        # Keep coverage of the compatibility secure-peer admission branch.
+        # Same-server direct delivery is now retired before provider admission.
+        req = req.model_copy(update={
+            "purpose": agent_server.SECURE_PEER_DELIVERY_PURPOSE,
+            "cross_chat_envelope_id": None,
+            "secure_peer_envelope_id": "secure_rebuilt",
+        })
         with (
+            patch.object(agent_server, "SECURE_PEER_AGENT_RELAY_ENABLED", True),
+            patch.object(agent_server.SECURE_PEER_RUNTIME, "delivery", return_value={
+                "target_chat_id": "target", "state": "queued", "queued_id": "queued_delivery",
+            }),
             patch.object(
                 agent_server.STORE,
                 "sessions",
@@ -180,7 +193,7 @@ class RebuiltDeliveryRowTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(raised.exception.status_code, 400)
                 self.assertEqual(
                     raised.exception.detail,
-                    "cross-chat delivery runtime is immutable",
+                    "invalid secure peer delivery envelope",
                 )
 
     async def test_capability_set_of_another_backend_is_a_target_change(self) -> None:
@@ -194,7 +207,7 @@ class RebuiltDeliveryRowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 410)
         self.assertEqual(
             raised.exception.detail,
-            "cross-chat delivery target runtime changed",
+            "secure peer delivery target runtime changed",
         )
 
     async def test_unknown_capability_set_is_still_immutable_violation(self) -> None:
@@ -208,8 +221,43 @@ class RebuiltDeliveryRowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 400)
         self.assertEqual(
             raised.exception.detail,
-            "cross-chat delivery runtime is immutable",
+            "secure peer delivery runtime is immutable",
         )
+
+
+    async def test_rebuilt_legacy_delivery_is_retired_without_touching_user_queue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = agent_server.CrossChatStore(Path(directory) / "cross-chat.sqlite3")
+            await ledger.initialize()
+            await ledger.create_instruction(envelope_id="handoff_rebuilt", source_session_id="source",
+                source_run_id="run_source", target_session_id="target", body="Preserve original delivery",
+                idempotency_key="rebuilt-delivery")
+            await ledger.update("handoff_rebuilt", expected={"ready"}, status="queued", queued_id="queued_delivery")
+            legacy = agent_server.queued_turn_from_event(delivery_event(), dict(TARGET_SESSION), 1)
+            user = queued_user_item(_paused_after_stop=True)
+            queue = {"target": deque([legacy, user])}
+            with (
+                patch.object(agent_server, "CROSS_CHAT", ledger),
+                patch.object(agent_server.STORE, "sessions", {"source": {"id": "source", "backend": "codex"}, "target": dict(TARGET_SESSION)}),
+                patch.object(agent_server, "QUEUED_TURNS", queue),
+                patch.object(agent_server, "RUN_NOW_TURNS", {}),
+                patch.object(agent_server, "CURRENT_TURNS", {}),
+                patch.object(agent_server, "append_durable_event", AsyncMock()) as durable,
+                patch.object(agent_server, "append_cross_chat_terminal_lifecycle", AsyncMock()),
+                patch.object(agent_server, "validate_session_file_ids", MagicMock(side_effect=AdmissionReached)) as provider,
+            ):
+                with self.assertRaises(HTTPException) as error:
+                    await agent_server._start_turn_locked("target", delivery_request(legacy), queue_if_busy=False,
+                        queued_id="queued_delivery", accepted_provider_route_snapshot=[])
+            self.assertEqual(error.exception.status_code, 410)
+            retired = await ledger.get("handoff_rebuilt")
+            self.assertEqual(retired["status"], "cancelled")
+            self.assertIn("legacy_route_disabled", retired["error"])
+            self.assertEqual(retired["body"], "Preserve original delivery")
+            self.assertEqual(list(queue["target"]), [user])
+            self.assertTrue(any(call.args[1] == "turn_unqueued" and call.args[2]["queued_id"] == "queued_delivery"
+                                for call in durable.await_args_list))
+            provider.assert_not_called()
 
 
 def queued_delivery_item(**overrides) -> dict:
@@ -221,12 +269,12 @@ def queued_delivery_item(**overrides) -> dict:
         "model": None,
         "effort": None,
         "display_prompt": "Incoming cross-chat message",
-        "purpose": agent_server.LOCAL_CROSS_CHAT_DELIVERY_PURPOSE,
+        "purpose": agent_server.SECURE_PEER_DELIVERY_PURPOSE,
         "source_session_id": "source",
         "target_session_id": "target",
         "chat_references": [],
         "team_references": [],
-        "cross_chat_envelope_id": "handoff_retry",
+        "secure_peer_envelope_id": "secure_retry",
         "client_capabilities": list(CLAUDE_CAPS),
         "_durable": True,
     }

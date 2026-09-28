@@ -437,30 +437,17 @@ class StandaloneProviderContextTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(len(capabilities), 1)
                 capability = capabilities[0]
-                self.assertEqual(
-                    capability["grants"],
-                    {("sess_target", "instruction")},
-                )
-                self.assertEqual(
-                    len(capability["provider_direct_grants"]),
-                    1,
-                )
-                direct_handle, direct_grant = next(iter(
-                    capability["provider_direct_grants"].items()
-                ))
-                self.assertEqual(direct_grant, {
-                    "target_session_id": "sess_target",
-                    "action": "instruction",
-                })
+                # Scheduled references retain their job provenance without
+                # recreating handles for the retired direct-delivery protocol.
+                self.assertEqual(capability["grants"], set())
+                self.assertEqual(capability["provider_direct_grants"], {})
                 launched_prompt = run_claude.await_args.args[2]
                 self.assertEqual(launched_prompt, "scheduled prompt")
                 launched_env = run_claude.await_args.kwargs[
                     "provider_runtime_env"
                 ]
-                self.assertEqual(
-                    launched_env["AGENTSDOCK_CROSS_CHAT_HANDLE_1"],
-                    direct_handle,
-                )
+                self.assertEqual(launched_env["AGENTSDOCK_CROSS_CHAT_HANDLE_COUNT"], "0")
+                self.assertNotIn("AGENTSDOCK_CROSS_CHAT_HANDLE_1", launched_env)
                 self.assertNotIn("sess_target", str(launched_env))
                 self.assertEqual(capability["provider_route_grants"], {})
                 self.assertNotIn(

@@ -555,7 +555,7 @@ class SessionBackendUpdateFenceTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(
                     run_metadata[run_id]["cross_chat_obligation_ids"],
-                    ["obligation-live"],
+                    [],  # Retired final-reply obligations are not carried forward.
                 )
                 revoke.assert_not_awaited()
             finally:

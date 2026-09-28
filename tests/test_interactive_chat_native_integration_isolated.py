@@ -87,6 +87,7 @@ class InteractiveChatNativeGlueTests(unittest.IsolatedAsyncioTestCase):
             "CLAUDE_PENDING_INTERACTIONS": {}, "public_codex_interaction": lambda row: dict(row), "public_claude_interaction": lambda row: dict(row),
             "get_codex_goal": AsyncMock(return_value={"enabled": True, "goal": None}),
             "queued_turns_snapshot": AsyncMock(return_value=[{"queued_id": "queued-own", "prompt": "Waiting", "file_ids": ["private-file"]}]),
+            "queue_recovery_status": Mock(return_value={"status": "ready", "ready": True}),
             "strip_agentsdock_generated_user_text": lambda text, **kwargs: text,
             "list_session_jobs": AsyncMock(return_value={"jobs": []}),
             "session_lifecycle_lock": lambda sid: self.lock, "ensure_session_not_deleting": Mock(),
@@ -113,6 +114,8 @@ class InteractiveChatNativeGlueTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("cwd", result["session"])
         self.assertEqual(result["queue"][0]["queued_id"], "queued-own")
         self.assertEqual(result["queue"][0]["file_ids"], [])
+        self.assertEqual(result["queue_recovery"], {"status": "ready", "ready": True})
+        self.native["queue_recovery_status"].assert_called_once_with("chat-one")
         self.assertEqual([row["id"] for row in result["codex_runtime"]["pending_interactions"]], ["approval-own"])
         self.assertNotIn("headers", result["codex_runtime"]["pending_interactions"][0]["params"])
         self.assertFalse(result["health"]["capabilities"]["workspace_files"]["available"])

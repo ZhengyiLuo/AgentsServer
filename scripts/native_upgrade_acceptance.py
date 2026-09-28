@@ -317,7 +317,7 @@ def token(home: Path) -> str:
 def request(port: int, secret: str, path: str, body: dict | None = None, *, timeout: int = 10) -> dict:
     req = urllib.request.Request(f"http://127.0.0.1:{port}{path}",
                                  data=json.dumps(body).encode() if body is not None else None,
-                                 headers={"Authorization": "Bearer " + secret, "Content-Type": "application/json"})
+                                 headers={"X-AgentsDock-Token": secret, "Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as response:
         return json.load(response)
 

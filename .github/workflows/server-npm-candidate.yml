@@ -4,7 +4,8 @@ name: Prepare signed npm server candidate
 # reuse that repository's existing signing secret; do not copy the private key
 # to the canonical or private desktop repository. This workflow only prepares
 # an Actions artifact. Native/migration acceptance and explicit publication of
-# the exact three files happen later; no release or registry is changed here.
+# the exact prepared files happen later; no release or registry is changed here.
+# product_bundle explicitly exercises both signed formats for local testing.
 on:
   workflow_call:
     inputs:
@@ -17,6 +18,9 @@ on:
       version:
         required: true
         type: string
+      product_bundle:
+        type: boolean
+        default: false
     secrets:
       AGENTS_SERVER_RELEASE_PRIVATE_KEY_B64:
         required: true
@@ -35,6 +39,10 @@ on:
         description: Exact reviewed server and app version (for example 1.0.4-beta.12)
         required: true
         type: string
+      product_bundle:
+        description: Prepare both signed server formats for local testing; never publish
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -89,6 +97,12 @@ jobs:
           # signed descriptor; electron/package.json is a development placeholder.
           cmp "$GITHUB_WORKSPACE/release-public-key.pem" server/release-public-key.pem
           test -z "$(git status --porcelain --untracked-files=normal)"
+      - name: Bind product signing workflow to the exact canonical server export
+        if: inputs.product_bundle
+        working-directory: release-source
+        shell: bash
+        run: |
+          test "$(git -C "$GITHUB_WORKSPACE" rev-parse 'HEAD^{tree}')" = "$(git rev-parse "$SOURCE_SHA:server")"
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24
@@ -100,9 +114,11 @@ jobs:
           node --test server/npm/cli.test.cjs scripts/tests/stage_coordinated_release.test.mjs scripts/tests/verify_npm_publication.test.mjs
           python3 -m unittest discover -s server -p test_npm_release_package.py
       - name: Prepare the exact clean candidate once
+        if: ${{ !inputs.product_bundle }}
         working-directory: release-source
         run: python3 server/scripts/package_npm_release.py --output "$RUNNER_TEMP/npm-candidate" --require-clean-source
       - name: Sign and verify the exact prepared descriptor
+        if: ${{ !inputs.product_bundle }}
         env:
           RELEASE_KEY_B64: ${{ secrets.AGENTS_SERVER_RELEASE_PRIVATE_KEY_B64 }}
         shell: bash
@@ -119,6 +135,7 @@ jobs:
             -in "$RUNNER_TEMP/npm-candidate/agents-server-npm-manifest.json" \
             -sigfile "$RUNNER_TEMP/npm-candidate/agents-server-npm-manifest.sig"
       - name: Inspect the signed bundle without publication or acceptance
+        if: ${{ !inputs.product_bundle }}
         working-directory: release-source
         shell: bash
         run: |
@@ -139,6 +156,7 @@ jobs:
           NODE
           node scripts/verify_npm_publication.mjs inspect "$RUNNER_TEMP/npm-candidate" "$SOURCE_SHA" "$(cat "$RUNNER_TEMP/npm-candidate-manifest-sha256")" "$RUNNER_TEMP/npm-candidate-inspection.json"
       - name: Preserve only the signed candidate bundle
+        if: ${{ !inputs.product_bundle }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: signed-npm-server-${{ inputs.version }}-${{ inputs.source_sha }}
@@ -149,6 +167,94 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Record preparation status
+        if: ${{ !inputs.product_bundle }}
         shell: bash
         run: |
           printf 'Prepared signed npm candidate **%s** from canonical commit `%s`.\n\nCandidate manifest SHA-256: `%s`.\n\nThis is signing preparation only. Native app and migration acceptance remain required before this hash can be used as an accepted publication pin. No npm package, GitHub release, or native app was published.\n' "$RELEASE_VERSION" "$SOURCE_SHA" "$CANDIDATE_MANIFEST_SHA256" >> "$GITHUB_STEP_SUMMARY"
+      - name: Test the product bundle helper and deterministic legacy packaging
+        if: inputs.product_bundle
+        working-directory: release-source
+        shell: bash
+        run: |
+          node --test scripts/tests/product_candidate_signing.test.mjs scripts/tests/legacy-server-release.test.mjs
+          python3 -m unittest discover -s scripts/tests -p test_prepare_product_server.py
+          python3 -m unittest discover -s server/tests -t server -p test_package_release_reproducibility.py
+          python3 -m unittest discover -s server/tests -t server -p test_npm_release_package.py
+      - name: Prepare both signed formats twice from the exact clean canonical source
+        if: inputs.product_bundle
+        working-directory: release-source
+        env:
+          AGENTS_SERVER_RELEASE_PRIVATE_KEY_B64: ${{ secrets.AGENTS_SERVER_RELEASE_PRIVATE_KEY_B64 }}
+        shell: bash
+        run: |
+          python3 scripts/prepare_product_server.py --source-sha "$SOURCE_SHA" --version "$RELEASE_VERSION" --output "$RUNNER_TEMP/product-server"
+          sleep 2
+          python3 scripts/prepare_product_server.py --source-sha "$SOURCE_SHA" --version "$RELEASE_VERSION" --output "$RUNNER_TEMP/product-server-repeat"
+      - name: Independently verify signatures, exact runtime and byte-identical preparation
+        if: inputs.product_bundle
+        working-directory: release-source
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict'
+          import { createHash } from 'node:crypto'
+          import { appendFileSync, lstatSync, readFileSync, readdirSync } from 'node:fs'
+          import { join } from 'node:path'
+          import { verifyLegacyCandidate } from './scripts/legacy-server-release.mjs'
+          const version = process.env.RELEASE_VERSION, sourceSha = process.env.SOURCE_SHA
+          const track = version.includes('-') ? 'beta' : 'stable'
+          const directory = join(process.env.RUNNER_TEMP, 'product-server')
+          const repeated = join(process.env.RUNNER_TEMP, 'product-server-repeat')
+          const hash = bytes => createHash('sha256').update(bytes).digest('hex')
+          const assets = ['npm/agents-server-npm-manifest.json', 'npm/agents-server-npm-manifest.sig', `npm/server-${version}.tgz`,
+            'legacy/agents-server-manifest.json', 'legacy/agents-server-manifest.sig', `legacy/agents-server-${version}.tar.gz`].sort()
+          for (const root of [directory, repeated]) {
+            assert(lstatSync(root).isDirectory())
+            assert.deepEqual(readdirSync(root).sort(), ['legacy', 'npm', 'product-server-bundle.json'])
+            for (const component of ['npm', 'legacy']) {
+              assert(lstatSync(join(root, component)).isDirectory())
+              assert.deepEqual(readdirSync(join(root, component)).sort(), assets.filter(name => name.startsWith(`${component}/`)).map(name => name.slice(component.length + 1)).sort())
+            }
+            const receipt = JSON.parse(readFileSync(join(root, 'product-server-bundle.json')))
+            assert.equal(receipt.schema, 1); assert.equal(receipt.sourceSha, sourceSha)
+            assert.equal(receipt.version, version); assert.equal(receipt.track, track)
+            assert.deepEqual(Object.keys(receipt.artifacts).sort(), assets)
+            for (const name of assets) {
+              const path = join(root, name)
+              assert(lstatSync(path).isFile())
+              const bytes = readFileSync(path)
+              assert.deepEqual(receipt.artifacts[name], { sha256: hash(bytes), size: bytes.length })
+            }
+            assert.equal(receipt.npmManifestSha256, receipt.artifacts['npm/agents-server-npm-manifest.json'].sha256)
+            assert.equal(receipt.legacyManifestSha256, receipt.artifacts['legacy/agents-server-manifest.json'].sha256)
+          }
+          for (const name of [...assets, 'product-server-bundle.json']) {
+            assert(lstatSync(join(directory, name)).isFile()); assert(lstatSync(join(repeated, name)).isFile())
+            assert(readFileSync(join(directory, name)).equals(readFileSync(join(repeated, name))), `Preparation changed ${name}`)
+          }
+          // Local verifier only: no remote export inspection, staging, or publication.
+          await verifyLegacyCandidate({ assets: join(directory, 'legacy'), npmAssets: join(directory, 'npm'),
+            version, track, sourceSha, sourceRef: process.env.SOURCE_REF, exportSha: process.env.GITHUB_SHA })
+          appendFileSync(process.env.GITHUB_ENV, `PRODUCT_SERVER_BUNDLE_SHA256=${hash(readFileSync(join(directory, 'product-server-bundle.json')))}\n`)
+          console.log('Verified both signed formats, runtime parity and all seven byte-identical public bundle files.')
+          NODE
+      - name: Preserve only the seven public product server bundle files
+        if: inputs.product_bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signed-product-server-${{ inputs.version }}-${{ inputs.source_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/product-server/product-server-bundle.json
+            ${{ runner.temp }}/product-server/npm/agents-server-npm-manifest.json
+            ${{ runner.temp }}/product-server/npm/agents-server-npm-manifest.sig
+            ${{ runner.temp }}/product-server/npm/server-${{ inputs.version }}.tgz
+            ${{ runner.temp }}/product-server/legacy/agents-server-manifest.json
+            ${{ runner.temp }}/product-server/legacy/agents-server-manifest.sig
+            ${{ runner.temp }}/product-server/legacy/agents-server-${{ inputs.version }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+      - name: Record local-test-only product preparation
+        if: inputs.product_bundle
+        shell: bash
+        run: |
+          printf 'Prepared signed product server test bundle **%s** from canonical commit `%s`.\n\nBundle inventory SHA-256: `%s`.\n\nBoth preparation passes produced identical files. This is artifact preparation only, not native update acceptance. No npm package, GitHub release/draft, native app, installation, or deployment was created.\n' "$RELEASE_VERSION" "$SOURCE_SHA" "$PRODUCT_SERVER_BUNDLE_SHA256" >> "$GITHUB_STEP_SUMMARY"

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress, closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -57,7 +57,36 @@ class SideQuestionError(Exception):
 
 def capability():
     return {"available": True, "version": 2, "native_context": True, "backends": ["codex", "claude"],
-            "max_question_chars": MAX_QUESTION_CHARS, "sync": True}
+            "max_question_chars": MAX_QUESTION_CHARS, "sync": True, "runtime_settings": True}
+
+
+def validate_runtime_settings(value):
+    """Only explicit per-turn choices; omission preserves the side runtime."""
+    result = {}
+    for key in ("model", "effort"):
+        if key not in value:
+            continue
+        setting = value[key]
+        if not isinstance(setting, str) or len(setting) > 256 or any(ord(c) < 32 for c in setting):
+            raise SideQuestionError(400, "Invalid side chat runtime setting")
+        try:
+            setting.encode("utf-8")
+        except UnicodeEncodeError:
+            raise SideQuestionError(400, "Invalid side chat runtime setting") from None
+        setting = setting.strip()
+        if key == "model" and not setting:
+            raise SideQuestionError(400, "Side chat model must not be empty")
+        if key == "effort" and setting not in {"", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}:
+            raise SideQuestionError(400, "Invalid side chat reasoning effort")
+        result[key] = setting
+    return result
+
+
+def request_digest(question, runtime_settings=None):
+    # Retain old receipts exactly when the optional settings were absent.
+    payload = (json.dumps([question, runtime_settings], sort_keys=True, ensure_ascii=False)
+               if runtime_settings else question)
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def validate_history(value) -> tuple[tuple[str, str], ...]:
@@ -328,6 +357,7 @@ class _Receipt:
     waiters: int = 0
     side_chat_id: str | None = None
     after_request_id: str | None = None
+    runtime_settings: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -345,14 +375,15 @@ NATIVE_IDLE_SECONDS = 30 * 60
 
 
 class SideQuestions:
-    def __init__(self, answer=None, *, native_factory=None, storage_path=None, notify=None, admission_check=None):
+    def __init__(self, answer=None, *, native_factory=None, storage_path=None, notify=None, admission_check=None, runtime_settings_for_session=None):
         self.answer = answer
         self.native_factory = native_factory
         self.admission_check = admission_check
         self.receipts: dict[tuple[str, str, str], _Receipt] = {}
         self.conversations: dict[tuple[str, str, str], _NativeConversation] = {}
         self.cleanup_tasks: set[asyncio.Task] = set()
-        self.synced = (SyncedSideChats(storage_path, native_factory=native_factory, notify=notify, admission_check=admission_check)
+        self.synced = (SyncedSideChats(storage_path, native_factory=native_factory, notify=notify, admission_check=admission_check,
+                                       runtime_settings_for_session=runtime_settings_for_session)
                        if storage_path is not None else None)
 
     def active_session_ids(self):
@@ -395,7 +426,7 @@ class SideQuestions:
                 task.exception()
         task.add_done_callback(finished)
 
-    async def _native_answer(self, owner, session_id, request_id, question, side_chat_id, after_request_id):
+    async def _native_answer(self, owner, session_id, request_id, question, side_chat_id, after_request_id, runtime_settings=None):
         key = (owner, session_id, side_chat_id)
         conversation = self.conversations.get(key)
         if conversation is None:
@@ -416,7 +447,8 @@ class SideQuestions:
                 conversation.handle = await self.native_factory(session_id)
             if conversation.closed:
                 raise SideQuestionError(410, "Side chat ended")
-            result = await conversation.handle.ask(question, history=list(conversation.history))
+            result = await conversation.handle.ask(question, history=list(conversation.history),
+                **({"runtime_settings": runtime_settings} if runtime_settings else {}))
             if conversation.closed:
                 raise SideQuestionError(410, "Side chat ended")
             # Claude /btw replays the last twenty side exchanges natively.
@@ -450,9 +482,10 @@ class SideQuestions:
                 self.receipts.pop(key, None)
 
     def submit(self, owner: str, session_id: str, request_id: str, question: str, *, history: list[dict] | None = None,
-               side_chat_id: str | None = None, after_request_id: str | None = None):
+               side_chat_id: str | None = None, after_request_id: str | None = None, runtime_settings=None):
         if self.admission_check is not None:
             self.admission_check()
+        runtime_settings = validate_runtime_settings(runtime_settings or {})
         frozen_history = validate_history([] if history is None else history)
         self._prune()
         key = (owner, session_id, request_id)
@@ -461,17 +494,19 @@ class SideQuestions:
             if receipt.cancelled:
                 raise SideQuestionError(409, "Side question was cancelled; submit with a new request ID")
             if (receipt.question != question or receipt.history != frozen_history
-                    or receipt.side_chat_id != side_chat_id or receipt.after_request_id != after_request_id):
+                    or receipt.side_chat_id != side_chat_id or receipt.after_request_id != after_request_id
+                    or receipt.runtime_settings != runtime_settings):
                 raise SideQuestionError(409, "Request ID already belongs to a different side question")
             return receipt
         if self.native_factory is not None and (not side_chat_id or frozen_history):
             raise SideQuestionError(409, "Update the app to use native Side chat; copied conversation history is no longer accepted.")
-        receipt = _Receipt(question, history=frozen_history, side_chat_id=side_chat_id, after_request_id=after_request_id)
+        receipt = _Receipt(question, history=frozen_history, side_chat_id=side_chat_id, after_request_id=after_request_id,
+                           runtime_settings=runtime_settings)
         self.receipts[key] = receipt
 
         async def run():
             try:
-                answer = (self._native_answer(owner, session_id, request_id, question, side_chat_id, after_request_id)
+                answer = (self._native_answer(owner, session_id, request_id, question, side_chat_id, after_request_id, runtime_settings)
                           if self.native_factory is not None else
                           self.answer(session_id, question, history=history_messages(frozen_history))
                           if frozen_history else self.answer(session_id, question))
@@ -603,7 +638,7 @@ class SideChatStore:
             if receipt is not None:
                 database.execute("INSERT INTO receipts VALUES(?,?,?,?,?)",
                                  (owner, session, receipt["request_id"], document["side_chat_id"],
-                                  hashlib.sha256(receipt["question"].encode()).hexdigest()))
+                                  request_digest(receipt["question"], receipt.get("runtime_settings"))))
             provider_state = document.get("_provider_state") or {}
             thread_id = (provider_state.get("codex") or {}).get("thread_id")
             if isinstance(thread_id, str) and thread_id:
@@ -658,7 +693,8 @@ class SyncedSideChats:
     after an app disconnect or an unexpected process exit.
     """
 
-    def __init__(self, path, *, native_factory, notify=None, admission_check=None):
+    def __init__(self, path, *, native_factory, notify=None, admission_check=None, runtime_settings_for_session=None):
+        self.runtime_settings_for_session = runtime_settings_for_session
         self.store = SideChatStore(path)
         self.native_factory = native_factory
         self.notify = notify
@@ -700,9 +736,21 @@ class SyncedSideChats:
 
     async def snapshot(self, owner, session):
         async with self._lock((owner, session)):
-            return self.public(self._load((owner, session)))
+            document = self._load((owner, session))
+            if "model" not in document and self.runtime_settings_for_session is not None:
+                # Retained history stays readable when provider credentials,
+                # endpoint configuration or model discovery are unavailable.
+                settings = {}
+                with suppress(Exception):
+                    settings = self.runtime_settings_for_session(session)
+                if settings:
+                    document.update(settings)
+                    document["revision"] += 1
+                    self.store.save(owner, session, document)
+            return self.public(document)
 
-    async def submit(self, owner, session, request_id, question, side_chat_id, after_request_id=None):
+    async def submit(self, owner, session, request_id, question, side_chat_id, after_request_id=None, runtime_settings=None):
+        runtime_settings = validate_runtime_settings(runtime_settings or {})
         key = (owner, session)
         async with self._lock(key):
             if self.stopping:
@@ -712,7 +760,7 @@ class SyncedSideChats:
             document = self._load(key)
             previous = self.store.receipt(*key, request_id)
             if previous is not None:
-                if previous != (side_chat_id, hashlib.sha256(question.encode()).hexdigest()) or document["side_chat_id"] != side_chat_id:
+                if previous != (side_chat_id, request_digest(question, runtime_settings)) or document["side_chat_id"] != side_chat_id:
                     raise SideQuestionError(409, "Request ID belongs to a different or cleared side chat")
                 return self.public(document)
             if document["side_chat_id"] != side_chat_id:
@@ -725,14 +773,15 @@ class SyncedSideChats:
             if document["last_request_id"] != after_request_id:
                 raise SideQuestionError(409, "Side chat changed; refresh before sending")
             exchange = {"request_id": request_id, "question": question, "status": "running",
-                        "created_at": side_chat_timestamp(), "updated_at": side_chat_timestamp()}
+                        "created_at": side_chat_timestamp(), "updated_at": side_chat_timestamp(),
+                        **({"runtime_settings": runtime_settings} if runtime_settings else {})}
             document["exchanges"].append(exchange)
             document["revision"] += 1
             self.store.save(*key, document, receipt=exchange)
             timer = self.timers.pop(key, None)
             if timer is not None:
                 timer.cancel()
-            task = asyncio.create_task(self._answer(key, side_chat_id, request_id, question), name="synced-side-question")
+            task = asyncio.create_task(self._answer(key, side_chat_id, request_id, question, runtime_settings), name="synced-side-question")
             self.tasks[key] = task
             def done(completed):
                 if self.tasks.get(key) is completed:
@@ -750,9 +799,16 @@ class SyncedSideChats:
             if document["side_chat_id"] != side_chat_id:
                 raise SideQuestionError(409, "Side chat was cleared")
             document["_provider_state"] = value
+            settings = value.get("runtime_settings") or {}
+            changed = any(document.get(name) != setting for name, setting in settings.items())
+            document.update(settings)
+            if changed:
+                document["revision"] += 1
             self.store.save(*key, document)
+        if changed:
+            await self._changed(document)
 
-    async def _answer(self, key, side_chat_id, request_id, question):
+    async def _answer(self, key, side_chat_id, request_id, question, runtime_settings=None):
         handle = None
         failed = False
         try:
@@ -762,11 +818,14 @@ class SyncedSideChats:
             handle = self.handles.get(key)
             if handle is None:
                 handle = await self.native_factory(key[1], persisted_state=document.get("_provider_state"),
-                    persist_state=lambda value: self._provider_state(key, side_chat_id, value), durable=True)
+                    persist_state=lambda value: self._provider_state(key, side_chat_id, value), durable=True,
+                    **({"initial_runtime_settings": {name: document[name] for name in ("model", "effort") if name in document}}
+                       if "model" in document else {}))
                 self.handles[key] = handle
             history = [{"question": item["question"], "response": item["answer"]}
                        for item in document["exchanges"] if item["status"] == "completed"][-20:]
-            result = await handle.ask(question, history=history)
+            result = await handle.ask(question, history=history,
+                **({"runtime_settings": runtime_settings} if runtime_settings else {}))
             await self._finish(key, side_chat_id, request_id, "completed", **result)
         except asyncio.CancelledError:
             failed = True
@@ -809,6 +868,7 @@ class SyncedSideChats:
             if exchange is None or exchange["status"] != "running":
                 return
             exchange.update(status=status, updated_at=side_chat_timestamp(), **result)
+            document.update({key: result[key] for key in ("model", "effort") if key in result})
             document["last_request_id"] = request_id
             document["revision"] += 1
             try:
@@ -864,6 +924,8 @@ class SyncedSideChats:
                 # new conversation it has not seen.
                 return self.public(document)
             document.update(side_chat_id=uuid.uuid4().hex, exchanges=[], last_request_id=None, _provider_state=None)
+            document.pop("model", None)
+            document.pop("effort", None)
             document["revision"] += 1
             try:
                 self.store.save(*key, document)
@@ -947,7 +1009,7 @@ def create_side_question_router(*, authorize, session_exists, runtime: SideQuest
         except asyncio.TimeoutError:
             raise HTTPException(408, "Side question request was not received") from None
         if (not isinstance(value, dict) or not {"request_id", "question"} <= set(value)
-                or set(value) - {"request_id", "question", "history", "side_chat_id", "after_request_id"}):
+                or set(value) - {"request_id", "question", "history", "side_chat_id", "after_request_id", "model", "effort"}):
             raise HTTPException(400, "Invalid side question fields")
         for field in ("side_chat_id", "after_request_id"):
             if field in value and (not isinstance(value[field], str) or not IDENTIFIER.fullmatch(value[field])):
@@ -977,7 +1039,8 @@ def create_side_question_router(*, authorize, session_exists, runtime: SideQuest
         receipt = None
         try:
             receipt = runtime.submit(owner, session_id, request_id, question, history=history,
-                                     side_chat_id=value.get("side_chat_id"), after_request_id=value.get("after_request_id"))
+                                     side_chat_id=value.get("side_chat_id"), after_request_id=value.get("after_request_id"),
+                                     runtime_settings=validate_runtime_settings(value))
             receipt.waiters += 1
             watcher = asyncio.create_task(disconnected())
             done, _ = await asyncio.wait({receipt.task, watcher}, return_when=asyncio.FIRST_COMPLETED)
@@ -1047,7 +1110,7 @@ def create_side_question_router(*, authorize, session_exists, runtime: SideQuest
         except asyncio.TimeoutError:
             raise HTTPException(408, "Side question request was not received") from None
         if (not isinstance(value, dict) or not {"request_id", "question", "side_chat_id"} <= set(value)
-                or set(value) - {"request_id", "question", "side_chat_id", "after_request_id"}):
+                or set(value) - {"request_id", "question", "side_chat_id", "after_request_id", "model", "effort"}):
             raise HTTPException(400, "Invalid side question fields")
         for field in ("request_id", "side_chat_id", "after_request_id"):
             if field == "after_request_id" and value.get(field) is None:
@@ -1062,7 +1125,8 @@ def create_side_question_router(*, authorize, session_exists, runtime: SideQuest
         except UnicodeEncodeError:
             raise HTTPException(400, "Question must contain valid Unicode text") from None
         return await synced_response(synced_runtime().submit(owner, session_id, value["request_id"], question,
-            value["side_chat_id"], value.get("after_request_id")), status_code=202)
+            value["side_chat_id"], value.get("after_request_id"),
+            runtime_settings=value), status_code=202)
 
     @router.delete("/api/sessions/{session_id}/side-chat/requests/{request_id}")
     async def cancel_synced(session_id: str, request_id: str, request: Request):

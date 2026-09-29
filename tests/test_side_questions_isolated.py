@@ -288,6 +288,21 @@ class NativeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         return self.runtime.submit(owner, session_id, request_id, question,
             side_chat_id=side_chat_id, after_request_id=after_request_id, **kwargs)
 
+    async def test_legacy_native_runtime_carries_choices_and_receipt_identity(self):
+        first = self.submit(runtime_settings={"model": "side-model", "effort": "high"})
+        self.assertIs(self.submit(runtime_settings={"model": "side-model", "effort": "high"}), first)
+        for changed in ({"model": "different", "effort": "high"}, {"model": "side-model", "effort": ""}, {}):
+            with self.assertRaises(side.SideQuestionError) as caught:
+                self.submit(runtime_settings=changed)
+            self.assertEqual(caught.exception.status_code, 409)
+        await first.task
+        handle = self.handles[0]
+        self.assertEqual(handle.ask.await_args.kwargs["runtime_settings"], {"model": "side-model", "effort": "high"})
+        await self.submit("second", "Followup?", after_request_id="first", runtime_settings={"effort": "low"}).task
+        self.factory.assert_awaited_once_with("chat")
+        self.assertEqual(handle.ask.await_args.kwargs["runtime_settings"], {"effort": "low"})
+        self.assertEqual(handle.ask.await_args.kwargs["history"], [{"question": "Question?", "response": "Native answer"}])
+
     async def test_long_native_answer_keeps_context_for_followup(self):
         await self.submit().task
         started, release = asyncio.Event(), asyncio.Event()
@@ -511,6 +526,23 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
         queue.put_nowait({"type": "http.request", "body": json.dumps(value, ensure_ascii=ensure_ascii).encode(), "more_body": False})
         return Request({"type": "http", "method": "POST", "path": "/", "headers":
                         [(b"x-agentsdock-token", b"synthetic-owner")]}, queue.get), queue
+
+    async def test_legacy_http_runtime_settings_and_effective_answer(self):
+        handle = SimpleNamespace(ask=AsyncMock(return_value={"backend": "codex", "answer": "Native answer",
+            "model": "side-model", "effort": "low"}), close=AsyncMock())
+        self.runtime.native_factory = AsyncMock(return_value=handle)
+        payload = {"request_id": "runtime", "question": "Question?", "side_chat_id": "side", "model": "side-model", "effort": "low"}
+        request, _ = self.request(payload)
+        response = json.loads((await self.post("chat", request)).body)
+        self.assertEqual((response["model"], response["effort"]), ("side-model", "low"))
+        handle.ask.assert_awaited_once_with("Question?", history=[], runtime_settings={"model": "side-model", "effort": "low"})
+        for settings in ({"model": ""}, {"model": "x" * 257}, {"model": "line\nbreak"}, {"model": "\udfff"},
+                         {"effort": None}, {"effort": "imaginary"}):
+            request, _ = self.request({**payload, "request_id": "invalid", **settings})
+            with self.assertRaises(HTTPException) as caught:
+                await self.post("chat", request)
+            self.assertEqual(caught.exception.status_code, 400)
+        self.assertEqual(handle.ask.await_count, 1)
 
     async def test_routes_return_contract_and_do_not_poll(self):
         request, queue = self.request({"request_id": "request", "question": "Question?"})
@@ -872,6 +904,59 @@ class ServerCallbackTests(unittest.IsolatedAsyncioTestCase):
             runner_env=lambda: {"AGENTSDOCK_CHAT_ID": "parent", "HOME": "/synthetic"})
         self.namespace["public_chat_share_session_exists"] = lambda sid: sid in self.namespace["STORE"].sessions
         exec(self.code, self.namespace)
+
+    async def test_codex_runtime_choices_preserve_history_parent_and_survive_recreation(self):
+        self.session.update(backend="codex", model="parent-model", effort="high")
+        original = json.dumps(self.session, sort_keys=True)
+        # This mirrors native normal Codex default resolution on a session copy.
+        self.namespace["codex_runtime_settings"] = lambda value: (value.get("model"), value.get("effort") or "medium", "")
+        saved = AsyncMock()
+        with patch.dict(sys.modules, {"codex_side_question": SimpleNamespace(NativeCodexSideChat=self.codex_factory)}):
+            chat = await self.namespace["create_native_side_chat"]("chat", durable=True, persist_state=saved)
+            first = await chat.ask("first", history=[])
+            self.assertEqual((first["model"], first["effort"]), ("parent-model", "high"))
+            await self.codex_factory.call_args.kwargs["persist_state"]({"thread_id": "same-side", "path": "/side.jsonl"})
+            changed = await chat.ask("followup", history=[], runtime_settings={"model": "side-model", "effort": "low"})
+            self.assertEqual((changed["model"], changed["effort"]), ("side-model", "low"))
+            self.codex_factory.assert_called_once()
+            reset = await chat.ask("default", history=[], runtime_settings={"effort": ""})
+            self.assertEqual(reset["effort"], "medium")
+            state = saved.await_args.args[0]
+            self.assertEqual(state["codex"], {"thread_id": "same-side", "path": "/side.jsonl"})
+            self.assertEqual(state["runtime_settings"], {"model": "side-model", "effort": "medium"})
+            self.assertEqual(json.dumps(self.session, sort_keys=True), original)
+            self.session.update(model="changed-parent", effort="ultra")
+            resumed = await self.namespace["create_native_side_chat"]("chat", durable=True,
+                persisted_state=state, persist_state=saved)
+            answer = await resumed.ask("after reconnect", history=[])
+            self.assertEqual((answer["model"], answer["effort"]), ("side-model", "medium"))
+            self.assertEqual(self.codex_factory.call_args.kwargs["resume_state"], state["codex"])
+            self.assertEqual(self.session["model"], "changed-parent")
+
+    async def test_custom_runtime_choices_use_selected_model_catalog_and_same_credentials(self):
+        self.session.update(backend="codex", codex_provider="custom", model="model-a", effort="high")
+        original = json.dumps(self.session, sort_keys=True)
+        selected = {"base_url": "https://synthetic.invalid/v1", "api_key": "synthetic-key", "credential_id": "retained"}
+        catalog = {"model_capabilities": {
+            "model-a": {"reasoning_efforts": ["high"], "reasoning_summary_supported": True},
+            "model-b": {"reasoning_efforts": ["low"], "reasoning_summary_supported": False}}}
+        self.namespace["CODEX_PROVIDER_STORE"] = SimpleNamespace(
+            for_session=lambda value, **kwargs: {**selected, "model": value["model"]},
+            cached_catalog=lambda value: catalog, require_thread=Mock())
+        with patch.dict(sys.modules, {"codex_side_question": SimpleNamespace(NativeCodexSideChat=self.codex_factory)}):
+            chat = await self.namespace["create_native_side_chat"]("chat")
+            await chat.ask("first", history=[])
+            result = await chat.ask("second", history=[], runtime_settings={"model": "model-b", "effort": "low"})
+            self.assertEqual((result["model"], result["effort"]), ("model-b", "low"))
+            self.assertEqual(self.codex.ask.await_args.kwargs["runtime_settings"],
+                {"model": "model-b", "effort": "low", "reasoning_summary": "none"})
+            reset = await chat.ask("default", history=[], runtime_settings={"effort": ""})
+            self.assertEqual(reset["effort"], "")
+            unsupported = await chat.ask("unknown effort", history=[], runtime_settings={"effort": "ultra"})
+            self.assertEqual(unsupported["effort"], "")
+            self.codex_factory.assert_called_once()
+            self.assertEqual(self.codex_factory.call_args.kwargs["provider_selection"]["credential_id"], "retained")
+            self.assertEqual(json.dumps(self.session, sort_keys=True), original)
 
     async def test_codex_side_fork_carries_parent_permissions_and_scopes_approval_owner(self):
         self.session.update(backend="codex", cwd="/project", codex_approval_policy="on-request",

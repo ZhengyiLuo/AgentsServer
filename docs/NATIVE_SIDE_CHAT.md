@@ -31,6 +31,14 @@ Codex captures the main context on its first question; Clear starts a new fork
 with the latest main context. Its workspace tools can inspect current files
 even when the inherited conversation predates those files.
 
+Servers advertising `side_questions.runtime_settings` accept optional Codex
+`model` and `effort` on both submission routes. Selection changes apply to the
+next turn in the existing child; they do not clear history or change the main
+chat. Empty effort requests the normal Codex server default or the custom
+endpoint default, while omitted fields preserve the side selection. Synchronized side chats persist their effective selection
+alongside the native thread reference, and expose it in snapshots; legacy
+answers expose it too. Claude `/btw` continues using its connected parent.
+
 `DELETE /api/sessions/{session}/side-questions/{request}` cancels one request.
 `DELETE /api/sessions/{session}/side-chats/{side_chat}` closes the side chat.
 Both are native-operator-only and scoped to the authenticated owner and parent.

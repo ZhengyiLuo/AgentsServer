@@ -1513,6 +1513,17 @@ side conversation. Devices using the same native server credential and main chat
 share the history. Side content never becomes main-chat transcript content.
 Existing transient side-question routes remain available to older clients.
 
+When `side_questions.runtime_settings` is true, Codex submissions can include
+`model` and `effort`. Omitted fields preserve the side conversation's selection;
+an empty effort selects the normal Codex server default or the custom endpoint
+default. These settings apply to the next
+side turn on the same native child, without changing the main chat or clearing
+history. Synced snapshots and legacy answers report effective `model`/`effort`.
+The initial selection inherits the main chat, then persists with the side
+conversation across reconnects and native transport recreation. Custom endpoint
+choices stay on that endpoint and use its model reasoning capabilities. Claude
+uses native `/btw` settings and receives no separate override.
+
 ### Provider account usage
 
 Authenticated native clients can read provider-reported allowance separately

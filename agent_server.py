@@ -83265,7 +83265,20 @@ def public_chat_share_session_exists(session_id: str) -> bool:
     )
 
 
-async def create_native_side_chat(session_id: str, *, persisted_state=None, persist_state=None, durable=False):
+def side_chat_runtime_settings(session_id: str):
+    session = STORE.sessions.get(session_id)
+    if not session or str(session.get("backend") or DEFAULT_BACKEND).lower() != BACKEND_CODEX:
+        return {}
+    try:
+        model, effort, _service_tier = codex_runtime_settings(session)
+    except HTTPException:
+        # Optional settings do not gate reading retained side-chat history.
+        return {}
+    return {"model": model, "effort": effort}
+
+
+async def create_native_side_chat(session_id: str, *, persisted_state=None, persist_state=None, durable=False,
+                                  initial_runtime_settings=None):
     """Bind a side conversation to the provider's actual parent.
 
     No visible-message projection, main turn, queue or goal mutation belongs
@@ -83296,6 +83309,15 @@ async def create_native_side_chat(session_id: str, *, persisted_state=None, pers
     class NativeSideChat:
         codex = None
 
+        def __init__(self):
+            self.runtime_settings = dict((persisted_state or {}).get("runtime_settings") or initial_runtime_settings or {})
+            self.codex_state = (persisted_state or {}).get("codex")
+
+        async def save_state(self):
+            if persist_state is not None:
+                await persist_state({**binding, **({"runtime_settings": self.runtime_settings} if self.runtime_settings else {}),
+                                     **({"codex": self.codex_state} if self.codex_state else {})})
+
         def current(self):
             if SERVER_SHUTTING_DOWN:
                 raise side_questions.SideQuestionError(503, "Server is shutting down")
@@ -83313,9 +83335,12 @@ async def create_native_side_chat(session_id: str, *, persisted_state=None, pers
                 CODEX_PROVIDER_STORE.require_thread(parent_id, selected)
             return current
 
-        async def ask(self, question, *, history):
+        async def ask(self, question, *, history, runtime_settings=None):
             current = self.current()
+            requested = side_questions.validate_runtime_settings(runtime_settings or {})
             if backend == BACKEND_CLAUDE:
+                if requested:
+                    raise side_questions.SideQuestionError(400, "Claude native side questions use the main conversation settings")
                 from claude_sdk_client import (ClaudeSDKGenerationChanged, ClaudeSDKConfigurationConflict,
                     ClaudeSDKRunActive, ClaudeSDKSupervisorError)
                 try:
@@ -83333,9 +83358,24 @@ async def create_native_side_chat(session_id: str, *, persisted_state=None, pers
                     raise side_questions.SideQuestionError(503, "Claude native side questions are unavailable; retry after reconnecting") from None
             else:
                 from codex_side_question import NativeCodexSideChat
+                # A side conversation owns its settings after first use. Only
+                # explicit side choices change them; never update the parent.
+                side_session = {**current, **self.runtime_settings, **requested}
+                model, effort, service_tier = codex_runtime_settings(side_session)
+                provider_selection = CODEX_PROVIDER_STORE.for_session(side_session, include_key=True)
+                summary = None
+                if provider_selection:
+                    model = provider_selection["model"]
+                    effort = codex_provider.runtime_effort(provider_selection,
+                        CODEX_PROVIDER_STORE.cached_catalog(provider_selection), side_session.get("effort"))
+                    summary = codex_provider.runtime_summary(provider_selection,
+                        CODEX_PROVIDER_STORE.cached_catalog(provider_selection))
+                    provider_selection["effort"] = effort
+                    provider_selection["reasoning_summary"] = summary
+                self.runtime_settings = {"model": model, "effort": effort}
+                await self.save_state()
                 if self.codex is None:
                     cwd = existing_cwd(str(current.get("cwd") or DEFAULT_CWD))
-                    model, effort, service_tier = codex_runtime_settings(current)
                     approval_policy = current.get("codex_approval_policy")
                     if approval_policy not in CODEX_APPROVAL_POLICIES:
                         approval_policy = CODEX_DEFAULT_APPROVAL_POLICY
@@ -83383,24 +83423,18 @@ async def create_native_side_chat(session_id: str, *, persisted_state=None, pers
                             side_session_id=session_id, side_owner_is_current=is_current,
                             side_approval_policy=approval_policy)
 
-                    provider_selection = CODEX_PROVIDER_STORE.for_session(current, include_key=True)
-                    if provider_selection:
-                        provider_selection["effort"] = codex_provider.runtime_effort(
-                            provider_selection, CODEX_PROVIDER_STORE.cached_catalog(provider_selection), current.get("effort"),
-                        )
-                        provider_selection["reasoning_summary"] = codex_provider.runtime_summary(
-                            provider_selection, CODEX_PROVIDER_STORE.cached_catalog(provider_selection))
                     async def save_codex_state(value):
-                        if persist_state is not None:
-                            await persist_state({**binding, "codex": value})
+                        self.codex_state = value
+                        await self.save_state()
                     self.codex = NativeCodexSideChat(parent_id, executable=CODEX_BIN,
                         model=model if isinstance(model, str) and model.strip() else None,
                         cwd=cwd, fork_overrides=fork_overrides, turn_overrides=turn_overrides,
                         server_request_handler=side_server_request,
                         env=side_questions.isolated_environment(runner_env()),
                         provider_selection=provider_selection, durable=durable,
-                        resume_state=(persisted_state or {}).get("codex"), persist_state=save_codex_state)
-                result = {"answer": await self.codex.ask(question),
+                        resume_state=self.codex_state, persist_state=save_codex_state)
+                result = {**self.runtime_settings, "answer": await self.codex.ask(question,
+                              runtime_settings={**self.runtime_settings, **({"reasoning_summary": summary} if summary else {})}),
                           "context_note": "Native Codex context from when Side chat started, including tool results. Clear Side chat to use the latest main context."}
             self.current()
             return {"backend": backend, **result}
@@ -83423,7 +83457,7 @@ def require_side_question_admission():
 
 SIDE_QUESTIONS = side_questions.SideQuestions(native_factory=create_native_side_chat,
     storage_path=STATE_DIR / "side_chats.sqlite3", notify=lambda session_id, event: HUB.broadcast(session_id, event),
-    admission_check=require_side_question_admission)
+    admission_check=require_side_question_admission, runtime_settings_for_session=side_chat_runtime_settings)
 app.include_router(side_questions.create_side_question_router(
     authorize=require_native_admin_control,
     session_exists=public_chat_share_session_exists,

@@ -284,7 +284,7 @@ class NativeCodexSideChat:
         elif metadata.get("ephemeral") is not True or metadata.get("path") is not None:
             raise SideQuestionError(503, "Codex did not confirm an ephemeral side chat")
 
-    async def ask(self, question: str) -> str:
+    async def ask(self, question: str, *, runtime_settings: dict | None = None) -> str:
         if self._closed:
             raise SideQuestionError(409, "Side chat was closed; open a new side chat")
         if self._lock.locked():
@@ -300,9 +300,24 @@ class NativeCodexSideChat:
                 await asyncio.shield(self._opening)
                 if self._closed:
                     raise SideQuestionError(409, "Side chat was closed; open a new side chat")
+                overrides = {**self.turn_overrides, **self.provider_turn_overrides}
+                if runtime_settings is not None:
+                    model = runtime_settings["model"]
+                    effort = runtime_settings.get("effort") or ""
+                    # Explicit default must clear a previous turn's effort;
+                    # null effort alone would inherit it from the thread.
+                    overrides.pop("effort", None)
+                    overrides.update({"model": model, "collaborationMode": {"mode": "default", "settings": {
+                        "model": model, "reasoning_effort": effort or None, "developer_instructions": None}}})
+                    if effort:
+                        overrides["effort"] = effort
+                    if self.provider_config:
+                        from codex_provider import turn_overrides
+                        overrides.update(turn_overrides(model, effort,
+                            summary=runtime_settings.get("reasoning_summary") or "none"))
                 turn = await self._client.start_turn(
                     self.thread_id, [{"type": "text", "text": question}],
-                    overrides={**self.turn_overrides, **self.provider_turn_overrides},
+                    overrides=overrides,
                 )
                 answers: dict[str, str] = {}
                 while True:

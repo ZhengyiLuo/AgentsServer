@@ -310,6 +310,60 @@ class SyncTests(unittest.IsolatedAsyncioTestCase):
         candidates = await asyncio.to_thread(namespace["local_codex_session_candidates"], set())
         self.assertEqual([row["provider_session_id"] for row in candidates], ["normal-thread"])
 
+    async def test_unavailable_runtime_defaults_never_block_retained_history(self):
+        await self.send()
+        await self.settle()
+        before = await self.snapshot()
+        def unavailable(session):
+            raise HTTPException(409, "Custom endpoint is temporarily unavailable")
+        self.runtime.synced.runtime_settings_for_session = unavailable
+        self.assertEqual(await self.snapshot(), before)
+        self.assertEqual(len(before["exchanges"]), 1)
+
+    async def test_runtime_choices_roundtrip_idempotency_defaults_and_reconnect(self):
+        self.runtime.synced.runtime_settings_for_session = lambda session: {"model": "parent-model", "effort": "high"}
+        initial = await self.snapshot()
+        self.assertEqual((initial["model"], initial["effort"]), ("parent-model", "high"))
+        self.runtime.synced.runtime_settings_for_session = lambda session: {"model": "parent-changed", "effort": "ultra"}
+        self.assertEqual(await self.snapshot(), initial)
+        calls = []
+        async def factory(session, **options):
+            settings = dict((options.get("persisted_state") or {}).get("runtime_settings") or options["initial_runtime_settings"])
+            class Handle:
+                async def ask(self, question, *, history, runtime_settings=None):
+                    settings.update(runtime_settings or {})
+                    calls.append((question, deepcopy(history), dict(settings)))
+                    await options["persist_state"]({"runtime_settings": dict(settings),
+                        "codex": {"thread_id": "same-native-side", "path": "/native-side.jsonl"}})
+                    return {"answer": "answer " + question, "backend": "codex", **settings}
+                async def close(self):
+                    pass
+            return Handle()
+        self.runtime.synced.native_factory = factory
+        payload = {"request_id": "runtime-1", "question": "first", "side_chat_id": initial["side_chat_id"],
+                   "model": "side-model", "effort": "low"}
+        accepted = await self.client.post(self.url, json=payload)
+        self.assertEqual(accepted.status_code, 202, accepted.text)
+        await self.settle()
+        completed = await self.snapshot()
+        self.assertEqual((completed["model"], completed["effort"]), ("side-model", "low"))
+        self.assertEqual((await self.client.post(self.url, json=payload)).status_code, 202)
+        self.assertEqual((await self.client.post(self.url, json={**payload, "effort": "high"})).status_code, 409)
+        self.assertEqual((await self.client.post(self.url, json={**payload, "model": "other-model"})).status_code, 409)
+        self.runtime.synced._expire((next(iter(self.runtime.synced.handles))[0], "main"))
+        followup = {"request_id": "runtime-2", "question": "followup", "side_chat_id": initial["side_chat_id"], "after_request_id": "runtime-1"}
+        self.assertEqual((await self.client.post(self.url, json=followup)).status_code, 202)
+        await self.settle()
+        restored = await self.snapshot()
+        self.assertEqual(restored["side_chat_id"], initial["side_chat_id"])
+        self.assertEqual((restored["model"], restored["effort"]), ("side-model", "low"))
+        self.assertEqual(len(restored["exchanges"]), 2)
+        self.assertEqual(calls[1][1], [{"question": "first", "response": "answer first"}])
+        self.assertEqual(calls[1][2], {"model": "side-model", "effort": "low"})
+        self.assertEqual((await self.client.post(self.url, json={**followup, "request_id": "bad-model", "model": ""})).status_code, 400)
+        self.assertEqual((await self.client.post(self.url, json={**followup, "request_id": "bad-effort", "effort": 3})).status_code, 400)
+
+
 
 class ManagedUpdateTests(unittest.IsolatedAsyncioTestCase):
     async def test_provider_retirement_joins_side_chat_cleanup(self):

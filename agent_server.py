@@ -83335,7 +83335,7 @@ async def create_native_side_chat(session_id: str, *, persisted_state=None, pers
                 CODEX_PROVIDER_STORE.require_thread(parent_id, selected)
             return current
 
-        async def ask(self, question, *, history, runtime_settings=None):
+        async def ask(self, question, *, history, runtime_settings=None, on_progress=None):
             current = self.current()
             requested = side_questions.validate_runtime_settings(runtime_settings or {})
             if backend == BACKEND_CLAUDE:
@@ -83433,7 +83433,7 @@ async def create_native_side_chat(session_id: str, *, persisted_state=None, pers
                         env=side_questions.isolated_environment(runner_env()),
                         provider_selection=provider_selection, durable=durable,
                         resume_state=self.codex_state, persist_state=save_codex_state)
-                result = {**self.runtime_settings, "answer": await self.codex.ask(question,
+                result = {**self.runtime_settings, "answer": await self.codex.ask(question, on_progress=on_progress,
                               runtime_settings={**self.runtime_settings, **({"reasoning_summary": summary} if summary else {})}),
                           "context_note": "Native Codex context from when Side chat started, including tool results. Clear Side chat to use the latest main context."}
             self.current()

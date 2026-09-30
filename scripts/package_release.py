@@ -68,6 +68,7 @@ FILES = (
     "side_questions.py",
     "title_generation.py",
     "codex_side_question.py",
+    "codex_side_chat_progress.py",
     "claude_side_question.py",
     "cursor_agent_client.py",
     "cursor_provider_mcp.py",

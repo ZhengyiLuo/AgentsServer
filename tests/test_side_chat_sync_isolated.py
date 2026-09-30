@@ -4,6 +4,8 @@ import ast
 from copy import deepcopy
 from contextlib import suppress
 import json
+import hashlib
+import sqlite3
 from pathlib import Path
 import tempfile
 import unittest
@@ -30,8 +32,9 @@ class SyncTests(unittest.IsolatedAsyncioTestCase):
         test = self
 
         class Handle:
-            async def ask(self, question, *, history):
+            async def ask(self, question, *, history, on_progress=None):
                 test.calls.append((question, deepcopy(history)))
+                test.progress = on_progress
                 test.started.set()
                 await test.release.wait()
                 return {"answer": "answer: " + question, "backend": "claude", "context_note": "native"}
@@ -79,6 +82,42 @@ class SyncTests(unittest.IsolatedAsyncioTestCase):
         tasks = tuple(self.runtime.synced.tasks.values())
         self.release.set()
         await asyncio.gather(*tasks)
+
+    async def test_progress_is_visible_before_answer_persisted_and_cannot_resurrect_cancel_or_clear(self):
+        await self.send()
+        await self.started.wait()
+        activity = [{"id": "reason:reasoning_summary", "kind": "reasoning_summary", "text": "Inspecting files", "status": "running"}]
+        await self.progress(activity)
+        running = await self.snapshot()
+        self.assertEqual(running["exchanges"][0]["activity"], activity)
+        self.assertEqual(running["exchanges"][0]["status"], "running")
+        owner = hashlib.sha256(b"owner-secret").hexdigest()
+        # Read storage without opening a second service (which performs startup recovery).
+        with sqlite3.connect(self.path) as persisted:
+            raw = persisted.execute("SELECT document FROM chats WHERE owner=? AND session=?", (owner, "main")).fetchone()[0]
+            self.assertEqual(json.loads(raw)["exchanges"][0]["activity"], activity)
+        cancelled = await self.client.delete(self.url + "/requests/request1")
+        self.assertEqual(cancelled.status_code, 200)
+        await self.progress([{**activity[0], "text": "too late"}])
+        terminal = await self.snapshot()
+        self.assertEqual(terminal["exchanges"][0]["status"], "cancelled")
+        self.assertEqual(terminal["exchanges"][0]["activity"], activity)
+        await self.runtime.synced.clear(owner, "main", terminal["side_chat_id"])
+        await self.progress(activity)
+        self.assertEqual((await self.snapshot())["exchanges"], [])
+
+    async def test_progress_write_failure_keeps_native_answer_and_recovers_without_resending(self):
+        await self.send()
+        await self.started.wait()
+        activity = [{"id": "a", "kind": "answer", "text": "Partial", "status": "running"}]
+        with patch.object(self.runtime.synced.store, "save", side_effect=OSError("disk unavailable")):
+            await self.progress(activity)
+            await self.settle()
+        restored = await self.snapshot()
+        self.assertEqual(restored["exchanges"][0]["status"], "completed")
+        self.assertEqual(restored["exchanges"][0]["answer"], "answer: question")
+        self.assertEqual(restored["exchanges"][0]["activity"], activity)
+        self.assertEqual(len(self.calls), 1)
 
     async def test_two_clients_share_ordered_answers_and_native_history(self):
         first = await self.send()
@@ -330,7 +369,7 @@ class SyncTests(unittest.IsolatedAsyncioTestCase):
         async def factory(session, **options):
             settings = dict((options.get("persisted_state") or {}).get("runtime_settings") or options["initial_runtime_settings"])
             class Handle:
-                async def ask(self, question, *, history, runtime_settings=None):
+                async def ask(self, question, *, history, runtime_settings=None, on_progress=None):
                     settings.update(runtime_settings or {})
                     calls.append((question, deepcopy(history), dict(settings)))
                     await options["persist_state"]({"runtime_settings": dict(settings),

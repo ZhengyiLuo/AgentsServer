@@ -284,7 +284,7 @@ class NativeCodexSideChat:
         elif metadata.get("ephemeral") is not True or metadata.get("path") is not None:
             raise SideQuestionError(503, "Codex did not confirm an ephemeral side chat")
 
-    async def ask(self, question: str, *, runtime_settings: dict | None = None) -> str:
+    async def ask(self, question: str, *, runtime_settings: dict | None = None, on_progress=None) -> str:
         if self._closed:
             raise SideQuestionError(409, "Side chat was closed; open a new side chat")
         if self._lock.locked():
@@ -292,6 +292,7 @@ class NativeCodexSideChat:
         async with self._lock:
             self._active = asyncio.current_task()
             turn = None
+            progress = None
             try:
                 if self._opening is None:
                     self._opening = asyncio.create_task(self._open())
@@ -319,10 +320,17 @@ class NativeCodexSideChat:
                     self.thread_id, [{"type": "text", "text": question}],
                     overrides=overrides,
                 )
+                if on_progress is not None:
+                    from codex_side_chat_progress import CodexSideChatProgress
+                    progress = CodexSideChatProgress(on_progress, thread_id=self.thread_id)
                 answers: dict[str, str] = {}
                 while True:
                     packet = await turn.next_notification()
                     method, data = packet.get("method"), packet.get("params", {})
+                    if data.get("threadId") not in (None, self.thread_id):
+                        continue
+                    if progress is not None:
+                        progress.receive(packet)
                     if method == "item/completed":
                         item = data.get("item", {})
                         if item.get("type") == "agentMessage" and item.get("phase") in (None, "", "final_answer"):
@@ -338,6 +346,8 @@ class NativeCodexSideChat:
                         answer = "\n\n".join(answers.values()).strip()
                         if not answer:
                             raise SideQuestionError(502, "Codex did not return a side question answer")
+                        if progress is not None:
+                            await progress.flush()
                         return answer
             except CodexAppServerError:
                 await self.close()
@@ -346,9 +356,13 @@ class NativeCodexSideChat:
                 await self.close()
                 raise
             finally:
-                if turn is not None:
-                    await turn.close()
-                self._active = None
+                try:
+                    if progress is not None:
+                        await progress.flush()
+                finally:
+                    if turn is not None:
+                        await turn.close()
+                    self._active = None
 
     async def close(self):
         self._closed = True

@@ -808,6 +808,23 @@ class SyncedSideChats:
         if changed:
             await self._changed(document)
 
+    async def _progress(self, key, side_chat_id, request_id, activity):
+        async with self._lock(key):
+            document = self.pending_writes.get(key) or self._load(key)
+            if document["side_chat_id"] != side_chat_id:
+                return
+            exchange = next((item for item in document["exchanges"] if item["request_id"] == request_id), None)
+            if exchange is None or exchange["status"] != "running":
+                return
+            exchange.update(activity=activity, updated_at=side_chat_timestamp())
+            document["revision"] += 1
+            try:
+                self.store.save(*key, document)
+                self.pending_writes.pop(key, None)
+            except (OSError, sqlite3.Error):
+                self.pending_writes[key] = document
+        await self._changed(document)
+
     async def _answer(self, key, side_chat_id, request_id, question, runtime_settings=None):
         handle = None
         failed = False
@@ -825,6 +842,7 @@ class SyncedSideChats:
             history = [{"question": item["question"], "response": item["answer"]}
                        for item in document["exchanges"] if item["status"] == "completed"][-20:]
             result = await handle.ask(question, history=history,
+                on_progress=lambda activity: self._progress(key, side_chat_id, request_id, activity),
                 **({"runtime_settings": runtime_settings} if runtime_settings else {}))
             await self._finish(key, side_chat_id, request_id, "completed", **result)
         except asyncio.CancelledError:
@@ -861,7 +879,7 @@ class SyncedSideChats:
 
     async def _finish(self, key, side_chat_id, request_id, status, **result):
         async with self._lock(key):
-            document = self._load(key)
+            document = self.pending_writes.get(key) or self._load(key)
             if document["side_chat_id"] != side_chat_id:
                 return
             exchange = next((item for item in document["exchanges"] if item["request_id"] == request_id), None)
@@ -873,6 +891,7 @@ class SyncedSideChats:
             document["revision"] += 1
             try:
                 self.store.save(*key, document)
+                self.pending_writes.pop(key, None)
             except (OSError, sqlite3.Error):
                 self.pending_writes[key] = document
         await self._changed(document)

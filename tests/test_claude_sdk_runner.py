@@ -964,7 +964,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         runtime_success.assert_called_once_with(agent_server.BACKEND_CLAUDE)
         runtime_failure.assert_not_called()
 
-    async def test_sdk_text_streams_as_commentary_and_result_is_only_final(
+    async def test_sdk_text_streams_as_assistant_text_and_result_is_final(
         self,
     ) -> None:
         append_event, append_finished, runtime_success, runtime_failure = (
@@ -990,30 +990,30 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             (call.args[1], call.args[2])
             for call in append_event.await_args_list
         ]
-        self.assertFalse(any(
-            event_type == "assistant_text"
-            for event_type, _payload in projected
-        ))
         self.assertEqual(
             [
                 payload
                 for event_type, payload in projected
-                if event_type == "reasoning_summary"
+                if event_type == "assistant_text"
             ],
             [{
                 "run_id": "run-claude",
                 "text": "Checking the repository now.",
-                "phase": "commentary",
                 "backend": agent_server.BACKEND_CLAUDE,
             }],
         )
+        self.assertFalse(any(
+            event_type == "reasoning_summary"
+            and payload.get("text") == "Checking the repository now."
+            for event_type, payload in projected
+        ))
         terminal = append_finished.await_args.args[1]
         self.assertEqual(terminal["result_text"], "The repository is ready.")
         self.assertFalse(terminal["stopped"])
         runtime_success.assert_called_once_with(agent_server.BACKEND_CLAUDE)
         runtime_failure.assert_not_called()
 
-    async def test_aborted_sdk_result_does_not_promote_commentary_to_final(
+    async def test_aborted_sdk_result_preserves_visible_text_without_final(
         self,
     ) -> None:
         append_event, append_finished, runtime_success, runtime_failure = (
@@ -1036,8 +1036,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(any(
-            call.args[1] == "reasoning_summary"
-            and call.args[2].get("phase") == "commentary"
+            call.args[1] == "assistant_text"
             and call.args[2].get("text")
             == "Partial work before cancellation."
             for call in append_event.await_args_list

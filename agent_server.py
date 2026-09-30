@@ -63560,10 +63560,9 @@ async def run_claude_print(
                     if btype == "text" and block.get("text"):
                         text = clean_assistant_text(block["text"])
                         if text:
-                            await append_event(session_id, "reasoning_summary", {
+                            await append_event(session_id, "assistant_text", {
                                 "run_id": run_id,
                                 "text": text,
-                                "phase": "commentary",
                                 "backend": BACKEND_CLAUDE,
                                 **run_event_metadata(run_id),
                             })
@@ -64003,10 +64002,9 @@ async def project_claude_sdk_message(
                 )
                 if text:
                     text_parts.append(text)
-                    await append_event(session_id, "reasoning_summary", {
+                    await append_event(session_id, "assistant_text", {
                         "run_id": run_id,
                         "text": text,
-                        "phase": "commentary",
                         "backend": BACKEND_CLAUDE,
                         **({"provider_message_id": message_uuid}
                            if (message_uuid := claude_sdk_field(message, "uuid")) else {}),

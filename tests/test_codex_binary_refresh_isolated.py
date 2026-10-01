@@ -31,6 +31,9 @@ class Manager:
         self.closed = False
         self.goal = None
         self.terminals = []
+        self.native_loaded_threads = set()
+        self.request = AsyncMock(side_effect=lambda method, params: {
+            "data": sorted(self.native_loaded_threads), "nextCursor": None})
         self.get_thread_goal = AsyncMock(side_effect=lambda _thread: self.goal)
         self.list_background_terminals = AsyncMock(side_effect=lambda _thread: self.terminals)
 
@@ -54,6 +57,7 @@ class BinaryRefreshTests(unittest.IsolatedAsyncioTestCase):
         source = (Path(__file__).resolve().parents[1] / "agent_server.py")
         names = {"codex_app_server_managers", "retain_codex_manager_caller",
             "codex_manager_has_callers", "codex_manager_has_callbacks", "codex_manager_owns_notification",
+            "watch_codex_provider_handoff_blockers",
             "refresh_codex_app_server_binary", "codex_manager_session_busy",
             "prepare_codex_app_server_process",
             "refresh_codex_app_server_login", "release_idle_codex_manager_session", "prepare_codex_login_turn",
@@ -82,11 +86,11 @@ class BinaryRefreshTests(unittest.IsolatedAsyncioTestCase):
             "TransientAdmissionWait": HTTPException,
             "CODEX_APP_SERVER_MANAGER_EPOCH": 0, "CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH": None,
             "CODEX_MANAGER_DRAIN_TASK": None, "CODEX_MANAGER_DRAIN_REQUESTED": False,
-            "CODEX_MANAGER_CLOSING": False,
+            "CODEX_MANAGER_CLOSING": False, "CODEX_SUBAGENT_LIMIT_TASKS": {}, "CODEX_SUBAGENT_LIMIT_REQUESTED": set(),
             "CODEX_TRANSPORT": "app-server", "CODEX_TRANSPORT_EXEC": "exec",
             "CODEX_GOALS_ENABLED": True, "CODEX_GOALS_RECONFIGURING": False,
             "CODEX_BIN": "/fixture/codex", "DEFAULT_CWD": "/fixture", "SERVER_VERSION": "test",
-            "CodexAppServerManager": Manager, "existing_cwd": lambda value: value,
+            "CodexAppServerManager": Manager, "CustomCodexAppServerManager": Manager, "existing_cwd": lambda value: value,
             "codex_app_server_env": lambda *_args: {}, "codex_binary_identity": lambda: self.identity,
             "ensure_provider_manager_factory_admission": lambda **_kwargs: None,
             "STORE": SimpleNamespace(sessions={}), "CODEX_PROVIDER_STORE": SimpleNamespace(
@@ -97,6 +101,8 @@ class BinaryRefreshTests(unittest.IsolatedAsyncioTestCase):
             "codex_session_has_live_subagents": lambda session: False,
             "schedule_codex_manager_drain": Mock(),
             "expire_codex_login_diagnostic": Mock(),
+            "release_codex_provider_writers": AsyncMock(),
+            "apply_codex_provider_when_idle": AsyncMock(return_value=False),
             "cancel_codex_interactions": AsyncMock(), "cancel_codex_native_actions": AsyncMock(),
             "decline_server_request": AsyncMock(return_value={"decision": "decline"}),
             "CODEX_INTERACTION_METHODS": {"item/commandExecution/requestApproval"},
@@ -150,6 +156,7 @@ class BinaryRefreshTests(unittest.IsolatedAsyncioTestCase):
         thread = "thread-" + session_id
         self.ns["STORE"].sessions[session_id]["codex_thread_id"] = thread
         manager.client._loaded_threads.add(thread)
+        manager.native_loaded_threads.add(thread)
         return thread
 
     async def upgrade(self):
@@ -199,6 +206,76 @@ class BinaryRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.ns["STORE"].sessions["old"]["codex_thread_id"], thread)
         self.assertNotIn("old", self.ns["CODEX_GOAL_SYNC_GENERATIONS"])
         self.assertIsNot(await self.manager("old"), old)
+
+    async def test_idle_handoff_releases_writer_before_routing_away_from_active_peer(self):
+        old = await self.manager("idle")
+        thread = self.load("idle", old)
+        self.assertIs(await self.manager("busy"), old)
+        peer = self.load("busy", old)
+        self.ns["BUSY_SESSIONS"].add("busy")
+        old.client._turns_by_thread[peer] = SimpleNamespace(_completed=False)
+        async def release(manager, session_id, threads):
+            self.assertIs(manager, old)
+            self.assertEqual((session_id, threads), ("idle", [thread]))
+            self.assertIs(self.ns["CODEX_SESSION_APP_SERVER_MANAGERS"]["idle"], old)
+            self.assertFalse(manager.is_thread_loaded(thread))
+        self.ns["release_codex_provider_writers"].side_effect = release
+        await self.upgrade()
+        await self.drain()
+        self.ns["release_codex_provider_writers"].assert_awaited_once_with(old, "idle", [thread])
+        self.assertFalse(old.closed)
+        self.assertTrue(old.is_thread_loaded(peer))
+        self.assertIsNot(await self.manager("idle"), old)
+        self.assertIs(await self.manager("busy"), old)
+
+    async def test_writer_release_failure_keeps_owner_and_retries_unsubscribed_parent(self):
+        old = await self.manager("idle")
+        thread = self.load("idle", old)
+        await self.upgrade()
+        release = self.ns["release_codex_provider_writers"]
+        release.side_effect = RuntimeError("native archive failed")
+        await self.drain()
+        self.assertIs(self.ns["CODEX_SESSION_APP_SERVER_MANAGERS"]["idle"], old)
+        self.assertFalse(old.is_thread_loaded(thread))
+        self.assertFalse(old.closed)
+        release.side_effect = None
+        await self.drain()
+        self.assertEqual(release.await_count, 2)
+        release.assert_awaited_with(old, "idle", [thread])
+        self.assertTrue(old.closed)
+
+    async def test_failed_resume_mapping_does_not_archive_an_unowned_persisted_parent(self):
+        old = await self.manager("unowned")
+        self.ns["STORE"].sessions["unowned"]["codex_thread_id"] = "externally-owned"
+        await self.upgrade()
+        await self.drain()
+        self.ns["release_codex_provider_writers"].assert_awaited_once_with(old, "unowned", [])
+        self.assertTrue(old.closed)
+
+    async def test_native_unsubscribed_writer_is_released_from_later_ownership_page(self):
+        old = await self.manager("idle")
+        thread = self.load("idle", old)
+        old.client._loaded_threads.discard(thread)
+        old.request.side_effect = [
+            {"data": ["unrelated-native-thread"], "nextCursor": "second"},
+            {"data": [thread], "nextCursor": None},
+        ]
+        await self.upgrade()
+        await self.drain()
+        self.ns["evict_codex_app_server_thread"].assert_not_awaited()
+        self.ns["release_codex_provider_writers"].assert_awaited_once_with(old, "idle", [thread])
+        self.assertEqual(old.request.await_args.args, ("thread/loaded/list", {"limit": 100, "cursor": "second"}))
+        self.assertTrue(old.closed)
+
+    async def test_failed_native_ownership_query_retains_old_owner(self):
+        old = await self.manager("idle")
+        self.load("idle", old)
+        old.request.side_effect = RuntimeError("ownership unavailable")
+        await self.upgrade()
+        await self.drain()
+        self.assertFalse(old.closed)
+        self.assertIs(self.ns["CODEX_SESSION_APP_SERVER_MANAGERS"]["idle"], old)
+        self.ns["release_codex_provider_writers"].assert_not_awaited()
 
     async def test_native_goal_background_terminal_and_pending_approval_preserve_owner(self):
         old = await self.manager("old")

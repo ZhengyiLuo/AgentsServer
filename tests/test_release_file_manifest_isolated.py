@@ -21,6 +21,7 @@ NEW_MODULES = {
     "workspace_git.py",
     "codex_auth.py",
     "codex_provider.py",
+    "codex_response_stream.py",
     "provider_connections.py",
     "cursor_api_key.py",
     "side_questions.py", "codex_side_question.py", "codex_side_chat_progress.py", "claude_side_question.py",

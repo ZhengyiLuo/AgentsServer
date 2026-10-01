@@ -195,6 +195,19 @@ def session_choice(value) -> str:
     return choice
 
 
+RUNTIME_FIELDS = ("codex_provider", "codex_provider_revision", "codex_provider_binding", "model", "effort", "_codex_provider_removed")
+
+
+def requested_session(session: dict) -> dict:
+    """Desired runtime is separate from the owner of an in-flight turn."""
+    pending = session.get("_codex_provider_pending")
+    return {**session, **pending} if isinstance(pending, dict) else dict(session)
+
+
+def runtime_selection(session: dict) -> dict:
+    return {key: session.get(key) for key in RUNTIME_FIELDS}
+
+
 class ProviderStore:
     """Atomic metadata pointer plus private, endpoint-bound credential records."""
     def __init__(self, root: Path):
@@ -329,6 +342,8 @@ class ProviderStore:
     def for_session(self, session: dict, *, include_key=False) -> dict | None:
         if session_choice(session.get("codex_provider")) == "default":
             return None
+        if session.get("_codex_provider_removed"):
+            raise HTTPException(409, "Configure the custom Codex endpoint before using this chat.")
         revision = session.get("codex_provider_revision")
         selected = self.selection(include_key=include_key, revision=revision, include_revision=True)
         if selected is None:
@@ -344,6 +359,30 @@ class ProviderStore:
         if model:
             selected["model"] = validate_model(model)
         return selected
+
+    def control(self, session: dict, *, available=True, summary=False) -> dict:
+        requested = requested_session(session)
+        pending = isinstance(session.get("_codex_provider_pending"), dict)
+        requested_provider = session_choice(requested.get("codex_provider"))
+        def endpoint(value):
+            if session_choice(value.get("codex_provider")) != "custom" or value.get("_codex_provider_removed"):
+                return None
+            try:
+                selected = self._public_selections.get(value.get("codex_provider_revision")) or self.for_session(value)
+                return selected.get("base_url") if selected else None
+            except HTTPException:
+                return None
+        return {"pending": pending,
+            "pending_reason": session.get("_codex_provider_pending_reason") if pending else None,
+            "requested_provider": requested_provider,
+            "active_provider": session_choice(session.get("codex_provider")),
+            "requested_model": requested.get("model"), "requested_effort": requested.get("effort"),
+            # The next-turn picker must use the requested endpoint's catalog,
+            # while active runtime fields continue describing running work.
+            # Avoid duplicating the active catalog on ordinary session events.
+            "requested_catalog": self.catalog(available=available, session=requested, summary=summary)
+                if pending and requested_provider == "custom" else None,
+            "requested_base_url": endpoint(requested), "active_base_url": endpoint(session)}
 
     def registration(self, *, include_key=False) -> dict | None:
         # A damaged optional endpoint must not prevent normal Codex startup.
@@ -575,6 +614,17 @@ class ProviderStore:
             if selected:
                 self._atomic(self._binding_name(thread_id), {"binding": binding(selected),
                     "credential_id": selected.get("credential_id")})
+            else:
+                self._atomic(self._binding_name(thread_id), {"binding": None, "credential_id": None})
+
+    def thread_binding(self, thread_id: str) -> dict:
+        """Snapshot rollback metadata without reopening revoked credentials."""
+        with self.lock:
+            return self._read(self._binding_name(thread_id)) or {"binding": None, "credential_id": None}
+
+    def restore_thread_binding(self, thread_id: str, record: dict) -> None:
+        with self.lock:
+            self._atomic(self._binding_name(thread_id), record)
 
     def for_thread(self, thread_id: str, *, include_key=False) -> dict | None:
         with self.lock:
@@ -1076,7 +1126,7 @@ def create_router(*, authorize, store: ProviderStore, mutate, probe, available, 
                     session = session_lookup(session_id) if session_lookup else None
                     if not session:
                         raise HTTPException(404, "Chat not found.")
-                    selected = await asyncio.to_thread(store.for_session, session, include_key=True)
+                    selected = await asyncio.to_thread(store.for_session, requested_session(session), include_key=True)
                 else:
                     selected = await asyncio.to_thread(store.selection, include_key=True, include_revision=True)
                 if selected is None:
@@ -1141,7 +1191,7 @@ def create_router(*, authorize, store: ProviderStore, mutate, probe, available, 
             session = session_lookup(session_id) if session_lookup else None
             if not session:
                 raise HTTPException(404, "Chat not found.")
-            selected = await asyncio.to_thread(store.for_session, session, include_key=True)
+            selected = await asyncio.to_thread(store.for_session, requested_session(session), include_key=True)
         else:
             selected = await asyncio.to_thread(store.selection, include_key=True, include_revision=True)
         if selected is None:

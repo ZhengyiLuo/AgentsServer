@@ -56,6 +56,8 @@ class CodexSubagentIdentityTests(unittest.IsolatedAsyncioTestCase):
             # Optional root naming is covered by test_native_session_titles;
             # this fixture only supplies child identity/lifecycle state.
             "native_session_title": Mock(return_value=None),
+            "schedule_codex_subagent_limit_application": Mock(),
+            "schedule_codex_provider_application": Mock(),
             "session_codex_thread_id": lambda session: session.get("codex_thread_id", ""),
             "logger": Mock(), "concise_error_message": str,
             "codex_session_has_active_run": AsyncMock(side_effect=AssertionError("identity must not inspect/wake execution")),

@@ -50,10 +50,15 @@ A fresh chat can use a new process while another chat finishes on the old one.
 Idle chat migration runs under its lifecycle lock. It checks caller leases,
 callbacks, registered tasks, native turns, approvals, goals, subagents, side
 chats and background terminals. Native metadata and unsubscribe work share an
-eight-second budget. The old thread must be verifiably unloaded before its
-local owner mapping is released; its persisted provider ID is unchanged.
-Metadata, unsubscribe or spawn failure does not silently restore stale
-credentials or restart a shared process.
+eight-second budget. Unsubscribe alone can leave a native writer lock alive.
+Before releasing the local owner mapping, AgentsServer uses native
+`thread/archive` followed by `thread/unarchive` on the idle chat and its owned
+threads. This releases the old writer while preserving the thread ID, history
+and native goal; unrelated active chats keep their process. A durable pending
+unarchive marker preserves recovery if that lifecycle is interrupted. Failed
+writer release retains the old owner instead of routing another process to a
+locked thread. Metadata, unsubscribe, writer-release or spawn failure does not
+silently restore stale credentials or restart a shared process.
 
 A new ordinary turn checks this before its admission/acceptance. Busy messages
 can follow the existing queue path; queue promotion repeats the check. A

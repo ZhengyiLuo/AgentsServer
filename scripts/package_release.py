@@ -63,6 +63,7 @@ FILES = (
     "codex_app_server.py",
     "codex_auth.py",
     "codex_provider.py",
+    "codex_response_stream.py",
     "provider_connections.py",
     "cursor_api_key.py",
     "side_questions.py",

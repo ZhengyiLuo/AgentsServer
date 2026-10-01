@@ -358,6 +358,20 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
         manager.clean_background_terminals.assert_awaited_once_with("thread")
         release.assert_awaited_once_with("chat", manager, "thread")
 
+    async def test_pending_switch_cleans_only_native_descendants_then_releases_control(self):
+        manager = AsyncMock(spec=agent_server.CodexAppServerManager)
+        manager.list_descendant_threads.return_value = [{"id": "child"}, {"id": "idle-child"}, {"id": "historical-child", "status": {"type": "notLoaded"}}]
+        manager.list_background_terminals.side_effect = [[{"processId": "command"}], []]
+        with patch.object(agent_server, "acquire_codex_control_thread", AsyncMock(return_value=(
+            manager, "parent", {"_codex_provider_pending": {"codex_provider": "custom"}}
+        ))), patch.object(agent_server, "release_codex_control_thread", AsyncMock()) as release:
+            result = await agent_server.post_codex_background_terminals_clean(
+                "chat", agent_server.CodexBackgroundTerminalsCleanRequest(confirmed=True))
+        self.assertEqual(result, {"cleaned": True})
+        manager.list_descendant_threads.assert_awaited_once_with("parent")
+        self.assertEqual([call.args[0] for call in manager.clean_background_terminals.await_args_list], ["parent", "child"])
+        release.assert_awaited_once_with("chat", manager, "parent")
+
     async def test_terminate_terminal_requires_confirmation(self) -> None:
         with patch.object(
             agent_server,

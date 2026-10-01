@@ -169,7 +169,7 @@ class LoginHandoffTests(binary.BinaryRefreshTests):
     async def test_pending_nonturn_request_blocks_unsubscribe_and_process_close(self):
         old = await self.manager("idle")
         self.load("idle", old)
-        old.client._pending[1] = ("thread/resume", object(), None)
+        old.client._pending[1] = ("thread/resume", asyncio.get_running_loop().create_future(), None)
         await self.relogin()
         with self.assertRaises(HTTPException):
             await self.preflight("idle")
@@ -196,7 +196,7 @@ class LoginHandoffTests(binary.BinaryRefreshTests):
         draining = asyncio.create_task(self.drain())
         await asyncio.wait_for(waiting.wait(), 1)
         old.client._turns_by_thread["late"] = SimpleNamespace(_completed=False)
-        old.client._pending[1] = ("thread/resume", object(), None)
+        old.client._pending[1] = ("thread/resume", asyncio.get_running_loop().create_future(), None)
         lock.release()
         await draining
         self.assertFalse(old.closed)

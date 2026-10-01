@@ -60,7 +60,29 @@ class SessionSummaryTests(unittest.TestCase):
         summary_bytes = len(JSONResponse({"sessions": summaries}).body)
         full_bytes = len(JSONResponse({"sessions": full_sessions}).body)
 
-        self.assertLess(summary_bytes, 150_000)
+        # Endpoint switching added this explicit active/requested state to
+        # list snapshots so the composer can show a saved pending selection.
+        # Include the additive requested model/effort projection, but retain
+        # the existing budget for every other summary field.
+        default_provider_control = {
+            "pending": False,
+            "requested_provider": "default",
+            "active_provider": "default",
+            "requested_model": None,
+            "requested_effort": None,
+            "requested_catalog": None,
+            "requested_base_url": None,
+            "active_base_url": None,
+        }
+        base_summaries = []
+        for summary in summaries:
+            base = dict(summary)
+            self.assertEqual(base.pop("codex_provider_control"), default_provider_control)
+            base_summaries.append(base)
+        base_bytes = len(JSONResponse({"sessions": base_summaries}).body)
+        self.assertLess(base_bytes, 150_000)
+        control_bytes = len(JSONResponse({"codex_provider_control": default_provider_control}).body) - 1
+        self.assertEqual(summary_bytes - base_bytes, control_bytes * len(raw_sessions))
         self.assertLess(summary_bytes, full_bytes * 0.05)
 
 

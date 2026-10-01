@@ -180,6 +180,25 @@ class CodexHistoryDeferralTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cancellation, [True])
         self.assert_no_persistence()
 
+    def test_endpoint_handoff_repairs_history_from_retained_cursor_without_rebinding(self):
+        self.session["codex_thread_id"] = None
+        before = deepcopy(self.session)
+        self.ns["prepare_codex_native_history_repair"]("chat")
+        args = self.cache.prepare.call_args.args
+        self.assertEqual(args[1], PROVIDER)
+        self.assertEqual(args[3], self.source)
+        self.assertEqual(self.session, before)
+        self.store.save.assert_not_called()
+
+    def test_endpoint_handoff_does_not_use_malformed_or_other_backend_cursor(self):
+        for change in ({"backend": "claude"}, {"source_digest": "invalid"}, {"version": 99}):
+            with self.subTest(change=change):
+                self.session["codex_thread_id"] = None
+                self.session["_history_sync_cursor"] = {**self.cursor, **change}
+                self.cache.prepare.reset_mock()
+                self.ns["prepare_codex_native_history_repair"]("chat")
+                self.cache.prepare.assert_not_called()
+
     def test_incomplete_cache_preparation_dirties_no_indexes_and_next_request_retries(self):
         self.cache.prepare.side_effect = [CodexNativeHistoryProofUnavailable("Incomplete proof"), True]
         self.ns["prepare_codex_native_history_repair"]("chat")

@@ -909,7 +909,9 @@ class SyncedSideChats:
     async def cancel(self, owner, session, request_id):
         key = (owner, session)
         async with self._lock(key):
-            document = self._load(key)
+            # Pending progress may be unsaved while provider work is active.
+            # Storage recovery must not gate the operator's Stop intent.
+            document = self.pending_writes.get(key) or self._load(key)
             exchange = next((item for item in document["exchanges"] if item["request_id"] == request_id), None)
             if exchange is None:
                 # Stop can overtake submission in transit. Preserve an opaque
@@ -918,15 +920,24 @@ class SyncedSideChats:
                     self.store.save(*key, document, receipt={"request_id": request_id, "question": ""})
                 return self.public(document)
             if exchange["status"] != "running":
-                return self.public(document)
+                return self.public(self._load(key))
+            task = self.tasks.get(key)
+            snapshot_progress = getattr(self.handles.get(key), "snapshot_progress", None)
+            if task is not None and callable(snapshot_progress):
+                # Capture only native items received by this exact request
+                # before Stop. Later coalesced callbacks stay fenced below.
+                with suppress(Exception):
+                    activity = snapshot_progress(task)
+                    if activity is not None:
+                        exchange["activity"] = activity
             exchange.update(status="cancelled", updated_at=side_chat_timestamp())
             document["last_request_id"] = request_id
             document["revision"] += 1
             try:
                 self.store.save(*key, document)
+                self.pending_writes.pop(key, None)
             except (OSError, sqlite3.Error):
                 self.pending_writes[key] = document
-            task = self.tasks.get(key)
             if task is not None:
                 task.cancel()
         if task is not None:
@@ -937,17 +948,20 @@ class SyncedSideChats:
     async def clear(self, owner, session, side_chat_id):
         key = (owner, session)
         async with self._lock(key):
-            document = self._load(key)
+            # Preserve the new conversation fence even if progress storage
+            # is unavailable; still retire the old provider immediately.
+            document = self.pending_writes.get(key) or self._load(key)
             if document["side_chat_id"] != side_chat_id:
                 # A repeated Clear is harmless. A stale device cannot clear a
                 # new conversation it has not seen.
-                return self.public(document)
+                return self.public(self._load(key))
             document.update(side_chat_id=uuid.uuid4().hex, exchanges=[], last_request_id=None, _provider_state=None)
             document.pop("model", None)
             document.pop("effort", None)
             document["revision"] += 1
             try:
                 self.store.save(*key, document)
+                self.pending_writes.pop(key, None)
             except (OSError, sqlite3.Error):
                 self.pending_writes[key] = document
             task = self.tasks.get(key)

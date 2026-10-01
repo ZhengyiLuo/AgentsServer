@@ -83439,6 +83439,9 @@ async def create_native_side_chat(session_id: str, *, persisted_state=None, pers
             self.current()
             return {"backend": backend, **result}
 
+        def snapshot_progress(self, task):
+            return self.codex.snapshot_progress(task) if self.codex is not None else None
+
         async def close(self):
             if self.codex is not None:
                 await self.codex.close()

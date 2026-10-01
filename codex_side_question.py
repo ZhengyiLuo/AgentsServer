@@ -179,12 +179,19 @@ class NativeCodexSideChat:
         self._cleaning: asyncio.Task | None = None
         self._process_started = asyncio.Event()
         self._active: asyncio.Task | None = None
+        self._progress = None
         self._lock = asyncio.Lock()
         self._closed = False
 
     @property
     def closed(self) -> bool:
         return self._closed
+
+    def snapshot_progress(self, task):
+        """Copy exposed native items at Stop without flushing or awaiting IO."""
+        if task is None or task.done() or self._active is not task or self._progress is None:
+            return None
+        return deepcopy(list(self._progress.items.values()))
 
     async def _handle_server_request(self, request_id, method, params):
         # The callback can present approvals through the existing UI, but only
@@ -323,6 +330,7 @@ class NativeCodexSideChat:
                 if on_progress is not None:
                     from codex_side_chat_progress import CodexSideChatProgress
                     progress = CodexSideChatProgress(on_progress, thread_id=self.thread_id)
+                    self._progress = progress
                 answers: dict[str, str] = {}
                 while True:
                     packet = await turn.next_notification()
@@ -360,9 +368,12 @@ class NativeCodexSideChat:
                     if progress is not None:
                         await progress.flush()
                 finally:
-                    if turn is not None:
-                        await turn.close()
-                    self._active = None
+                    try:
+                        if turn is not None:
+                            await turn.close()
+                    finally:
+                        self._progress = None
+                        self._active = None
 
     async def close(self):
         self._closed = True

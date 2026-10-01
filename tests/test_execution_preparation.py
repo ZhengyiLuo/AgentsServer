@@ -307,6 +307,7 @@ preparation.write_prepared(candidate=pathlib.Path(sys.argv[2]),root=pathlib.Path
                                                output=output, **self.pins)
                 self.assertFalse(output.exists())
         self.receipt.parent.mkdir(mode=0o755)
+        self.receipt.parent.chmod(0o755)  # The unsafe fixture must not inherit a restrictive umask.
         with self.assertRaises(PermissionError):
             self.write()
 

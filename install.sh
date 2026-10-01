@@ -3055,21 +3055,37 @@ install_lock_control() {
   local action="$1"
   local expected_device="${2:-0}"
   local expected_inode="${3:-0}"
+  local wait_for_prepared="false"
+  # Old managed preparers do not pass a managed-update ID. The existing pinned
+  # preparation/activation modes may serialize briefly; this grants no update
+  # authority and leaves ordinary installation and recovery fail-fast.
+  if [[ "$action" == "acquire" && "${RECOVER_ONLY:-false}" != "true" \
+    && "${RECOVER_UNARMED_ONLY:-false}" != "true" \
+    && ( "${PREPARE_ONLY:-false}" == "true" || -n "${ACTIVATE_PREPARED:-}" ) \
+    && "${PREPARED_ARCHIVE_SHA256:-}" =~ ^[0-9a-f]{64}$ \
+    && "${EXPECTED_API_CONTRACT:-}" =~ ^[1-9][0-9]*$ \
+    && -n "${RELEASE_VERSION:-}" ]]; then
+    wait_for_prepared="true"
+  fi
   local python_path=""
   python_path="$(install_lock_python)" || return 1
   "$python_path" - \
-    "$action" "$INSTALL_ROOT" "$$" "$expected_device" "$expected_inode" <<'PY'
+    "$action" "$INSTALL_ROOT" "$$" "$expected_device" "$expected_inode" "$wait_for_prepared" <<'PY'
 import errno
 import os
 from pathlib import Path
 import secrets
+import signal
 import stat
 import sys
+import time
 
-action, raw_root, raw_pid, raw_device, raw_inode = sys.argv[1:]
+action, raw_root, raw_pid, raw_device, raw_inode, raw_wait = sys.argv[1:]
 root = Path(os.path.abspath(raw_root))
 pid = int(raw_pid)
 lock = root / ".install-lock"
+PREPARED_LOCK_WAIT_SECONDS = 30.0
+wait_for_prepared = action == "acquire" and raw_wait == "true"
 
 root_info = root.lstat()
 if (
@@ -3145,7 +3161,56 @@ def read_owner(directory_descriptor: int) -> tuple[int, tuple[int, int]]:
     return int(value), (int(info.st_dev), int(info.st_ino))
 
 
+def check_wait_root() -> None:
+    current = root.lstat()
+    if ((current.st_dev, current.st_ino) != (root_info.st_dev, root_info.st_ino)
+            or not stat.S_ISDIR(current.st_mode) or current.st_uid != os.geteuid()
+            or stat.S_IMODE(current.st_mode) & 0o022):
+        raise PermissionError("AgentsServer install root changed while waiting")
+
+
+def same_wait_owner(directory_descriptor, directory_info, owner_pid, owner_identity) -> bool:
+    check_wait_root()
+    current = lock.lstat()
+    if ((current.st_dev, current.st_ino) != (directory_info.st_dev, directory_info.st_ino)):
+        return False
+    if (not stat.S_ISDIR(current.st_mode) or current.st_uid != os.geteuid()
+            or stat.S_IMODE(current.st_mode) & 0o077):
+        raise PermissionError("AgentsServer install lock directory is unsafe")
+    return read_owner(directory_descriptor) == (owner_pid, owner_identity)
+
+
+def cleanup_wait_candidate(path, expected) -> None:
+    # Cancellation while waiting may remove only our still-unpublished draft.
+    # An acquired-but-unreported lock is left for ordinary dead-owner reaping.
+    try:
+        check_wait_root()
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+        try:
+            current = os.fstat(descriptor)
+            linked = path.lstat()
+            identity = (expected.st_dev, expected.st_ino)
+            if ((current.st_dev, current.st_ino) != identity
+                    or (linked.st_dev, linked.st_ino) != identity):
+                return
+            owner, owner_identity = read_owner(descriptor)
+            if owner != pid or read_owner(descriptor) != (owner, owner_identity):
+                return
+            os.unlink("pid", dir_fd=descriptor)
+            os.fsync(descriptor)
+            linked = path.lstat()
+            if (linked.st_dev, linked.st_ino) == identity:
+                path.rmdir()
+        finally:
+            os.close(descriptor)
+    except (OSError, RuntimeError):
+        pass  # Preserve the original cancellation/failure; never guess ownership.
+
+
 if action == "acquire":
+    # One budget includes owner/namespace changes. Waiting only observes an
+    # existing safe lock; all authority checks still follow atomic acquisition.
+    deadline = time.monotonic() + PREPARED_LOCK_WAIT_SECONDS
     candidate = root / f".install-lock.{pid}.{secrets.token_hex(12)}.tmp"
     os.mkdir(candidate, 0o700)
     os.chmod(candidate, 0o700)
@@ -3165,21 +3230,44 @@ if action == "acquire":
         finally:
             os.close(descriptor)
         fsync_directory(candidate)
-        for _attempt in range(32):
+        if wait_for_prepared:
+            def cancelled(signum, _frame):
+                raise SystemExit(128 + signum)
+            for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                signal.signal(signum, cancelled)
+        namespace_attempts = 0
+        while namespace_attempts < 32:
+            if wait_for_prepared:
+                check_wait_root()
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("AgentsServer prepared update timed out waiting for the installation lock")
             try:
                 os.rename(candidate, lock)
             except OSError as exc:
                 if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
                     raise
-                directory_descriptor, directory_info = open_lock_directory()
                 try:
+                    directory_descriptor, directory_info = open_lock_directory()
+                except FileNotFoundError:
+                    if not wait_for_prepared:
+                        raise
+                    # The incumbent retired after rename observed its lock.
+                    namespace_attempts += 1
+                    continue
+                try:
+                    if wait_for_prepared and any(
+                        name != "pid" for name in os.listdir(directory_descriptor)
+                    ):
+                        raise PermissionError("AgentsServer install lock contains unknown files")
                     try:
                         owner_pid, owner_identity = read_owner(directory_descriptor)
                     except FileNotFoundError:
                         # An old installer may have crashed in mkdir->pid. The
                         # next atomic directory rename replaces only that
                         # exact empty namespace; a populated replacement wins.
+                        namespace_attempts += 1
                         continue
+                    alive = False
                     try:
                         os.kill(owner_pid, 0)
                     except ProcessLookupError:
@@ -3189,6 +3277,22 @@ if action == "acquire":
                             f"another AgentsServer installation is active ({owner_pid})"
                         )
                     else:
+                        alive = True
+                    if alive:
+                        if wait_for_prepared:
+                            try:
+                                unchanged = same_wait_owner(directory_descriptor, directory_info,
+                                                            owner_pid, owner_identity)
+                            except FileNotFoundError:
+                                unchanged = False
+                            if not unchanged:
+                                namespace_attempts += 1
+                                continue
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise RuntimeError("AgentsServer prepared update timed out waiting for the installation lock")
+                            time.sleep(min(0.1, remaining))
+                            continue
                         raise RuntimeError(
                             f"another AgentsServer installation is active ({owner_pid})"
                         )
@@ -3200,19 +3304,25 @@ if action == "acquire":
                             directory_descriptor
                         )
                     except FileNotFoundError:
+                        namespace_attempts += 1
                         continue
                     if current_owner != owner_pid or current_identity != owner_identity:
+                        namespace_attempts += 1
                         continue
                     try:
                         os.unlink("pid", dir_fd=directory_descriptor)
                     except FileNotFoundError:
+                        namespace_attempts += 1
                         continue
                     os.fsync(directory_descriptor)
                 finally:
                     os.close(directory_descriptor)
+                namespace_attempts += 1
                 continue
             else:
                 owned = True
+                if wait_for_prepared:
+                    check_wait_root()
                 for _ in range(3):
                     try:
                         fsync_directory(root)
@@ -3232,7 +3342,9 @@ if action == "acquire":
                 raise SystemExit(0)
         raise RuntimeError("AgentsServer install lock ownership kept changing")
     finally:
-        if not owned:
+        if not owned and wait_for_prepared:
+            cleanup_wait_candidate(candidate, candidate_info)
+        elif not owned:
             try:
                 (candidate / "pid").unlink()
             except FileNotFoundError:

@@ -4,8 +4,20 @@ Permanent same-server `async_route_v1` sends are stored as mailbox messages.
 Acceptance stores each message immediately and returns without waiting for a
 reply. If the recipient is idle, one event-driven wake lets its agent read the
 mailbox. Busy recipients are never steered or interrupted; their existing tool
-checkpoint hint and eventual idle transition handle availability. Existing
-legacy exchanges retain their negotiated delivery behavior.
+checkpoint hint and eventual idle transition handle availability. The old
+same-server direct-turn and request/reply exchange routes are disabled.
+Older paired-route requests also use mailbox delivery, even when they omit the
+async mode or request a live response. No exchange or wait lease is created.
+Pending legacy delivery rows are cancelled without deleting their message
+bodies or history; genuine user queue entries remain available.
+
+Scheduled jobs use the mailbox for saved references whose exact recipient has
+a live permanent pair. The run retains only each saved reference's permitted
+actions, without adding the chat's other peers. A saved request/reply-only
+reference sends an independent mailbox question in this mode, with no live wait
+or queued delivery. References without a permanent pair cannot use the retired
+exchange transport. Existing authorized pairs are reused; the server does not
+create new pair permissions implicitly.
 
 ## Agent workflow
 

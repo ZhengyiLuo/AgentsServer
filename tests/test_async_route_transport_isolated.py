@@ -6,6 +6,9 @@ import asyncio
 from contextlib import asynccontextmanager, suppress
 from copy import deepcopy
 import hashlib
+import json
+import os
+import secrets
 from pathlib import Path
 import re
 import sqlite3
@@ -30,6 +33,10 @@ FUNCTIONS = {
     "issued_provider_capability_snapshot", "provider_authority_runtime_env",
     "resolve_provider_tool_arguments", "provider_tool_argument_value",
     "validated_cross_chat_source_user_instruction",
+    "create_authorized_cross_chat_instruction", "create_authorized_cross_chat_exchange_response",
+    "register_request_reply_exchanges", "register_final_result_obligations",
+    "provider_route_capability_source", "authorize_provider_action", "provider_capability_header",
+    "expire_provider_route_authority", "issue_cross_chat_capability",
 }
 ROUTE = "route_" + "a" * 32
 PAIR = "pair_" + "b" * 32
@@ -278,9 +285,11 @@ class AsyncRouteAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         yield
 
     def request(self, key="message-key-one", **extra):
-        return SimpleNamespace(mode="async_route_v1", action="instruction", artifact_grants=[],
-                               body="Prepared message", idempotency_key=key, wait_for_response=False,
-                               response_timeout_seconds=None, **{"reply_to_message_id": None, **extra})
+        return SimpleNamespace(**{
+            "mode": "async_route_v1", "action": "instruction", "artifact_grants": [],
+            "body": "Prepared message", "idempotency_key": key, "wait_for_response": False,
+            "response_timeout_seconds": None, "reply_to_message_id": None, **extra,
+        })
 
     async def send(self, key="message-key-one", body="Prepared message"):
         request = self.request(key)
@@ -297,6 +306,91 @@ class AsyncRouteAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         self.ledger.create_route_exchange_request.assert_not_awaited()
         self.ns["reserve_provider_route_handoff"].assert_not_awaited()
         self.ns["submit_cross_chat_delivery"].assert_not_awaited()
+
+    async def test_old_send_and_live_ask_are_mailbox_messages_without_exchange_or_wait(self):
+        self.capability["async_route_v1"] = False
+        waiter = self.ns["register_or_replay_cross_chat_live_waiter_locked"] = AsyncMock(
+            side_effect=AssertionError("legacy live waiter created"))
+        wait = self.ns["finalized_cross_chat_live_receipt"] = AsyncMock(
+            side_effect=AssertionError("legacy live response wait"))
+        for action in ("instruction", "request_reply"):
+            request = self.request("old-wire-" + action, mode=None, action=action,
+                                   wait_for_response=action == "request_reply", response_timeout_seconds=30)
+            receipt = await self.ns["submit_provider_route_handoff"](ROUTE, request, object())
+            self.assertEqual((receipt["mode"], receipt["delivery_mode"], receipt["execution_started"]),
+                             ("async_route_v1", "mailbox", False))
+            self.assertNotIn("exchange_id", receipt)
+            record = await self.ledger.get(receipt["message_id"])
+            self.assertEqual((record["status"], record["authorization_pair_id"]), ("stored", PAIR))
+            replay = await self.ns["submit_provider_route_handoff"](ROUTE, request, object())
+            self.assertEqual(replay["message_id"], receipt["message_id"])
+            self.assertTrue(replay["duplicate"])
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM chat_mailbox_messages").fetchone()[0], 2)
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM cross_chat_exchanges").fetchone()[0], 0)
+        self.ledger.create_route_exchange_request.assert_not_awaited()
+        self.ns["reserve_provider_route_handoff"].assert_not_awaited()
+        waiter.assert_not_awaited()
+        wait.assert_not_awaited()
+
+    async def test_old_unpaired_route_cannot_create_mail_or_implicit_pair(self):
+        self.capability["async_route_v1"] = False
+        self.capability["provider_route_grants"][ROUTE].pop("pair_id")
+        before = deepcopy(self.capability)
+        for action in ("instruction", "request_reply"):
+            with self.assertRaises(HTTPException) as rejected:
+                await self.ns["submit_provider_route_handoff"](
+                    ROUTE, self.request("old-unpaired-" + action, mode=None, action=action), object())
+            self.assertEqual(rejected.exception.status_code, 410)
+            self.assertEqual(rejected.exception.detail["code"], "legacy_cross_chat_disabled")
+        self.assertEqual(self.capability, before)
+        for table in ("cross_chat_envelopes", "chat_mailbox_messages", "cross_chat_exchanges"):
+            self.assertEqual(self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 0)
+        self.ns["publish_chat_mailbox_message"].assert_not_awaited()
+
+    async def test_old_wire_keeps_actual_capability_authentication_and_live_owner_checks(self):
+        actual = server_namespace()
+        for name in ("provider_route_capability_source", "authorize_provider_action", "provider_capability_header",
+                     "expire_provider_route_authority"):
+            # Bind the extracted production functions to the same SQLite test namespace.
+            function = actual[name]
+            self.ns[name] = type(function)(function.__code__, self.ns, name, function.__defaults__, function.__closure__)
+        token = "isolated-provider-token"
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        self.capability.update(server_identity="isolated-server", expires_at=time.time() + 3600,
+                               actions={"agent_cross_chat_routes"}, async_route_v1=False)
+        self.ns.update({
+            "CROSS_CHAT_CAPABILITY_LOCK": asyncio.Lock(), "CROSS_CHAT_CAPABILITIES": {token_hash: self.capability},
+            "server_identity": lambda: "isolated-server", "request_client_is_provider_helper_local": Mock(return_value=True),
+            "provider_capability_has_ambient_native_routes": lambda capability: False, "PROVIDER_TEAM_ACTIONS": set(),
+        })
+        wire = SimpleNamespace(headers={"x-agentsdock-provider-capability": token})
+        request = self.request(mode=None, action="request_reply", wait_for_response=True)
+        receipt = await self.ns["submit_provider_route_handoff"](ROUTE, request, wire)
+        self.assertEqual(receipt["delivery_mode"], "mailbox")
+        for failure in ("missing_token", "foreign_server", "expired", "missing_action", "detached", "remote"):
+            original = deepcopy(self.capability)
+            with self.subTest(failure=failure):
+                if failure == "missing_token":
+                    wire.headers.clear()
+                elif failure == "foreign_server":
+                    self.capability["server_identity"] = "foreign-server"
+                elif failure == "expired":
+                    self.capability["expires_at"] = 0
+                elif failure == "missing_action":
+                    self.capability["actions"] = set()
+                elif failure == "detached":
+                    self.ns["provider_capability_is_attached_to_live_run"].return_value = False
+                else:
+                    self.ns["request_client_is_provider_helper_local"].return_value = False
+                with self.assertRaises(HTTPException) as rejected:
+                    await self.ns["submit_provider_route_handoff"](ROUTE, request, wire)
+                self.assertEqual(rejected.exception.status_code, 403)
+            self.capability.clear()
+            self.capability.update(original)
+            wire.headers["x-agentsdock-provider-capability"] = token
+            self.ns["provider_capability_is_attached_to_live_run"].return_value = True
+            self.ns["request_client_is_provider_helper_local"].return_value = True
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM chat_mailbox_messages").fetchone()[0], 1)
 
     async def test_same_key_replay_is_single_mailbox_effect_and_zero_execution(self):
         first = await self.send()
@@ -370,12 +464,7 @@ class AsyncRouteAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         self.ns["schedule_chat_mailbox_wake"].assert_called_once_with("b")
         self.ns["submit_cross_chat_delivery"].assert_not_awaited()
 
-    async def test_unnegotiated_or_revoked_or_expired_run_fails_before_new_effect(self):
-        self.capability["async_route_v1"] = False
-        with self.assertRaises(HTTPException) as rejected:
-            await self.send()
-        self.assertEqual(rejected.exception.status_code, 409)
-        self.capability["async_route_v1"] = True
+    async def test_revoked_or_expired_run_fails_before_new_effect(self):
         self.ns["live_provider_cross_chat_route"].return_value = None
         self.ns["live_provider_cross_chat_route"].side_effect = None
         with self.assertRaises(HTTPException):
@@ -453,6 +542,121 @@ class AsyncRouteAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.ns["CROSS_CHAT"].update.await_args.kwargs["status"], "delivered")
         terminal.assert_awaited_once()
         self.ns["submit_cross_chat_delivery"].assert_not_awaited()
+
+
+class RetiredCrossChatCreationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.ns = server_namespace()
+        self.token = "isolated-legacy-token"
+        self.handle = "direct_" + "d" * 32
+        self.capability = {
+            "server_identity": "isolated-server", "source_session_id": "a", "source_run_id": "run_one",
+            "actions": {"cross_chat_instruction", "cross_chat_request_reply", "cross_chat_response"},
+            "grants": {("b", "instruction")}, "provider_direct_grants": {
+                self.handle: {"target_session_id": "b", "action": "instruction"}},
+            "exchange_response_grants": {("exchange_one", "leg_one")},
+        }
+        self.ledger = SimpleNamespace(create_instruction=AsyncMock(), create_initial_exchange_leg=AsyncMock(),
+                                      commit_exchange_response=AsyncMock(), create_exchange_obligation=AsyncMock(),
+                                      create_final_obligation=AsyncMock())
+        self.ns.update({
+            "AGENT_TOKEN": "isolated-admin-token", "time": time, "CROSS_CHAT_CAPABILITY_LOCK": asyncio.Lock(),
+            "CROSS_CHAT_CAPABILITIES": {hashlib.sha256(self.token.encode()).hexdigest(): self.capability},
+            "server_identity": lambda: "isolated-server", "provider_capability_is_attached_to_live_run": Mock(return_value=True),
+            "PROVIDER_DIRECT_GRANT_ID_RE": re.compile(r"direct_[0-9a-f]{32}"), "CROSS_CHAT": self.ledger,
+        })
+
+    def request(self):
+        return SimpleNamespace(body="prepared message", artifact_grants=[], target_session_id=self.handle,
+                               action="instruction", idempotency_key="legacy-request-one", wait_for_response=False,
+                               inbound_leg_id="leg_one", request_response=False)
+
+    async def test_authorized_legacy_direct_and_response_are_gone_before_any_mutation(self):
+        for name, args in (("create_authorized_cross_chat_instruction", (self.token, self.request())),
+                           ("create_authorized_cross_chat_exchange_response", (self.token, "exchange_one", self.request()))):
+            with self.subTest(name=name), self.assertRaises(HTTPException) as rejected:
+                await self.ns[name](*args)
+            self.assertEqual(rejected.exception.status_code, 410)
+            self.assertEqual(rejected.exception.detail["code"], "legacy_cross_chat_disabled")
+        self.assertNotIn("consumed", self.capability)
+        self.ledger.create_instruction.assert_not_awaited()
+        self.ledger.create_initial_exchange_leg.assert_not_awaited()
+        self.ledger.commit_exchange_response.assert_not_awaited()
+
+    async def test_legacy_direct_authentication_and_exact_grant_still_fail_closed(self):
+        for token in ("", "invalid-provider-token"):
+            with self.assertRaises(HTTPException) as rejected:
+                await self.ns["create_authorized_cross_chat_instruction"](token, self.request())
+            self.assertEqual(rejected.exception.status_code, 403)
+        self.capability["grants"] = set()
+        with self.assertRaises(HTTPException) as rejected:
+            await self.ns["create_authorized_cross_chat_instruction"](self.token, self.request())
+        self.assertEqual(rejected.exception.status_code, 403)
+        self.ledger.create_instruction.assert_not_awaited()
+
+    async def test_authorized_secure_peer_initial_and_response_paths_are_preserved(self):
+        self.capability["actions"].update({"secure_peer_instruction", "secure_peer_response"})
+        snapshot = {"source_server_identity": "isolated-server", "target_server_identity": "peer-server",
+                    "source_route_id": "source-peer-route", "target_route_id": self.handle, "expires_at": 9999999999}
+        self.capability["secure_peer_grants"] = {(self.handle, "instruction"): snapshot}
+        self.capability["secure_peer_response_grants"] = {("exchange_one", "leg_one"): snapshot}
+        accepted = {"exchange_id": "peer-exchange", "envelope_id": "peer-envelope", "status": "ready",
+                    "used_legs": 2, "max_legs": 6, "expires_at": 9999999999}
+        runtime = SimpleNamespace(
+            prepare_outbound_handoff=Mock(return_value=({"state": "committed", "response": accepted}, False)),
+            prepare_delivery_response=Mock(return_value={"used_legs": 1}),
+            submit_remote_handoff=Mock(return_value=accepted), mark_delivery_response=Mock(return_value={"ok": True}),
+        )
+        self.ns.update(SECURE_PEER_AGENT_RELAY_ENABLED=True, SECURE_PEER_RUNTIME=runtime,
+                       secure_peer_request_uuid=lambda *a, **k: "isolated-request-id")
+        first, _created = await self.ns["create_authorized_cross_chat_instruction"](self.token, self.request())
+        self.assertTrue(first["_secure_peer"])
+        reply, leg, _created = await self.ns["create_authorized_cross_chat_exchange_response"](
+            self.token, "exchange_one", self.request())
+        self.assertTrue(reply["_secure_peer"])
+        self.assertEqual(leg["id"], "peer-envelope")
+        runtime.prepare_outbound_handoff.assert_called_once()
+        runtime.submit_remote_handoff.assert_called_once()
+        self.ledger.create_instruction.assert_not_awaited()
+        self.ledger.commit_exchange_response.assert_not_awaited()
+
+    async def test_new_capability_is_mailbox_only_even_when_old_client_flag_is_false(self):
+        with tempfile.TemporaryDirectory(prefix="mailbox-authority-") as temporary:
+            root = Path(temporary)
+            self.ns.update({
+                "validate_team_references": lambda *a, **k: [], "effective_provider_jobs_access": lambda session: "blocked",
+                "normalized_provider_cross_chat_route_snapshot": lambda routes: routes,
+                "normalized_secure_peer_route_snapshots": lambda routes: routes,
+                "SECURE_PEER_AGENT_RELAY_ENABLED": False, "PROVIDER_TEAM_ACTIONS": set(),
+                "team_mail_grants": SimpleNamespace(snapshot=lambda routes: [], normalize_routes=lambda routes: [], ROUTES_KEY="team_routes"),
+                "secrets": secrets, "json": json, "os": os, "CROSS_CHAT_CAPABILITY_TTL_SECONDS": 3600,
+                "CROSS_CHAT_AUTHORITY_ROOT": root, "cross_chat_authority_path": lambda *a: root / "authority.json",
+                "provider_helper_server_origin": lambda: "http://127.0.0.1:12345", "write_all": os.write,
+            })
+            route = {"route_id": ROUTE, "target_session_id": "b", "pair_id": PAIR}
+            reference = SimpleNamespace(session_id="b", target_kind=None, action="instruction")
+            path = await self.ns["issue_cross_chat_capability"](
+                "a", "run_new", [reference], async_route_v1=False, provider_route_snapshot=[route],
+                actions={"agent_cross_chat_routes", "cross_chat_instruction", "cross_chat_request_reply", "cross_chat_response"},
+                exchange_request_grants={"b": "old-exchange"}, exchange_response_grants={("old-exchange", "old-leg")},
+                async_route_response_route_id=ROUTE,
+            )
+            payload = json.loads(path.read_text())
+            capability = self.ns["CROSS_CHAT_CAPABILITIES"][hashlib.sha256(payload["provider_capability"].encode()).hexdigest()]
+            self.assertTrue(capability["async_route_v1"])
+            self.assertEqual(capability["async_route_response_route_id"], ROUTE)
+            self.assertEqual(capability["provider_route_grants"], {ROUTE: route})
+            self.assertEqual(capability["actions"], {"agent_cross_chat_routes"})
+            for key in ("grants", "exchange_response_grants", "exchange_request_grants", "provider_direct_grants"):
+                self.assertFalse(capability[key])
+
+    async def test_admission_registers_no_legacy_pending_or_automatic_obligations(self):
+        references = [SimpleNamespace(action="request_reply", target_kind=None, session_id="b"),
+                      SimpleNamespace(action="final_result", target_kind=None, session_id="b")]
+        for name in ("register_request_reply_exchanges", "register_final_result_obligations"):
+            self.assertEqual(await self.ns[name]("a", "run_one", references), [])
+        self.ledger.create_exchange_obligation.assert_not_awaited()
+        self.ledger.create_final_obligation.assert_not_awaited()
 
 
 class AsyncRouteHelperTests(unittest.TestCase):

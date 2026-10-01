@@ -213,6 +213,72 @@ class CodexNativeHistoryRepairTests(unittest.TestCase):
         return filter_native_codex_history_items("chat", PROVIDER, self.events, items,
             source_path=self.source, root=self.root, sync_checkpoint=checkpoint, parse_item=self.parse)
 
+    def queued_status_fixture(self):
+        wrapper = ('[AgentsDock delivery kind=status leg=0/2 origin=route from=Other chat]\n'
+                   '[Source user instruction — verbatim, user-authored]\nOriginal user request\n'
+                   '[End source user instruction]\n[Server-generated exchange status]\n'
+                   'The queued request was skipped.\n[End server-generated exchange status]\n'
+                   'reply: none (terminal status notice; do not respond to the exchange)\n[End delivery]')
+        self.raw = self.raw[:2]
+        self.raw[0]['payload']['content'][0]['text'] = wrapper
+        fields = {'purpose': 'cross_chat_handoff_delivery', 'backend': 'codex',
+                  'cross_chat_exchange_status': True, 'cross_chat_exchange_id': 'exchange-status',
+                  'cross_chat_exchange_leg_id': 'leg-status', 'source_session_id': 'sender',
+                  'target_session_id': 'chat'}
+        self.native = [
+            {**fields, 'seq': 1, 'id': 'status-queue', 'type': 'turn_queued',
+             'queued_id': 'queue-status', 'prompt': 'Cross-chat exchange status', 'request_prompt': wrapper},
+            {**fields, 'seq': 2, 'id': 'native-input-1', 'run_id': 'native-1', 'type': 'turn_started',
+             'prompt': 'Cross-chat exchange status', 'queued_id': 'queue-status', 'ts': '2026-09-11T12:01:00Z'},
+            {'seq': 3, 'id': 'native-answer-1', 'run_id': 'native-1', 'type': 'assistant_text', 'text': 'Original answer'},
+            {**fields, 'seq': 4, 'id': 'native-end-1', 'run_id': 'native-1', 'type': 'turn_finished',
+             'transport': 'app-server', 'provider_thread_id': PROVIDER, 'provider_turn_id': 'turn-1',
+             'result_text': 'Original answer', 'ts': '2026-09-11T12:01:02Z'},
+        ]
+        self.fixture()
+        return wrapper
+
+    def test_queued_status_replay_uses_exact_private_receipt_and_keeps_source_files(self):
+        self.queued_status_fixture()
+        before = self.events.read_bytes(), self.source.read_bytes()
+        self.prepare()
+        projected = self.cache.project_event('chat', self.imports[0])
+        self.assertEqual(projected['prompt'], '')
+        self.assertTrue(projected['metadata_only'])
+        self.assertEqual(projected['provider_origin']['native_event_id'], 'native-input-1')
+        item = self.parse(self.raw[0])
+        self.assertEqual(self.filter_async_delivery([item])[0]['text'], '')
+        # A delta without a verified source checkpoint cannot establish uniqueness.
+        self.assertEqual(filter_native_codex_history_items('chat', PROVIDER, self.events, [item]), [item])
+        self.assertEqual(before, (self.events.read_bytes(), self.source.read_bytes()))
+        self.assertIsNone(self.cache.project_event('chat', self.native[1]))
+
+    def test_status_repair_requires_exact_queue_leg_input_and_nonhuman_receipt(self):
+        for changes in ({'cross_chat_exchange_leg_id': 'different-leg'}, {'queued_id': 'other-queue'},
+                        {'request_prompt': 'Different input'}, {'provider_user_authored': True},
+                        {'cross_chat_exchange_status': False}):
+            with self.subTest(changes=changes):
+                self.cache.forget('chat')
+                self.queued_status_fixture()
+                self.native[0].update(changes)
+                self.fixture(); self.prepare()
+                self.assertIsNone(self.cache.project_event('chat', self.imports[0]))
+                item = self.parse(self.raw[0])
+                self.assertEqual(self.filter_async_delivery([item]), [item])
+
+    def test_identical_user_quote_is_not_hidden_by_a_status_receipt(self):
+        self.queued_status_fixture()
+        # Two native source user items in one turn are ambiguous; neither may
+        # be erased just because one server delivery has the same wording.
+        self.raw.append({**self.raw[0], 'timestamp': '2026-09-11T12:01:01.500Z',
+                         'payload': {**self.raw[0]['payload'], 'id': 'genuine-user-quote'}})
+        self.fixture(); self.prepare()
+        self.assertIsNone(self.cache.project_event('chat', self.imports[0]))
+        self.assertIsNone(self.cache.project_event('chat', self.imports[-1]))
+        # Even a later import containing only the quote checks the full prefix.
+        quote = self.parse(self.raw[-1])
+        self.assertEqual(self.filter_async_delivery([quote]), [quote])
+
     def assert_async_delivery_visible(self):
         self.fixture(); self.cache.forget("chat"); self.prepare()
         self.assertIsNone(self.cache.project_event("chat", self.imports[0]))

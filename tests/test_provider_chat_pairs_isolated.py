@@ -417,9 +417,9 @@ class ChatPairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({route["target_session_id"] for route in self.routes("a")}, {"c"})
         self.assertEqual(len(self.routes("c")), 1)
         self.assertIsNone(self.call("live_provider_cross_chat_route", "a", forward))
-        retire_delivery.assert_awaited_once_with(message)
-        retire_leg.assert_awaited_once()
-        self.retired.assert_not_awaited()
+        self.assertEqual(self.retired.await_count, 2)
+        self.retired.assert_any_await("a", forward["route_id"])
+        self.retired.assert_any_await("b", reverse["route_id"])
 
     async def test_stale_revoke_cannot_delete_regranted_pair(self):
         await self.grant()

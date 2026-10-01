@@ -55,6 +55,26 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
             await bridge.close()
         self.assertEqual(records,[(url+'/responses','Bearer '+key,b'{"input":"unchanged"}') for url,key in [('https://one.invalid/v1','key-one'),('https://two.invalid/api','key-two')]])
 
+    async def test_replacing_bridge_releases_listener_and_accepts_new_requests(self):
+        # Exercise real loopback sockets: a stale event-loop reader can strand
+        # the next provider even though in-process ASGI requests still pass.
+        async with httpx.AsyncClient(trust_env=False, timeout=2) as client:
+            for _ in range(3):
+                bridge = ResponseStreamBridge({'base_url': 'https://upstream.invalid/v1', 'api_key': 'synthetic'})
+                await bridge.start()
+                await bridge.client.aclose()
+                bridge.client = httpx.AsyncClient(transport=httpx.MockTransport(
+                    lambda request: httpx.Response(200, json={'ok': True})))
+                url = bridge.url + '/responses'
+                try:
+                    response = await client.post(url, json={'input': 'unchanged'},
+                        headers={'Authorization': 'Bearer ' + bridge.token})
+                    self.assertEqual(response.json(), {'ok': True})
+                finally:
+                    await asyncio.wait_for(bridge.close(), 3)
+                with self.assertRaises(httpx.ConnectError):
+                    await client.post(url, json={})
+
     async def test_http_error_status_and_retry_after_are_preserved(self):
         bridge=ResponseStreamBridge({'base_url':'https://one.invalid/v1','api_key':'key'})
         bridge.client=httpx.AsyncClient(transport=httpx.MockTransport(lambda req:httpx.Response(429,headers={'Retry-After':'7'},json={'error':{'message':'TPM'}})))

@@ -196,7 +196,9 @@ class ResponseStreamBridge:
             for task in tasks: task.cancel()
             if tasks: await asyncio.gather(*tasks, return_exceptions=True)
         if self.task is not None:
-            self.task.cancel()
+            # Let Uvicorn close its asyncio listeners and remove their readers.
+            # Cancelling serve() skips shutdown and can leave a stale selector
+            # entry when the next provider reuses the same socket descriptor.
             with suppress(asyncio.CancelledError): await self.task
         if self.client is not None: await self.client.aclose()
         if self.socket is not None: self.socket.close()

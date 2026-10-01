@@ -2260,7 +2260,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(captured_options["permission_mode"], "plan")
-        self.assertEqual(agent_server.CLAUDE_SDK_CONFIGURATION_VERSION, 10)
+        self.assertEqual(agent_server.CLAUDE_SDK_CONFIGURATION_VERSION, 11)
         self.assertEqual(
             captured_options["disallowed_tools"],
             ["CronCreate", "Monitor", "ScheduleWakeup"],

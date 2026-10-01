@@ -1,17 +1,70 @@
 """Retired direct-turn routes cannot restart a model or discard user work."""
 
 import unittest
+import json
+from fastapi import HTTPException
 from collections import deque
 from unittest.mock import AsyncMock, Mock, patch
 
 import agent_server
-import test_cross_chat_handoffs as fixtures
+from tests import test_cross_chat_handoffs as fixtures
 
 
 class RetiredCrossChatExecutionTests(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = fixtures.CrossChatStoreTests.asyncSetUp
     asyncTearDown = fixtures.CrossChatStoreTests.asyncTearDown
     create_exchange = fixtures.CrossChatStoreTests.create_exchange
+
+    async def test_old_reference_actions_never_issue_local_delivery_or_reply_grants(self):
+        for action in ("instruction", "request_reply", "final_result"):
+            run_id = "run_retired_" + action
+            agent_server.CURRENT_TURNS["source"] = {"run_id": run_id}
+            reference = agent_server.ChatReference(session_id="target", display_title_snapshot="Target",
+                source_text_start=0, source_text_end=7, action=action)
+            authority = await agent_server.issue_cross_chat_capability("source", run_id, [reference], actions={"publish"})
+            token = json.loads(authority.read_text())["provider_capability"]
+            capability = agent_server.CROSS_CHAT_CAPABILITIES[agent_server.hashlib.sha256(token.encode()).hexdigest()]
+            self.assertEqual(capability["provider_direct_grants"], {})
+            self.assertFalse(capability["exchange_response_grants"])
+            with self.assertRaises(HTTPException) as denied:
+                await agent_server.create_authorized_cross_chat_instruction(token,
+                    agent_server.CrossChatHandoffRequest(target_session_id="target", body="must not execute",
+                        idempotency_key="retired_" + action))
+            self.assertEqual(denied.exception.status_code, 403)
+            self.assertEqual(await agent_server.CROSS_CHAT.for_source_run(run_id), [])
+            await agent_server.revoke_cross_chat_capability(run_id)
+
+    async def test_every_unowned_legacy_exchange_state_retires_without_retry(self):
+        provider = AsyncMock()
+        with patch.object(agent_server, "start_turn_durably", provider), patch.object(
+            agent_server, "append_cross_chat_exchange_leg_terminal_lifecycle", AsyncMock()), patch.object(
+            agent_server, "append_cross_chat_exchange_terminal_lifecycle", AsyncMock()):
+            for status in ("registered", "submitting", "queued", "running"):
+                with self.subTest(status=status):
+                    exchange, leg = await self.create_exchange("retired_" + status)
+                    leg = await agent_server.CROSS_CHAT.update_exchange_leg(leg["id"], expected={"registered"}, status=status)
+                    await agent_server.submit_cross_chat_exchange_leg(exchange, leg)
+                    await agent_server.reconcile_cross_chat_exchanges()
+                    terminal = await agent_server.CROSS_CHAT.get_exchange_leg(leg["id"])
+                    self.assertEqual(terminal["status"], "cancelled")
+                    self.assertEqual(terminal["error_code"], "legacy_route_disabled")
+                    self.assertEqual(terminal["body"], "Please investigate")
+                    self.assertEqual(len(await agent_server.CROSS_CHAT.exchange_legs(exchange["id"])), 1)
+        provider.assert_not_awaited()
+        self.assertFalse(agent_server.QUEUED_TURNS)
+
+    async def test_exact_running_legacy_owner_keeps_its_turn_until_completion(self):
+        exchange, leg = await self.create_exchange("running_owner")
+        leg = await agent_server.CROSS_CHAT.update_exchange_leg(leg["id"], expected={"registered"},
+            status="running", target_run_id="owned_run")
+        current = {"run_id": "owned_run", "cross_chat_exchange_id": exchange["id"],
+                   "cross_chat_exchange_leg_id": leg["id"]}
+        with patch.object(agent_server, "CURRENT_TURNS", {"target": current}), patch.object(
+            agent_server, "start_turn_durably", AsyncMock()) as provider:
+            await agent_server.submit_cross_chat_exchange_leg(exchange, leg)
+        self.assertEqual((await agent_server.CROSS_CHAT.get_exchange_leg(leg["id"]))["status"], "running")
+        self.assertEqual(current["run_id"], "owned_run")
+        provider.assert_not_awaited()
 
     async def test_failure_notice_is_metadata_only_and_preserves_failure(self):
         exchange, leg = await self.create_exchange("notice_only")

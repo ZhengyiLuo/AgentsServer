@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 from fastapi import FastAPI, HTTPException, Request
@@ -66,6 +67,10 @@ class CodexSubagentsAdminTests(unittest.IsolatedAsyncioTestCase):
             "release_codex_goals_reconfiguration": AsyncMock(),
             "pause_idle_codex_goals_before_disable": AsyncMock(return_value={}),
             "close_codex_app_server_manager": AsyncMock(),
+            "STORE": SimpleNamespace(sessions={}),
+            "DEFAULT_BACKEND": "codex", "BACKEND_CODEX": "codex",
+            "broadcast_codex_subagent_limit": AsyncMock(),
+            "schedule_codex_subagent_limit_application": Mock(),
             "AGENT_TOKEN": "synthetic-native-token",
             "TEAM_HUB_MOUNT_PATH": "/api/team-hub",
             "TEAM_HUB_SERVER_SESSION_MOUNT_PATH": "/api/team-hub-server-session",
@@ -101,7 +106,7 @@ class CodexSubagentsAdminTests(unittest.IsolatedAsyncioTestCase):
         result = await self.ns["get_codex_subagents_admin"]()
         self.assertIsNone(result["max_concurrent_threads_per_session"])
         self.assertTrue(result["configurable"])
-        self.assertEqual(result["applies_to"], "new_or_reloaded_threads")
+        self.assertEqual(result["applies_to"], "automatically_when_idle")
         self.assertEqual(result["provider_config_key"], "agents.max_concurrent_threads_per_session")
         self.assertFalse(self.settings.exists())
         self.ns["close_codex_app_server_manager"].assert_not_called()

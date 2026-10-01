@@ -132,7 +132,7 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         # v11 scopes messaging guidance to the out-of-band provider tool.
-        self.assertEqual(agent_server.CODEX_THREAD_POLICY_VERSION, "11")
+        self.assertEqual(agent_server.CODEX_THREAD_POLICY_VERSION, "12")
         self.assertNotEqual(current_hash, previous_hash)
 
     def test_claude_policy_has_the_same_retry_and_context_hygiene_rules(self) -> None:
@@ -330,7 +330,9 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(task, return_exceptions=True)
         self.assertIsNone(session["subagent_limit"])
         self.assertEqual(session["_codex_subagent_limit_applied"]["limit"], 3)
-        self.assertEqual(session["_codex_subagent_limit_reset_pending"], session["_codex_subagent_limit_applied"]["process"])
+        self.assertNotIn("_codex_subagent_limit_reset_pending", session)
+        # A raced save remains distinguishable from the acknowledged native cap.
+        self.assertNotEqual(session["subagent_limit"], session["_codex_subagent_limit_applied"]["limit"])
 
     async def test_native_fork_is_rebound_to_child_chat_policy(self) -> None:
         manager = FakeCodexAppServerManager(loaded={"thread-fork"})

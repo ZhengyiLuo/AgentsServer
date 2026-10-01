@@ -106,7 +106,7 @@ class CompactProviderAuthorityBlockTests(unittest.TestCase):
         self.assertNotIn("Target Title", block)
         self.assertLess(len(block), 600)
 
-    def test_block_states_reply_grant_and_followup_budget(self) -> None:
+    def test_only_secure_peer_advertises_reply_followup(self) -> None:
         terminal = compact_block(
             {"cross_chat_response"},
             exchange_response_grant=("exchange_abc", "leg_def"),
@@ -129,13 +129,13 @@ class CompactProviderAuthorityBlockTests(unittest.TestCase):
             exchange_response_followup_async=True,
         )
 
-        self.assertIn("respond: exchange=exchange_abc inbound-leg=leg_def followup=none", terminal)
-        self.assertIn("respond: exchange=exchange_abc inbound-leg=leg_def followup=allowed", open_followup)
+        self.assertNotIn("respond:", terminal)
+        self.assertNotIn("respond:", open_followup)
         self.assertIn("followup=allowed-async", secure)
-        self.assertIn("followup=allowed-async", local_async)
+        self.assertNotIn("respond:", local_async)
         self.assertNotIn("--request-response", terminal)
 
-    def test_verbose_async_local_followup_documents_async_response_flag(self) -> None:
+    def test_retired_exchange_does_not_advertise_request_reply_flags(self) -> None:
         block = agent_server.cross_chat_provider_authority_block(
             [],
             AUTHORITY_PATH,
@@ -146,7 +146,9 @@ class CompactProviderAuthorityBlockTests(unittest.TestCase):
             exchange_response_followup_async=True,
         )
 
-        self.assertIn("`--request-response --async-response`", block)
+        self.assertNotIn("--request-response", block)
+        self.assertNotIn("--async-response", block)
+        self.assertNotIn("respond-current", block)
 
     def test_block_marks_prebound_team_mail_and_team_send_mentions(self) -> None:
         reference = agent_server.TeamReference(
@@ -237,7 +239,7 @@ class ThreadInstructionTests(unittest.TestCase):
             self.assertNotIn("--chat-id chat-1", instructions)
 
     def test_policy_version_migrates_resumed_codex_threads(self) -> None:
-        self.assertEqual(agent_server.CODEX_THREAD_POLICY_VERSION, "11")
+        self.assertEqual(agent_server.CODEX_THREAD_POLICY_VERSION, "12")
 
     def test_static_addendum_is_format_safe(self) -> None:
         # Both preludes are rendered with str.format, so the appended static

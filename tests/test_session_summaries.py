@@ -66,6 +66,7 @@ class SessionSummaryTests(unittest.TestCase):
         # the existing budget for every other summary field.
         default_provider_control = {
             "pending": False,
+            "pending_reason": None,
             "requested_provider": "default",
             "active_provider": "default",
             "requested_model": None,

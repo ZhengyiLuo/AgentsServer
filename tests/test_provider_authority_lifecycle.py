@@ -181,10 +181,8 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
             [predecessor_reference],
         )
         predecessor_token = self.token_for_path(predecessor_path)
-        predecessor_handle = self.direct_handle_for_token(
-            predecessor_token,
-            target_session_id="neighbor",
-        )
+        self.assertEqual(self.record_for_token(predecessor_token)["provider_direct_grants"], {})
+        predecessor_handle = "retired-direct-grant"
         transition_nonce = "1" * 32
         transition_ready = asyncio.Event()
         agent_server.CURRENT_TURNS = {

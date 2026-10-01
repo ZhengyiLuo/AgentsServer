@@ -122,7 +122,7 @@ class SessionSubagentLimitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(changed["subagent_limit"], 6)
         self.assertIn(sid, self.ns["ACTIVE"])
         self.ns["ensure_claude_permission_mode_update_allowed"].assert_not_awaited()
-        self.assertEqual(changed["subagent_limit_control"]["applies_to"], "new_or_reloaded_threads")
+        self.assertEqual(changed["subagent_limit_control"]["applies_to"], "automatically_when_idle")
 
     async def test_failed_save_restores_cap_and_unrelated_settings(self):
         session = await self.create(title="Original", subagent_limit=3)
@@ -146,40 +146,37 @@ class SessionSubagentLimitTests(unittest.IsolatedAsyncioTestCase):
         child["codex_config_overrides"]["agents"]["default_subagent_model"] = "changed"
         self.assertEqual(parent["codex_config_overrides"]["agents"]["default_subagent_model"], "child-model")
 
-    async def test_clearing_unknown_native_default_stays_pending_until_fresh_process_applies(self):
+    async def test_clearing_native_override_waits_for_acknowledged_idle_application(self):
         session = await self.create(subagent_limit=3)
         manager = SimpleNamespace(generation=1, ready=True)
         self.ns["existing_codex_app_server_manager"] = lambda session: manager
         record = self.ns["record_codex_subagent_limit_application"]
         await record(manager, session["id"], dict(session))
         cleared = await self.update(session["id"], subagent_limit=None)
-        self.assertEqual(cleared["subagent_limit_control"]["applies_to"], "next_provider_process_start")
-        await record(manager, session["id"], dict(session))  # unsubscribe/resume retains native process
-        self.assertIn("_codex_subagent_limit_reset_pending", session)
-        self.ns["SERVER_INSTANCE_ID"] = "fresh-server-instance"
-        self.assertEqual(self.ns["public_session"](session)["subagent_limit_control"]["applies_to"], "new_or_reloaded_threads")
-        self.ns["SERVER_INSTANCE_ID"] = "owned-server-instance"
-        manager.generation += 1
+        self.assertEqual(cleared["subagent_limit_control"]["applies_to"], "automatically_when_idle")
+        self.assertEqual(session["_codex_subagent_limit_applied"]["limit"], 3)
+        # A completed native application, not Save alone, updates the receipt.
         await record(manager, session["id"], dict(session))
+        self.assertIsNone(session["_codex_subagent_limit_applied"]["limit"])
         self.assertNotIn("_codex_subagent_limit_reset_pending", session)
-        self.assertNotIn("_codex_subagent_limit_applied", session)
         persisted = json.loads((self.root / "sessions.json").read_text())[session["id"]]
-        self.assertNotIn("_codex_subagent_limit_reset_pending", persisted)
+        self.assertIsNone(persisted["_codex_subagent_limit_applied"]["limit"])
 
-    async def test_clear_during_native_start_records_captured_override_and_known_default_applies_on_reload(self):
+    async def test_clear_during_native_start_retains_actual_cap_until_next_ack(self):
         session = await self.create(subagent_limit=3)
         captured = dict(session)
         await self.update(session["id"], subagent_limit=None)
         manager = SimpleNamespace(generation=1)
         record = self.ns["record_codex_subagent_limit_application"]
         await record(manager, session["id"], captured)
-        self.assertIn("_codex_subagent_limit_reset_pending", session)
+        self.assertEqual(session["_codex_subagent_limit_applied"]["limit"], 3)
+        self.assertIsNone(session["subagent_limit"])
         session["codex_config_overrides"] = {"agents": {"max_concurrent_threads_per_session": 7}}
         await self.update(session["id"], subagent_limit=None)
-        self.assertNotIn("_codex_subagent_limit_reset_pending", session)
+        self.assertEqual(session["_codex_subagent_limit_applied"]["limit"], 3)
         await record(manager, session["id"], dict(session))
+        self.assertEqual(session["_codex_subagent_limit_applied"]["limit"], 7)
         self.assertNotIn("_codex_subagent_limit_reset_pending", session)
-        self.assertNotIn("_codex_subagent_limit_applied", session)
 
 
 if __name__ == "__main__":

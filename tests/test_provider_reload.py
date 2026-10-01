@@ -17,6 +17,9 @@ class FakeCodexManager:
         self.native_requests: list[tuple[str, dict[str, object]]] = []
         self.goal: dict[str, object] | None = None
 
+    async def list_descendant_threads(self, _thread_id):
+        return []
+
     async def get_thread_goal(self, _thread_id: str) -> dict[str, object] | None:
         return self.goal
 

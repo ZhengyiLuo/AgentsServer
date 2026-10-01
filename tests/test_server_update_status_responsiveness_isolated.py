@@ -80,6 +80,7 @@ class ServerUpdateStatusResponsivenessTests(unittest.IsolatedAsyncioTestCase):
             "managed_update_provider_quiesce_failed": Mock(return_value=False),
             "ensure_managed_update_provider_quiesce_failure_status": self.quiesce_failure_write,
             "managed_server_update_is_pending": Mock(side_effect=lambda status: status.get("phase") == "pending"),
+            "managed_server_force_update_is_pending": Mock(return_value=False),
             "managed_server_update_blocks_work": Mock(side_effect=lambda status: status.get("phase") in {"starting", "downloading", "installing"}),
             "server_update_is_active": Mock(return_value=False),
             "server_update_status_age_seconds": Mock(return_value=60.0),
@@ -243,8 +244,16 @@ class ServerUpdateStatusResponsivenessTests(unittest.IsolatedAsyncioTestCase):
         self.write.assert_not_called()
         self.assertFalse(self.lock.locked())
 
-    async def test_unlocked_pending_status_rearms_only_its_schedule(self):
+    async def test_unlocked_pending_status_rearms_legacy_parked_jobs(self):
         self.status.update(phase="pending", schedule_id="exact-schedule")
+        await self.status_response()
+        self.resume.assert_awaited_once_with()
+        self.write.assert_not_called()
+        self.assertEqual(self.status["phase"], "pending")
+
+    async def test_explicit_force_update_keeps_its_parked_jobs(self):
+        self.status.update(phase="pending", schedule_id="exact-schedule")
+        self.namespace["managed_server_force_update_is_pending"].return_value = True
         await self.status_response()
         self.resume.assert_awaited_once_with(active_schedule_id="exact-schedule")
         self.write.assert_not_called()

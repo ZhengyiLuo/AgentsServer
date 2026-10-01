@@ -74632,22 +74632,14 @@ def managed_server_update_scheduled_job_blocker(
     *,
     manual: bool = False,
 ) -> str | None:
-    """Fence autonomous job admission while an idle update is reserved.
+    """Apply the same update admission policy to scheduled and manual work.
 
-    A pending reservation deliberately stays invisible to ordinary user turns,
-    Force Send, provider controls, and manual Run Now. Automatic job
-    dispatches are durable and retryable, so deferring only that autonomous
-    admission path prevents recurring jobs from starving the updater without
-    reviving the global pending fence that locked operators out on
-    2026-09-04.
+    Waiting for idle must not manufacture idle by suspending recurring jobs.
+    Only an actual replacement/restart (or an explicitly confirmed force
+    update) fences new work, just as it does for ordinary user turns.
     """
 
-    blocker = managed_server_update_blocker()
-    if blocker:
-        return blocker
-    if not manual and managed_server_update_is_pending():
-        return MANAGED_SERVER_UPDATE_PENDING_DETAIL
-    return None
+    return managed_server_update_admission_blocker()
 
 
 def live_unsafe_http_mutation_ids_locked() -> list[str]:
@@ -78234,13 +78226,12 @@ async def lifespan(app: FastAPI):
             startup_update_status = read_server_update_status()
     active_update_schedule_id = (
         str(startup_update_status.get("schedule_id") or "").strip()
-        if managed_server_update_is_pending(startup_update_status)
+        if managed_server_force_update_is_pending(startup_update_status)
         else None
     )
-    # A completed/failed update, an offline cancellation, or replacement by a
-    # new reservation may leave exact automatic occurrences parked in the
-    # durable job registry. Rearm untouched revisions except those owned by
-    # the one reservation that is still live.
+    # Older releases parked automatic jobs while merely waiting for idle.
+    # Restore those unchanged occurrences even if that reservation still exists.
+    # Preserve only an explicitly confirmed force update's admission fence.
     await JOBS.resume_update_parked(
         active_schedule_id=active_update_schedule_id,
     )
@@ -84985,7 +84976,7 @@ async def server_update_status(
         # second update attempt before reconnecting.
         public_status = public_server_update_status(status)
         await TERMINAL_ATTACHMENTS.reopen_if_update_inactive(public_status)
-        if managed_server_update_is_pending(status):
+        if managed_server_force_update_is_pending(status):
             await JOBS.resume_update_parked(
                 active_schedule_id=str(status.get("schedule_id") or "").strip(),
             )
@@ -85543,7 +85534,14 @@ async def _start_server_update(
                     active_session_ids = (
                         server_update_active_session_ids_locked()
                     )
-                    queued_turn_count = update_blocking_queued_turn_count_locked()
+                    # An idle update waits behind queued work too; persistence
+                    # across restart is not permission to jump ahead of it.
+                    queued_turn_count = (
+                        sum(len(queue) for queue in QUEUED_TURNS.values())
+                        + len(RUN_NOW_TURNS)
+                        if body.when_idle and not managed_server_force_update_is_pending(status)
+                        else update_blocking_queued_turn_count_locked()
+                    )
                     mutation_count = unsafe_http_mutation_count_locked()
                     duplicate_provider_labels = {
                         *(f"active chat {session_id}" for session_id in BUSY_SESSIONS),

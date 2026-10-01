@@ -2516,10 +2516,10 @@ class JobStoreTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(events.await_args_list[1].args[2]["job"]["manual_run_pending"])
 
-    async def test_pending_update_drains_automatic_jobs_but_runs_manual_job(
+    async def test_pending_update_runs_automatic_and_manual_jobs(
         self,
     ) -> None:
-        """Autonomous work must not continuously refill a pending drain."""
+        """An update waiting for idle must not suspend scheduled work."""
 
         store = agent_server.JobStore()
         store.jobs = {
@@ -2540,8 +2540,7 @@ class JobStoreTests(unittest.IsolatedAsyncioTestCase):
                 "manual_run_pending": False,
                 "_revision": "job_rev_recurring",
             },
-            # Provider-authorized jobs use this same durable JobStore dispatch
-            # lane; creation provenance cannot bypass update draining.
+            # Provider-created schedules follow the same admission policy.
             "job_provider": {
                 "id": "job_provider",
                 "session_id": "provider-chat",
@@ -2657,51 +2656,19 @@ class JobStoreTests(unittest.IsolatedAsyncioTestCase):
 
             await run_one_scheduler_iteration()
 
-            self.assertEqual(started_job_ids, ["job_manual"])
+            self.assertEqual(
+                set(started_job_ids),
+                {"job_recurring", "job_provider", "job_manual"},
+            )
             for job_id in ("job_recurring", "job_provider"):
                 job = store.jobs[job_id]
                 self.assertTrue(job["enabled"])
-                self.assertEqual(job["run_count"], 0)
-                self.assertEqual(job["scheduled_run_at"], 1.0)
-                self.assertEqual(
-                    job["_update_park_schedule_id"],
-                    pending["schedule_id"],
-                )
-                self.assertEqual(job["_update_park_occurrence"], 1.0)
-                self.assertEqual(
-                    job["_update_park_original_next_run_at"],
-                    1.0,
-                )
-                self.assertEqual(
-                    job["_update_park_revision"],
-                    job["_revision"],
-                )
-            manual = store.jobs["job_manual"]
-            self.assertFalse(manual["manual_run_pending"])
-            self.assertEqual(manual["run_count"], 1)
-            self.assertIsNone(manual.get("manual_run_requested_at"))
-
-            busy.clear()
-            cancelled = await agent_server.cancel_server_update(
-                agent_server.ServerUpdateCancelRequest(
-                    schedule_id=pending["schedule_id"],
-                )
-            )
-            self.assertEqual(cancelled["phase"], "available")
-            for job_id in ("job_recurring", "job_provider"):
-                job = store.jobs[job_id]
-                self.assertEqual(job["next_run_at"], 1.0)
-                for field in (
-                    "_update_park_schedule_id",
-                    "_update_park_occurrence",
-                    "_update_park_original_next_run_at",
-                    "_update_park_revision",
-                ):
-                    self.assertNotIn(field, job)
-
-            # Cancellation must make every exact automatic occurrence eligible
-            # on the next scheduler pass, not strand it behind the generic busy
-            # retry delay.
+                self.assertEqual(job["run_count"], 1)
+                self.assertNotIn("_update_park_schedule_id", job)
+            self.assertFalse(store.jobs["job_manual"]["manual_run_pending"])
+            # The update stays pending and existing work is not interrupted.
+            self.assertEqual(agent_server.read_server_update_status()["phase"], "pending")
+            self.assertEqual(busy, {"long-running-chat"})
             await run_one_scheduler_iteration()
 
         self.assertEqual(

@@ -55346,8 +55346,17 @@ def codex_manager_has_callers(manager: CodexAppServerManager, session_id: str | 
                for task, owner in tuple(getattr(manager, "_agentsdock_callers", {}).items()))
 
 
-def codex_manager_has_callbacks(manager: CodexAppServerManager) -> bool:
-    tasks = [task for task in manager.client._callback_tasks if not task.done()]
+def codex_manager_work_belongs_to_session(work: Any, session_id: str) -> bool:
+    thread_id = getattr(work, "_codex_thread_id", "")
+    owner = codex_session_id_for_thread(thread_id) if thread_id else None
+    # Unknown ownership stays process-wide. Work for a known different chat
+    # must not prevent an idle chat from releasing its own subscription.
+    return owner is None or owner == session_id
+
+
+def codex_manager_has_callbacks(manager: CodexAppServerManager, session_id: str | None = None) -> bool:
+    tasks = [task for task in manager.client._callback_tasks if not task.done()
+             and (session_id is None or codex_manager_work_belongs_to_session(task, session_id))]
     for task in tasks:
         if not getattr(task, "_agentsdock_drain_watched", False):
             task._agentsdock_drain_watched = True
@@ -55426,7 +55435,12 @@ async def refresh_codex_app_server_login(*, request_handoff: bool = False) -> No
                         continue
                     previous = getattr(manager, "_agentsdock_login_revision", None)
                     changed = revision is not None and revision != previous
-                    if changed or request_handoff:
+                    # Recheck CLIs is observational when the native sign-in
+                    # revision is unchanged. Retiring a healthy writer here
+                    # strands its chats behind an unnecessary login handoff.
+                    if revision is not None and revision == previous:
+                        manager._agentsdock_login_superseded = False
+                    if changed or (request_handoff and revision is None):
                         manager._agentsdock_login_superseded = True
                         if not any(manager is item for item in CODEX_RETIRED_APP_SERVER_MANAGERS):
                             CODEX_RETIRED_APP_SERVER_MANAGERS.append(manager)
@@ -55441,7 +55455,7 @@ def codex_manager_session_busy(manager: CodexAppServerManager, session_id: str, 
         session_id in BUSY_SESSIONS or ACTIVE.get(session_id) is not None
         or (not ignore_maintenance and session_id in SERVER_MAINTENANCE_SESSIONS)
         or codex_manager_has_callers(manager, session_id, ignore_task=ignore_task)
-        or codex_manager_has_callbacks(manager)
+        or codex_manager_has_callbacks(manager, session_id)
         or any(task is not ignore_task and not task.done()
             for registry in (SESSION_TURN_TASKS, CODEX_NATIVE_ACTION_TASKS, CODEX_INTERACTION_HANDLER_TASKS)
             for task in registry.get(session_id, ()))
@@ -55458,7 +55472,10 @@ async def release_idle_codex_manager_session(manager: CodexAppServerManager, ses
     def blocked(*, own_maintenance=False):
         return (codex_manager_session_busy(manager, session_id, ignore_task=ignore_task,
                     ignore_maintenance=own_maintenance)
-                or bool(manager.client._pending or manager.client._server_request_tasks))
+                or any(codex_manager_work_belongs_to_session(request[1], session_id)
+                       for request in manager.client._pending.values())
+                or any(codex_manager_work_belongs_to_session(task, session_id)
+                       for task in manager.client._server_request_tasks.values() if not task.done()))
 
     if blocked():
         return False
@@ -86894,7 +86911,9 @@ async def get_session_subagents(
     session = STORE.sessions[session_id]
     if str(session.get("backend") or "") == BACKEND_CODEX and session_provider_id(session):
         try:
-            manager = await codex_app_server_manager(session)
+            # Inspect the process which still owns the children during login
+            # handoff. This read must not be rejected as a new model turn.
+            manager = await codex_app_server_manager(session, allow_retired_login=True)
             await reconcile_codex_subagents(session_id, manager)
         except Exception as exc:
             logger.warning(

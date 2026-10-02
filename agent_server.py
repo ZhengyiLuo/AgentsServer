@@ -54111,8 +54111,17 @@ def codex_manager_has_callers(manager: CodexAppServerManager, session_id: str | 
                for task, owner in tuple(getattr(manager, "_agentsdock_callers", {}).items()))
 
 
-def codex_manager_has_callbacks(manager: CodexAppServerManager) -> bool:
-    tasks = [task for task in manager.client._callback_tasks if not task.done()]
+def codex_manager_work_belongs_to_session(work: Any, session_id: str) -> bool:
+    thread_id = getattr(work, "_codex_thread_id", "")
+    owner = codex_session_id_for_thread(thread_id) if thread_id else None
+    # Unknown ownership stays process-wide. Work for a known different chat
+    # must not prevent an idle chat from releasing its own subscription.
+    return owner is None or owner == session_id
+
+
+def codex_manager_has_callbacks(manager: CodexAppServerManager, session_id: str | None = None) -> bool:
+    tasks = [task for task in manager.client._callback_tasks if not task.done()
+             and (session_id is None or codex_manager_work_belongs_to_session(task, session_id))]
     for task in tasks:
         if not getattr(task, "_agentsdock_drain_watched", False):
             task._agentsdock_drain_watched = True
@@ -54191,7 +54200,12 @@ async def refresh_codex_app_server_login(*, request_handoff: bool = False) -> No
                         continue
                     previous = getattr(manager, "_agentsdock_login_revision", None)
                     changed = revision is not None and revision != previous
-                    if changed or request_handoff:
+                    # Recheck CLIs is observational when the native sign-in
+                    # revision is unchanged. Retiring a healthy writer here
+                    # strands its chats behind an unnecessary login handoff.
+                    if revision is not None and revision == previous:
+                        manager._agentsdock_login_superseded = False
+                    if changed or (request_handoff and revision is None):
                         manager._agentsdock_login_superseded = True
                         if not any(manager is item for item in CODEX_RETIRED_APP_SERVER_MANAGERS):
                             CODEX_RETIRED_APP_SERVER_MANAGERS.append(manager)
@@ -54206,7 +54220,7 @@ def codex_manager_session_busy(manager: CodexAppServerManager, session_id: str, 
         session_id in BUSY_SESSIONS or ACTIVE.get(session_id) is not None
         or (not ignore_maintenance and session_id in SERVER_MAINTENANCE_SESSIONS)
         or codex_manager_has_callers(manager, session_id, ignore_task=ignore_task)
-        or codex_manager_has_callbacks(manager)
+        or codex_manager_has_callbacks(manager, session_id)
         or any(task is not ignore_task and not task.done()
             for registry in (SESSION_TURN_TASKS, CODEX_NATIVE_ACTION_TASKS, CODEX_INTERACTION_HANDLER_TASKS)
             for task in registry.get(session_id, ()))
@@ -54269,8 +54283,10 @@ async def release_idle_codex_manager_session(manager: CodexAppServerManager, ses
                 # The response Future can finish before its RPC coroutine
                 # removes the registry entry. Treat that settled response as
                 # complete so its wakeup cannot get lost during unwinding.
-                or any(not value[1].done() for value in manager.client._pending.values())
-                or any(not task.done() for task in manager.client._server_request_tasks.values()))
+                or any(not value[1].done() and codex_manager_work_belongs_to_session(value[1], session_id)
+                       for value in manager.client._pending.values())
+                or any(not task.done() and codex_manager_work_belongs_to_session(task, session_id)
+                       for task in manager.client._server_request_tasks.values()))
 
     async def defer(reason: str, *, error_type: str = "") -> bool:
         session = STORE.sessions.get(session_id) or {}
@@ -73610,22 +73626,14 @@ def managed_server_update_scheduled_job_blocker(
     *,
     manual: bool = False,
 ) -> str | None:
-    """Fence autonomous job admission while an idle update is reserved.
+    """Apply the same update admission policy to scheduled and manual work.
 
-    A pending reservation deliberately stays invisible to ordinary user turns,
-    Force Send, provider controls, and manual Run Now. Automatic job
-    dispatches are durable and retryable, so deferring only that autonomous
-    admission path prevents recurring jobs from starving the updater without
-    reviving the global pending fence that locked operators out on
-    2026-09-04.
+    Waiting for idle must not manufacture idle by suspending recurring jobs.
+    Only an actual replacement/restart (or an explicitly confirmed force
+    update) fences new work, just as it does for ordinary user turns.
     """
 
-    blocker = managed_server_update_blocker()
-    if blocker:
-        return blocker
-    if not manual and managed_server_update_is_pending():
-        return MANAGED_SERVER_UPDATE_PENDING_DETAIL
-    return None
+    return managed_server_update_admission_blocker()
 
 
 def live_unsafe_http_mutation_ids_locked() -> list[str]:
@@ -77212,13 +77220,12 @@ async def lifespan(app: FastAPI):
             startup_update_status = read_server_update_status()
     active_update_schedule_id = (
         str(startup_update_status.get("schedule_id") or "").strip()
-        if managed_server_update_is_pending(startup_update_status)
+        if managed_server_force_update_is_pending(startup_update_status)
         else None
     )
-    # A completed/failed update, an offline cancellation, or replacement by a
-    # new reservation may leave exact automatic occurrences parked in the
-    # durable job registry. Rearm untouched revisions except those owned by
-    # the one reservation that is still live.
+    # Older releases parked automatic jobs while merely waiting for idle.
+    # Restore those unchanged occurrences even if that reservation still exists.
+    # Preserve only an explicitly confirmed force update's admission fence.
     await JOBS.resume_update_parked(
         active_schedule_id=active_update_schedule_id,
     )
@@ -82185,15 +82192,16 @@ async def release_codex_provider_writers(manager: CodexAppServerManager, session
         try:
             await manager.request("thread/unarchive", {"threadId": thread_id})
         except CodexAppServerRequestError:
-            if thread_id == parent_id:
-                raise
+            # A lost restore response can leave the parent marker after the
+            # native rollout is already restored. Recover it idempotently too.
             # Older versions archived the parent, then tried to archive each
             # already-archived child. Their finally block restored the child
             # but left its marker. Require native relationship, terminal turn
             # and existing unarchived rollout proof before clearing it.
-            descendants = await manager.list_descendant_threads(parent_id)
-            if not any(isinstance(child, dict) and child.get("id") == thread_id for child in descendants):
-                raise
+            if thread_id != parent_id:
+                descendants = await manager.list_descendant_threads(parent_id)
+                if not any(isinstance(child, dict) and child.get("id") == thread_id for child in descendants):
+                    raise
             child = await manager.read_thread(thread_id)
             turns = await manager.list_turns(thread_id, limit=1, items_view="summary", sort_direction="desc")
             path = Path(str(child.get("path") or ""))
@@ -84198,7 +84206,7 @@ async def server_update_status(
         # second update attempt before reconnecting.
         public_status = public_server_update_status(status)
         await TERMINAL_ATTACHMENTS.reopen_if_update_inactive(public_status)
-        if managed_server_update_is_pending(status):
+        if managed_server_force_update_is_pending(status):
             await JOBS.resume_update_parked(
                 active_schedule_id=str(status.get("schedule_id") or "").strip(),
             )
@@ -84756,7 +84764,14 @@ async def _start_server_update(
                     active_session_ids = (
                         server_update_active_session_ids_locked()
                     )
-                    queued_turn_count = update_blocking_queued_turn_count_locked()
+                    # An idle update waits behind queued work too; persistence
+                    # across restart is not permission to jump ahead of it.
+                    queued_turn_count = (
+                        sum(len(queue) for queue in QUEUED_TURNS.values())
+                        + len(RUN_NOW_TURNS)
+                        if body.when_idle and not managed_server_force_update_is_pending(status)
+                        else update_blocking_queued_turn_count_locked()
+                    )
                     mutation_count = unsafe_http_mutation_count_locked()
                     duplicate_provider_labels = {
                         *(f"active chat {session_id}" for session_id in BUSY_SESSIONS),
@@ -86109,7 +86124,9 @@ async def get_session_subagents(
     session = STORE.sessions[session_id]
     if str(session.get("backend") or "") == BACKEND_CODEX and session_provider_id(session):
         try:
-            manager = await codex_app_server_manager(session)
+            # Inspect the process which still owns the children during login
+            # handoff. This read must not be rejected as a new model turn.
+            manager = await codex_app_server_manager(session, allow_retired_login=True)
             await reconcile_codex_subagents(session_id, manager)
         except Exception as exc:
             logger.warning(

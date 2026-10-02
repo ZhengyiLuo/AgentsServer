@@ -180,6 +180,47 @@ class LoginHandoffTests(binary.BinaryRefreshTests):
         await self.preflight("idle")
         self.assertIsNot(await self.manager("idle"), old)
 
+    async def test_other_chat_requests_do_not_strand_idle_login_handoff(self):
+        old = await self.manager("idle")
+        self.load("idle", old)
+        await self.manager("working")
+        other_thread = self.load("working", old)
+        self.ns["BUSY_SESSIONS"].add("working")
+        request = asyncio.get_running_loop().create_future()
+        request._codex_thread_id = other_thread
+        old.client._pending[9] = ("thread/read", request, None)
+        callback = asyncio.create_task(asyncio.Event().wait())
+        callback._codex_thread_id = other_thread
+        old.client._callback_tasks.add(callback)
+        old.client._server_request_tasks[10] = callback
+        try:
+            await self.relogin()
+            await self.preflight("idle")
+            self.assertIsNot(await self.manager("idle"), old)
+            self.assertIs(self.ns["CODEX_SESSION_APP_SERVER_MANAGERS"]["working"], old)
+            self.assertFalse(old.closed)
+            self.assertFalse(callback.done())
+            self.assertFalse(request.done())
+        finally:
+            callback.cancel()
+            await asyncio.gather(callback, return_exceptions=True)
+            request.cancel()
+
+    async def test_same_chat_request_still_preserves_its_provider_work(self):
+        old = await self.manager("idle")
+        thread = self.load("idle", old)
+        request = asyncio.get_running_loop().create_future()
+        request._codex_thread_id = thread
+        old.client._pending[9] = ("thread/resume", request, None)
+        try:
+            await self.relogin()
+            with self.assertRaises(HTTPException):
+                await self.preflight("idle")
+            self.assertIs(self.ns["CODEX_SESSION_APP_SERVER_MANAGERS"]["idle"], old)
+            self.assertFalse(old.closed)
+        finally:
+            request.cancel()
+
     async def test_close_rechecks_after_start_lock_wait(self):
         old = await self.manager("idle")
         await self.relogin()
@@ -259,6 +300,19 @@ class LoginHandoffTests(binary.BinaryRefreshTests):
         self.login = codex_auth.LoginRevision(b"changed")
         await asyncio.gather(*[self.ns["refresh_codex_app_server_login"]() for _ in range(5)])
         self.assertEqual(self.ns["CODEX_RETIRED_APP_SERVER_MANAGERS"], [old])
+
+    async def test_recheck_unchanged_login_keeps_existing_writer_and_all_chats_usable(self):
+        old = await self.manager("idle")
+        self.load("idle", old)
+        await self.manager("working")
+        self.load("working", old)
+        self.ns["BUSY_SESSIONS"].add("working")
+        await self.ns["refresh_codex_app_server_login"](request_handoff=True)
+        await self.preflight("idle")
+        self.assertIs(await self.manager("idle"), old)
+        self.assertFalse(old._agentsdock_login_superseded)
+        self.assertNotIn(old, self.ns["CODEX_RETIRED_APP_SERVER_MANAGERS"])
+        self.ns["evict_codex_app_server_thread"].assert_not_awaited()
 
     async def test_explicit_recheck_handles_opaque_store_without_touching_custom_manager(self):
         self.login = None

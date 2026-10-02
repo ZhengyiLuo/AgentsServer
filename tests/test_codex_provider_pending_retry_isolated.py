@@ -21,6 +21,7 @@ from tests.test_codex_provider_sessions_isolated import make_namespace
 
 SOURCE = Path(__file__).resolve().parents[1] / "agent_server.py"
 NAMES = {
+    "codex_manager_work_belongs_to_session",
     "schedule_codex_subagent_limit_application", "apply_pending_codex_subagent_limit",
     "codex_manager_has_callers", "codex_manager_has_callbacks", "codex_manager_session_busy",
     "release_idle_codex_manager_session", "release_codex_provider_writers",
@@ -238,28 +239,34 @@ class PendingProviderCompletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([(call.args[0], call.args[1]["threadId"]) for call in self.manager.request.await_args_list if call.args[0] in {"thread/archive", "thread/unarchive"}],
             [("thread/unarchive", child_id), ("thread/archive", "target-thread"), ("thread/unarchive", "target-thread"), ("thread/unarchive", child_id)])
 
-    async def test_peer_notification_completion_retries_pending_unloaded_chat(self):
+    async def test_peer_notification_does_not_delay_unloaded_chat_handoff(self):
         gate = asyncio.Event()
         async def handler(notification):
             await gate.wait()
         self.client._dispatch_notification_handlers({"method": "thread/status/changed", "params": {"threadId": "peer-thread"}}, (handler,))
         await asyncio.sleep(0)
         self.assertTrue(self.client._callback_tasks)
-        await self.save_default()
+        await self.ns["update_session"](self.sid, self.ns["UpdateSessionRequest"](codex_provider="default"))
+        await self.settle()
+        self.assert_handoff_preserved_ownership()
+        self.assertTrue(self.client._callback_tasks)
         gate.set()
         await asyncio.gather(*tuple(self.client._callback_tasks))
         await self.settle()
         self.assertFalse(self.client._callback_tasks)
         self.assert_handoff_preserved_ownership()
 
-    async def test_shared_rpc_completion_retries_pending_unloaded_chat(self):
+    async def test_peer_rpc_does_not_delay_unloaded_chat_handoff(self):
         self.client._proc = SimpleNamespace(returncode=None, stdin=object())
         self.client._send = AsyncMock()
         request = asyncio.create_task(self.client._request_connected("thread/read", {"threadId": "peer-thread"}))
         self.cleanup_tasks.append(request)
         await asyncio.sleep(0)
         self.assertTrue(self.client._pending)
-        await self.save_default()
+        await self.ns["update_session"](self.sid, self.ns["UpdateSessionRequest"](codex_provider="default"))
+        await self.settle()
+        self.assert_handoff_preserved_ownership()
+        self.assertFalse(request.done())
         future = next(iter(self.client._pending.values()))[1]
         future.set_result({"thread": {"id": "peer-thread"}})
         await request

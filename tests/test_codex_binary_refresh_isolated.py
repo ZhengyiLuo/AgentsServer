@@ -56,7 +56,7 @@ class BinaryRefreshTests(unittest.IsolatedAsyncioTestCase):
     def lifecycle_code():
         source = (Path(__file__).resolve().parents[1] / "agent_server.py")
         names = {"codex_app_server_managers", "retain_codex_manager_caller",
-            "codex_manager_has_callers", "codex_manager_has_callbacks", "codex_manager_owns_notification",
+            "codex_manager_has_callers", "codex_manager_has_callbacks", "codex_manager_work_belongs_to_session", "codex_manager_owns_notification",
             "watch_codex_provider_handoff_blockers",
             "refresh_codex_app_server_binary", "codex_manager_session_busy",
             "prepare_codex_app_server_process",

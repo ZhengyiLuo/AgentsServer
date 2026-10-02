@@ -222,11 +222,23 @@ class NativeWriterReleaseTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.session['_codex_provider_unarchive_pending'],['owned-child'])
                 self.assertEqual([x.args[1]['threadId'] for x in self.manager.request.await_args_list],['owned-child'])
 
-    async def test_native_parent_unarchive_error_cannot_use_child_recovery(self):
+    async def test_native_parent_unarchive_error_cannot_use_unrelated_child_proof(self):
         self.child_recovery()
         self.session['_codex_provider_unarchive_pending']=['parent']
         self.manager.request.side_effect=CodexAppServerRequestError('thread/unarchive',{'code':-32000,'message':'no archived rollout found'})
         with self.assertRaises(CodexAppServerRequestError):
             await self.ns['release_codex_provider_writers'](self.manager,'chat',['parent'])
-        self.manager.read_thread.assert_not_awaited()
+        self.manager.read_thread.assert_awaited_once_with('parent')
         self.assertEqual(self.session['_codex_provider_unarchive_pending'],['parent'])
+
+    async def test_already_restored_parent_clears_stale_recovery_marker(self):
+        self.session['_codex_provider_unarchive_pending']=['parent']
+        path=self.ns['CODEX_SESSIONS_ROOT']/'rollout-parent.jsonl'
+        path.write_text('synthetic parent rollout\n')
+        self.manager.read_thread=AsyncMock(return_value={'id':'parent','path':str(path)})
+        self.manager.list_turns=AsyncMock(return_value=[{'id':'parent-turn','status':'interrupted'}])
+        self.manager.request.side_effect=[CodexAppServerRequestError('thread/unarchive',
+            {'code':-32000,'message':'no archived rollout found'}), {}, {}]
+        await self.ns['release_codex_provider_writers'](self.manager,'chat',[])
+        self.assertNotIn('_codex_provider_unarchive_pending',self.session)
+        self.manager.read_thread.assert_awaited_once_with('parent')

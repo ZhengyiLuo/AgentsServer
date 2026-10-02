@@ -1088,6 +1088,8 @@ class CodexAppServerClient:
         self._next_id += 1
         request_id = self._next_id
         future: asyncio.Future[Any] = loop.create_future()
+        # Preserve request ownership for per-chat process handoff.
+        future._codex_thread_id = str((params or {}).get("threadId") or (params or {}).get("ancestorThreadId") or "")
         self._pending[request_id] = (
             method,
             future,
@@ -1557,6 +1559,7 @@ class CodexAppServerClient:
                         previous,
                     )
                 )
+            task._codex_thread_id = thread_id
             self._callback_tails[owner] = task
             self._callback_tasks.add(task)
             task.add_done_callback(
@@ -1619,6 +1622,7 @@ class CodexAppServerClient:
             self._handle_server_request(request_id, method, params),
             name=f"codex-app-server-request-{request_id}",
         )
+        task._codex_thread_id = str(params.get("threadId") or "")
         self._server_request_tasks[request_id] = task
         task.add_done_callback(
             lambda done, rid=request_id: self._finish_server_request(rid, done)

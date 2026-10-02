@@ -50,12 +50,14 @@ class InstanceTests(unittest.TestCase):
         else:
             service.write_text(f"[Service]\nEnvironmentFile={instance.config / 'env'}\nExecStart={instance.runtime / 'current/.venv/bin/python'} {instance.runtime / 'current/agent_server.py'} serve --port {port}\n")
 
-    def cli(self, *args, **patches):
+    def cli(self, *args, terminal=False, **patches):
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.object(instances, "Registry", return_value=self.registry))
             stack.enter_context(patch.object(instances, "service_status", return_value="stopped"))
             stack.enter_context(patch.object(instances, "tailscale_status", return_value={"status": "unavailable", "ipv4": ""}))
+            stack.enter_context(patch.dict(os.environ, {"TERM": "dumb"}))
             output, errors = io.StringIO(), io.StringIO()
+            stack.enter_context(patch.object(output, "isatty", return_value=terminal))
             stack.enter_context(contextlib.redirect_stdout(output))
             stack.enter_context(contextlib.redirect_stderr(errors))
             mocks = {name: stack.enter_context(patch.object(instances, name, **options)) for name, options in patches.items()}
@@ -99,6 +101,183 @@ class InstanceTests(unittest.TestCase):
     def test_list_discovers_direct_named_install(self):
         self.configured(self.work)
         self.assertEqual([item.name for item in self.registry.instances()], ["work"])
+
+    def test_status_prints_all_instances_with_their_own_version_without_writes_or_tokens(self):
+        for item, port, version in ((self.default, 7850, "1.0.9"), (self.work, 7851, "1.0.10-beta.1")):
+            self.configured(item, port)
+            (item.runtime / "current").mkdir()
+            (item.runtime / "current/VERSION").write_text(version)
+        result, output, errors, mocks = self.cli("status", run={},
+            service_status={"side_effect": lambda item: "running" if item.name == "default" else "stopped"},
+            tailscale_status={"return_value": {"status": "connected", "ipv4": "100.64.0.2"}})
+        self.assertEqual(result, 0, errors)
+        self.assertIn("Server (default):\n  Status:   running\n  Address:  http://127.0.0.1:7850 (This machine only)\n  Version:  1.0.9\n  Port:     7850\n\n", output)
+        self.assertIn("Server (work):\n  Status:   stopped\n  Address:  http://127.0.0.1:7851 (This machine only)\n  Version:  1.0.10-beta.1\n  Port:     7851\n\n", output)
+        self.assertNotIn("100.64.0.2", output)  # Loopback services never advertise Tailscale access.
+        self.assertNotIn("test-token", output)
+        self.assertNotIn(str(self.home), output)
+        self.assertFalse(self.registry.root.exists())
+        mocks["run"].assert_not_called()
+        mocks["tailscale_status"].assert_called_once()
+
+    def test_token_chooser_selects_only_the_named_or_numbered_instance(self):
+        self.configured(self.default, 7850)
+        self.configured(self.work, 7851)
+        before = {item.name: (item.config / "env").read_bytes() for item in (self.default, self.work)}
+        for answer, expected in (("2", self.work), ("work", self.work), ("1", self.default), ("default", self.default)):
+            with self.subTest(answer=answer), patch("sys.stdin.isatty", return_value=True), \
+                    patch("builtins.input", return_value=answer):
+                code, output, errors, mocks = self.cli("token", terminal=True, run={})
+            self.assertEqual(code, 0, errors)
+            self.assertIn("1.", output)
+            self.assertIn("default", output)
+            self.assertIn("work", output)
+            self.assertIn("stopped", output)  # Stopped servers remain selectable.
+            self.assertIn("7850", output)
+            self.assertIn("7851", output)
+            self.assertNotIn("test-token", output)
+            mocks["run"].assert_called_once()
+            self.assertEqual(mocks["run"].call_args.args[0],
+                             ["/bin/bash", str(ROOT / "install.sh"), "--instance", expected.name, "--show-token"])
+            self.assertEqual(mocks["run"].call_args.kwargs["env"]["AGENTS_SERVER_CONFIG_DIR"], str(expected.config))
+        self.assertEqual(before, {item.name: (item.config / "env").read_bytes() for item in (self.default, self.work)})
+        self.assertFalse(self.registry.root.exists())
+
+    def test_token_chooser_invalid_input_retries_without_defaulting(self):
+        self.configured(self.work)
+        with patch("sys.stdin.isatty", return_value=True), \
+                patch("builtins.input", side_effect=["0", "2", "../default", "unknown", "9" * 5000, "1"]):
+            code, output, errors, mocks = self.cli("token", terminal=True, run={})
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(output.count("Please enter a number from 1 to 1"), 5)
+        self.assertEqual(mocks["run"].call_args.args[0][-2:], ["work", "--show-token"])
+        mocks["run"].assert_called_once()
+
+    def test_token_chooser_cancel_eof_and_interrupt_do_not_read_a_token(self):
+        self.configured(self.default)
+        for answer in ("", EOFError(), KeyboardInterrupt()):
+            with self.subTest(answer=type(answer)), patch("sys.stdin.isatty", return_value=True), \
+                    patch("builtins.input", side_effect=[answer]) as prompt:
+                code, output, errors, mocks = self.cli("token", terminal=True, run={})
+            self.assertEqual(code, 0, errors)
+            self.assertIn("Cancelled; no token was shown", output)
+            self.assertNotIn("test-token", output)
+            prompt.assert_called_once()  # Even one server must be explicitly selected.
+            mocks["run"].assert_not_called()
+        self.assertFalse(self.registry.root.exists())
+
+    def test_token_chooser_noninteractive_requires_name_and_empty_installation_is_inert(self):
+        code, output, errors, mocks = self.cli("token", run={})
+        self.assertEqual(code, 0, errors)
+        self.assertIn("No installations found", output)
+        mocks["run"].assert_not_called()
+        self.configured(self.work)
+        for stdin_tty, stdout_tty in ((False, True), (True, False), (False, False)):
+            with patch("sys.stdin.isatty", return_value=stdin_tty), \
+                    patch("builtins.input") as prompt:
+                code, output, errors, mocks = self.cli("token", terminal=stdout_tty, run={})
+            self.assertEqual(code, 1)
+            self.assertIn("agentsdock token NAME", errors)
+            self.assertNotIn("test-token", output + errors)
+            prompt.assert_not_called()
+            mocks["run"].assert_not_called()
+        self.assertFalse(self.registry.root.exists())
+
+    def test_token_chooser_does_not_retarget_after_selected_instance_disappears(self):
+        self.configured(self.default)
+        self.configured(self.work)
+        with patch.object(self.registry, "instances", side_effect=[[self.default, self.work], [self.default]]), \
+                patch("sys.stdin.isatty", return_value=True), \
+                patch("builtins.input", return_value="2"):
+            code, output, errors, mocks = self.cli("token", terminal=True, run={})
+        self.assertEqual(code, 1)
+        self.assertIn("no longer available", errors)
+        mocks["run"].assert_not_called()
+
+    def test_token_chooser_preserves_token_helper_failure_without_fallback(self):
+        self.configured(self.work)
+        with patch("sys.stdin.isatty", return_value=True), \
+                patch("builtins.input", return_value="work"):
+            code, output, errors, mocks = self.cli("token", terminal=True, run={"side_effect": subprocess.CalledProcessError(7, "fixture")})
+        self.assertEqual(code, 7)
+        mocks["run"].assert_called_once()
+
+    def test_arrow_token_menu_moves_wraps_scrolls_and_restores_terminal(self):
+        rows = [f"server-{index} running Port: {7850 + index}" for index in range(12)]
+        for keys, expected in ((["down", "down", "up", "enter"], 1),
+                               (["up", "enter"], 11), (["up", "down", "enter"], 0),
+                               (["other", "cancel"], None)):
+            output = io.StringIO()
+            with self.subTest(keys=keys), contextlib.redirect_stdout(output), \
+                    patch.object(instances.shutil, "get_terminal_size", return_value=os.terminal_size((40, 10))), \
+                    patch.object(instances.tty, "setcbreak") as cbreak, \
+                    patch.object(instances.termios, "tcsetattr") as restore, \
+                    patch.object(instances, "read_token_menu_key", side_effect=keys):
+                self.assertEqual(instances.arrow_token_choice(rows, 17, ["original settings"]), expected)
+            cbreak.assert_called_once_with(17, instances.termios.TCSANOW)
+            restore.assert_called_once_with(17, instances.termios.TCSANOW, ["original settings"])
+            self.assertIn("\033[?25l", output.getvalue())
+            self.assertTrue(output.getvalue().endswith("\033[?25h\n"))
+            if "up" in keys or "down" in keys:
+                self.assertIn("\033[5A", output.getvalue())
+            plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", output.getvalue())
+            self.assertTrue(all(len(line) <= 39 for line in plain.splitlines()))
+
+    def test_arrow_token_menu_restores_input_on_interrupt_and_read_error(self):
+        for failure in (KeyboardInterrupt(), OSError("read failed")):
+            with contextlib.redirect_stdout(io.StringIO()), patch.object(instances.tty, "setcbreak"), \
+                    patch.object(instances.termios, "tcsetattr") as restore, \
+                    patch.object(instances, "read_token_menu_key", side_effect=failure):
+                if isinstance(failure, KeyboardInterrupt):
+                    self.assertIsNone(instances.arrow_token_choice(["only-server"], 17, ["original"]))
+                else:
+                    with self.assertRaises(OSError):
+                        instances.arrow_token_choice(["only-server"], 17, ["original"])
+            restore.assert_called_once_with(17, instances.termios.TCSANOW, ["original"])
+
+    def test_arrow_menu_key_decoding_accepts_csi_and_application_keys(self):
+        for encoded, expected in ((b"\x1b[A", "up"), (b"\x1bOA", "up"),
+                                  (b"\x1b[B", "down"), (b"\x1bOB", "down"),
+                                  (b"\r", "enter"), (b"\n", "enter"),
+                                  (b"\x1b", "cancel"), (b"\x04", "cancel"),
+                                  (b"\x03", "cancel"), (b"", "cancel"),
+                                  (b"\x1b[C", "other")):
+            chunks = [bytes([byte]) for byte in encoded] or [b""]
+            with self.subTest(encoded=encoded), patch.object(instances.os, "read", side_effect=chunks), \
+                    patch.object(instances.select, "select", return_value=([17] if len(encoded) > 1 else [], [], [])):
+                self.assertEqual(instances.read_token_menu_key(17), expected)
+
+    def test_status_one_instance_and_info_json_remain_distinct(self):
+        self.configured(self.default, 7850)
+        self.configured(self.work)
+        result, output, errors, _ = self.cli("status", "work")
+        self.assertEqual(result, 0, errors)
+        self.assertIn("Server (work):", output)
+        self.assertIn("Version:  not installed", output)
+        self.assertNotIn("Server (default)", output)
+        result, output, errors, _ = self.cli("info", "work")
+        self.assertEqual(result, 0, errors)
+        self.assertEqual(json.loads(output)["name"], "work")
+
+    def test_status_empty_and_unknown_name_do_not_create_state(self):
+        result, output, errors, _ = self.cli("status")
+        self.assertEqual(result, 0, errors)
+        self.assertIn("No installations found. Run agentsdock setup", output)
+        result, output, errors, _ = self.cli("status", "missing")
+        self.assertEqual(result, 1)
+        self.assertEqual(output, "")
+        self.assertIn("Unknown instance", errors)
+        self.assertFalse(self.registry.root.exists())
+
+    def test_status_colors_only_the_header_when_terminal_supports_color(self):
+        self.configured(self.work)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), patch.object(output, "isatty", return_value=True), \
+                patch.dict(os.environ, {"TERM": "xterm"}, clear=True), \
+                patch.object(instances, "service_status", return_value="stopped"):
+            instances.show_status(self.work, network={"status": "unavailable", "ipv4": ""})
+        self.assertIn("\033[34mServer (work):\033[0m\n", output.getvalue())
+        self.assertIn("  Status:   stopped", output.getvalue())
 
     def test_private_registry_contains_only_name_and_status(self):
         with self.registry.locked():

@@ -108,6 +108,19 @@ Features in this checkout may not yet be in a published release. The maintained 
 standalone AgentsServer repository remains a compatibility distribution during
 the update migration.
 
+### Short npm command (prepared, not yet published)
+
+The public [`agentsdock` CLI](npm/agentsdock/README.md) is being prepared as the
+short entry point. After publication, install it with `npm install -g agentsdock`
+and use `agentsdock list`, `agentsdock restart NAME`, and
+`agentsdock token NAME`. Local npm installs use `npx agentsdock`.
+The CLI pins the same-version `@agentsdock/server` runtime and preserves its
+signed update protocol. The first global installation automatically creates and
+starts the default server; existing default/named installations or state are
+left unchanged. `agentsdock setup` remains available for explicit/custom setup.
+Local/CI installs do not auto-start a service. Existing published scoped-package instructions remain
+valid; an unpublished CLI is not yet available from the public registry.
+
 ## License
 
 AgentsServer's original code and documentation are licensed under the

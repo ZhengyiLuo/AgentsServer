@@ -20,6 +20,9 @@ class FakeCodexManager:
     async def get_thread_goal(self, _thread_id: str) -> dict[str, object] | None:
         return self.goal
 
+    async def list_descendant_threads(self, _thread_id: str) -> list:
+        return []
+
     async def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
         self.native_requests.append((method, params))
         return {}
@@ -63,6 +66,7 @@ class FakeClaudeManager:
 class ProviderReloadEndpointTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.enterContext(patch.object(agent_server.STORE, "save", new=AsyncMock()))
+        self.login_refresh = self.enterContext(patch.object(agent_server, "refresh_codex_app_server_login", new=AsyncMock()))
         names = (
             "ACTIVE",
             "BUSY_SESSIONS",
@@ -166,6 +170,7 @@ class ProviderReloadEndpointTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await agent_server.post_session_provider_reload("chat")
 
+        self.login_refresh.assert_awaited_once_with(request_handoff=True)
         self.assertEqual(manager.unsubscribe_calls, ["codex-thread"])
         self.assertEqual(manager.native_requests, [
             ("thread/archive", {"threadId": "codex-thread"}),

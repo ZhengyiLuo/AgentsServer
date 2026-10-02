@@ -21,7 +21,7 @@ from tests.test_codex_provider_sessions_isolated import make_namespace
 
 SOURCE = Path(__file__).resolve().parents[1] / "agent_server.py"
 NAMES = {
-    "codex_manager_work_belongs_to_session",
+    "codex_manager_work_belongs_to_session", "codex_manager_session_blocker", "codex_login_handoff_wait", "watch_codex_login_handoff_blockers",
     "schedule_codex_subagent_limit_application", "apply_pending_codex_subagent_limit",
     "codex_manager_has_callers", "codex_manager_has_callbacks", "codex_manager_session_busy",
     "release_idle_codex_manager_session", "release_codex_provider_writers",

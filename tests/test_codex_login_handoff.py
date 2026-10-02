@@ -301,6 +301,66 @@ class LoginHandoffTests(binary.BinaryRefreshTests):
         await asyncio.gather(*[self.ns["refresh_codex_app_server_login"]() for _ in range(5)])
         self.assertEqual(self.ns["CODEX_RETIRED_APP_SERVER_MANAGERS"], [old])
 
+    async def test_two_clients_refresh_catalog_without_retiring_opaque_login(self):
+        from fastapi import FastAPI
+        import httpx
+        self.login = None
+        old = await self.manager("existing")
+        thread = self.load("existing", old)
+        await self.manager("concurrent")
+        self.load("concurrent", old)
+        self.ns["BUSY_SESSIONS"].add("concurrent")
+        app = FastAPI()
+        app.get("/api/runtime/catalog")(self.ns["runtime_catalog"])
+        for address in ("127.0.0.1", "100.100.10.20", "127.0.0.1", "100.100.10.20"):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app, client=(address, 12000)), base_url="http://test") as client:
+                response = await client.get("/api/runtime/catalog?refresh=true")
+            self.assertEqual(response.status_code, 200)
+            await self.preflight("existing")
+            self.assertIs(await self.manager("existing"), old)
+            self.assertTrue(old.is_thread_loaded(thread))
+            self.assertFalse(old.closed)
+        self.assertEqual(self.ns["CODEX_RETIRED_APP_SERVER_MANAGERS"], [])
+
+    async def test_metadata_failure_reports_reason_and_retry_recovers_same_thread(self):
+        old = await self.manager("existing")
+        thread = self.load("existing", old)
+        await self.relogin()
+        old.get_thread_goal.side_effect = RuntimeError("private provider diagnostic must not escape")
+        with self.assertRaises(HTTPException) as raised:
+            await self.preflight("existing")
+        self.assertEqual(raised.exception.detail["code"], "codex_login_handoff")
+        self.assertEqual(raised.exception.detail["reason"], "goal_state_unavailable")
+        self.assertNotIn("private provider", str(raised.exception.detail))
+        self.assertIs(self.ns["CODEX_SESSION_APP_SERVER_MANAGERS"]["existing"], old)
+        self.assertEqual(self.ns["STORE"].sessions["existing"]["codex_thread_id"], thread)
+        calls = old.get_thread_goal.await_count
+        await self.drain()
+        self.assertEqual(old.get_thread_goal.await_count, calls)
+        old.get_thread_goal.side_effect = None
+        old.get_thread_goal.return_value = None
+        await self.preflight("existing")
+        self.assertIsNot(await self.manager("existing"), old)
+        self.assertEqual(self.ns["STORE"].sessions["existing"]["codex_thread_id"], thread)
+
+    async def test_pending_request_completion_wakes_login_handoff(self):
+        old = await self.manager("existing")
+        self.load("existing", old)
+        future = asyncio.get_running_loop().create_future()
+        future._codex_thread_id = "thread-existing"
+        old.client._pending[5] = ("thread/read", future, None)
+        await self.relogin()
+        with self.assertRaises(HTTPException) as raised:
+            await self.preflight("existing")
+        self.assertEqual(raised.exception.detail["reason"], "runtime_request")
+        self.ns["schedule_codex_manager_drain"].reset_mock()
+        future.set_result({})
+        await asyncio.sleep(0)
+        self.ns["schedule_codex_manager_drain"].assert_called()
+        old.client._pending.clear()
+        await self.drain()
+        self.assertNotIn("existing", self.ns["CODEX_SESSION_APP_SERVER_MANAGERS"])
+
     async def test_recheck_unchanged_login_keeps_existing_writer_and_all_chats_usable(self):
         old = await self.manager("idle")
         self.load("idle", old)

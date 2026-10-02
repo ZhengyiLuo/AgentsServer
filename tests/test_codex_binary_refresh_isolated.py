@@ -56,17 +56,19 @@ class BinaryRefreshTests(unittest.IsolatedAsyncioTestCase):
     def lifecycle_code():
         source = (Path(__file__).resolve().parents[1] / "agent_server.py")
         names = {"codex_app_server_managers", "retain_codex_manager_caller",
-            "codex_manager_has_callers", "codex_manager_has_callbacks", "codex_manager_work_belongs_to_session", "codex_manager_owns_notification",
+            "codex_manager_has_callers", "codex_manager_has_callbacks", "codex_manager_work_belongs_to_session", "codex_manager_session_blocker", "codex_login_handoff_wait", "watch_codex_login_handoff_blockers", "codex_manager_owns_notification",
             "watch_codex_provider_handoff_blockers",
             "refresh_codex_app_server_binary", "codex_manager_session_busy",
             "prepare_codex_app_server_process",
-            "refresh_codex_app_server_login", "release_idle_codex_manager_session", "prepare_codex_login_turn",
+            "runtime_catalog", "refresh_codex_app_server_login", "release_idle_codex_manager_session", "prepare_codex_login_turn",
             "drain_retired_codex_managers", "existing_codex_app_server_manager",
             "existing_codex_app_server_manager_for_thread", "codex_app_server_manager",
             "close_codex_app_server_manager", "session_registry_has_live_tasks"}
         names.update({"handle_codex_server_request", "cache_codex_approval_item", "schedule_codex_manager_drain"})
         nodes = [node for node in ast.parse(source.read_text()).body
                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
+        for node in nodes:
+            if node.name == "runtime_catalog": node.decorator_list = []
         module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *nodes], type_ignores=[])
         return compile(ast.fix_missing_locations(module), str(source), "exec")
 
@@ -75,6 +77,7 @@ class BinaryRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.locks = {}
         self.ns = ns = {"asyncio": asyncio, "time": time, "weakref": weakref,
             "HTTPException": HTTPException, "CodexAppServerRequestError": CodexAppServerRequestError,
+            "discover_runtime_catalog": lambda **kw: {"probe": kw.get("force_runtime_probe", False)},
             "logger": logging.getLogger(__name__), "codex_provider": codex_provider,
             "CODEX_APP_SERVER_MANAGER": None, "CODEX_CUSTOM_APP_SERVER_MANAGERS": {},
             "CODEX_RETIRED_APP_SERVER_MANAGERS": [], "CODEX_SESSION_APP_SERVER_MANAGERS": {},
@@ -82,7 +85,7 @@ class BinaryRefreshTests(unittest.IsolatedAsyncioTestCase):
             "CODEX_LOGIN_REVISION": None,
             "codex_auth": SimpleNamespace(native_login_revision=lambda *_args, **_kwargs: None,
                 native_login_handoff_supported=lambda *_args, **_kwargs: True,
-                HANDOFF_MESSAGE=codex_auth.HANDOFF_MESSAGE),
+                HANDOFF_PROBE_FAILURES=codex_auth.HANDOFF_PROBE_FAILURES, handoff_detail=codex_auth.handoff_detail, HANDOFF_MESSAGE=codex_auth.HANDOFF_MESSAGE),
             "TransientAdmissionWait": HTTPException,
             "CODEX_APP_SERVER_MANAGER_EPOCH": 0, "CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH": None,
             "CODEX_MANAGER_DRAIN_TASK": None, "CODEX_MANAGER_DRAIN_REQUESTED": False,

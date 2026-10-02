@@ -28,6 +28,37 @@ HANDOFF_MESSAGE = (
 )
 _REVISION_KEY = secrets.token_bytes(32)
 _MAX_AUTH_BYTES = 128 * 1024
+HANDOFF_PROBE_FAILURES = frozenset({"thread_list_unavailable", "goal_state_unavailable",
+    "terminal_state_unavailable", "ownership_deadline", "native_unsubscribe_incomplete", "writer_release_failed"})
+
+
+def handoff_detail(reason: str) -> dict:
+    """Content-free admission status, distinct from a native auth rejection."""
+    reasons = {
+        "active_turn": "this chat still has a running turn",
+        "maintenance": "this chat is finishing a provider operation",
+        "approval": "this chat has an unanswered approval or question",
+        "side_chat": "this chat has a running Side chat",
+        "active_goal": "this chat has an active goal",
+        "native_goal_active": "Codex reports an active goal for this chat",
+        "subagents": "this chat has running subagents",
+        "callback": "this chat is finishing a provider notification",
+        "runtime_request": "a provider request for this chat is still finishing",
+        "native_thread_in_use": "Codex still has work using this thread",
+        "background_terminals": "this chat has a running background terminal",
+        "thread_list_unavailable": "Codex could not report which threads it owns",
+        "goal_state_unavailable": "Codex could not report this chat's goal state",
+        "terminal_state_unavailable": "Codex could not report this chat's background terminals",
+        "ownership_deadline": "Codex took too long to report this chat's state",
+        "native_unsubscribe_incomplete": "Codex has not released this thread yet",
+        "writer_release_failed": "Codex could not release the old connection to this thread",
+    }
+    reason = reason if reason in reasons else "runtime_request"
+    action = ("Retry the message to check again." if reason in HANDOFF_PROBE_FAILURES
+              else "Retry after that operation finishes.")
+    return {"code": "codex_login_handoff", "reason": reason, "retryable": True,
+            "message": f"Codex sign-in handoff is waiting: {reasons[reason]}. "
+                       f"Your message has not been sent. {action}"}
 
 
 @dataclass(frozen=True)

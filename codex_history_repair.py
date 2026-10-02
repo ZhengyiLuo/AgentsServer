@@ -202,7 +202,7 @@ def _native_records(path: Path, expected: tuple[int, int, int, int], budget: _Na
 
 def _native_event_identity(event: dict) -> dict:
     """Keep bounded public identity, never retain tool bodies or message text."""
-    return {key: event[key] for key in ("id", "seq", "type", "phase", "item_id")
+    return {key: event[key] for key in ("id", "seq", "type", "phase", "item_id", "provider_thread_id")
             if key in event and (type(event[key]) is int or isinstance(event[key], str) and len(event[key]) <= 256)}
 
 
@@ -242,10 +242,13 @@ def _native_owned_turn_ids(event: dict) -> set[str]:
             if isinstance(value := event.get(field), str) and 0 < len(value) <= 256}
 
 
-def _native_assistant_item_owners(assistant_items: dict, completed_runs: set[str]) -> dict:
+def _native_assistant_item_owners(assistant_items: dict, completed_runs: set[str], provider_id: str) -> dict:
     owners: dict = {}
-    for run, item_id, body_key in assistant_items:
-        if run in completed_runs:
+    for (run, item_id, body_key), event in assistant_items.items():
+        # A restart or Stop can omit the completion receipt. An exact public
+        # item already delivered by this provider thread still identifies its
+        # native run; source reconciliation below supplies the matching turn.
+        if run in completed_runs or event.get("provider_thread_id") == provider_id:
             owners.setdefault((item_id, body_key), set()).add(run)
     return owners
 
@@ -896,7 +899,7 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
         (run, item_id, body_key): event
         for (run, kind, body_key), events in native.items() if kind == "assistant"
         for event in events if (item_id := _public_assistant_item_id(event)) is not None
-    }, completed_runs)
+    }, completed_runs, thread)
     assistant_owner_evidence: dict = {}
     assistant_source_turns: dict = {}
     allowed_header_owners, header_parents = {thread}, {}
@@ -1241,11 +1244,11 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
                         wake_keys.add((run, wake_hash))
                     item_id = _public_assistant_item_id(event)
                     if item_id is not None:
-                        assistant_items[(run, item_id, key[1])] = event["id"]
+                        assistant_items[(run, item_id, key[1])] = _native_event_identity(event)
             if native_count + owner_count + len(assistant_items) + deliveries.count > MAX_KEYS:
                 raise _Unproven()
         assistant_item_owners = _native_assistant_item_owners(
-            assistant_items, {run for runs in owners.values() for run in runs},
+            assistant_items, {run for runs in owners.values() for run in runs}, provider_id,
         )
         assistant_source_turns: dict = {}
         for item in items:

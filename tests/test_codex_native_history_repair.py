@@ -76,6 +76,54 @@ class CodexNativeHistoryRepairTests(unittest.TestCase):
         self.assertTrue(all(self.cache.project_event("chat", row) is None for row in self.native))
         self.assertEqual(before, (self.events.read_bytes(), self.source.read_bytes()))
 
+    def recovered_stop_fixture(self):
+        # Restart recovery has no native completion/turn-ID receipt. The public
+        # commentary already delivered by this run still has its exact item ID.
+        self.native[1].update(type="reasoning_summary", phase="commentary",
+            item_id=self.raw[1]["payload"]["id"], provider_thread_id=PROVIDER)
+        self.native[2] = {"seq": 3, "id": "recovered-stop", "run_id": "native-1",
+            "type": "turn_stopped", "backend": "codex", "stopped": True,
+            "recovered_after_restart": True, "forced_restart": True}
+        self.fixture()
+
+    def test_recovered_stop_reconciles_original_input_and_public_commentary(self):
+        self.recovered_stop_fixture()
+        before = self.events.read_bytes(), self.source.read_bytes()
+        self.prepare()
+        replay = self.cache.project_event("chat", self.imports[0])
+        self.assertIsNotNone(replay)
+        self.assertEqual(replay["prompt"], "")
+        self.assertEqual(replay["provider_origin"]["native_event_id"], "native-input-1")
+        self.assertEqual(self.cache.project_event("chat", self.imports[1])["text"], "")
+        items = [self.parse(row) for row in self.raw]
+        filtered = filter_native_codex_history_items("chat", PROVIDER, self.events, items)
+        self.assertEqual([item["text"] for item in filtered], ["", ""])
+        self.assertEqual(before, (self.events.read_bytes(), self.source.read_bytes()))
+        self.assertTrue(all(self.cache.project_event("chat", row) is None for row in self.native))
+
+    def test_recovered_stop_keeps_a_genuine_repeat_in_another_turn(self):
+        self.recovered_stop_fixture()
+        self.raw.append({**self.raw[0], "timestamp": "2026-09-11T12:09:00Z",
+            "payload": {**self.raw[0]["payload"], "id": "genuine-repeat",
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "new-human-turn", "content_item_kinds": ["user.text"]}}})
+        self.fixture(); self.prepare()
+        self.assertIsNone(self.cache.project_event("chat", self.imports[-1]))
+        items = [self.parse(row) for row in self.raw]
+        self.assertEqual(filter_native_codex_history_items("chat", PROVIDER, self.events, items)[-1], items[-1])
+
+    def test_recovered_stop_does_not_match_text_without_exact_provider_item(self):
+        for change in ({"item_id": "another-item"}, {"item_id": None},
+                       {"provider_thread_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"},
+                       {"type": "reasoning_summary", "phase": "summary"}):
+            with self.subTest(change=change):
+                self.recovered_stop_fixture()
+                self.native[1].update(change)
+                self.fixture(); self.cache.forget("chat"); self.prepare()
+                self.assertIsNone(self.cache.project_event("chat", self.imports[0]))
+                items = [self.parse(row) for row in self.raw]
+                self.assertEqual(filter_native_codex_history_items("chat", PROVIDER, self.events, items)[0], items[0])
+
     def test_unowned_same_text_different_turn_and_changed_import_stay_visible(self):
         self.raw.append({**self.raw[0], "timestamp": "2026-09-11T12:09:00Z", "payload": {**self.raw[0]["payload"],
             "id": "other-source-item", "internal_chat_message_metadata_passthrough": {"turn_id": "unowned-turn", "content_item_kinds": ["user.text"]}}})

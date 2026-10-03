@@ -23,6 +23,7 @@ SOURCE = Path(__file__).resolve().parents[1] / "agent_server.py"
 NAMES = {
     "schedule_codex_subagent_limit_application", "apply_pending_codex_subagent_limit",
     "codex_manager_has_callers", "codex_manager_has_callbacks", "codex_manager_session_busy",
+    "codex_manager_work_belongs_to_session",
     "release_idle_codex_manager_session", "release_codex_provider_writers",
     "watch_codex_provider_handoff_blockers",
     "schedule_codex_manager_drain", "join_task_despite_caller_cancellation",
@@ -238,31 +239,63 @@ class PendingProviderCompletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([(call.args[0], call.args[1]["threadId"]) for call in self.manager.request.await_args_list if call.args[0] in {"thread/archive", "thread/unarchive"}],
             [("thread/unarchive", child_id), ("thread/archive", "target-thread"), ("thread/unarchive", "target-thread"), ("thread/unarchive", child_id)])
 
-    async def test_peer_notification_completion_retries_pending_unloaded_chat(self):
+    async def assert_notification_handoff(self, thread_id, *, deferred):
         gate = asyncio.Event()
         async def handler(notification):
             await gate.wait()
-        self.client._dispatch_notification_handlers({"method": "thread/status/changed", "params": {"threadId": "peer-thread"}}, (handler,))
+        self.client._dispatch_notification_handlers({"method": "thread/status/changed", "params": {"threadId": thread_id}}, (handler,))
         await asyncio.sleep(0)
         self.assertTrue(self.client._callback_tasks)
-        await self.save_default()
+        callbacks = tuple(self.client._callback_tasks)
+        if deferred:
+            await self.save_default()
+        else:
+            await self.ns["update_session"](self.sid, self.ns["UpdateSessionRequest"](codex_provider="default"))
+            await self.settle()
+            self.assert_handoff_preserved_ownership()
+        self.assertTrue(all(not task.done() for task in callbacks))
         gate.set()
-        await asyncio.gather(*tuple(self.client._callback_tasks))
+        await asyncio.gather(*callbacks)
         await self.settle()
         self.assertFalse(self.client._callback_tasks)
         self.assert_handoff_preserved_ownership()
 
-    async def test_shared_rpc_completion_retries_pending_unloaded_chat(self):
+    async def test_peer_notification_does_not_delay_unloaded_chat_handoff(self):
+        await self.assert_notification_handoff("peer-thread", deferred=False)
+
+    async def test_target_notification_completion_retries_pending_unloaded_chat(self):
+        await self.assert_notification_handoff("target-thread", deferred=True)
+
+    async def test_unknown_notification_completion_retries_pending_unloaded_chat(self):
+        await self.assert_notification_handoff("unknown-thread", deferred=True)
+
+    async def assert_rpc_handoff(self, thread_id, *, deferred):
         self.client._proc = SimpleNamespace(returncode=None, stdin=object())
         self.client._send = AsyncMock()
-        request = asyncio.create_task(self.client._request_connected("thread/read", {"threadId": "peer-thread"}))
+        request = asyncio.create_task(self.client._request_connected("thread/read", {"threadId": thread_id}))
         self.cleanup_tasks.append(request)
         await asyncio.sleep(0)
         self.assertTrue(self.client._pending)
-        await self.save_default()
         future = next(iter(self.client._pending.values()))[1]
-        future.set_result({"thread": {"id": "peer-thread"}})
+        if deferred:
+            await self.save_default()
+        else:
+            await self.ns["update_session"](self.sid, self.ns["UpdateSessionRequest"](codex_provider="default"))
+            await self.settle()
+            self.assert_handoff_preserved_ownership()
+        self.assertFalse(request.done())
+        self.assertFalse(future.done())
+        future.set_result({"thread": {"id": thread_id}})
         await request
         await self.settle()
         self.assertFalse(self.client._pending)
         self.assert_handoff_preserved_ownership()
+
+    async def test_peer_rpc_does_not_delay_unloaded_chat_handoff(self):
+        await self.assert_rpc_handoff("peer-thread", deferred=False)
+
+    async def test_target_rpc_completion_retries_pending_unloaded_chat(self):
+        await self.assert_rpc_handoff("target-thread", deferred=True)
+
+    async def test_unknown_rpc_completion_retries_pending_unloaded_chat(self):
+        await self.assert_rpc_handoff("unknown-thread", deferred=True)

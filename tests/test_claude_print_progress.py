@@ -133,28 +133,28 @@ class ClaudePrintProgressTests(unittest.IsolatedAsyncioTestCase):
             },
         ])
 
-        commentary = [
+        visible_text = [
             call.args[2]
             for call in append_event.await_args_list
-            if call.args[1] == "reasoning_summary"
+            if call.args[1] == "assistant_text"
         ]
-        self.assertEqual(commentary, [{
+        self.assertEqual(visible_text, [{
             "run_id": "run-print",
             "text": "I am checking the release.",
-            "phase": "commentary",
             "backend": agent_server.BACKEND_CLAUDE,
             "purpose": "scheduled_job",
             "job_id": "job-1",
         }])
         self.assertFalse(any(
-            call.args[1] == "assistant_text"
+            call.args[1] == "reasoning_summary"
+            and call.args[2].get("text") == "I am checking the release."
             for call in append_event.await_args_list
         ))
         terminal = finalize.await_args.kwargs["payload"]
         self.assertEqual(terminal["result_text"], "The release is ready.")
         self.assertIs(terminal["stopped"], False)
 
-    async def test_stopped_turn_without_result_does_not_promote_commentary(self) -> None:
+    async def test_stopped_turn_without_result_preserves_visible_text(self) -> None:
         append_event, finalize = await self.run_print([
             {
                 "type": "assistant",
@@ -168,13 +168,13 @@ class ClaudePrintProgressTests(unittest.IsolatedAsyncioTestCase):
         ], stopped=True)
 
         self.assertTrue(any(
-            call.args[1] == "reasoning_summary"
-            and call.args[2].get("phase") == "commentary"
+            call.args[1] == "assistant_text"
             and call.args[2].get("text") == "Partial progress before Stop."
             for call in append_event.await_args_list
         ))
         self.assertFalse(any(
-            call.args[1] == "assistant_text"
+            call.args[1] == "reasoning_summary"
+            and call.args[2].get("text") == "Partial progress before Stop."
             for call in append_event.await_args_list
         ))
         terminal = finalize.await_args.kwargs["payload"]

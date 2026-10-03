@@ -1,0 +1,19 @@
+{
+  "name": "agentsdock",
+  "version": "0.0.0-development",
+  "private": true,
+  "description": "Install and manage your AgentsDock server from the command line",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ZhengyiLuo/AgentsDock.git",
+    "directory": "server/npm/agentsdock"
+  },
+  "bin": { "agentsdock": "cli.cjs" },
+  "engines": { "node": ">=22.14.0" },
+  "os": ["darwin", "linux"],
+  "files": ["cli.cjs", "postinstall.cjs", "README.md", "LICENSE", "NOTICE"],
+  "scripts": { "postinstall": "node postinstall.cjs" },
+  "dependencies": { "@agentsdock/server": "0.0.0-development" },
+  "publishConfig": { "access": "public", "registry": "https://registry.npmjs.org/" }
+}

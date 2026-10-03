@@ -2862,6 +2862,13 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 )
                 busy.clear()
+                waiting = await agent_server.advance_pending_server_update_once()
+                self.assertEqual(waiting["phase"], "pending")
+                self.assertEqual(waiting["blocker_counts"]["queued_turns"], 1)
+                self.assertEqual(durable_queue["chat"][0]["queued_id"], "durable-paused")
+                run_tmux.assert_not_called()
+                # Only advance once the queue has been handled as well.
+                durable_queue.clear()
                 started = await agent_server.advance_pending_server_update_once()
 
         self.assertEqual(started["phase"], "starting")
@@ -2869,10 +2876,6 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertRegex(started["update_id"], r"^[0-9a-f]{32}$")
         self.assertNotEqual(started["update_id"], pending["schedule_id"])
         self.assertFalse(started["cancelable"])
-        self.assertEqual(
-            list(durable_queue["chat"])[0]["queued_id"],
-            "durable-paused",
-        )
         run_tmux.assert_called_once()
 
     async def test_stale_pending_reconcile_cannot_overwrite_new_starting_row(self):
@@ -3302,7 +3305,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.detail["code"], "server_update_not_cancelable")
         self.assertEqual(raised.exception.detail["schedule_id"], pending["schedule_id"])
 
-    async def test_pending_defers_automation_but_preserves_manual_controls(self):
+    async def test_pending_preserves_automation_and_manual_controls(self):
         with tempfile.TemporaryDirectory() as temporary:
             status_path = Path(temporary) / "status.json"
             stop_turn = AsyncMock(return_value={"stopped": True})
@@ -3353,15 +3356,10 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 )
 
-        # A pending when-idle reservation remains passive for user/provider
-        # controls, but unattended jobs must yield so recurring automation
-        # cannot continuously refill the active-work set ahead of the updater.
+        # A pending when-idle reservation stays passive for all work.
         self.assertIsNone(admission)
         self.assertIsNone(interactive)
-        self.assertEqual(
-            scheduled,
-            agent_server.MANAGED_SERVER_UPDATE_PENDING_DETAIL,
-        )
+        self.assertIsNone(scheduled)
         self.assertIsNone(manual_job)
         self.assertEqual(stopped, {"stopped": True})
         self.assertEqual(codex["interaction"]["status"], "resolved")
@@ -3431,8 +3429,8 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("_force_restart_request_id", public)
         self.assertNotIn("_force_restart_requested_at", public)
 
-    async def test_scheduled_job_admission_rechecks_pending_after_blocker_probe(self):
-        """The turn reservation is the final fence for a scheduler race."""
+    async def test_scheduled_job_admission_allows_pending_update_after_blocker_probe(self):
+        """An idle-update reservation must not stop an already due job."""
 
         store = agent_server.JobStore()
         job_revision = "job_rev_pending_race"
@@ -3487,7 +3485,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                 cancelable=True,
             )
 
-            with self.assertRaises(agent_server.ManagedServerUpdatePendingError):
+            with self.assertRaises(RuntimeProbeReached):
                 await agent_server._start_turn_locked(
                     "job-chat",
                     agent_server.TurnRequest(
@@ -3500,10 +3498,9 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                     scheduled_job_revision=job_revision,
                     scheduled_job_manual_run=False,
                 )
-            escaped_to_runtime.assert_not_awaited()
+            self.assertEqual(escaped_to_runtime.await_count, 1)
 
-            # Manual Run Now carries the same durable job revision, but it is
-            # operator work and therefore must pass the pending-only fence.
+            # Manual and automatic runs obey the same pending-update policy.
             with self.assertRaises(RuntimeProbeReached):
                 await agent_server._start_turn_locked(
                     "job-chat",
@@ -3518,9 +3515,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                     scheduled_job_manual_run=True,
                 )
 
-            # Merely claiming the scheduled-job purpose is not sufficient to
-            # enter the autonomous lane. Only a revision-backed automatic
-            # dispatch may be selectively fenced by a pending update.
+            # Provider-purpose and ordinary turns remain eligible too.
             with self.assertRaises(RuntimeProbeReached):
                 await agent_server._start_turn_locked(
                     "job-chat",
@@ -3539,7 +3534,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertEqual(busy, set())
-        self.assertEqual(escaped_to_runtime.await_count, 3)
+        self.assertEqual(escaped_to_runtime.await_count, 4)
 
     async def test_user_message_is_parked_durably_while_update_is_pending(self):
         queued = {"status": "queued", "queued_id": "queued-after-update"}
@@ -4335,6 +4330,42 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["phase"], "starting")
         self.assertEqual(list(queued["chat"])[0]["queued_id"], "kept")
         run_tmux.assert_called_once()
+    async def test_idle_update_waits_for_durable_queued_turns(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "update_runner.py"
+            key = root / "release-public-key.pem"
+            runner.write_text("# runner\n")
+            key.write_text("public key\n")
+            queued = {
+                "chat": deque([
+                    {
+                        "queued_id": "kept",
+                        "prompt": "Keep this for later.",
+                        "_durable": True,
+                        "_paused_after_stop": True,
+                    },
+                ]),
+            }
+            with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", root / "status.json"), \
+                 patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
+                 patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
+                 patch.object(agent_server, "BUSY_SESSIONS", set()), \
+                 patch.object(agent_server, "QUEUED_TURNS", queued), \
+                 patch.object(agent_server, "RUN_NOW_TURNS", {}), \
+                 patch.object(agent_server, "active_provider_background_work_labels", return_value=[]), \
+                 patch.object(agent_server, "server_update_is_active", return_value=False), \
+                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
+                 patch.object(agent_server, "run_tmux") as run_tmux:
+                status = await agent_server.start_server_update(
+                    agent_server.ServerUpdateRequest(version="1.1.0", when_idle=True),
+                )
+
+        self.assertEqual(status["phase"], "pending")
+        self.assertEqual(status["blocker_counts"]["queued_turns"], 1)
+        self.assertEqual(list(queued["chat"])[0]["queued_id"], "kept")
+        run_tmux.assert_not_called()
 
     async def test_start_rejects_update_while_a_codex_subagent_is_live(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -56,7 +56,7 @@ class BinaryRefreshTests(unittest.IsolatedAsyncioTestCase):
     def lifecycle_code():
         source = (Path(__file__).resolve().parents[1] / "agent_server.py")
         names = {"codex_app_server_managers", "retain_codex_manager_caller",
-            "codex_manager_has_callers", "codex_manager_has_callbacks", "codex_manager_owns_notification",
+            "codex_manager_has_callers", "codex_manager_has_callbacks", "codex_manager_work_belongs_to_session", "codex_manager_owns_notification",
             "watch_codex_provider_handoff_blockers",
             "refresh_codex_app_server_binary", "codex_manager_session_busy",
             "prepare_codex_app_server_process",
@@ -243,6 +243,32 @@ class BinaryRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(release.await_count, 2)
         release.assert_awaited_with(old, "idle", [thread])
         self.assertTrue(old.closed)
+
+    async def test_settled_own_request_does_not_block_handoff_behind_active_peer(self):
+        manager = await self.manager("idle")
+        thread = self.load("idle", manager)
+        self.assertIs(await self.manager("peer"), manager)
+        peer_thread = self.load("peer", manager)
+        settled = asyncio.get_running_loop().create_future()
+        settled._codex_thread_id = thread
+        settled.set_result({})
+        peer = asyncio.get_running_loop().create_future()
+        peer._codex_thread_id = peer_thread
+        manager.client._pending.update({
+            1: ("thread/read", settled, None),
+            2: ("thread/read", peer, None),
+        })
+        try:
+            async with self.ns["session_lifecycle_lock"]("idle"):
+                self.assertTrue(await self.ns["release_idle_codex_manager_session"](manager, "idle"))
+            self.ns["release_codex_provider_writers"].assert_awaited_once_with(manager, "idle", [thread])
+            self.assertNotIn("idle", self.ns["CODEX_SESSION_APP_SERVER_MANAGERS"])
+            self.assertIs(self.ns["CODEX_SESSION_APP_SERVER_MANAGERS"]["peer"], manager)
+            self.assertTrue(manager.is_thread_loaded(peer_thread))
+            self.assertFalse(peer.done())
+            self.assertFalse(manager.closed)
+        finally:
+            peer.cancel()
 
     async def test_failed_resume_mapping_does_not_archive_an_unowned_persisted_parent(self):
         old = await self.manager("unowned")

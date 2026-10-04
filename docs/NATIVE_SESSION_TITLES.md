@@ -114,6 +114,11 @@ guarantee for all future Cursor versions or the separate Cursor IDE history.
   a 45-second deadline, followed by bounded cleanup of its own processes.
 - Manual rename, opt-out, archive, deletion, and shutdown cancel pending work.
   Provider/model/identity/ownership checks also reject stale results.
+  Repeating unchanged provider/model settings when sending or promoting a
+  queued message does not cancel the pending request. Explicit renames still
+  take manual ownership even when the text is unchanged. Cancellation does not
+  reset the once-only usage claim; this fix does not retroactively retry old
+  chats whose title attempt was already consumed.
 - A global `AGENTSDOCK_AUTO_TITLES=0` environment setting disables additional
   title requests. Creation or PATCH can set `auto_title_enabled: false` for one
   chat. No settings toggle has been added to the clients. Native metadata

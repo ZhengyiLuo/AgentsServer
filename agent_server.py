@@ -86192,6 +86192,29 @@ async def get_session_subagents(
     return await asyncio.to_thread(build_subagent_snapshot, session_id, limit)
 
 
+def find_timeline_event_anchor(session_id: str, event_id: str) -> dict[str, Any] | None:
+    """Resolve a persisted pin by identity, independent of FTS text/index lag."""
+    for event in iter_session_events(session_id):
+        if event.get("id") != event_id:
+            continue
+        if str(event.get("session_id") or session_id) != session_id:
+            return None
+        seq = event.get("seq")
+        if type(seq) is not int or seq <= 0:
+            return None
+        return {"session_id": session_id, "event_id": event_id, "seq": seq,
+                "ts": event.get("ts", ""), "role": "system", "snippet": ""}
+    return None
+
+
+@app.get("/api/sessions/{session_id}/timeline-event/{event_id}")
+async def get_timeline_event_anchor(session_id: str, event_id: str) -> dict[str, Any]:
+    if session_id not in STORE.sessions:
+        raise HTTPException(status_code=404, detail="session not found")
+    anchor = await asyncio.to_thread(find_timeline_event_anchor, session_id, event_id)
+    return {"event": anchor}
+
+
 @app.get("/api/sessions/{session_id}/search")
 async def search_session_timeline(
     session_id: str,

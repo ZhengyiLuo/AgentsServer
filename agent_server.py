@@ -80710,14 +80710,21 @@ async def codex_provider_mcp(request: Request) -> Response:
         client_meta = turn_meta
     run_id = str(client_meta.get("agentsdock_run_id") or "")
     proof = str(client_meta.get("agentsdock_run_proof") or "")
+    # Codex's own goal turns need not inherit turn/start client metadata.
+    # Their authenticated native thread/turn identity still has an exact
+    # server-owned supervisor. Resolve that owner, never a caller's chat ID
+    # or a previously completed run. Partially supplied proofs stay invalid.
+    native_goal_metadata = not run_id and not proof
     core_call_id = str(meta.get("callId") or "")
     if (
         not thread_id
         or len(thread_id) > 256
         or not turn_id
         or len(turn_id) > 256
-        or re.fullmatch(r"run_[A-Za-z0-9_-]{1,128}", run_id) is None
-        or re.fullmatch(r"[0-9a-f]{64}", proof) is None
+        or (not native_goal_metadata and (
+            re.fullmatch(r"run_[A-Za-z0-9_-]{1,128}", run_id) is None
+            or re.fullmatch(r"[0-9a-f]{64}", proof) is None
+        ))
         or not core_call_id
     ):
         return codex_provider_mcp_jsonrpc_error(request_id, -32602, "Incomplete turn metadata")
@@ -80732,11 +80739,18 @@ async def codex_provider_mcp(request: Request) -> Response:
                 active.get("backend") == BACKEND_CODEX
                 and active.get("transport") == CODEX_TRANSPORT_APP_SERVER
                 and str(active.get("provider_thread_id") or "") == thread_id
-                and str(active.get("run_id") or "") == run_id
+                and (
+                    codex_native_mailbox_owner_matches(
+                        session_id, str(active.get("run_id") or ""), thread_id, turn_id,
+                    ) if native_goal_metadata
+                    else str(active.get("run_id") or "") == run_id
+                )
                 and session_id in BUSY_SESSIONS
             )
         ]
         if len(owners) == 1:
+            if native_goal_metadata:
+                run_id = str(ACTIVE[owners[0]].get("run_id") or "")
             standalone_active_owner = bool(
                 (ACTIVE.get(owners[0]) or {}).get(
                     "standalone_provider_context"
@@ -80759,7 +80773,7 @@ async def codex_provider_mcp(request: Request) -> Response:
     ):
         return codex_provider_mcp_jsonrpc_error(request_id, -32602, "Ambiguous thread owner")
     expected_proof = codex_provider_mcp_run_proof(session_id, thread_id, run_id)
-    if not hmac.compare_digest(proof, expected_proof):
+    if not native_goal_metadata and not hmac.compare_digest(proof, expected_proof):
         return codex_provider_mcp_jsonrpc_error(request_id, -32602, "Invalid turn proof")
     try:
         text, is_error = await execute_provider_tool_once(
@@ -88661,7 +88675,7 @@ async def _put_codex_goal_locked(
             blocker = await turn_start_blocker(ignore_session_id=session_id)
             if blocker:
                 raise HTTPException(status_code=503, detail=f"agent launch deferred: {blocker}")
-            operation_id = f"codexgoal_{uuid.uuid4().hex[:16]}"
+            operation_id = f"run_goal_{uuid.uuid4().hex[:16]}"
             subscription = manager.subscribe_thread(thread_id)
             provider_model, provider_effort, provider_service_tier = codex_runtime_settings(stored_session)
             async with ACTIVE_LOCK:
@@ -88678,6 +88692,21 @@ async def _put_codex_goal_locked(
                 if current_turn is not None:
                     current_turn["run_id"] = operation_id
                     current_turn["purpose"] = "codex_goal_resume"
+            # goal/set starts native work without passing through turn/start.
+            # Issue this new logical run's helper authority before native work
+            # can call Publish/Jobs/Mail. Reuse only existing durable routes;
+            # resuming a goal must not mint grants from its text or history.
+            resume_routes = provider_cross_chat_route_snapshot_for_authority(
+                provider_cross_chat_routes(stored_session), [], source_session_id=session_id,
+            )
+            authority_path = await issue_cross_chat_capability(
+                session_id, operation_id, [],
+                actions={"publish", "jobs", "emergency", "agent_cross_chat_routes"},
+                provider_route_snapshot=resume_routes,
+                async_route_v1=True,
+            )
+            if authority_path is None:
+                raise ProviderToolError("Could not prepare the resumed goal's tools")
             await append_event(session_id, "turn_started", {
                 "run_id": operation_id,
                 "backend": BACKEND_CODEX,
@@ -88802,6 +88831,8 @@ async def _put_codex_goal_locked(
     finally:
         if not consumer_owns_reservation:
             try:
+                if operation_id:
+                    await revoke_cross_chat_capability(operation_id)
                 if goal_activation_attempted:
                     await stop_codex_goal_resume(
                         session_id, manager, thread_id, reservation_id,
@@ -96009,7 +96040,12 @@ async def active_artifact_publication_run(
             or not isinstance(active, dict)
             or not run_id
             or str(active.get("run_id") or "").strip() != run_id
-            or active.get("codex_native_operation") is True
+            or (active.get("codex_native_operation") is True
+                and not codex_native_mailbox_owner_matches(
+                    session_id, run_id,
+                    str(active.get("provider_thread_id") or ""),
+                    str(active.get("provider_turn_id") or ""),
+                ))
             or active.get("stop_requested") is True
             or run_id in STOPPED_RUNS
         ):

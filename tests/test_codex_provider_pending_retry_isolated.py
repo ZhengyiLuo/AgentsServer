@@ -24,7 +24,6 @@ NAMES = {
     "codex_manager_work_belongs_to_session", "codex_manager_session_blocker", "codex_login_handoff_wait", "watch_codex_login_handoff_blockers",
     "schedule_codex_subagent_limit_application", "apply_pending_codex_subagent_limit",
     "codex_manager_has_callers", "codex_manager_has_callbacks", "codex_manager_session_busy",
-    "codex_manager_work_belongs_to_session",
     "release_idle_codex_manager_session", "release_codex_provider_writers",
     "watch_codex_provider_handoff_blockers",
     "schedule_codex_manager_drain", "join_task_despite_caller_cancellation",

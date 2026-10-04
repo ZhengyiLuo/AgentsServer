@@ -106,6 +106,62 @@ class CodexNativeHistoryRepairTests(unittest.TestCase):
         self.prepare()
         self.assertEqual(len(self.cache.signature("chat")), 4)
 
+    def trimmed_scheduled_fixture(self):
+        namespace = load_projection()
+        namespace["MAX_IMPORTED_TEXT_CHARS"] = 12000
+        self.parse = namespace["codex_history_event_item"]
+        prompt = "Scheduled monitoring request.\n\n" + "Long task detail. " * 750 + "Complete tail A."
+        self.raw[2]["payload"]["content"][0]["text"] = prompt
+        self.native[3]["prompt"] = prompt
+        self.fixture()
+        item = self.parse(self.raw[2])
+        self.assertIn("[import trimmed]", item["text"])
+        self.imports[2].update(prompt=item["text"], source_text_sha256=item["source_text_sha256"])
+        rows = [json.loads(line) for line in self.events.read_text().splitlines()]
+        for index, row in enumerate(rows):
+            if row.get("id") == self.imports[2]["id"]:
+                rows[index] = {"session_id": "chat", **self.imports[2]}
+        self.events.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        checkpoint = next(row["_history_sync_checkpoint"] for row in rows if row["type"] == "history_imported")
+        return item, checkpoint
+
+    def test_trimmed_cron_input_uses_full_source_for_replay_and_old_projection(self):
+        item, checkpoint = self.trimmed_scheduled_fixture()
+        before = self.events.read_bytes(), self.source.read_bytes()
+        self.prepare()
+        projected = self.cache.project_event("chat", self.imports[2])
+        self.assertIsNotNone(projected)
+        self.assertEqual(projected["prompt"], "")
+        self.assertEqual(projected["provider_origin"]["native_event_id"], self.native[3]["id"])
+        result = filter_native_codex_history_items("chat", PROVIDER, self.events, [item],
+            source_path=self.source, root=self.root, sync_checkpoint=checkpoint, parse_item=self.parse)
+        self.assertEqual(result[0]["text"], "")
+        self.assertTrue(result[0]["metadata_only"])
+        self.assertEqual(result[0]["provider_origin"]["source_text_sha256"],
+                         hashlib.sha256(self.native[3]["prompt"].encode()).hexdigest())
+        self.assertEqual(before, (self.events.read_bytes(), self.source.read_bytes()))
+
+    def test_trimmed_input_never_matches_preview_alone_or_unowned_turn(self):
+        item, checkpoint = self.trimmed_scheduled_fixture()
+        self.assertEqual(filter_native_codex_history_items("chat", PROVIDER, self.events, [item]), [item])
+        for alteration in ("different-tail", "different-turn", "forged-hash"):
+            with self.subTest(alteration=alteration):
+                item, checkpoint = self.trimmed_scheduled_fixture()
+                if alteration == "different-tail":
+                    rows = [json.loads(line) for line in self.events.read_text().splitlines()]
+                    rows[3]["prompt"] = rows[3]["prompt"].replace("tail A.", "tail B.")
+                    self.events.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                elif alteration == "different-turn":
+                    item = {**item, "provider_origin": {**item["provider_origin"], "turn_id": "unowned"}}
+                else:
+                    item = {**item, "source_text_sha256": "f" * 64}
+                result = filter_native_codex_history_items("chat", PROVIDER, self.events, [item],
+                    source_path=self.source, root=self.root, sync_checkpoint=checkpoint, parse_item=self.parse)
+                self.assertEqual(result, [item])
+                if alteration == "different-tail":
+                    self.prepare()
+                    self.assertIsNone(self.cache.project_event("chat", self.imports[2]))
+
     def test_assistant_normalization_matches_actual_native_cleaner(self):
         tree = ast.parse((Path(__file__).resolve().parents[1] / "agent_server.py").read_text())
         selected = [node for node in tree.body if (

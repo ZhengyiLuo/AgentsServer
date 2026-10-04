@@ -131,3 +131,20 @@ checks both new-import filtering and old cron/wake projection, and preserves a
 genuine identical user message. It also covers cancellation, work/key-budget
 exhaustion, concurrent source/ledger mutation, malformed sequence, unchanged
 original ownership, and a later source tail outside the frozen checkpoint.
+
+## Display-trimmed scheduled inputs
+
+Long prompts can exceed the imported-message display limit while their full
+native input remains in the ledger and provider rollout. Such imports carry a
+normalized full-text hash and an `[import trimmed]` preview. Previously that
+hash excluded them from native replay matching, exposing cron input as a new
+human message even when native turn ownership was known.
+
+Both forward import and existing-history projection now compare the complete
+source input with the original native prompt after verifying the source
+checkpoint, parsed preview/hash, message identity and native turn owner. The
+preview is never a matching key by itself. Different full-text tails, unknown
+turns, forged hashes and missing checkpoints retain the message. This path
+supports plain user-message records and single-text-block user response items;
+it does not infer equality for other truncated content shapes. Original events
+and provider transcripts remain unchanged.

@@ -10772,6 +10772,7 @@ class SessionStore:
             if "subagent_limit" in patch:
                 validate_session_subagent_limit({**sess, "backend": patch.get("backend") or sess.get("backend")}, patch["subagent_limit"])
             previous_provider_runtime = dict(sess) if {"codex_provider", "provider_connection", "subagent_limit"}.intersection(patch) else None
+            previous_title_runtime = title_runtime_key(sess)
             missing_policy = object()
             previous_provider_jobs_access = sess.get(
                 "provider_jobs_access",
@@ -10869,9 +10870,6 @@ class SessionStore:
                         sess.pop("_title_seed", None)
             if patch.get("auto_title_enabled") is not None:
                 sess["auto_title_enabled"] = bool(patch["auto_title_enabled"])
-            if (any(key in patch for key in ("title", "model", "backend", "codex_provider"))
-                    or patch.get("auto_title_enabled") is False or patch.get("archived") is True):
-                cancel_generated_session_title(sid)
             for key, default, allowed in (
                 (
                     "claude_permission_mode",
@@ -10993,6 +10991,13 @@ class SessionStore:
             new_section = session_section_key(sess)
             if new_section != old_section:
                 sess["sort_order"] = self.top_order_for_section(new_section, excluding_id=sid)
+            # Ordinary/queued turns re-save their backend and may repeat model
+            # or provider selections. Only an actual runtime change invalidates
+            # the in-flight title; cancelling a no-op consumes its sole attempt.
+            # An explicit title PATCH is still manual ownership, even if equal.
+            if ("title" in patch or title_runtime_key(sess) != previous_title_runtime
+                    or patch.get("auto_title_enabled") is False or patch.get("archived") is True):
+                cancel_generated_session_title(sid)
             sess["updated_at"] = now_iso()
             try:
                 await self.save()
@@ -48064,8 +48069,9 @@ def active_generated_title_work_labels() -> list[str]:
 
 def title_runtime_key(sess: dict[str, Any]) -> tuple:
     return (sess.get("backend") or DEFAULT_BACKEND, session_provider_id(sess),
-            sess.get("model"), sess.get("codex_provider"), sess.get("codex_provider_revision"),
-            sess.get("provider_connection"), sess.get("provider_connection_revision"))
+            sess.get("model"), codex_provider.session_choice(sess.get("codex_provider")),
+            sess.get("codex_provider_revision"), sess.get("provider_connection") or "default",
+            sess.get("provider_connection_revision"))
 
 
 def generated_title_eligible(sess: dict[str, Any], *, allow_attempted: bool = False) -> bool:

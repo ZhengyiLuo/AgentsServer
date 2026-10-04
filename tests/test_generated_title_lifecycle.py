@@ -201,6 +201,92 @@ class GeneratedTitleLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(task.cancelled())
         self.assertEqual(self.sess['title'], 'My own title')
 
+    async def test_unchanged_turn_settings_preserve_pending_title(self):
+        for backend in ('codex', 'cursor'):
+            for model in (None, 'selected-model'):
+                with self.subTest(backend=backend, model=model):
+                    await server.close_generated_session_titles()
+                    await asyncio.sleep(0)
+                    self.sess.update(backend=backend, model=model, title='Write a song',
+                        _title_source='prompt', _title_auto_value='Write a song',
+                        _title_seed='Write a song about cats')
+                    self.sess.pop('_title_generation_attempted', None)
+                    # Also cover old sessions without explicit default bindings.
+                    self.sess.pop('codex_provider', None)
+                    self.sess.pop('provider_connection', None)
+                    started, release = asyncio.Event(), asyncio.Event()
+                    async def pending(*args, **kwargs):
+                        started.set()
+                        await release.wait()
+                        return 'Song About Two Cats'
+                    self.generator.reset_mock(side_effect=True)
+                    self.generator.side_effect = pending
+                    self.schedule()
+                    await asyncio.wait_for(started.wait(), 1)
+                    task = self.tasks['title-chat']
+                    # start_turn re-saves backend even when unchanged; other
+                    # clients can repeat model/default-provider selections too.
+                    for fields in ({'backend': backend}, {'model': model},
+                            {'codex_provider': 'default'}, {'provider_connection': 'default'},
+                            {'backend': backend, 'model': f' {model} ' if model else ''}):
+                        await self.store.update('title-chat', fields)
+                        await asyncio.sleep(0)
+                        self.assertFalse(task.done(), fields)
+                    self.schedule(run_id='queued-follow-up')
+                    self.assertIs(self.tasks['title-chat'], task)
+                    release.set()
+                    await self.drain()
+                    self.assertEqual(self.sess['title'], 'Song About Two Cats')
+                    self.assertEqual(self.sess['_title_source'], 'generated')
+                    self.generator.assert_awaited_once()
+
+    async def test_real_setting_or_ownership_changes_still_cancel_title(self):
+        for fields in ({'model': 'different-model'}, {'archived': True},
+                {'title': 'Write a song'}, {'auto_title_enabled': False}):
+            original = dict(self.sess)
+            with self.subTest(fields=fields):
+                started = asyncio.Event()
+                async def pending(*args, **kwargs):
+                    started.set()
+                    await asyncio.Event().wait()
+                self.generator.side_effect = pending
+                self.schedule()
+                await asyncio.wait_for(started.wait(), 1)
+                task = self.tasks['title-chat']
+                await self.store.update('title-chat', fields)
+                await asyncio.gather(task, return_exceptions=True)
+                await asyncio.sleep(0)
+                self.assertTrue(task.cancelled())
+                self.assertEqual(self.sess['title'], 'Write a song')
+                self.assertTrue(self.sess['_title_generation_attempted'])
+            self.sess.clear()
+            self.sess.update(original)
+
+    async def test_reselected_custom_connection_cancels_only_if_credentials_change(self):
+        self.sess.update(provider_connection='custom', provider_connection_revision='original')
+        connections = SimpleNamespace(
+            bind=Mock(return_value={'credential_id': 'original', 'model': 'selected-model'}),
+            cursor_overrides=Mock(return_value={}),
+        )
+        self.enterContext(patch.object(server, 'PROVIDER_CONNECTION_STORE', connections))
+        self.enterContext(patch.object(server.cursor_api_key, 'require_isolation', new_callable=AsyncMock))
+        started = asyncio.Event()
+        async def pending(*args, **kwargs):
+            started.set()
+            await asyncio.Event().wait()
+        self.generator.side_effect = pending
+        self.schedule()
+        await asyncio.wait_for(started.wait(), 1)
+        task = self.tasks['title-chat']
+        await self.store.update('title-chat', {'provider_connection': 'custom'})
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+        connections.bind.return_value = {'credential_id': 'replacement', 'model': 'selected-model'}
+        await self.store.update('title-chat', {'provider_connection': 'custom'})
+        await asyncio.gather(task, return_exceptions=True)
+        self.assertTrue(task.cancelled())
+        self.assertEqual(self.sess['title'], 'Write a song')
+
     async def test_opt_out_cancels_pending_generation(self):
         started = asyncio.Event()
         async def pending(*args, **kwargs):

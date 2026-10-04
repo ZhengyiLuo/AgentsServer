@@ -23,7 +23,7 @@ import local_session_ownership
 from tests import test_codex_subagent_config_isolated as config_fixture
 
 SOURCE = (Path(__file__).resolve().parents[1] / "agent_server.py")
-FUNCTIONS = {"preview_session_runtime_update", "session_backend_locked", "public_session",
+FUNCTIONS = {"preview_session_runtime_update", "session_backend_locked", "public_session", "title_runtime_key",
     "effective_opencode_permission_mode", "ensure_opencode_permission_mode_update_allowed",
     "session_subagent_limit_control", "validate_session_subagent_limit",
     "record_codex_subagent_limit_application",

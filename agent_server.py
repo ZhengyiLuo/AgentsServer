@@ -25593,7 +25593,7 @@ async def _start_next_queued_turn_locked(
         if e.status_code in (409, 503):
             already_notified = bool(item.get("_turn_deferred_notified"))
             item["_turn_deferred_notified"] = True
-            deferred_detail = str(e.detail or "")
+            deferred_detail = str(e.detail.get("message", "") if isinstance(e.detail, dict) else e.detail or "")
             item["_last_deferred_detail"] = deferred_detail
             # Pure wait states (capacity, memory, goals or maintenance in
             # progress) are not admission failures of this row.
@@ -25607,7 +25607,7 @@ async def _start_next_queued_turn_locked(
             if not already_notified:
                 await append_event(session_id, "turn_deferred", {
                     "queued_id": item.get("queued_id"),
-                    "message": f"Queued turn deferred: {e.detail}",
+                    "message": f"Queued turn deferred: {deferred_detail}",
                 })
             schedule_queued_turn_retry(session_id)
             return
@@ -41588,7 +41588,7 @@ def cross_chat_exchange_submission_defer_reason(
     if isinstance(error, asyncio.CancelledError):
         return "AgentsServer stopped while admitting the delivery"
     if isinstance(error, TransientAdmissionWait):
-        return str(error.detail or "").strip() or "target admission deferred"
+        return str(error.detail.get("message", "") if isinstance(error.detail, dict) else error.detail or "").strip() or "target admission deferred"
     if isinstance(error, HTTPException) and error.status_code == 503:
         detail = error.detail
         if isinstance(detail, dict):
@@ -54180,9 +54180,9 @@ async def refresh_codex_app_server_binary(*, force: bool = False) -> None:
 async def refresh_codex_app_server_login(*, request_handoff: bool = False) -> None:
     """Change normal-Codex admission; never kill a credential-owning process.
 
-    Ordinary lookups use a conservative native file revision. Recheck CLIs is
-    an explicit handoff request, also covering keyring and same-account logins
-    without an OIDC auth_time. This is not a token refresh or login operation.
+    Catalog refresh only observes the native login revision. Only an explicit
+    provider reload requests handoff for opaque credential stores. Neither
+    operation logs in or rotates native credentials.
     """
     global CODEX_APP_SERVER_MANAGER, CODEX_LOGIN_REVISION
     if CODEX_TRANSPORT == CODEX_TRANSPORT_EXEC or CODEX_AUTH_LOCK.locked() or CODEX_MANAGER_CLOSING:
@@ -54220,22 +54220,59 @@ async def refresh_codex_app_server_login(*, request_handoff: bool = False) -> No
     schedule_codex_manager_drain()
 
 
-def codex_manager_session_busy(manager: CodexAppServerManager, session_id: str, *, ignore_task=None, ignore_maintenance=False) -> bool:
+def codex_manager_session_blocker(manager: CodexAppServerManager, session_id: str, *, ignore_task=None, ignore_maintenance=False) -> str | None:
     session = STORE.sessions.get(session_id) or {}
-    return bool(
-        session_id in BUSY_SESSIONS or ACTIVE.get(session_id) is not None
-        or (not ignore_maintenance and session_id in SERVER_MAINTENANCE_SESSIONS)
-        or codex_manager_has_callers(manager, session_id, ignore_task=ignore_task)
-        or codex_manager_has_callbacks(manager, session_id)
-        or any(task is not ignore_task and not task.done()
-            for registry in (SESSION_TURN_TASKS, CODEX_NATIVE_ACTION_TASKS, CODEX_INTERACTION_HANDLER_TASKS)
-            for task in registry.get(session_id, ()))
-        or any(item.get("session_id") == session_id for item in CODEX_PENDING_INTERACTIONS.values())
-        or session_id in SIDE_QUESTIONS.active_session_ids()
-        or (isinstance(session.get("codex_goal"), dict)
-            and session["codex_goal"].get("status") == "active")
-        or codex_session_has_live_subagents(session_id)
-    )
+    if session_id in BUSY_SESSIONS or ACTIVE.get(session_id) is not None:
+        return "active_turn"
+    if not ignore_maintenance and session_id in SERVER_MAINTENANCE_SESSIONS:
+        return "maintenance"
+    if any(item.get("session_id") == session_id for item in CODEX_PENDING_INTERACTIONS.values()):
+        return "approval"
+    if session_id in SIDE_QUESTIONS.active_session_ids():
+        return "side_chat"
+    if (session.get("codex_goal") or {}).get("status") == "active":
+        return "active_goal"
+    if codex_session_has_live_subagents(session_id):
+        return "subagents"
+    if codex_manager_has_callers(manager, session_id, ignore_task=ignore_task):
+        return "runtime_request"
+    if codex_manager_has_callbacks(manager, session_id):
+        return "callback"
+    if any(task is not ignore_task and not task.done()
+           for registry in (SESSION_TURN_TASKS, CODEX_INTERACTION_HANDLER_TASKS)
+           for task in registry.get(session_id, ())):
+        return "runtime_request"
+    if any(sid == session_id and task is not ignore_task and not task.done()
+           for (sid, _), task in CODEX_NATIVE_ACTION_TASKS.items()):
+        return "runtime_request"
+    return None
+
+
+def codex_manager_session_busy(manager: CodexAppServerManager, session_id: str, *, ignore_task=None, ignore_maintenance=False) -> bool:
+    return codex_manager_session_blocker(manager, session_id, ignore_task=ignore_task,
+        ignore_maintenance=ignore_maintenance) is not None
+
+
+def codex_login_handoff_wait(manager: CodexAppServerManager, session_id: str) -> HTTPException:
+    reason = (getattr(manager, "_agentsdock_handoff_reasons", {}).get(session_id)
+              or codex_manager_session_blocker(manager, session_id, ignore_task=asyncio.current_task())
+              or "runtime_request")
+    return TransientAdmissionWait(409, codex_auth.handoff_detail(reason))
+
+
+def watch_codex_login_handoff_blockers(manager: CodexAppServerManager, session_id: str, *, ignore_task=None) -> None:
+    if not getattr(manager, "_agentsdock_login_superseded", False):
+        return
+    work = set(manager.client._callback_tasks) | set(manager.client._server_request_tasks.values())
+    work.update(value[1] for value in manager.client._pending.values())
+    work.update(task for task, owner in tuple(getattr(manager, "_agentsdock_callers", {}).items())
+                if not owner or owner == session_id)
+    for task in work:
+        if task is ignore_task or task.done() or not codex_manager_work_belongs_to_session(task, session_id):
+            continue
+        if not getattr(task, "_agentsdock_login_handoff_watched", False):
+            task._agentsdock_login_handoff_watched = True
+            task.add_done_callback(lambda _: schedule_codex_manager_drain())
 
 
 def watch_codex_provider_handoff_blockers(
@@ -54289,14 +54326,20 @@ async def release_idle_codex_manager_session(manager: CodexAppServerManager, ses
                 # The response Future can finish before its RPC coroutine
                 # removes the registry entry. Treat that settled response as
                 # complete so its wakeup cannot get lost during unwinding.
-                or any(not request[1].done()
-                       and codex_manager_work_belongs_to_session(request[1], session_id)
-                       for request in manager.client._pending.values())
-                or any(codex_manager_work_belongs_to_session(task, session_id)
-                       for task in manager.client._server_request_tasks.values() if not task.done()))
+                or any(not value[1].done() and codex_manager_work_belongs_to_session(value[1], session_id)
+                       for value in manager.client._pending.values())
+                or any(not task.done() and codex_manager_work_belongs_to_session(task, session_id)
+                       for task in manager.client._server_request_tasks.values()))
 
     async def defer(reason: str, *, error_type: str = "") -> bool:
         session = STORE.sessions.get(session_id) or {}
+        reasons = getattr(manager, "_agentsdock_handoff_reasons", None)
+        if reasons is None:
+            reasons = manager._agentsdock_handoff_reasons = {}
+        reasons[session_id] = reason
+        if reason in {"runtime_borrowers", "runtime_borrowers_after_metadata", "runtime_borrowers_after_unsubscribe"}:
+            reasons[session_id] = codex_manager_session_blocker(manager, session_id, ignore_task=ignore_task, ignore_maintenance=True) or "runtime_request"
+            watch_codex_login_handoff_blockers(manager, session_id, ignore_task=ignore_task)
         if isinstance(session.get("_codex_provider_pending"), dict):
             # A failed ownership/goal request can itself emit callbacks.
             # Only verified transient borrowers own a completion retry; an
@@ -54322,6 +54365,7 @@ async def release_idle_codex_manager_session(manager: CodexAppServerManager, ses
     if blocked():
         return await defer("runtime_borrowers")
     deadline = time.monotonic() + 8.0
+    failure_reason = "thread_list_unavailable"
     SERVER_MAINTENANCE_SESSIONS.add(session_id)
     try:
         threads = [thread for thread in tuple(manager.client._loaded_threads)
@@ -54357,6 +54401,7 @@ async def release_idle_codex_manager_session(manager: CodexAppServerManager, ses
             if (thread in CODEX_APP_SERVER_PINNED_THREADS or thread in CODEX_INTERACTIVE_CONTROL_THREADS
                     or manager.active_turn(thread) is not None):
                 return await defer("native_thread_in_use")
+            failure_reason = "goal_state_unavailable"
             try:
                 goal = await asyncio.wait_for(manager.get_thread_goal(thread), timeout=min(3.0, deadline - time.monotonic()))
             except CodexAppServerRequestError as exc:
@@ -54365,6 +54410,7 @@ async def release_idle_codex_manager_session(manager: CodexAppServerManager, ses
                 goal = None
             if isinstance(goal, dict) and goal.get("status") == "active":
                 return await defer("native_goal_active")
+            failure_reason = "terminal_state_unavailable"
             try:
                 terminals = await asyncio.wait_for(manager.list_background_terminals(thread), timeout=min(3.0, deadline - time.monotonic()))
             except CodexAppServerRequestError as exc:
@@ -54377,6 +54423,7 @@ async def release_idle_codex_manager_session(manager: CodexAppServerManager, ses
                 return await defer("background_terminals")
             if blocked(own_maintenance=True):
                 return await defer("runtime_borrowers_after_metadata")
+            failure_reason = "native_unsubscribe_incomplete"
             if manager.is_thread_loaded(thread):
                 evicted = await asyncio.wait_for(evict_codex_app_server_thread(manager, thread, reinsert_on_failure=True),
                     timeout=max(0.0, deadline - time.monotonic()))
@@ -54387,14 +54434,16 @@ async def release_idle_codex_manager_session(manager: CodexAppServerManager, ses
         # Unsubscribe removes the client subscription, but native Codex keeps
         # the native writer alive. Release it before another manager can own
         # this chat; unrelated active chats keep their current process.
+        failure_reason = "writer_release_failed"
         await release_codex_provider_writers(manager, session_id, threads)
+        getattr(manager, "_agentsdock_handoff_reasons", {}).pop(session_id, None)
         if CODEX_SESSION_APP_SERVER_MANAGERS.get(session_id) is manager:
             CODEX_SESSION_APP_SERVER_MANAGERS.pop(session_id, None)
             CODEX_GOAL_SYNC_GENERATIONS.pop(session_id, None)
         return True
     except Exception as exc:
         logger.debug("Codex handoff retained an unverified idle owner", exc_info=True)
-        return await defer("ownership_unverified", error_type=type(exc).__name__)
+        return await defer(failure_reason, error_type=type(exc).__name__)
     finally:
         SERVER_MAINTENANCE_SESSIONS.discard(session_id)
 
@@ -54420,7 +54469,7 @@ async def prepare_codex_login_turn(session: dict[str, Any]) -> None:
     if session_id in BUSY_SESSIONS or ACTIVE.get(session_id) is not None:
         return
     if not await release_idle_codex_manager_session(manager, session_id, ignore_task=asyncio.current_task()):
-        raise TransientAdmissionWait(409, codex_auth.HANDOFF_MESSAGE)
+        raise codex_login_handoff_wait(manager, session_id)
     schedule_codex_manager_drain()
 
 
@@ -54436,6 +54485,11 @@ async def drain_retired_codex_managers() -> None:
         for manager in tuple(CODEX_RETIRED_APP_SERVER_MANAGERS):
             for session_id, owner in tuple(CODEX_SESSION_APP_SERVER_MANAGERS.items()):
                 if owner is not manager or codex_manager_session_busy(manager, session_id):
+                    continue
+                # Failed metadata RPCs can emit status callbacks themselves.
+                # Those callbacks must not trigger an endless self-retry.
+                # A user's next send always retries the proof in preflight.
+                if getattr(manager, "_agentsdock_handoff_reasons", {}).get(session_id) in {"thread_list_unavailable", "goal_state_unavailable", "terminal_state_unavailable", "ownership_deadline"}:
                     continue
                 lock = session_lifecycle_lock(session_id)
                 if lock.locked():
@@ -54579,7 +54633,7 @@ async def codex_app_server_manager(sess: dict[str, Any] | None = None, *, allow_
             if (getattr(manager, "_agentsdock_login_superseded", False) is True and not allow_retired_login
                     and getattr(manager, "_agentsdock_callers", {}).get(asyncio.current_task()) != session_id):
                 schedule_codex_manager_drain()
-                raise TransientAdmissionWait(409, codex_auth.HANDOFF_MESSAGE)
+                raise codex_login_handoff_wait(manager, session_id)
             if session_id:
                 CODEX_SESSION_APP_SERVER_MANAGERS[session_id] = manager
             retain_codex_manager_caller(manager, session_id)
@@ -73493,7 +73547,7 @@ def scheduled_job_lifecycle_admission_defer_reason(
     """
 
     if isinstance(error, TransientAdmissionWait):
-        return str(error.detail or "").strip() or "turn admission deferred"
+        return str(error.detail.get("message", "") if isinstance(error.detail, dict) else error.detail or "").strip() or "turn admission deferred"
     if not isinstance(error, HTTPException) or error.status_code != 503:
         return None
     reason = str(error.detail or "").strip()
@@ -82197,15 +82251,16 @@ async def release_codex_provider_writers(manager: CodexAppServerManager, session
         try:
             await manager.request("thread/unarchive", {"threadId": thread_id})
         except CodexAppServerRequestError:
-            if thread_id == parent_id:
-                raise
+            # A lost restore response can leave the parent marker after the
+            # native rollout is already restored. Recover it idempotently too.
             # Older versions archived the parent, then tried to archive each
             # already-archived child. Their finally block restored the child
             # but left its marker. Require native relationship, terminal turn
             # and existing unarchived rollout proof before clearing it.
-            descendants = await manager.list_descendant_threads(parent_id)
-            if not any(isinstance(child, dict) and child.get("id") == thread_id for child in descendants):
-                raise
+            if thread_id != parent_id:
+                descendants = await manager.list_descendant_threads(parent_id)
+                if not any(isinstance(child, dict) and child.get("id") == thread_id for child in descendants):
+                    raise
             child = await manager.read_thread(thread_id)
             turns = await manager.list_turns(thread_id, limit=1, items_view="summary", sort_direction="desc")
             path = Path(str(child.get("path") or ""))
@@ -85704,7 +85759,7 @@ async def host_diagnostics(limit: int = 40) -> dict[str, Any]:
 async def runtime_catalog(refresh: bool = False) -> dict[str, Any]:
     if refresh:
         await refresh_codex_app_server_binary(force=True)
-        await refresh_codex_app_server_login(request_handoff=True)
+        await refresh_codex_app_server_login()
     return await asyncio.to_thread(discover_runtime_catalog, force_runtime_probe=refresh)
 
 
@@ -86139,6 +86194,29 @@ async def get_session_subagents(
                 concise_error_message(exc),
             )
     return await asyncio.to_thread(build_subagent_snapshot, session_id, limit)
+
+
+def find_timeline_event_anchor(session_id: str, event_id: str) -> dict[str, Any] | None:
+    """Resolve a persisted pin by identity, independent of FTS text/index lag."""
+    for event in iter_session_events(session_id):
+        if event.get("id") != event_id:
+            continue
+        if str(event.get("session_id") or session_id) != session_id:
+            return None
+        seq = event.get("seq")
+        if type(seq) is not int or seq <= 0:
+            return None
+        return {"session_id": session_id, "event_id": event_id, "seq": seq,
+                "ts": event.get("ts", ""), "role": "system", "snippet": ""}
+    return None
+
+
+@app.get("/api/sessions/{session_id}/timeline-event/{event_id}")
+async def get_timeline_event_anchor(session_id: str, event_id: str) -> dict[str, Any]:
+    if session_id not in STORE.sessions:
+        raise HTTPException(status_code=404, detail="session not found")
+    anchor = await asyncio.to_thread(find_timeline_event_anchor, session_id, event_id)
+    return {"event": anchor}
 
 
 @app.get("/api/sessions/{session_id}/search")
@@ -87272,6 +87350,8 @@ async def reload_session_provider(session_id: str) -> dict[str, Any]:
                                 ),
                             )
                         await release_codex_provider_writers(manager, session_id, [provider_id])
+                if codex_provider.session_choice(session.get("codex_provider")) != "custom":
+                    await refresh_codex_app_server_login(request_handoff=True)
                 runtime = await codex_runtime_snapshot(session_id)
 
             latest_session = STORE.sessions.get(session_id) or session

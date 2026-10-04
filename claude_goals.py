@@ -138,13 +138,19 @@ class ClaudeGoalProjection:
     def consume(self, event: Any) -> bool:
         """Fold one native JSONL record; return whether visible goal changed."""
         if not isinstance(event, dict) or (
-            event.get("type") != "attachment"
+            event.get("type") not in {"attachment", "system"}
             or event.get("sessionId") != self.provider_session_id
             or event.get("isSidechain") is not False
         ):
             return False
         attachment = event.get("attachment")
-        if not isinstance(attachment, dict) or attachment.get("type") != "goal_status":
+        content = event.get("content")
+        stopped = (event.get("type") == "system" and event.get("subtype") == "informational"
+                   and event.get("level") == "warning" and isinstance(content, str)
+                   and re.match(r"\AA hook blocked the turn from ending [0-9]+ consecutive times [—-] overriding and ending turn\.", content))
+        if stopped:
+            attachment = {"type": "goal_status", "condition": (self.goal or {}).get("condition"), "met": False}
+        elif not isinstance(attachment, dict) or attachment.get("type") != "goal_status":
             return False
         event_id = event.get("uuid")
         if not isinstance(event_id, str) or len(event_id) != 36:
@@ -175,10 +181,16 @@ class ClaudeGoalProjection:
                 return False
             goal = dict(previous)
             goal["status"] = "cleared" if sentinel else "achieved" if met else "active"
+            if stopped:
+                goal["execution_stop_reason"] = "continuation_limit"
+                goal["execution_stopped_at"] = timestamp
+            else:
+                goal.pop("execution_stop_reason", None)
+                goal.pop("execution_stopped_at", None)
             if sentinel:
                 for field in ("iterations", "duration_ms", "tokens"):
                     goal.pop(field, None)
-            if not sentinel:
+            if not sentinel and not stopped:
                 reason = attachment.get("reason")
                 if isinstance(reason, str) and reason:
                     goal["last_reason"] = reason[:8192]
@@ -233,7 +245,7 @@ class ClaudeGoalProjection:
             if self._discard_line:
                 self._discard_line = False
                 continue
-            if len(line) > MAX_GOAL_RECORD_BYTES or b'"goal_status"' not in line:
+            if len(line) > MAX_GOAL_RECORD_BYTES or not (b'"goal_status"' in line or b"A hook blocked the turn from ending" in line):
                 continue
             try:
                 self.consume(json.loads(line))

@@ -71,11 +71,39 @@ class CodexNativeHistoryRepairTests(unittest.TestCase):
             provider_user_authored=True, provider_turn_id="turn-1")
         self.fixture()
 
+    def filter_with_source(self, items, checkpoint=None):
+        if checkpoint is None:
+            checkpoint = next(json.loads(line)["_history_sync_checkpoint"]
+                for line in self.events.read_text().splitlines() if json.loads(line).get("type") == "history_imported")
+        return filter_native_codex_history_items("chat", PROVIDER, self.events, items,
+            source_path=self.source, root=self.root, sync_checkpoint=checkpoint, parse_item=self.parse)
+
+    def test_repeated_goal_followup_across_checkpoints_stays_visible(self):
+        self.goal_steer_fixture()
+        previous = self.source.read_bytes()
+        self.raw.append({**self.raw[0], "timestamp": "2026-09-11T12:01:30.000Z",
+            "payload": {**self.raw[0]["payload"], "id": "later-identical-user-item"}})
+        self.fixture()
+        checkpoint = next(json.loads(line)["_history_sync_checkpoint"]
+            for line in self.events.read_text().splitlines() if json.loads(line).get("type") == "history_imported")
+        checkpoint.update(previous_present=True, previous_source_offset=len(previous),
+            previous_source_digest=hashlib.sha256(previous).hexdigest())
+        self.assertEqual(self.source.read_bytes()[:len(previous)], previous)
+        # Only the new occurrence reaches this delta; the first equal input
+        # is before the committed checkpoint, in the same native turn.
+        item = self.parse(self.raw[-1])
+        self.assertEqual(self.filter_with_source([item], checkpoint), [item])
+
+    def test_goal_followup_without_source_occurrence_proof_stays_visible(self):
+        self.goal_steer_fixture()
+        item = self.parse(self.raw[0])
+        self.assertEqual(filter_native_codex_history_items("chat", PROVIDER, self.events, [item]), [item])
+
     def test_goal_followup_replay_is_hidden_before_import_and_on_history_read(self):
         self.goal_steer_fixture()
         before = self.events.read_bytes(), self.source.read_bytes()
         items = [self.parse(row) for row in self.raw]
-        filtered = filter_native_codex_history_items("chat", PROVIDER, self.events, items)
+        filtered = self.filter_with_source(items)
         self.assertEqual(filtered[0]["text"], "")
         self.assertEqual(filtered[0]["provider_origin"]["native_event_id"], "native-input-1")
         self.prepare()
@@ -94,8 +122,7 @@ class CodexNativeHistoryRepairTests(unittest.TestCase):
                 self.cache = CodexNativeHistoryRepairCache()
                 self.prepare()
                 self.assertIsNone(self.cache.project_event("chat", self.imports[0]))
-                result = filter_native_codex_history_items("chat", PROVIDER, self.events,
-                    [self.parse(row) for row in self.raw])
+                result = self.filter_with_source([self.parse(row) for row in self.raw])
                 self.assertEqual(result[0]["text"], "Genuine human request")
 
     def test_same_goal_followup_text_in_another_turn_stays_visible(self):
@@ -107,8 +134,7 @@ class CodexNativeHistoryRepairTests(unittest.TestCase):
             event["run_id"] = "native-1"
         self.fixture(); self.prepare()
         self.assertIsNone(self.cache.project_event("chat", self.imports[2]))
-        result = filter_native_codex_history_items("chat", PROVIDER, self.events,
-            [self.parse(row) for row in self.raw])
+        result = self.filter_with_source([self.parse(row) for row in self.raw])
         self.assertEqual(result[0]["text"], "")
         self.assertEqual(result[1]["text"], "Genuine human request")
 
@@ -119,8 +145,7 @@ class CodexNativeHistoryRepairTests(unittest.TestCase):
         self.fixture(); self.prepare()
         self.assertIsNone(self.cache.project_event("chat", self.imports[0]))
         self.assertIsNone(self.cache.project_event("chat", self.imports[-1]))
-        result = filter_native_codex_history_items("chat", PROVIDER, self.events,
-            [self.parse(row) for row in self.raw])
+        result = self.filter_with_source([self.parse(row) for row in self.raw])
         self.assertEqual([item["text"] for item in result].count("Genuine human request"), 2)
 
     def test_goal_followup_only_import_recovers_earlier_turn_from_public_item(self):

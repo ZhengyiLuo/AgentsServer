@@ -162,3 +162,7 @@ scan can recover earlier turn ownership from already-delivered public assistant
 item identities even when the import contains only user messages and the final
 run receipt names a later turn. Distinct source occurrences with the same text
 remain visible when their identity is ambiguous. Original events stay intact.
+Forward steer suppression always uses the verified source prefix, including
+records before the previous checkpoint. Uniqueness in the current delta alone
+cannot prove that a later equal user message is a replay. Without source
+occurrence proof, the message remains visible.

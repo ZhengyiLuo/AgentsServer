@@ -1376,12 +1376,6 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
                 and isinstance(origin, dict)):
                 key = (origin.get("turn_id"), _text_key(item["text"]))
                 wake_source_ids.setdefault(key, set()).add(origin.get("event_id"))
-        steer_source_ids = {}
-        for item in items if steered_inputs else ():
-            origin = item.get("provider_origin")
-            if item.get("kind") == "user" and isinstance(origin, dict) and isinstance(item.get("text"), str):
-                key = (origin.get("turn_id"), _text_key(item["text"]))
-                steer_source_ids.setdefault(key, set()).add(origin.get("event_id"))
         result = []
         for index, item in enumerate(items):
             budget.check()
@@ -1392,10 +1386,10 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
                      and origin.get("session_id", provider_id) == provider_id and len(runs) == 1
                      and item.get("source_text_sha256") is None and isinstance(item.get("text"), str))
             known = owned and (item["kind"], _text_key(item["text"])) in native.get(next(iter(runs)), {})
-            steer_id = None
-            if owned and item["kind"] == "user" and len(steer_source_ids.get((origin.get("turn_id"), _text_key(item["text"])), ())) == 1:
-                steer_id = steered_inputs.get((next(iter(runs)), origin.get("turn_id")), {}).get(("user", _text_key(item["text"])))
-                known = known or steer_id is not None
+            # Steers never use delta-local text equality as proof. An equal
+            # source item can precede this delta's checkpoint in the same
+            # native turn. Only the full verified prefix can establish that
+            # this source occurrence is the already-shown follow-up.
             # This proof already established exact source bytes, native owner,
             # original event and checkpoint even when the display is trimmed.
             delivery = delivery_proofs.get(index)
@@ -1415,7 +1409,7 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
                 result.append({**item, "text": "", "metadata_only": True,
                     "provider_history_repair": "source_proven_native_replay",
                     "provider_origin": {**origin, "session_id": provider_id,
-                        "native_event_id": delivery["native_event_id"] if delivery else steer_id or native[next(iter(runs))][key],
+                        "native_event_id": delivery["native_event_id"] if delivery else native[next(iter(runs))][key],
                         "source_text_sha256": delivery["source_text_sha256"] if delivery else key[1]}})
         budget.check()
         return result

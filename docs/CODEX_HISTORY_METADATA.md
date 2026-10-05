@@ -148,3 +148,17 @@ turns, forged hashes and missing checkpoints retain the message. This path
 supports plain user-message records and single-text-block user response items;
 it does not infer equality for other truncated content shapes. Original events
 and provider transcripts remain unchanged.
+
+## Accepted goal follow-ups
+
+Codex goal follow-ups are recorded as `turn_steered`, rather than a new
+`turn_started`. Their accepted native-goal, native-steer and user-authored
+markers identify an existing public input. Native replay reconciliation keeps
+their exact provider turn alongside the input hash; a logical goal run alone
+cannot identify a follow-up because it can span multiple native turns.
+
+Forward import and read-time repair both recognize these inputs. A checkpoint
+scan can recover earlier turn ownership from already-delivered public assistant
+item identities even when the import contains only user messages and the final
+run receipt names a later turn. Distinct source occurrences with the same text
+remain visible when their identity is ambiguous. Original events stay intact.

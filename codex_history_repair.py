@@ -202,8 +202,24 @@ def _native_records(path: Path, expected: tuple[int, int, int, int], budget: _Na
 
 def _native_event_identity(event: dict) -> dict:
     """Keep bounded public identity, never retain tool bodies or message text."""
-    return {key: event[key] for key in ("id", "seq", "type", "phase", "item_id", "provider_thread_id")
+    return {key: event[key] for key in ("id", "seq", "type", "phase", "item_id", "provider_thread_id", "provider_turn_id")
             if key in event and (type(event[key]) is int or isinstance(event[key], str) and len(event[key]) <= 256)}
+
+
+def _native_goal_steer_turn(event: dict) -> str | None:
+    """Accepted goal follow-ups already have a user bubble in this chat.
+
+    Keep their exact native turn: one goal run can span many provider turns,
+    including later genuine messages with identical text.
+    """
+    turn = event.get("provider_turn_id")
+    if (event.get("type") == "turn_steered" and event.get("backend") == "codex"
+        and event.get("purpose") == "codex_goal_resume"
+        and event.get("native_goal_steer") is True and event.get("native_steer") is True
+        and event.get("provider_user_authored") is True
+        and isinstance(turn, str) and 0 < len(turn) <= 256):
+        return turn
+    return None
 
 
 def _native_import_batch(event: dict) -> dict:
@@ -859,7 +875,7 @@ def _prove_native_replays(session_id: str, provider_id: str, events: Path, sourc
                         owned = owners.setdefault((thread, turn), set())
                         retained += run not in owned
                         owned.add(run)
-            kind = "user" if event.get("type") == "turn_started" else "assistant" if event.get("type") in ("assistant_text", "reasoning_summary", "turn_finished") else None
+            kind = "user" if event.get("type") == "turn_started" or _native_goal_steer_turn(event) else "assistant" if event.get("type") in ("assistant_text", "reasoning_summary", "turn_finished") else None
             body = event.get("prompt") if kind == "user" else event.get("result_text") if event.get("type") == "turn_finished" else event.get("text")
             if kind and isinstance(body, str) and body and len(body) <= 4 * 1024 * 1024:
                 native.setdefault((run, kind, _text_key(body)), []).append(_native_event_identity(event))
@@ -1104,7 +1120,8 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
             continue
         native_run = next(iter(owned_runs))
         native_body_key = full_user_keys.get(key, body_key)
-        native_matches = native.get((native_run, kind, native_body_key), [])
+        native_matches = [event for event in native.get((native_run, kind, native_body_key), [])
+                          if event.get("type") != "turn_steered" or event.get("provider_turn_id") == key[0]]
         if not native_matches and kind == "user" and source_hash is None:
             delivery = deliveries.match(session_id, thread, native_run, source_origin,
                                         delivery_bodies.get(key), delivery_source_ids.get(key[0], set()), body_key)
@@ -1212,6 +1229,8 @@ def _prove_pending_native_inputs(session_id: str, provider_id: str, items: list[
         raise _Unproven()
     run = "import_pending_native_delivery_proof"
     candidates, indexes = [], {}
+    steer_keys = {key[2] for key, events in (native_inputs or {}).items()
+                  if key[1] == "user" and any(event.get("type") == "turn_steered" for event in events)}
     for index, item in enumerate(items):
         budget.check()
         origin = item.get("provider_origin")
@@ -1219,7 +1238,8 @@ def _prove_pending_native_inputs(session_id: str, provider_id: str, items: list[
             or not isinstance(origin, dict) or origin.get("provider") != "codex" or origin.get("kind") != "user"
             or origin.get("session_id", provider_id) != provider_id
             or not (item.get("source_text_sha256") is not None
-                    or _async_delivery_body(item["text"]) or _text_key(item["text"]) in deliveries.status_body_keys)):
+                    or _async_delivery_body(item["text"]) or _text_key(item["text"]) in deliveries.status_body_keys
+                    or _text_key(item["text"]) in steer_keys)):
             continue
         candidate = _replay_target({"seq": previous_seq + index + 2, "id": f"pending:{index}", "run_id": run,
             "type": "turn_started", "backend": "codex", "imported": True, "prompt": item["text"],
@@ -1267,7 +1287,7 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
         budget = _NativeReadBudget(cancelled, deadline)
         stamp = _native_stamp(events)
         owners, native, assistant_items, wake_keys, native_count = {}, {}, {}, set(), 0
-        native_inputs = {}
+        native_inputs, steered_inputs = {}, {}
         deliveries = _AsyncDeliveryIndex()
         prove_deliveries = (source_path is not None and root is not None
             and isinstance(sync_checkpoint, dict) and callable(parse_item)
@@ -1293,17 +1313,22 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
                     owned = owners.setdefault(turn_id, set())
                     owner_count += run not in owned
                     owned.add(run)
-            kind = "user" if event.get("type") == "turn_started" else "assistant" if event.get("type") in ("assistant_text", "reasoning_summary", "turn_finished") else None
+            steer_turn = _native_goal_steer_turn(event)
+            kind = "user" if event.get("type") == "turn_started" or steer_turn else "assistant" if event.get("type") in ("assistant_text", "reasoning_summary", "turn_finished") else None
             body = event.get("prompt") if kind == "user" else event.get("result_text") if event.get("type") == "turn_finished" else event.get("text")
             wake_hash = _native_mailbox_wake_hash(event) if kind == "user" else None
             if kind and (isinstance(body, str) and body or wake_hash):
-                keys = native.setdefault(run, {})
+                keys = steered_inputs.setdefault((run, steer_turn), {}) if steer_turn else native.setdefault(run, {})
                 key = (kind, wake_hash or _text_key(body))
                 native_count += key not in keys
                 if isinstance(event.get("id"), str) and 0 < len(event["id"]) <= 256:
                     keys.setdefault(key, event["id"])
                     if prove_deliveries and kind == "user" and isinstance(body, str) and body:
-                        native_inputs.setdefault((run, kind, key[1]), [_native_event_identity(event)])
+                        inputs = native_inputs.setdefault((run, kind, key[1]), [])
+                        if not any(prior.get("type") == event.get("type")
+                                   and prior.get("provider_turn_id") == event.get("provider_turn_id") for prior in inputs):
+                            inputs.append(_native_event_identity(event))
+                            native_count += 1
                     if wake_hash:
                         wake_keys.add((run, wake_hash))
                     item_id = _public_assistant_item_id(event)
@@ -1330,10 +1355,16 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
         for item_key, turns in assistant_source_turns.items():
             if len(turns) == 1:
                 owners.setdefault(next(iter(turns)), set()).update(assistant_item_owners[item_key])
+        if prove_deliveries and steered_inputs:
+            # The unmatched import can contain only follow-ups: its assistant
+            # messages were already reconciled. Preserve public item identities
+            # for the source scan to recover earlier turns of a long goal run.
+            for (run, _item_id, body_key), event in assistant_items.items():
+                native_inputs.setdefault((run, "assistant", body_key), []).append(event)
         delivery_proofs = _prove_pending_native_inputs(
             session_id, provider_id, items, source_path, root, sync_checkpoint, parse_item,
             previous_seq, owners, deliveries, budget, native_inputs,
-        ) if prove_deliveries and (deliveries.starts or any(
+        ) if prove_deliveries and (deliveries.starts or steered_inputs or any(
             item.get("kind") == "user" and item.get("source_text_sha256") is not None for item in items)) else {}
         # A hidden wake has no public prompt body. Require a single exact source
         # item in this verified import range, in addition to native turn ownership.
@@ -1345,6 +1376,12 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
                 and isinstance(origin, dict)):
                 key = (origin.get("turn_id"), _text_key(item["text"]))
                 wake_source_ids.setdefault(key, set()).add(origin.get("event_id"))
+        steer_source_ids = {}
+        for item in items if steered_inputs else ():
+            origin = item.get("provider_origin")
+            if item.get("kind") == "user" and isinstance(origin, dict) and isinstance(item.get("text"), str):
+                key = (origin.get("turn_id"), _text_key(item["text"]))
+                steer_source_ids.setdefault(key, set()).add(origin.get("event_id"))
         result = []
         for index, item in enumerate(items):
             budget.check()
@@ -1355,11 +1392,15 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
                      and origin.get("session_id", provider_id) == provider_id and len(runs) == 1
                      and item.get("source_text_sha256") is None and isinstance(item.get("text"), str))
             known = owned and (item["kind"], _text_key(item["text"])) in native.get(next(iter(runs)), {})
+            steer_id = None
+            if owned and item["kind"] == "user" and len(steer_source_ids.get((origin.get("turn_id"), _text_key(item["text"])), ())) == 1:
+                steer_id = steered_inputs.get((next(iter(runs)), origin.get("turn_id")), {}).get(("user", _text_key(item["text"])))
+                known = known or steer_id is not None
             # This proof already established exact source bytes, native owner,
             # original event and checkpoint even when the display is trimmed.
             delivery = delivery_proofs.get(index)
             known = known or delivery is not None
-            if known and (next(iter(runs)), _text_key(item["text"])) in wake_keys:
+            if known and runs and (next(iter(runs)), _text_key(item["text"])) in wake_keys:
                 known = (bool(origin.get("event_id")) and bool(origin.get("timestamp"))
                          and len(wake_source_ids.get((origin.get("turn_id"), _text_key(item["text"])), set())) == 1)
             if owned and not known and item["kind"] == "assistant":
@@ -1374,7 +1415,7 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
                 result.append({**item, "text": "", "metadata_only": True,
                     "provider_history_repair": "source_proven_native_replay",
                     "provider_origin": {**origin, "session_id": provider_id,
-                        "native_event_id": delivery["native_event_id"] if delivery else native[next(iter(runs))][key],
+                        "native_event_id": delivery["native_event_id"] if delivery else steer_id or native[next(iter(runs))][key],
                         "source_text_sha256": delivery["source_text_sha256"] if delivery else key[1]}})
         budget.check()
         return result

@@ -156,6 +156,11 @@ def opencode_error_message(error: Any) -> str:
     if not message:
         message = str(error.get("message") or "")
     name = str(error.get("name") or "")
+    status = data.get("statusCode") if isinstance(data, dict) else None
+    if type(status) is int and 100 <= status <= 599:
+        # Preserve useful HTTP diagnostics without exposing request headers,
+        # gateway response bodies or URLs that may contain credentials.
+        name = f"{name} (HTTP {status})" if name else f"HTTP {status}"
     if message and name:
         return f"{name}: {message}"
     return message or name

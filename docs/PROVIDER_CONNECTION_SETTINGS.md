@@ -54,11 +54,47 @@ URL, exact model ID and authentication header instead of guessing these.
 A default connection check uses a read-only authenticated route: OpenRouter's
 private `/api/v1/key`, or a protected model catalog for other APIs. A public
 model list alone never produces a verified state. If a gateway cannot check
-keys this way, Claude/OpenCode offer an explicit model request through Advanced.
+keys this way, Claude/OpenCode offer an explicit model request via Model ID.
 A successful check does **not** establish native agent login, tool use,
 streaming, reasoning, context continuity or full runtime compatibility.
 The UI labels this **Connected**, not “logged in”; it records the last explicit
 check, not continuous verification.
+
+Desktop configuration shows URL, protocol and authentication as separate fields,
+with required/optional labels. Provider-fixed protocols remain read-only. Known
+public OpenCode Zen catalogs require a model ID for connection verification;
+other gateways can first try the read-only check. A URL alone does not identify
+which protocol a particular model supports.
+
+Non-secret drafts (URL, protocol, authentication choice and model ID) are kept
+locally per server connection and provider, including failed/cancelled attempts.
+Codex also remembers its endpoint URL. Returning to settings does not reconnect
+or mark a draft verified. API keys and URLs containing credentials, query strings
+or fragments are not persisted in drafts. Keys are still cleared after checks
+and when leaving the form. Draft writes are debounced and flushed on close.
+
+For Anthropic protocol, a root URL or a URL ending in `/v1` resolves to the
+same `/v1/messages` API for model checks and OpenCode runs. Gateway path prefixes
+are retained (for example, `/proxy/anthropic` becomes `/proxy/anthropic/v1`).
+Claude Code still receives the root URL expected by its own SDK. This does not
+rewrite stored URLs, credential identities or chat bindings; OpenAI-compatible
+protocols continue to use the exact API prefix supplied by the user.
+
+An OpenCode step with an unknown/invalid completion reason is a failed response,
+not a successful turn. The server stops that process to bound repeated requests
+and suggests checking the URL, protocol and streaming support. This can happen
+when a gateway returns an HTML page with HTTP 200; the CLI does not always expose
+the response content type, so the error does not claim HTML was confirmed.
+Provider error events retain an available HTTP status, without dumping headers
+or raw response bodies. Partial assistant text stays in the timeline.
+
+One custom connection still has one protocol. Explicit Claude/OpenCode model
+checks allow up to 256 output tokens, including reasoning, with no automatic
+retry. Empty or reasoning-only responses still cannot verify a connection;
+models requiring more reasoning may still exhaust this bounded check. Checks
+do not establish the runtime model's output/context limits. This fix does not
+add per-model protocols or override OpenCode's token limits.
+
 Checks happen only on explicit user actions. Optional model checks can incur
 a small charge; default read-only checks do not run inference. Checks
 send neither conversation history nor tools. Rechecking failure removes the

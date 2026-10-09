@@ -67519,8 +67519,8 @@ async def run_opencode_process(
       - The workspace is explicitly passed as ``--dir`` as well as cwd.
       - There is no init event. Every event already carries the sessionID, so
         the session is considered started at the first event of any kind.
-      - The turn ends at a ``step_finish`` whose reason is not ``tool-calls``;
-        there is no separate terminal result event.
+      - An explicit completion ``step_finish`` ends the turn; ``tool-calls``
+        continues it and invalid/unknown finishes fail closed.
       - Usage is reported per step and must be accumulated, not overwritten.
     """
     from opencode_agent_client import (
@@ -68429,10 +68429,24 @@ async def run_opencode_process(
                     opencode_usage,
                     normalized.get("usage") or {},
                 )
-                # A turn is a sequence of steps. "tool-calls" means another
-                # step follows; anything else ends the turn, and there is no
-                # separate terminal result event to wait for.
-                if str(normalized.get("reason") or "") != "tool-calls":
+                # Only explicit completion reasons end a turn. In particular,
+                # HTML-200/empty streams can yield "unknown" while the CLI
+                # immediately requests another step; waiting for exit lets it
+                # loop and hides the invalid response behind a cleanup error.
+                finish_reason = str(normalized.get("reason") or "")
+                if finish_reason not in {"tool-calls", "stop", "length", "content-filter"}:
+                    stream_error = (
+                        "OpenCode did not receive a valid completion from the "
+                        "model API. Check the endpoint URL, selected protocol "
+                        "and streaming support. The run was stopped to prevent "
+                        "repeated requests."
+                    )
+                    await terminate_process_tree(
+                        proc,
+                        grace=OPENCODE_GUARD_TEARDOWN_GRACE_SECONDS,
+                    )
+                    break
+                if finish_reason != "tool-calls":
                     await flush_opencode_reasoning()
                     terminal_event_seen = True
                     try:

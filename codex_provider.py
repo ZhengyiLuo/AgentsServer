@@ -814,6 +814,17 @@ def safe_model_label(label, model):
     return label.strip() if isinstance(label, str) and label.strip() and len(label) <= 160 and all(ord(c) >= 32 and ord(c) != 127 for c in label) else model
 
 
+def endpoint_api_base_url(base: str, protocol: str) -> str:
+    """Resolve the API prefix, retaining the gateway's path and saved identity.
+
+    Anthropic settings accept either a root or its /v1 API prefix. AI SDK
+    adapters append /messages, unlike Claude Code which appends /v1/messages.
+    OpenAI-compatible settings already specify their complete API prefix.
+    """
+    base = base.rstrip("/")
+    return base + "/v1" if protocol == "anthropic" and not base.endswith("/v1") else base
+
+
 def endpoint_model_catalog(selected: dict, *, protocol="responses") -> dict:
     """Read only this endpoint's inventory. Never use CLI models or infer a default.
 
@@ -823,8 +834,7 @@ def endpoint_model_catalog(selected: dict, *, protocol="responses") -> dict:
     base = selected["base_url"].rstrip("/")
     parsed = urlsplit(base)
     router = parsed.scheme == "https" and parsed.netloc in {"openrouter.ai", "eu.openrouter.ai"} and parsed.path in {"/api", "/api/v1"}
-    target = (base.removesuffix("/v1") + "/v1/models/user") if router else base + (
-        "/v1/models" if protocol == "anthropic" and not base.endswith("/v1") else "/models")
+    target = (base.removesuffix("/v1") + "/v1/models/user") if router else endpoint_api_base_url(base, protocol) + "/models"
     headers = {"Accept": "application/json", "anthropic-version": "2023-06-01"}
     header = selected.get("auth_header", "bearer")
     headers["x-api-key" if header == "x-api-key" else "Authorization"] = selected["api_key"] if header == "x-api-key" else "Bearer " + selected["api_key"]

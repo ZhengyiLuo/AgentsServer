@@ -159,6 +159,26 @@ class RuntimeBindingTests(unittest.TestCase):
         with self.assertRaisesRegex(HTTPException, "Choose a model"):
             self.store.claude_overrides(chat)
 
+    def test_opencode_openai_adapters_do_not_gain_an_anthropic_prefix(self):
+        for protocol, adapter in (("responses", "@ai-sdk/openai"), ("chat_completions", "@ai-sdk/openai-compatible")):
+            with self.subTest(protocol=protocol), tempfile.TemporaryDirectory() as directory:
+                store = connections.ConnectionStore(Path(directory) / "private")
+                store.write("opencode", 0, {**self.input, "protocol": protocol}, "verified")
+                chat = {"backend": "opencode", "provider_connection": "custom"}
+                chat["provider_connection_revision"] = store.bind(chat)["credential_id"]
+                env = store.opencode_overrides(chat, {})
+                provider = json.loads(env["OPENCODE_CONFIG_CONTENT"])["provider"]["agentsdock_custom"]
+                self.assertEqual(provider["options"]["baseURL"], self.input["base_url"])
+                self.assertEqual(provider["npm"], adapter)
+
+    def test_claude_still_receives_root_while_opencode_receives_api_prefix(self):
+        self.input["base_url"] += "/v1"
+        claude = self.chat("claude")
+        opencode = self.chat("opencode")
+        self.assertEqual(self.store.claude_overrides(claude)[0]["ANTHROPIC_BASE_URL"], "https://gateway.invalid/api")
+        env = self.store.opencode_overrides(opencode, {})
+        self.assertEqual(json.loads(env["OPENCODE_CONFIG_CONTENT"])["provider"]["agentsdock_custom"]["options"]["baseURL"], self.input["base_url"])
+
     def test_public_catalog_has_no_keys_and_session_projection_never_networks(self):
         chat = self.chat()
         with patch.object(connections, "discover_models", return_value=[{"value": "catalog/model", "label": "catalog/model"}]) as discover:

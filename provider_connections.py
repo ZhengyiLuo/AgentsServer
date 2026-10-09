@@ -22,9 +22,12 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from codex_provider import validate_selection, validate_model, endpoint_model_catalog
+from codex_provider import validate_selection, validate_model, endpoint_model_catalog, endpoint_api_base_url
 
 MAX_BODY_BYTES = 16 * 1024
+# Reasoning can consume output tokens before the short visible check answer.
+# Keep this explicit probe bounded and single-shot, including for such models.
+MODEL_CHECK_MAX_OUTPUT_TOKENS = 256
 PROTOCOLS = {"claude": {"anthropic"}, "opencode": {"anthropic", "chat_completions", "responses"}, "cursor": {"cursor"}}
 RESULTS = {"verified", "authentication_failed", "rate_limited", "unsupported", "connection_failed", "invalid_response", "model_required", "cli_update_required"}
 
@@ -277,7 +280,7 @@ class ConnectionStore:
         model = require_model(value)
         config = json.loads(env.get("OPENCODE_CONFIG_CONTENT") or "{}")
         adapter = {"anthropic": "@ai-sdk/anthropic", "chat_completions": "@ai-sdk/openai-compatible", "responses": "@ai-sdk/openai"}[value["protocol"]]
-        options = {"baseURL": value["base_url"], "apiKey": "{env:AGENTSDOCK_CUSTOM_API_KEY}"}
+        options = {"baseURL": endpoint_api_base_url(value["base_url"], value["protocol"]), "apiKey": "{env:AGENTSDOCK_CUSTOM_API_KEY}"}
         if value["protocol"] == "anthropic" and value["auth_header"] == "bearer":
             options["headers"] = {"Authorization": "Bearer {env:AGENTSDOCK_CUSTOM_API_KEY}", "x-api-key": ""}
         config.setdefault("provider", {})["agentsdock_custom"] = {"npm": adapter, "name": "Custom endpoint", "options": options, "models": {model: {"name": model}}}
@@ -361,8 +364,7 @@ async def probe_credentials(selected: dict) -> str:
         headers["Authorization"] = "Bearer " + selected["api_key"]
     url = urlsplit(base)
     router = url.scheme == "https" and url.netloc == "openrouter.ai" and url.path in {"/api", "/api/v1"}
-    target = "https://openrouter.ai/api/v1/key" if router else base + (
-        "/v1/models" if protocol == "anthropic" and not base.endswith("/v1") else "/models")
+    target = "https://openrouter.ai/api/v1/key" if router else endpoint_api_base_url(base, protocol) + "/models"
     async def send():
         async with httpx.AsyncClient(timeout=10, follow_redirects=False, trust_env=False) as client:
             async with client.stream("GET", target, headers=headers) as response:
@@ -403,18 +405,18 @@ async def probe(selected: dict) -> str:
         headers["x-api-key"] = selected["api_key"]
     else:
         headers["Authorization"] = "Bearer " + selected["api_key"]
-    base = selected["base_url"]
+    base = endpoint_api_base_url(selected["base_url"], protocol)
     prompt = "Connection check. Reply with OK only."
     if protocol == "anthropic":
-        suffix = "/messages" if base.endswith("/v1") else "/v1/messages"
+        suffix = "/messages"
         headers["anthropic-version"] = "2023-06-01"
-        body = {"model": selected["model"], "max_tokens": 32, "messages": [{"role": "user", "content": prompt}]}
+        body = {"model": selected["model"], "max_tokens": MODEL_CHECK_MAX_OUTPUT_TOKENS, "messages": [{"role": "user", "content": prompt}]}
     elif protocol == "responses":
         suffix = "/responses"
-        body = {"model": selected["model"], "max_output_tokens": 64, "input": prompt, "store": False}
+        body = {"model": selected["model"], "max_output_tokens": MODEL_CHECK_MAX_OUTPUT_TOKENS, "input": prompt, "store": False}
     else:
         suffix = "/chat/completions"
-        body = {"model": selected["model"], "max_tokens": 32, "messages": [{"role": "user", "content": prompt}]}
+        body = {"model": selected["model"], "max_tokens": MODEL_CHECK_MAX_OUTPUT_TOKENS, "messages": [{"role": "user", "content": prompt}]}
     async def send():
         async with httpx.AsyncClient(timeout=15, follow_redirects=False, trust_env=False) as client:
             async with client.stream("POST", base + suffix, headers=headers, json=body) as response:
@@ -600,7 +602,11 @@ def create_router(*, authorize, store: ConnectionStore, check=probe, account=nat
                     current = store.read(backend)
                     if current["revision"] != revision(payload["expected_revision"]):
                         raise HTTPException(409, "Endpoint settings changed. Refresh and try again.")
-                    if current.get("last_result") != "verified": raise HTTPException(409, "Check this API connection first.")
+                    if not current.get("configured"):
+                        raise HTTPException(409, "Connect a custom API first.")
+                    # A saved, unverified connection can choose its first model.
+                    # This write does not verify it or make it usable by chats;
+                    # the explicit /check operation must still succeed.
                     value = {key: current[key] for key in ("base_url", "api_key", "protocol", "auth_header")}
                     saved = store.write(backend, current["revision"], {**value, "model": model, "expected_revision": current["revision"]}, current["last_result"], checked_at=current["checked_at"])
                     cached = store.catalog_cache.get((backend, current["revision"]))
@@ -651,7 +657,11 @@ def create_router(*, authorize, store: ConnectionStore, check=probe, account=nat
                     result = "cli_update_required" if discovered.get("cli_update_required") else "verified" if discovered["discovery_status"] == "ready" and discovered["models"] else "connection_failed"
                 else:
                     result = await check(selected)
-                if request.method == "PUT" and result != "verified":
+                # Public catalogs cannot authenticate a key. Keep a private,
+                # explicitly unverified setup so the client can list models
+                # before choosing one for a subsequent explicit check.
+                pending_model = result == "model_required" and not selected.get("model") and backend != "cursor"
+                if request.method == "PUT" and result != "verified" and not pending_model:
                     return reply({"ok": False, "status": result})
                 configuration = await asyncio.to_thread(store.write, backend, expected, selected, result)
                 if backend == "cursor" and result == "verified":

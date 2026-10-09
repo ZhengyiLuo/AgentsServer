@@ -5,6 +5,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { parse, loadRuntime, run } = require('./cli.cjs')
+const { persistentPath } = require('../cli.cjs')
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agentsdock-entry-test-'))
@@ -14,7 +15,7 @@ function fixture(t) {
   for (const name of ['instances.sh', 'install.sh']) fs.writeFileSync(path.join(payload, name), '# fixture\n')
   const calls = [], output = []
   const context = { env: {}, uid: 1000, platform: 'darwin', home: root,
-    print: value => output.push(value), load: () => ({ version: '1.2.3-beta.4', payload,
+    print: value => output.push(value), load: () => ({ version: '1.2.3-beta.4', payload, persistentPath,
       run: async (args, options) => { calls.push({ core: args }); options.print('agentsdock-server install'); return 7 } }),
     spawn: (...args) => { calls.push(args); return { status: 0 } } }
   return { root, payload, calls, output, context }
@@ -39,6 +40,30 @@ test('setup, install, signed update and recovery retain the core CLI without new
     assert.deepEqual(f.calls.at(-1), { core: [command === 'setup' ? 'install' : command, '--dry-run'] })
     assert.equal(f.output.at(-1), 'agentsdock install')
   }
+})
+
+test('explicit setup/recovery and named or legacy helpers cannot persist npm execution paths', async t => {
+  const f = fixture(t)
+  const stable = ['/custom/provider bin', '/home/user/.local/bin', '/usr/bin', '/bin'].join(':')
+  const env = { PATH: '/cache/_npx/0123/node_modules/.bin::./bin:' + stable,
+    npm_config_prefix: '/custom/provider bin', npm_config_cache: '/home/user/.local/bin',
+    npm_config_original_path: '/untrusted/baseline', ORIGINAL_PATH: '/other/baseline',
+    BASH_ENV: '/startup', NODE_OPTIONS: '--bad', AGENTSDOCK_AGENT_TOKEN: 'private-token' }
+  let delegated
+  f.context.load = () => ({ payload: f.payload, persistentPath,
+    run: async (args, options) => { delegated = { args, env: options.env }; return 0 } })
+  for (const command of ['setup', 'install', 'recover']) {
+    assert.equal(await run([command], { ...f.context, env }), 0)
+    assert.deepEqual(delegated.env, { HOME: f.root, PATH: stable })
+    assert.equal(delegated.args[0], command === 'setup' ? 'install' : command)
+  }
+  for (const args of [['new', 'work'], ['restart', 'default'], ['remove', 'work'], ['token', 'work']]) {
+    assert.equal(await run(args, { ...f.context, env }), 0)
+    assert.deepEqual(f.calls.at(-1)[2].env, { HOME: f.root, PATH: stable })
+  }
+  assert.equal(env.BASH_ENV, '/startup')
+  assert.ok(env.PATH.startsWith('/cache/_npx')) // Never mutate caller/process env.
+  assert.doesNotMatch(f.output.join('\n'), /private-token|\/cache|baseline/)
 })
 
 test('bare token opens the chooser; explicit token selects exactly one instance without a prompt', async t => {

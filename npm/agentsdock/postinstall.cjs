@@ -62,6 +62,7 @@ async function postinstall(overrides = {}) {
     } catch (error) { if (error.code !== 'ENOENT') throw error }
   }
   const runtime = context.load()
+  if (Object.hasOwn(context.env, 'PATH')) environment.PATH = runtime.persistentPath(context.env.PATH)
   try {
     runtime.preflight({ ...context, env: environment })
   } catch (error) {

@@ -110,10 +110,11 @@ function loadRuntime(packageRoot = __dirname, resolve = require.resolve) {
     throw new Error('CLI and server payload versions differ. Reinstall the matching agentsdock package.')
   }
   const coreCli = require(path.join(coreRoot, 'npm/cli.cjs'))
-  return { version: own.version, payload, coreRoot, run: coreCli.run, preflight: coreCli.ensureFreshInstall }
+  return { version: own.version, payload, coreRoot, run: coreCli.run, preflight: coreCli.ensureFreshInstall,
+    persistentPath: coreCli.persistentPath }
 }
 
-function localEnvironment(context) {
+function localEnvironment(context, runtime) {
   if (context.uid === 0) throw new Error('Run as the server owner, without sudo.')
   if (!['darwin', 'linux'].includes(context.platform)) throw new Error('Server management requires macOS or Linux.')
   for (const name of ROOT_SELECTORS) {
@@ -121,6 +122,7 @@ function localEnvironment(context) {
   }
   const env = { HOME: context.home }
   for (const key of ENV_KEYS) if (context.env[key]) env[key] = context.env[key]
+  if (runtime && Object.hasOwn(context.env, 'PATH')) env.PATH = runtime.persistentPath(context.env.PATH)
   return env
 }
 
@@ -134,7 +136,9 @@ async function run(argv, overrides = {}) {
   if (request.kind === 'version') { context.print(runtime.version); return 0 }
   if (request.kind === 'core') {
     try {
-      return await runtime.run(request.args, { print: text => context.print(text.replaceAll('agentsdock-server', 'agentsdock')) })
+      const env = request.args[0] === 'update' ? context.env : localEnvironment(context, runtime)
+      return await runtime.run(request.args, { env,
+        print: text => context.print(text.replaceAll('agentsdock-server', 'agentsdock')) })
     } catch (error) {
       if (request.args[0] === 'install' && error.code === 'AGENTSDOCK_EXISTING_INSTALLATION') {
         error.message += '\nIf you want to add a new server instance, run: agentsdock new' +
@@ -143,7 +147,7 @@ async function run(argv, overrides = {}) {
       throw error
     }
   }
-  const env = localEnvironment(context)
+  const env = localEnvironment(context, runtime)
   const script = path.join(runtime.payload, request.script)
   if (!fs.lstatSync(script).isFile()) throw new Error('The installed server helper is not a regular file.')
   // Preserve the terminal for confirmation/clipboard prompts. Never interpolate

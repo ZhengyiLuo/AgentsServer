@@ -7,6 +7,7 @@ const path = require('node:path')
 const { EventEmitter } = require('node:events')
 const { PassThrough } = require('node:stream')
 const { postinstall, skipReason } = require('./postinstall.cjs')
+const { persistentPath } = require('../cli.cjs')
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agentsdock-postinstall-'))
@@ -15,7 +16,7 @@ function fixture(t) {
   const packageRoot = path.join(prefix, 'lib/node_modules/agentsdock')
   fs.mkdirSync(packageRoot, { recursive: true })
   const output = [], calls = []
-  const runtime = { version: '1.2.3-beta.4', coreRoot: path.join(root, 'core'),
+  const runtime = { version: '1.2.3-beta.4', coreRoot: path.join(root, 'core'), persistentPath,
     preflight: context => calls.push({ preflight: context.env }) }
   const context = { env: { npm_config_global: 'true', npm_config_prefix: prefix,
     npm_command: 'install', npm_lifecycle_event: 'postinstall' }, packageRoot,
@@ -47,6 +48,21 @@ test('direct global fresh installation invokes the exact runtime once and never 
   assert.deepEqual(f.calls[1].launch[2], { env: { HOME: f.root }, stdio: ['ignore', 'pipe', 'pipe'] })
   assert.match(f.output.at(-1), /ready at http:\/\/127.0.0.1:7850/)
   assert.doesNotMatch(f.output.join('\n'), /private-token|secret-stdout|secret-stderr|inherited-token/)
+})
+
+test('automatic setup strips npm lifecycle/cache paths without losing stable custom provider paths', async t => {
+  const f = fixture(t)
+  const stable = ['/custom/provider bin', '/home/user/.local/bin', '/usr/bin', '/bin'].join(':')
+  const transient = path.join(f.packageRoot, 'node_modules/.bin')
+  f.context.env.PATH = `:${transient}:/cache/_npx/0123/node_modules/provider/bin::${stable}:/usr/bin`
+  f.context.env.npm_config_original_path = '/untrusted/baseline'
+  f.context.env.BASH_ENV = '/startup'
+  f.context.env.AGENTSDOCK_AGENT_TOKEN = 'private-inherited-token'
+  assert.equal(await postinstall(f.context), 0)
+  assert.deepEqual(f.calls[0].preflight, { HOME: f.root, PATH: stable })
+  assert.deepEqual(f.calls[1].launch[2].env, { HOME: f.root, PATH: stable })
+  assert.ok(f.context.env.PATH.includes(transient))
+  assert.doesNotMatch(f.output.join('\n'), /private-token|private-inherited-token|secret-|baseline|\/cache|node_modules/)
 })
 
 test('existing installation/state is a successful no-op, not an automatic upgrade', async t => {

@@ -91,13 +91,15 @@ class AgentsDockCliPackageTests(unittest.TestCase):
         version = cli["version"]
         (core / "package.json").write_text(json.dumps({"name": "@agentsdock/server", "version": version}))
         (core / "server/VERSION").write_text(version)
+        shutil.copyfile(ROOT / "npm/cli.cjs", core / "npm/actual-cli.cjs")
         (core / "npm/cli.cjs").write_text(r'''
 const fs = require('node:fs'), path = require('node:path'), assert = require('node:assert/strict');
 const marker = path.join(process.env.HOME, 'synthetic-service-started');
 function ensureFreshInstall() {
   if (fs.existsSync(marker)) throw Object.assign(new Error('fixture existing state'), {code: 'AGENTSDOCK_EXISTING_INSTALLATION'});
 }
-module.exports = {ensureFreshInstall, run: () => 0};
+module.exports = {ensureFreshInstall, run: () => 0,
+  persistentPath: require('./actual-cli.cjs').persistentPath};
 if (require.main === module) {
   assert.deepEqual(process.argv.slice(2), ['install', '--non-interactive']);
   console.log('private installer output secret-lifecycle-sentinel');

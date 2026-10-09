@@ -7,7 +7,32 @@ const path = require('node:path')
 const http = require('node:http')
 const crypto = require('node:crypto')
 const { spawnSync } = require('node:child_process')
-const { parse, run, validateOrigin } = require('./cli.cjs')
+const { parse, run, validateOrigin, persistentPath } = require('./cli.cjs')
+
+test('persistent PATH removes npm lifecycle/cache entries without discarding stable provider bins', () => {
+  const stable = ['/custom/provider bin', "/custom/provider's/bin", '/opt/homebrew/bin',
+    '/home/user/.nvm/versions/node/v24/bin', '/home/user/.local/bin',
+    '/custom/npm-global/bin', '/custom/node_modules/provider/bin', '/usr/bin', '/bin']
+  const transient = ['/stage/prefix/lib/node_modules/agentsdock/node_modules/.bin',
+    '/stage/prefix/lib/node_modules/node_modules/.bin/', '/stage/prefix/node_modules/.bin',
+    '/stage/node_modules/x/../.bin', '/home/user/.npm/_npx/0123/node_modules/.bin',
+    '/different npm cache/_npx/abcd/node_modules/provider/bin',
+    '/opt/node/lib/node_modules/npm/node_modules/@npmcli/run-script/lib/node-gyp-bin',
+    '/opt/node/lib/node_modules/npm/bin/node-gyp-bin']
+  const input = ['', '.', 'relative/bin', ...transient, stable[0], '', ...stable, '/usr/bin', '\n/bad']
+  const expected = stable.join(':')
+  assert.equal(persistentPath(input.join(':')), expected)
+  assert.equal(persistentPath(expected), expected)
+  assert.equal(persistentPath(undefined), undefined)
+  for (const value of ['', '::', '.:../bin:node_modules/.bin', transient.join(':')]) {
+    assert.equal(persistentPath(value), '/usr/bin:/bin:/usr/sbin:/sbin')
+  }
+  // Deliberately lexical: do not dereference aliases or claim authorization
+  // for every executable residing in a retained directory.
+  assert.equal(persistentPath('/custom/cache-alias/bin:/custom/_npx-tools/bin:/custom/link/../bin'),
+    '/custom/cache-alias/bin:/custom/_npx-tools/bin:/custom/link/../bin')
+  assert.equal(persistentPath('//:/usr/bin/:/usr/bin/'), '//:/usr/bin/')
+})
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agentsdock-npm-cli-'))
@@ -76,7 +101,7 @@ test('recover with no installation or no journal never creates files or starts a
 
 test('recover delegates exact old journal pins to newer bundled installer and treats verified retirement as success', async t => {
   const f = fixture(t), r = pendingRecovery(f)
-  const env = { HOME: '/wrong/home', PATH: '/usr/bin:/bin', BASH_ENV: '/malicious', PYTHONPATH: '/unrelated', AGENTSDOCK_AGENT_TOKEN: 'must-not-leak' }
+  const env = { HOME: '/wrong/home', PATH: '/cache/_npx/a/node_modules/.bin:/usr/bin::/bin', BASH_ENV: '/malicious', PYTHONPATH: '/unrelated', AGENTSDOCK_AGENT_TOKEN: 'must-not-leak' }
   let invocation
   const result = await run(['recover'], { ...f.context, env, spawn: (...args) => {
     invocation = args
@@ -167,6 +192,16 @@ test('fresh install only delegates validated arguments to the bundled installer'
   assert.equal(install[0], '/bin/bash')
   assert.deepEqual(install[1], [path.join(f.packageRoot, 'server/install.sh'), '--fresh-install-only', '--release-version', '1.2.3-beta.4', '--port', '7851', '--bind', '127.0.0.1', '--non-interactive'])
   assert.equal(install[2].stdio, 'inherit')
+})
+
+test('scoped fresh installation filters npm PATH without trusting npm config as a baseline', async t => {
+  const f = fixture(t)
+  const env = { PATH: ':/tmp/prefix/node_modules/.bin:/usr/bin:/stable/provider bin:/cache/_npx/0123/bin::/bin',
+    npm_config_prefix: '/stable/provider bin', npm_config_cache: '/usr/bin', ORIGINAL_PATH: '/untrusted/bin' }
+  assert.equal(await run(['install'], { ...f.context, env, uid: 501 }), 0)
+  assert.equal(f.calls.at(-1)[2].env.PATH, '/usr/bin:/stable/provider bin:/bin')
+  assert.ok(env.PATH.includes('/tmp/prefix'))
+  assert.deepEqual(f.output, [])
 })
 
 test('fresh guard refuses an existing install or state without spawning anything', async t => {

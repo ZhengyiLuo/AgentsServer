@@ -55,6 +55,14 @@ agentsdock setup --port 7854 --bind 127.0.0.1
 `--ignore-scripts` also disables auto setup, as required by npm; this package does
 not bypass that setting. `setup` remains the explicit retry/custom-install path.
 
+Before a new setup or local instance-management helper runs, npm lifecycle
+`node_modules/.bin` paths, npm's disposable `_npx` cache paths and npm node-gyp
+shims are removed from the inherited PATH. Ordered absolute user, provider and
+Node locations remain available; empty/relative entries are not persisted.
+This lexical filter does not resolve symlink aliases or authenticate executables.
+It prevents new temporary npm-path dependencies; it does not rewrite the saved
+PATH of an already-installed server or change managed-update policy.
+
 ## Manage servers
 
 ```sh

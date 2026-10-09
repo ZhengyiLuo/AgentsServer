@@ -23,6 +23,27 @@ No installation hooks run when this npm package is installed.
 `
 const ROOT_SELECTORS = ['AGENTS_SERVER_INSTALL_DIR', 'AGENTS_SERVER_CONFIG_DIR', 'AGENTS_SERVER_STATE_DIR', 'AGENTSDOCK_STATE_DIR', 'ZENITHBOT_AGENT_DIR', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME']
 
+function persistentPath(value) {
+  if (value === undefined) return undefined
+  // npm adds package/ancestor .bin directories and node-gyp shims to lifecycle
+  // PATH; npx additionally exposes its disposable cache. These must not become
+  // dependencies of a long-lived native service. Keep stable absolute user,
+  // provider and Node paths in order; do not trust npm env as an "original PATH".
+  // This is a lexical persistence filter, not executable/symlink authorization.
+  const entries = new Set()
+  for (const entry of String(value).split(path.delimiter)) {
+    if (!path.isAbsolute(entry) || /[\x00-\x1f\x7f]/.test(entry)) continue
+    const normalized = path.normalize(entry).replace(/\/$/, '') || '/'
+    if (/\/node_modules\/\.bin$/.test(normalized) ||
+        /\/_npx\/[^/]+(?:\/|$)/.test(normalized) ||
+        /\/node_modules\/(?:npm\/bin|@npmcli\/run-script\/lib)\/node-gyp-bin$/.test(normalized)) continue
+    // Do not rewrite retained paths across symlink/.. boundaries: lexical
+    // normalization is only for recognizing npm entries, not resolving paths.
+    entries.add(entry)
+  }
+  return entries.size ? [...entries].join(path.delimiter) : '/usr/bin:/bin:/usr/sbin:/sbin'
+}
+
 function parse(argv) {
   const [command = 'help', ...args] = argv
   if (['help', '--help', '-h', '--version'].includes(command)) {
@@ -236,6 +257,7 @@ async function run(argv, overrides = {}) {
   const payload = path.join(context.packageRoot, 'server')
   const payloadVersion = readRegular(path.join(payload, 'VERSION'), 200).toString('utf8').trim()
   if (payloadVersion !== metadata.version) throw new Error('Package and server payload versions do not match.')
+  if (Object.hasOwn(context.env, 'PATH')) context.env = { ...context.env, PATH: persistentPath(context.env.PATH) }
   if (command === 'recover') {
     const recovery = recoveryContext(context)
     if (!recovery) { context.print('No unfinished default server migration was found. No changes were made.'); return 0 }
@@ -290,4 +312,4 @@ async function run(argv, overrides = {}) {
 }
 
 if (require.main === module) run(process.argv.slice(2)).then(code => { process.exitCode = code }).catch(error => { process.stderr.write(`agentsdock-server: ${error.message}\n`); process.exitCode = 1 })
-module.exports = { parse, readRegular, ensureFreshInstall, recoveryContext, validateOrigin, run }
+module.exports = { parse, readRegular, ensureFreshInstall, recoveryContext, validateOrigin, persistentPath, run }

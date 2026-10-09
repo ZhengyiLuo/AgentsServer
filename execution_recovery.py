@@ -107,7 +107,7 @@ def _source_inventory(source: Path) -> dict[str, str]:
 
 
 def _conflicts(root: Path) -> None:
-    for name in (".execution-transaction", ".execution-uninstall.json"):
+    for name in (".execution-transaction", ".execution-uninstall.json", ".execution-lifecycle.json"):
         if (root / name).exists() or (root / name).is_symlink():
             raise RuntimeError("another lifecycle operation owns this installation")
 

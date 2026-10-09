@@ -6,7 +6,6 @@ activation remains incomplete even after it has published the new files.
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -22,17 +21,11 @@ def current_components(
     """Read-only proof, invoked off the server event loop for an equal-version ensure."""
     root = files._path(root)
     files._owned_directory(root)
-    for name in (".activation-transaction", ".execution-transaction"):
+    for name in (".activation-transaction", ".execution-transaction", ".execution-lifecycle.json", ".execution-uninstall.json"):
         journal = root / name
         if journal.exists() or journal.is_symlink():
             return False
-    data, _mode = files._read_file(root / files.LAYOUT_NAME, private=True)
-    document = json.loads(data)
-    if not isinstance(document, dict) or document.get("format") != files.FORMAT:
-        raise ValueError("installed execution layout is invalid")
-    layout = files.ExecutionLayout.from_dict(document.get("layout"))
-    if layout.install_root != root or document != files.layout_manifest(layout):
-        raise ValueError("installed execution layout does not match its runtime")
+    layout = files.installed_layout(root)
     receipt: dict[str, Any] = WorkerControl().receipt(layout, NativeServices(layout))
     if (receipt.get("server_identity") != expected_server_identity
             or receipt.get("worker_instance_id") != expected_worker_instance):
@@ -45,5 +38,5 @@ def current_components(
     # Do not claim completion over the operation that just acquired ownership.
     return complete and not any(
         (root / name).exists() or (root / name).is_symlink()
-        for name in (".activation-transaction", ".execution-transaction")
+        for name in (".activation-transaction", ".execution-transaction", ".execution-lifecycle.json", ".execution-uninstall.json")
     )

@@ -30,9 +30,11 @@ def _no_activation(root: Path) -> None:
 
 def _no_handoff_recovery_overlap(root: Path) -> None:
     _no_activation(root)
-    marker = root / ".execution-uninstall.json"
-    if marker.exists() or marker.is_symlink():
-        raise RuntimeError("uninstall already owns execution recovery")
+    for name in (".execution-uninstall.json", ".execution-lifecycle.json"):
+        marker = root / name
+        if marker.exists() or marker.is_symlink():
+            owner = "uninstall" if name == ".execution-uninstall.json" else "native lifecycle"
+            raise RuntimeError(owner + " already owns execution recovery")
 
 
 def _read_handoff(root: Path, path: Path) -> dict[str, Any]:
@@ -68,14 +70,7 @@ def _read_handoff(root: Path, path: Path) -> dict[str, Any]:
 
 
 def _installed_layout(root: Path) -> files.ExecutionLayout:
-    data, _mode = files._read_file(root / files.LAYOUT_NAME, private=True)
-    value = json.loads(data)
-    if not isinstance(value, dict):
-        raise ValueError("installed execution layout is invalid")
-    layout = files.ExecutionLayout.from_dict(value.get("layout"))
-    if layout.install_root != root or value != files.layout_manifest(layout):
-        raise ValueError("installed execution layout changed")
-    return layout
+    return files.installed_layout(root)
 
 
 def _matching_status(handoff: dict, layout: files.ExecutionLayout, record: dict,

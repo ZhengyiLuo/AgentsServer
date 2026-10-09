@@ -329,6 +329,36 @@ def layout_manifest(layout: ExecutionLayout) -> dict[str, Any]:
             "retained_releases": sorted({str(layout.worker_release), str(layout.gateway_release)})}
 
 
+def installed_layout(root: Path) -> ExecutionLayout:
+    """Validate authoritative bindings without discarding retained rollback history."""
+    root = _path(root)
+    data, _mode = _read_file(root / LAYOUT_NAME, private=True)
+    value = json.loads(data)
+    if not isinstance(value, dict):
+        raise ValueError("installed execution layout is invalid")
+    layout = ExecutionLayout.from_dict(value.get("layout"))
+    expected = layout_manifest(layout)
+    retained = value.get("retained_releases")
+    if (layout.install_root != root or set(value) != set(expected)
+            or {key: item for key, item in value.items() if key != "retained_releases"}
+            != {key: item for key, item in expected.items() if key != "retained_releases"}
+            or not isinstance(retained, list) or not all(isinstance(item, str) for item in retained)
+            or len(retained) != len(set(retained))
+            or not set(expected["retained_releases"]).issubset(retained)):
+        raise ValueError("installed execution layout does not match its runtime")
+    # Old monolith releases may have no execution_service.py. Retention is not
+    # activation authority, but every advisory entry must be an owned, real
+    # version directory inside this installation (never an arbitrary path).
+    for item in retained:
+        path = _path(item)
+        if path.parent != root / "releases" or path.name.startswith("."):
+            raise ValueError("retained release is outside the installation")
+        _owned_directory(path)
+        version, _mode = _read_file(path / "VERSION")
+        _text(version.decode().strip())
+    return layout
+
+
 def prepare_runtime(layout: ExecutionLayout) -> None:
     """Create private IPC state; never rotate an existing control token."""
     from execution_transport import ensure_execution_secret
@@ -399,6 +429,10 @@ def stage(layout: ExecutionLayout, *, scope: str, prior_services: dict[str, Any]
     legacy = layout.install_root / ".activation-transaction"
     if legacy.exists() or legacy.is_symlink():
         raise RuntimeError("legacy activation recovery must finish before execution activation")
+    for name in (".execution-lifecycle.json", ".execution-uninstall.json"):
+        marker = layout.install_root / name
+        if marker.exists() or marker.is_symlink():
+            raise RuntimeError("native lifecycle ownership must finish before execution activation")
     if layout.transaction_dir.exists() or layout.transaction_dir.is_symlink():
         raise FileExistsError("an execution activation is already pending")
     prior_layout = _snapshot(layout.manifest_path)
@@ -674,6 +708,19 @@ def pending_worker_operation(root: Path, runtime_root: Path) -> str | None:
     journal = root / TRANSACTION_NAME
     outer = root / ".activation-transaction"
     uninstall = root / ".execution-uninstall.json"
+    lifecycle = root / ".execution-lifecycle.json"
+    if lifecycle.exists() or lifecycle.is_symlink():
+        if any(path.exists() or path.is_symlink() for path in (outer, journal)):
+            raise RuntimeError("activation and lifecycle both claim execution ownership")
+        from execution_manage import pending_lifecycle_operation
+        operation = pending_lifecycle_operation(root, runtime_root)
+        if uninstall.exists() or uninstall.is_symlink():
+            # An interrupted owned-stop -> uninstall adoption may retain both
+            # journals, but they must describe the very same sealed operation.
+            from execution_uninstall import pending_uninstall_operation
+            if pending_uninstall_operation(root, runtime_root) != operation:
+                raise RuntimeError("uninstall and lifecycle ownership conflict")
+        return operation
     if uninstall.exists() or uninstall.is_symlink():
         if outer.exists() or outer.is_symlink() or journal.exists() or journal.is_symlink():
             raise RuntimeError("activation and uninstall both claim execution ownership")
@@ -714,13 +761,7 @@ def active_worker_release(root: Path) -> Path | None:
         data, _mode = _read_file(root / LAYOUT_NAME, private=True)
     except FileNotFoundError:
         return None
-    value = json.loads(data)
-    if not isinstance(value, dict) or value.get("format") != FORMAT:
-        raise ValueError("installed execution layout is invalid")
-    layout = ExecutionLayout.from_dict(value.get("layout"))
-    if layout.install_root != root or value != layout_manifest(layout):
-        raise ValueError("installed execution layout no longer matches its runtime")
-    return layout.worker_release
+    return installed_layout(root).worker_release
 
 
 def main(argv: list[str] | None = None) -> None:

@@ -249,7 +249,7 @@ def require_retired_legacy_intent(layout: files.ExecutionLayout, previous: Any, 
 
     root = layout.install_root
     def no_journal():
-        for name in (".activation-transaction", ".execution-transaction", ".execution-uninstall.json"):
+        for name in (".activation-transaction", ".execution-transaction", ".execution-uninstall.json", ".execution-lifecycle.json"):
             if (root / name).exists() or (root / name).is_symlink():
                 raise RuntimeError("a lifecycle journal still owns the previous recovery intent")
     no_journal()

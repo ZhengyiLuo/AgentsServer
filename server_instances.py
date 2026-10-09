@@ -138,6 +138,26 @@ def read_config(instance: Instance) -> dict[str, str]:
     return result
 
 
+def split_layout(instance: Instance, platform: str = sys.platform):
+    """Default-only split detection; invalid evidence never falls back to legacy."""
+    if instance.name != "default":
+        return None
+    marker = instance.runtime / "execution-layout.json"
+    if not marker.exists() and not marker.is_symlink():
+        return None
+    import execution_install as files
+    from execution_uninstall import _service_files
+    layout = files.installed_layout(instance.runtime)
+    expected_platform = "Darwin" if platform == "darwin" else "Linux" if platform.startswith("linux") else None
+    if ((layout.install_root, layout.config_root, layout.state_root, layout.home, layout.platform)
+            != (instance.runtime, instance.config, instance.state, instance.home, expected_platform)):
+        raise ValueError("Default execution roots/platform do not match this instance.")
+    for role in ("worker", "gateway"):
+        check_path(layout.service_path(role), instance.home)
+    _service_files(layout)
+    return layout
+
+
 def validate_binding(instance: Instance, platform: str = sys.platform) -> None:
     for path in (instance.runtime, instance.config, instance.state, instance.logs, instance.service_file(platform)):
         check_path(path, instance.home)
@@ -145,6 +165,8 @@ def validate_binding(instance: Instance, platform: str = sys.platform) -> None:
     for key, value in instance.environment().items():
         if key in env and env[key] != value:
             raise ValueError(f"{instance.name}: {key} does not match this instance; refusing service changes.")
+    if split_layout(instance, platform) is not None:
+        return
     service = instance.service_file(platform)
     if service.exists():
         data = read_regular(service)
@@ -370,6 +392,22 @@ def run(command: list[str], **kwargs):
 
 
 def service_status(instance: Instance, platform: str = sys.platform) -> str:
+    try:
+        layout = split_layout(instance, platform)
+        if layout is not None:
+            from execution_manage import NativeServices, read_lifecycle_intent
+            native = NativeServices(layout)
+            native.validate_registered_bindings()
+            snapshot = native.snapshot()
+            states = {item["state"] for item in snapshot.values()}
+            intent = read_lifecycle_intent(layout)
+            if states <= {"absent", "stopped"}:
+                return "stopped"
+            if states == {"running"}:
+                return "pending" if intent is not None else "running"
+            return "partial"
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
+        return "unknown"
     command = ["launchctl", "print", f"gui/{os.getuid()}/{launchd_label(instance.name)}"] if platform == "darwin" else ["systemctl", "--user", "show", service_name(instance.name) + ".service", "--property=ActiveState", "--value"]
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=3, check=False)
@@ -863,6 +901,11 @@ def release_uninstalled_name(instance: Instance, registry: Registry) -> None:
 
 def control(instance: Instance, action: str, platform: str = sys.platform):
     validate_binding(instance, platform)
+    layout = split_layout(instance, platform)
+    if layout is not None:
+        from execution_manage import LifecycleController
+        LifecycleController(layout).run(action)
+        return
     if not instance.service_file(platform).exists():
         raise ValueError(f"{instance.name}: no installed service.")
     if platform == "darwin":
@@ -1080,13 +1123,13 @@ def main(argv: list[str] | None = None) -> int:
                         control(item, args.command)
                     if args.command != "remove":
                         print(f"{item.name}: {args.command} completed", flush=True)
-                except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as exc:
+                except (OSError, ValueError, RuntimeError, KeyError, subprocess.CalledProcessError) as exc:
                     print(f"{item.name}: failed ({exc})", file=sys.stderr)
                     failures += 1
             if args.command == "remove" and not failures:
                 print("\n" + terminal_color("Successful!", "32"), flush=True)
             return int(bool(failures))
-    except (OSError, ValueError, KeyError) as exc:
+    except (OSError, ValueError, RuntimeError, KeyError) as exc:
         print(f"Instance manager: {exc}", file=sys.stderr)
         return 1
 

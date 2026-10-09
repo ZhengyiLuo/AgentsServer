@@ -65,6 +65,7 @@ class ExecutionControlTests(unittest.IsolatedAsyncioTestCase):
         status, raw = await self.request(path=STATUS_PATH, method="GET")
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(raw)["worker_instance_id"], self.instance)
+        self.assertEqual(json.loads(raw)["native_lifecycle_protocol"], 1)
         status, _ = await self.request()
         self.assertEqual(status, 200)
         self.assertEqual(self.calls[-1], ("acquire", self.operation, None, 120))

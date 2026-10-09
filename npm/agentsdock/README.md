@@ -9,7 +9,7 @@ supported.
 ## Install the command
 
 ```sh
-npm install -g agentsdock
+npm install -g agentsdock@beta
 agentsdock list
 ```
 
@@ -20,10 +20,11 @@ state, including named instances; repeat installs leave these unchanged and do
 not restart, overwrite or upgrade a running service. The runtime lives in its
 managed installation directory, independently of the npm package/cache.
 
-For a beta, select `npm install -g agentsdock@beta`. This documentation describes
-the package being prepared; commands are available from the registry only after
-that package/channel has been published. Do not infer name ownership from an npm
-404 response.
+The first short-command release is on Beta. Use the explicit `@beta` above;
+untagged `npm install -g agentsdock` is for a future approved stable CLI release.
+This documentation describes the package being prepared; commands are available
+from the registry only after that package/channel has been published. Do not
+infer name ownership from an npm 404 response.
 
 `-g` makes the command available outside the current project when npm's global
 bin directory is on your PATH. A local `npm install agentsdock` is also supported;
@@ -47,7 +48,7 @@ A failed auto setup makes npm report failure instead of claiming the server is
 ready. To obtain interactive diagnostics or choose a custom port/bind:
 
 ```sh
-AGENTSDOCK_SKIP_SETUP=1 npm install -g agentsdock
+AGENTSDOCK_SKIP_SETUP=1 npm install -g agentsdock@beta
 agentsdock setup --port 7854 --bind 127.0.0.1
 ```
 
@@ -70,8 +71,10 @@ agentsdock remove work
 Flat commands are the primary interface. `servers ACTION` and `instances ACTION`
 remain aliases, as do `new --name NAME` and `token/status --instance NAME`.
 Start/stop/restart/remove require an
-explicit instance or the native helper's explicit `--all` selector. Stop/restart
-interrupt running work; wait for chats to finish first. Remove retains the
+explicit instance or the native helper's explicit `--all` selector. Legacy and
+named-instance stop/restart can interrupt running work; wait for chats to finish
+first. The split default server requires verified idle admission before stopping
+either component. Remove retains the
 existing confirmation and history-preservation behavior. Tokens are private;
 `token` only reads an existing token and does not reinstall or restart a server.
 Without a name, `agentsdock token` lists this OS user's existing servers on the
@@ -93,14 +96,18 @@ the version comes from that instance's installed runtime, not the npm CLI packag
 installation, it leaves it unchanged and points to `agentsdock new` for another
 instance (or `agentsdock new work --port 7854` for an explicit name and port).
 
-Current acceptance gap: the native instance manager still validates the older
-single-service layout. `remove default --yes` was observed refusing a current
-split gateway/execution installation before making changes. Start/stop/restart
-and removal for split layouts need guarded lifecycle integration and native
-acceptance before this CLI can be advertised as complete instance management.
-Do not bypass the binding check or stop only one process. Fresh auto setup and
-safe repeated npm installation have been verified independently on Linux;
-macOS first-service creation still needs disposable native acceptance.
+Beta.5 preparation adds guarded control of both default-server components.
+Stop/restart requires an installed worker that supports the paired lifecycle
+protocol; installing a newer CLI alone does not update an older server. If the
+command reports that requirement, update the installed server through the app's
+signed managed-update path first. It leaves unsupported running services intact.
+Busy work, pending updates, changed native registrations or uncertain ownership
+prevent a forced stop. Interrupted operations retain an owned retry journal;
+follow the command's retry guidance rather than deleting it manually.
+
+Exact-package native setup, lifecycle and removal acceptance for beta.5 remains
+pending. Source/fixture tests are not proof of fresh macOS or Linux service
+operation. Earlier Linux auto-setup results do not substitute for the new pair.
 
 The packaged CLI has also been installed and reinstalled on Apple silicon
 macOS with existing services. Disposable named launchd instances passed real

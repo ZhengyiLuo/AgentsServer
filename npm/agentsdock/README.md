@@ -207,3 +207,10 @@ Test the tarball with that exact server package before publication. Release
 automation must publish/verify the scoped runtime first, then this CLI, with the
 same stable/beta channel and appropriate trusted-publisher ownership. Existing
 server manifests, signing keys and previously frozen candidates are unchanged.
+
+The canonical `server-npm-publish.yml` now prepares both packages and publishes
+the verified runtime before this CLI, with exact source/version/hash checks and
+explicit stable-tag preservation. See the
+[matched release procedure](../../../docs/NPM_CLI_RELEASES.md) for private staging,
+first-publication authentication and required native acceptance. A first beta
+uses `agentsdock@beta`; it does not create a stable unscoped `latest` tag.

@@ -549,6 +549,20 @@ def describe(instance: Instance) -> dict:
     }
 
 
+def pairing_info(instance: Instance) -> dict:
+    """Private pipe to the CLI QR renderer; never write these details to logs."""
+    for target in (instance.config, instance.config / "env"):
+        check_path(target, instance.home)
+    env = read_config(instance)
+    token = env.get("AGENTSDOCK_AGENT_TOKEN", "")
+    if not token or any(ord(char) < 32 or ord(char) == 127 for char in token):
+        raise ValueError("This instance has no usable saved access token.")
+    port = int(env.get("AGENTSDOCK_AGENT_PORT", "7850"))
+    bind = env.get("AGENTSDOCK_AGENT_BIND", "0.0.0.0")
+    choices = connection_choices(bind, port, candidate_addresses(bind, port), tailscale_status())
+    return {"name": instance.name, "accessToken": token, "choices": choices}
+
+
 def connection_choices(bind: str, port: int, addresses: list[str], network: dict[str, str]) -> dict:
     """Label candidates, never infer Tailscale connectivity from an IP range."""
     choices = {"local": [], "lan": [], "other": [], "tailscale": "", "tailscale_note": ""}
@@ -894,6 +908,8 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("token", help="Choose an existing server and display only its access token")
     info = commands.add_parser("info")
     info.add_argument("name", type=instance_name)
+    pairing = commands.add_parser("_pair-info", help=argparse.SUPPRESS)
+    pairing.add_argument("name", type=instance_name)
     status = commands.add_parser("status", help="Show readable details for all instances or one name")
     status.add_argument("name", nargs="?", type=instance_name)
     new = commands.add_parser("new")
@@ -931,6 +947,12 @@ def main(argv: list[str] | None = None) -> int:
             instance = Instance(args.name, registry.home)
             validate_binding(instance)
             print(instance.shell_bindings())
+            return 0
+        if args.command == "_pair-info":
+            selected = next((item for item in registry.instances() if item.name == args.name), None)
+            if selected is None:
+                raise ValueError("Unknown instance. Use agentsdock list.")
+            print(json.dumps(pairing_info(selected)))
             return 0
         if args.command == "token":
             selected = choose_token_instance(registry)

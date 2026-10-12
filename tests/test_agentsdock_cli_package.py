@@ -29,7 +29,7 @@ class AgentsDockCliPackageTests(unittest.TestCase):
         self.root = self.work / "source/server"
         source = self.root / "npm/agentsdock"
         source.mkdir(parents=True)
-        for name in ("package.json", "cli.cjs", "postinstall.cjs", "README.md"):
+        for name in ("package.json", "cli.cjs", "postinstall.cjs", "pair.cjs", "qr-renderer.cjs", "QR-NOTICES.txt", "README.md"):
             shutil.copyfile(ROOT / "npm/agentsdock" / name, source / name)
         (self.root / "VERSION").write_text("1.2.3-beta.4\n")
         for name in ("LICENSE", "NOTICE"):
@@ -72,7 +72,7 @@ class AgentsDockCliPackageTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256(archive.read_bytes()).hexdigest(), one["archive"]["sha256"])
         with tarfile.open(archive) as packed:
             self.assertEqual(set(packed.getnames()), {f"package/{name}" for name in
-                             ("package.json", "cli.cjs", "postinstall.cjs", "README.md", "LICENSE", "NOTICE")})
+                             ("package.json", "cli.cjs", "postinstall.cjs", "pair.cjs", "qr-renderer.cjs", "QR-NOTICES.txt", "README.md", "LICENSE", "NOTICE")})
         with self.assertRaises(FileExistsError):
             cli_package.prepare(self.root, self.work / "one")
         self.assertEqual(hashlib.sha256(archive.read_bytes()).hexdigest(), one["archive"]["sha256"])

@@ -50,6 +50,29 @@ class InstanceTests(unittest.TestCase):
         else:
             service.write_text(f"[Service]\nEnvironmentFile={instance.config / 'env'}\nExecStart={instance.runtime / 'current/.venv/bin/python'} {instance.runtime / 'current/agent_server.py'} serve --port {port}\n")
 
+    def test_pairing_reads_only_selected_token_and_never_advertises_loopback_as_lan(self):
+        self.configured(self.work)
+        before = (self.work.config / "env").read_bytes()
+        with patch.object(instances, "tailscale_status", return_value={"status": "connected", "ipv4": "100.64.0.12"}):
+            details = instances.pairing_info(self.work)
+        self.assertEqual(details["name"], "work")
+        self.assertEqual(details["accessToken"], "test-token-not-real")
+        self.assertEqual(details["choices"]["local"], ["http://127.0.0.1:7851"])
+        self.assertFalse(details["choices"]["lan"])
+        self.assertFalse(details["choices"]["tailscale"])
+        self.assertEqual(before, (self.work.config / "env").read_bytes())
+        with self.assertRaisesRegex(ValueError, "no usable saved access token"):
+            instances.pairing_info(self.default)
+
+    def test_pairing_rejects_symlinked_configuration(self):
+        self.configured(self.work)
+        target = self.work.config / "env"
+        saved = self.home / "other-env"
+        target.rename(saved)
+        target.symlink_to(saved)
+        with self.assertRaises(ValueError):
+            instances.pairing_info(self.work)
+
     def cli(self, *args, terminal=False, **patches):
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.object(instances, "Registry", return_value=self.registry))

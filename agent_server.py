@@ -10713,6 +10713,8 @@ class SessionStore:
             "created_at": now,
             "updated_at": now,
         }
+        if not active_provider_id and not parent_id and sess["title"] == "New chat":
+            sess["_empty_chat_cleanup"] = {"version": 1, "dismissed_by": {}}
         if req.subagent_limit is not None:
             sess["subagent_limit"] = req.subagent_limit
         if initializing_fork and parent_id:
@@ -51523,6 +51525,9 @@ def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, 
     # Provider ids are intentionally omitted from summary responses, but the
     # UI still needs the authoritative first-turn backend fence.
     public["backend_locked"] = session_backend_locked(sess)
+    # Capability, not proof of emptiness: dismiss-empty repeats the full proof.
+    if sess.get("title") == "New chat" and not public["backend_locked"]:
+        public["empty_chat_cleanup"] = "client-v1"
     public["codex_provider"] = codex_provider.session_choice(sess.get("codex_provider"))
     connection = sess.get("provider_connection") or "default"
     # Keep legacy native summaries sparse, but retain a stored default as the
@@ -86628,12 +86633,13 @@ async def tail_session_process_log(session_id: str, path: str, lines: int = 200)
 
 
 @app.get("/api/sessions")
-async def list_sessions(summary: bool = False) -> dict[str, Any]:
+async def list_sessions(summary: bool = False, placeholder_client_id: str = "") -> dict[str, Any]:
     await STORE.ensure_sort_orders()
     sessions = [
         public_session(session, summary=summary)
         for session in sorted_sessions(list(STORE.sessions.values()))
         if not session.get("_fork_initializing")
+        and not empty_chat_dismissed_for(session, placeholder_client_id)
     ]
     return {"sessions": sessions}
 
@@ -90161,6 +90167,74 @@ async def ensure_discardable_empty_session(session_id: str, expected_updated_at:
     )
     if not untouched() or not history_empty or files or terminal.get("exists"):
         raise HTTPException(status_code=409, detail="Chat has content or resources; it was preserved.")
+
+
+def empty_chat_revision(session: dict[str, Any]) -> str:
+    # Use durable content/settings, not public runtime projections, read cursors
+    # or sort order. Reconnecting, reading or normalizing runtime metadata on
+    # startup must not resurrect an unchanged blank row.
+    revision = {key: session.get(key) for key in (
+        "created_at", "updated_at", "title", "folder", "cwd", "backend",
+        "model", "effort", "system_prompt", "_title_source",
+        "codex_provider", "provider_connection", "parent_id",
+        "codex_goal", "claude_goal",
+    )}
+    revision["latest_event_seq"] = int(session.get("latest_event_seq") or 0)
+    for key in ("backend_locked", "pinned", "archived", "manual_unread"):
+        revision[key] = bool(session.get(key))
+    return hashlib.sha256(json.dumps(revision, sort_keys=True,
+                                     separators=(",", ":")).encode()).hexdigest()
+
+
+def empty_chat_dismissed_for(session: dict[str, Any], client_id: str) -> bool:
+    if not client_id or session_backend_locked(session):
+        return False
+    state = session.get("_empty_chat_cleanup") or {}
+    return (isinstance(state, dict) and state.get("version") == 1
+            and isinstance(state.get("dismissed_by"), dict)
+            and state["dismissed_by"].get(client_id) == empty_chat_revision(session))
+
+
+@app.post("/api/sessions/{session_id}/dismiss-empty")
+async def dismiss_empty_session(session_id: str, expected_updated_at: str,
+                                placeholder_client_id: str) -> dict[str, Any]:
+    """Remove an unused row from one desktop's list without deleting its identity.
+
+    Another/offline desktop may own an unsent draft. Its list is unaffected;
+    subsequent real changes also invalidate this desktop's dismissal. No draft
+    content leaves a desktop, and no native history/process is touched.
+    """
+    if not re.fullmatch(r"[a-zA-Z0-9_-]{16,80}", placeholder_client_id):
+        raise HTTPException(400, "Invalid placeholder client identity")
+    await wait_for_queue_recovery_admission()
+    async with session_lifecycle_lock(session_id):
+        ensure_session_not_initializing(session_id)
+        if session_id in DELETING_SESSIONS or session_id in DELETED_SESSION_TOMBSTONES:
+            raise HTTPException(409, "Chat deletion is already in progress")
+        # Existing admission, uploads, jobs and terminal routes use this fence.
+        DELETING_SESSIONS.add(session_id)
+        try:
+            await ensure_discardable_empty_session(session_id, expected_updated_at)
+            async with STORE._lock:
+                session = STORE.sessions[session_id]
+                previous = session.get("_empty_chat_cleanup")
+                state = previous if isinstance(previous, dict) else {}
+                dismissed = dict(state.get("dismissed_by") or {})
+                if placeholder_client_id not in dismissed and len(dismissed) >= 256:
+                    raise HTTPException(409, "Too many desktop cleanup identities; chat preserved")
+                dismissed[placeholder_client_id] = empty_chat_revision(session)
+                session["_empty_chat_cleanup"] = {"version": 1, "dismissed_by": dismissed}
+                try:
+                    await STORE.save()
+                except BaseException:
+                    if previous is None:
+                        session.pop("_empty_chat_cleanup", None)
+                    else:
+                        session["_empty_chat_cleanup"] = previous
+                    raise
+            return {"ok": True, "dismissed": True}
+        finally:
+            DELETING_SESSIONS.discard(session_id)
 
 
 @app.post("/api/sessions/{session_id}/discard-empty")

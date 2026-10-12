@@ -1572,3 +1572,26 @@ Do not commit:
 - `.env` files or access tokens
 - machine-specific hostnames, IP addresses, or user home paths
 - compiled Python caches
+
+
+### Recoverable desktop empty-chat cleanup
+
+New desktops pass a durable random `placeholder_client_id` to `GET /api/sessions`.
+A candidate session advertises `empty_chat_cleanup: "client-v1"`; this is a
+capability, not evidence that a row is safe to remove. On startup and explicit
+sidebar refresh, the desktop checks its unsent drafts, references and uploads,
+then calls `POST /api/sessions/{id}/dismiss-empty` with that client identity and
+`expected_updated_at`. The server repeats the existing conditional empty-history
+and live-resource checks under the session lifecycle lock and admission fence.
+
+The result `{ "dismissed": true }` hides only the unchanged row in that desktop's
+list. It persists across restarts without deleting the session or provider
+history, and never removes another desktop's offline drafts. Reading with no
+client identity still exposes retained rows; subsequent session/content changes
+invalidate a dismissal. Legacy blank records are adopted only after the same
+proof. Each row accepts at most 256 client identities and rejects overflow.
+
+An unsupported endpoint, stale session or failed proof preserves the chat. The
+new client never falls back to DELETE or the legacy `discard-empty` route.
+Explicit user deletion retains its existing behavior. Updating only the server
+or only an older client does not provide the complete new cleanup workflow.

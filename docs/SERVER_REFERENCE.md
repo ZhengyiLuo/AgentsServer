@@ -949,6 +949,12 @@ reports `ready`, `missing`, `unauthenticated`, `unknown`, or probe `error`, plus
 actionable recovery instruction. It never returns account identity, auth
 output, or tokens.
 
+Catalog refresh is not a request to reload Codex sign-in. An unknown native
+login revision must not retire a working Codex process. Explicit sign-in reload
+uses the native-admin `POST /api/admin/codex/auth/reload` with `{}`; account GET
+advertises `login_reload_available` and the POST reports `login_reload_pending`.
+See [Codex login handoff](CODEX_LOGIN_HANDOFF.md) for ownership and audit behavior.
+
 Claude startup, automatic refresh, manual **Recheck CLIs**, and turn admission
 never execute `claude auth status`. Short-lived auth-status commands can start
 OAuth renewal and exit before persisting the replacement credential (see

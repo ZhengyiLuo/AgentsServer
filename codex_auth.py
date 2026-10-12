@@ -22,9 +22,10 @@ MAX_API_KEY_CHARS = 4096
 AUTH_TIMEOUT_SECONDS = 30.0
 BUSY_MESSAGE = "Wait for Codex chats, goals, queued turns and Side chat requests to finish before changing authentication."
 HANDOFF_MESSAGE = (
-    "Refreshing Codex sign-in. Wait for this chat's running work, approvals, "
-    "goals and background terminals to finish, then retry. Your message has "
-    "not been sent to Codex."
+    "Codex sign-in changed or was explicitly reloaded. This chat is waiting for "
+    "its running work, approvals, goals or background terminals before switching. "
+    "Your running work has not been stopped and this message has not been sent. "
+    "Retry after that work finishes."
 )
 _REVISION_KEY = secrets.token_bytes(32)
 _MAX_AUTH_BYTES = 128 * 1024
@@ -84,8 +85,9 @@ def native_login_revision(env: dict[str, str], *, cwd: str) -> LoginRevision | N
 
     Ignore rotating access/refresh tokens and last_refresh. OIDC auth_time is
     stable across refresh but changes on an interactive authentication. Without
-    it we can detect an account switch, not prove a same-account re-login;
-    Recheck CLIs provides an explicit handoff for that case and keyring stores.
+    it we can detect an account switch, not prove a same-account re-login.
+    Explicit native-admin reload can hand off opaque/keyring logins; an
+    unchanged known revision remains observational even on explicit reload.
     Missing/malformed files are not evidence of a new login. No secret survives
     this bounded read except a process-keyed comparison digest.
     """
@@ -178,7 +180,7 @@ async def read_account(manager) -> dict:
     return account_summary(result)
 
 
-def create_router(*, authorize, operation, available) -> APIRouter:
+def create_router(*, authorize, operation, available, reload_login=None) -> APIRouter:
     router = APIRouter()
 
     @router.get("/api/admin/codex/auth")
@@ -196,7 +198,26 @@ def create_router(*, authorize, operation, available) -> APIRouter:
             raise
         except Exception:
             raise HTTPException(503, "Codex authentication status is unavailable.") from None
-        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+        return JSONResponse({**result, "login_reload_available": reload_login is not None},
+                            headers={"Cache-Control": "no-store"})
+
+    @router.post("/api/admin/codex/auth/reload")
+    async def reload(request: Request):
+        authorize(request)
+        if not available() or reload_login is None:
+            raise HTTPException(501, "Native Codex sign-in reload is unavailable.")
+        # No credential input; no handoff from GET, mounting a page or polling.
+        try:
+            body = await request.json()
+        except ValueError:
+            raise HTTPException(400, "Send an empty JSON object to reload Codex sign-in.") from None
+        if body != {}:
+            raise HTTPException(400, "Send an empty JSON object to reload Codex sign-in.")
+        pending = await reload_login()
+        response = await status(request)
+        result = json.loads(response.body)
+        return JSONResponse({**result, "login_reload_pending": pending},
+                            headers={"Cache-Control": "no-store"})
 
     @router.post("/api/admin/codex/auth/api-key")
     async def login(request: Request):

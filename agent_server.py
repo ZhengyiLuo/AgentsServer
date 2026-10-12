@@ -55417,26 +55417,29 @@ async def refresh_codex_app_server_binary(*, force: bool = False) -> None:
     schedule_codex_manager_drain()
 
 
-async def refresh_codex_app_server_login(*, request_handoff: bool = False) -> None:
+async def refresh_codex_app_server_login(*, request_handoff: bool = False, source: str = "manager_lookup") -> bool:
     """Change normal-Codex admission; never kill a credential-owning process.
 
-    Ordinary lookups use a conservative native file revision. Recheck CLIs is
-    an explicit handoff request, also covering keyring and same-account logins
-    without an OIDC auth_time. This is not a token refresh or login operation.
+    Ordinary lookups/catalog refreshes only observe native file revisions.
+    Explicit native-admin login reload also covers opaque credential stores.
+    This is not a token refresh or login operation.
     """
     global CODEX_APP_SERVER_MANAGER, CODEX_LOGIN_REVISION
     if CODEX_TRANSPORT == CODEX_TRANSPORT_EXEC or CODEX_AUTH_LOCK.locked() or CODEX_MANAGER_CLOSING:
-        return
+        return False
+    # Sources are server-owned labels, never request text, account IDs or keys.
+    if source not in {"manager_lookup", "turn_admission", "account_status", "catalog_refresh", "manual_login_reload"}:
+        source = "manager_lookup"
     async with CODEX_LOGIN_PROBE_LOCK:
         if not await asyncio.to_thread(codex_auth.native_login_handoff_supported,
                 codex_app_server_env(), cwd=existing_cwd(DEFAULT_CWD)):
-            return
+            return False
         revision = await asyncio.to_thread(codex_auth.native_login_revision,
             codex_app_server_env(), cwd=existing_cwd(DEFAULT_CWD))
         async with CODEX_GOALS_CONFIG_LOCK:
             async with CODEX_APP_SERVER_MANAGER_LOCK:
                 if CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH is not None or CODEX_AUTH_LOCK.locked() or CODEX_MANAGER_CLOSING:
-                    return
+                    return False
                 observed_change = revision is not None and revision != CODEX_LOGIN_REVISION
                 CODEX_LOGIN_REVISION = revision
                 if observed_change or request_handoff:
@@ -55452,12 +55455,17 @@ async def refresh_codex_app_server_login(*, request_handoff: bool = False) -> No
                     if revision is not None and revision == previous:
                         manager._agentsdock_login_superseded = False
                     if changed or (request_handoff and revision is None):
+                        if getattr(manager, "_agentsdock_login_superseded", False) is not True:
+                            reason = "login_revision_changed" if changed else "explicit_reload_opaque_login"
+                            manager._agentsdock_login_handoff_source = source
+                            logger.info("Codex login handoff requested source=%s reason=%s manager=%x", source, reason, id(manager))
                         manager._agentsdock_login_superseded = True
                         if not any(manager is item for item in CODEX_RETIRED_APP_SERVER_MANAGERS):
                             CODEX_RETIRED_APP_SERVER_MANAGERS.append(manager)
                         if CODEX_APP_SERVER_MANAGER is manager:
                             CODEX_APP_SERVER_MANAGER = None
     schedule_codex_manager_drain()
+    return True
 
 
 def codex_manager_session_busy(manager: CodexAppServerManager, session_id: str, *, ignore_task=None, ignore_maintenance=False) -> bool:
@@ -55480,6 +55488,17 @@ def codex_manager_session_busy(manager: CodexAppServerManager, session_id: str, 
 
 async def release_idle_codex_manager_session(manager: CodexAppServerManager, session_id: str, *, ignore_task=None) -> bool:
     """Called under the session lifecycle lock; retain ownership on any doubt."""
+    def retained(reason: str) -> bool:
+        if getattr(manager, "_agentsdock_login_superseded", False) is True:
+            reasons = getattr(manager, "_agentsdock_login_handoff_blockers", None)
+            if reasons is None:
+                reasons = manager._agentsdock_login_handoff_blockers = {}
+            if reasons.get(session_id) != reason:
+                reasons[session_id] = reason
+                logger.info("Codex login handoff waiting source=%s manager=%x session=%s reason=%s",
+                    getattr(manager, "_agentsdock_login_handoff_source", "unknown"), id(manager), session_id, reason)
+        return False
+
     def blocked(*, own_maintenance=False):
         return (codex_manager_session_busy(manager, session_id, ignore_task=ignore_task,
                     ignore_maintenance=own_maintenance)
@@ -55489,7 +55508,7 @@ async def release_idle_codex_manager_session(manager: CodexAppServerManager, ses
                        for task in manager.client._server_request_tasks.values() if not task.done()))
 
     if blocked():
-        return False
+        return retained("owned_work")
     deadline = time.monotonic() + 8.0
     SERVER_MAINTENANCE_SESSIONS.add(session_id)
     try:
@@ -55497,10 +55516,10 @@ async def release_idle_codex_manager_session(manager: CodexAppServerManager, ses
                    if codex_session_id_for_thread(thread) == session_id]
         for thread in threads:
             if time.monotonic() >= deadline:
-                return False
+                return retained("metadata_deadline")
             if (thread in CODEX_APP_SERVER_PINNED_THREADS or thread in CODEX_INTERACTIVE_CONTROL_THREADS
                     or manager.active_turn(thread) is not None):
-                return False
+                return retained("active_or_pinned_thread")
             try:
                 goal = await asyncio.wait_for(manager.get_thread_goal(thread), timeout=min(3.0, deadline - time.monotonic()))
             except CodexAppServerRequestError as exc:
@@ -55508,7 +55527,7 @@ async def release_idle_codex_manager_session(manager: CodexAppServerManager, ses
                     raise
                 goal = None
             if isinstance(goal, dict) and goal.get("status") == "active":
-                return False
+                return retained("active_goal")
             try:
                 terminals = await asyncio.wait_for(manager.list_background_terminals(thread), timeout=min(3.0, deadline - time.monotonic()))
             except CodexAppServerRequestError as exc:
@@ -55518,20 +55537,23 @@ async def release_idle_codex_manager_session(manager: CodexAppServerManager, ses
             # Those metadata requests yielded. A new borrower or native
             # request may now own the process even without a registered turn.
             if terminals or blocked(own_maintenance=True):
-                return False
+                return retained("background_terminals" if terminals else "owned_work")
             evicted = await asyncio.wait_for(evict_codex_app_server_thread(manager, thread, reinsert_on_failure=True),
                 timeout=max(0.0, deadline - time.monotonic()))
             if not evicted or manager.is_thread_loaded(thread):
-                return False
+                return retained("thread_not_unloaded")
         if blocked(own_maintenance=True):
-            return False
+            return retained("owned_work")
         if CODEX_SESSION_APP_SERVER_MANAGERS.get(session_id) is manager:
             CODEX_SESSION_APP_SERVER_MANAGERS.pop(session_id, None)
             CODEX_GOAL_SYNC_GENERATIONS.pop(session_id, None)
+        if getattr(manager, "_agentsdock_login_superseded", False) is True:
+            getattr(manager, "_agentsdock_login_handoff_blockers", {}).pop(session_id, None)
+            logger.info("Codex login handoff released source=%s manager=%x session=%s",
+                getattr(manager, "_agentsdock_login_handoff_source", "unknown"), id(manager), session_id)
         return True
     except Exception:
-        logger.debug("Codex handoff retained an unverified idle owner", exc_info=True)
-        return False
+        return retained("metadata_or_unload_failed")
     finally:
         SERVER_MAINTENANCE_SESSIONS.discard(session_id)
 
@@ -55540,7 +55562,7 @@ async def prepare_codex_login_turn(session: dict[str, Any]) -> None:
     """Pre-admission handoff under the chat lock, before message acceptance."""
     if CODEX_TRANSPORT == CODEX_TRANSPORT_EXEC or codex_provider.session_choice(session.get("codex_provider")) == "custom":
         return
-    await refresh_codex_app_server_login()
+    await refresh_codex_app_server_login(source="turn_admission")
     session_id = str(session.get("id") or "")
     manager = existing_codex_app_server_manager(session)
     if getattr(manager, "_agentsdock_login_superseded", False) is not True:
@@ -79270,6 +79292,7 @@ async def require_agent_token(request: Request, call_next):
     codex_goals_admin_route = request.url.path in {
         "/api/admin/codex/goals", "/api/admin/codex/subagents",
         "/api/admin/codex/auth", "/api/admin/codex/auth/api-key",
+        "/api/admin/codex/auth/reload",
         "/api/admin/codex/provider", "/api/admin/codex/provider/test",
         "/api/admin/codex/provider/models",
         "/api/admin/provider-connections/claude", "/api/admin/provider-connections/claude/check",
@@ -79458,7 +79481,7 @@ async def require_agent_token(request: Request, call_next):
             if body_error is not None:
                 status_code, detail = body_error
                 return JSONResponse({"detail": detail}, status_code=status_code)
-        elif request.url.path == "/api/admin/codex/auth/api-key" and request.method.upper() == "POST":
+        elif request.url.path in {"/api/admin/codex/auth/api-key", "/api/admin/codex/auth/reload"} and request.method.upper() == "POST":
             declared_size, transport_error = privileged_native_json_transport(
                 request, max_body_bytes=codex_auth.MAX_BODY_BYTES,
                 label="Codex authentication", require_content_length=True,
@@ -83141,7 +83164,7 @@ def require_native_admin_control(request: Request) -> None:
 async def codex_auth_operation(*, mutate: bool, existing_only: bool = False):
     """Fence native authentication changes with the existing Codex admission barrier."""
     if not mutate:
-        await refresh_codex_app_server_login()
+        await refresh_codex_app_server_login(source="account_status")
     async with CODEX_AUTH_LOCK:
         reserved = False
         try:
@@ -83178,10 +83201,20 @@ async def codex_auth_operation(*, mutate: bool, existing_only: bool = False):
                 await release_codex_goals_reconfiguration()
 
 
+async def reload_codex_login() -> bool:
+    logger.info("Codex login reload requested source=manual_login_reload")
+    if not await refresh_codex_app_server_login(request_handoff=True, source="manual_login_reload"):
+        logger.info("Codex login reload deferred source=manual_login_reload reason=unavailable_or_busy")
+        raise HTTPException(409, "Codex sign-in cannot be reloaded now. Its credential store is unsupported or maintenance is active.")
+    return any(getattr(manager, "_agentsdock_login_superseded", False) is True
+               for manager in codex_app_server_managers())
+
+
 app.include_router(codex_auth.create_router(
     authorize=require_native_admin_control,
     operation=codex_auth_operation,
     available=lambda: CODEX_TRANSPORT != CODEX_TRANSPORT_EXEC,
+    reload_login=reload_codex_login,
 ))
 
 
@@ -86512,7 +86545,7 @@ async def host_diagnostics(limit: int = 40) -> dict[str, Any]:
 async def runtime_catalog(refresh: bool = False) -> dict[str, Any]:
     if refresh:
         await refresh_codex_app_server_binary(force=True)
-        await refresh_codex_app_server_login(request_handoff=True)
+        await refresh_codex_app_server_login(source="catalog_refresh")
     return await asyncio.to_thread(discover_runtime_catalog, force_runtime_probe=refresh)
 
 

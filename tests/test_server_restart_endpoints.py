@@ -2336,10 +2336,20 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
                     force=True,
                     blocker_revision=confirmed["revision"],
                 )
-                with patch.object(
-                    agent_server,
-                    "server_restart_tmux_cgroup_state",
-                    return_value=changed_state,
+                # Exercise the real threaded probe and private revision audit.
+                # A full-suite scheduling pause must not turn this successful
+                # probe fixture into an unrelated probe-timeout scenario.
+                with (
+                    patch.object(
+                        agent_server,
+                        "server_restart_tmux_cgroup_state",
+                        return_value=changed_state,
+                    ),
+                    patch.object(
+                        agent_server,
+                        "SERVER_RESTART_FORCE_PROBE_TIMEOUT_SECONDS",
+                        15.0,
+                    ),
                 ):
                     status = await agent_server.restart_server_endpoint(
                         body,

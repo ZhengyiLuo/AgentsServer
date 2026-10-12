@@ -470,39 +470,17 @@ def boolean_setting(suffix: str, default: bool) -> bool:
     return default
 
 
-CODEX_GOALS_DEFAULT_ENABLED = boolean_setting("CODEX_GOALS_ENABLED", True)
+CODEX_GOALS_DEFAULT_ENABLED = True
 
 
 def read_codex_goals_enabled(path: Path | None = None) -> bool:
-    """Read the persistent server-wide Codex goals policy.
+    """Goals are available without a server-wide opt-in.
 
-    Existing installations have no settings file, so goals remain enabled by
-    default.  An environment setting can choose the first-run default, while
-    an administrator's persisted choice remains authoritative afterward.
+    Ignore the retired environment/config switch, including persisted False
+    from older clients. Do not rewrite shared settings or resume paused goals.
+    Keep the optional path argument for compatibility with existing callers.
     """
-
-    settings_path = path or CODEX_SETTINGS_FILE
-    try:
-        value = json.loads(settings_path.read_text())
-    except FileNotFoundError:
-        return CODEX_GOALS_DEFAULT_ENABLED
-    except (json.JSONDecodeError, OSError) as exc:
-        logger.warning(
-            "could not read Codex server settings from %s: %s",
-            settings_path,
-            exc,
-        )
-        return CODEX_GOALS_DEFAULT_ENABLED
-    if not isinstance(value, dict) or not isinstance(
-        value.get("goals_enabled"),
-        bool,
-    ):
-        logger.warning(
-            "ignoring malformed Codex server settings at %s",
-            settings_path,
-        )
-        return CODEX_GOALS_DEFAULT_ENABLED
-    return bool(value["goals_enabled"])
+    return True
 
 
 # Per-thread Codex config overrides (codex-cli 0.149.1: thread/start,
@@ -55716,9 +55694,8 @@ async def codex_app_server_manager(sess: dict[str, Any] | None = None, *, allow_
     selected = CODEX_PROVIDER_STORE.for_session(sess, include_key=True) if sess is not None else None
     revision = selected["credential_id"] if selected else None
     session_id = str((sess or {}).get("id") or "")
-    # Goal enablement is a process launch flag. Manager lookup therefore takes
-    # the same barrier as configuration replacement, including the fast path;
-    # no caller can retain/create the old generation halfway through a toggle.
+    # Manager lookup shares the provider reconfiguration barrier, including the
+    # fast path, so a sign-in reload cannot race a retained/created generation.
     async with CODEX_GOALS_CONFIG_LOCK:
         ensure_provider_manager_factory_admission(codex=True)
         manager = existing_codex_app_server_manager(sess) if sess is not None else None
@@ -82286,15 +82263,11 @@ def codex_goals_admin_status() -> dict[str, Any]:
     enabled = bool(CODEX_GOALS_ENABLED)
     return {
         "enabled": enabled,
-        "configurable": True,
+        "configurable": False,
         "default_enabled": bool(CODEX_GOALS_DEFAULT_ENABLED),
         "scope": "server",
         "reconfiguring": bool(CODEX_GOALS_RECONFIGURING),
-        "message": (
-            "Persistent Codex goals are enabled for this server."
-            if enabled
-            else "Persistent Codex goals are disabled for this server."
-        ),
+        "message": "Persistent Codex goals are always available. Manage each goal in its chat.",
     }
 
 
@@ -83111,36 +83084,14 @@ async def get_codex_goals_admin() -> dict[str, Any]:
 async def put_codex_goals_admin(
     req: CodexGoalsAdminRequest,
 ) -> dict[str, Any]:
-    global CODEX_GOALS_ENABLED
-    async with CODEX_GOALS_CONFIG_LOCK:
-        requested = bool(req.enabled)
-        if requested == CODEX_GOALS_ENABLED:
-            return codex_goals_admin_status()
-        settings = read_codex_admin_settings()
-        await reserve_codex_goals_reconfiguration()
-        transition: dict[str, int] = {
-            "paused_goal_count": 0,
-            "fenced_goal_count": 0,
-        }
-        try:
-            if not requested:
-                transition = await pause_idle_codex_goals_before_disable()
-            # The feature flag is a process-level Codex setting. Replacing the
-            # shared, idle manager is the only way to make it authoritative for
-            # every loaded and future thread.
-            await close_codex_app_server_manager()
-            atomic_update_json(
-                CODEX_SETTINGS_FILE,
-                {
-                    **settings,
-                    "goals_enabled": requested,
-                    "updated_at": update_utc_now(),
-                },
-            )
-            CODEX_GOALS_ENABLED = requested
-        finally:
-            await release_codex_goals_reconfiguration()
-        return {**codex_goals_admin_status(), **transition}
+    # Preserve the authenticated legacy route without allowing an older client
+    # to disable goals for every chat or restart the shared provider manager.
+    if not req.enabled:
+        raise HTTPException(
+            status_code=409,
+            detail="Persistent Codex goals cannot be disabled server-wide. Pause individual goals in their chats.",
+        )
+    return codex_goals_admin_status()
 
 
 def require_native_admin_control(request: Request) -> None:

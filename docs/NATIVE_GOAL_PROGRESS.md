@@ -27,6 +27,14 @@ responses, not a claim of real-model reasoning or production GUI validation.
 
 ## Persistent native goals
 
+Persistent goals are available by default without a server-wide switch. The
+retired `CODEX_GOALS_ENABLED` environment variable and persisted `goals_enabled`
+setting no longer disable them. Upgrading does not create goals or resume paused
+goals; creation, pause, resume and limits remain per-chat actions. The legacy
+admin status route reports `enabled: true, configurable: false`; enabling is a
+read-only compatibility operation and disabling returns 409 without changing
+settings, goal state or provider processes.
+
 One persistent native Codex goal reservation spans several provider turns.
 An intermediate final answer is not the end of that AgentsDock operation.
 Keep the shared `run_id` and preserve `provider_turn_id`, `item_id`, and the

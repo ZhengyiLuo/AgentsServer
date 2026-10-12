@@ -319,12 +319,26 @@ if (require.main === module) {
         self.assertIn("existing server installation or state", rejected.stderr)
         self.assertIn("If you want to add a new server instance, run: agentsdock new", rejected.stderr)
         self.assertEqual(private_env.read_bytes(), before)
-        for command in ("restart", "remove", "uninstall"):
+        for command in ("start", "stop", "restart", "remove", "uninstall"):
             rejected = subprocess.run(["agentsdock", command], cwd=outside, env=env,
                                       capture_output=True, text=True, timeout=20)
             self.assertNotEqual(rejected.returncode, 0)
             self.assertIn("Select exactly one instance or --all", rejected.stderr)
             self.assertEqual(private_env.read_bytes(), before)
+
+        # Exercise the actual packaged postinstall with real npm and real core
+        # source. Named-instance state makes this an intentional safe no-op;
+        # no service-manager spoofing or fresh native installation is involved.
+        before_named = named_env.read_bytes()
+        reinstall = invoke(["npm", "install", "--global", "--prefix", str(prefix),
+                            "--force", "--foreground-scripts", "--no-audit", "--no-fund",
+                            "--offline", *archives])
+        self.assertIn("Existing named-server installation or state found; left unchanged", reinstall)
+        self.assertNotIn("Setting up your first", reinstall)
+        self.assertNotIn("fixture-only-token", reinstall)
+        self.assertNotIn("separate-fixture-token", reinstall)
+        self.assertEqual(private_env.read_bytes(), before)
+        self.assertEqual(named_env.read_bytes(), before_named)
         self.assertFalse((home / "Library/LaunchAgents").exists())
         self.assertFalse((home / ".config/systemd").exists())
 

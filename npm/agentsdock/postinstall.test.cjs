@@ -77,11 +77,57 @@ test('setup receipts accept the native installer Tailscale/LAN preference withou
 })
 
 test('an existing named-only installation does not cause a second default server to appear', async t => {
+  for (const relative of ['.local/share/agents-server-instances', '.config/agents-server-instances', '.agentsdock-instances']) {
+    const f = fixture(t)
+    const marker = path.join(f.root, relative, 'work', 'retained-state')
+    fs.mkdirSync(path.dirname(marker), { recursive: true })
+    fs.writeFileSync(marker, 'fixture named history')
+    f.context.load = () => { throw new Error('must not load runtime for named-only state') }
+    assert.equal(await postinstall(f.context), 0)
+    assert.match(f.output.join('\n'), /named-server.*left unchanged/)
+    assert.equal(fs.readFileSync(marker, 'utf8'), 'fixture named history')
+    assert.equal(f.calls.length, 0)
+  }
+})
+
+test('a concurrently detected installation remains a no-op without claiming a ready server', async t => {
   const f = fixture(t)
-  fs.mkdirSync(path.join(f.root, '.config/agents-server-instances/work'), { recursive: true })
+  f.context.launch = () => {
+    const child = new EventEmitter()
+    child.stdout = new PassThrough(); child.stderr = new PassThrough()
+    queueMicrotask(() => {
+      child.stderr.write('An existing server installation or state was found. private-token\n')
+      child.emit('close', 1)
+    })
+    return child
+  }
   assert.equal(await postinstall(f.context), 0)
-  assert.match(f.output.join('\n'), /named-server.*left unchanged/)
-  assert.equal(f.calls.length, 0)
+  assert.match(f.output.at(-1), /no replacement was attempted/)
+  assert.doesNotMatch(f.output.join('\n'), /ready|private-token/)
+  assert.equal(f.calls.length, 1) // Fresh preflight only; no retry is launched.
+})
+
+test('setup spawn failure, signal termination and wrong-version receipt cannot report success', async t => {
+  const f = fixture(t)
+  for (const result of ['spawn-error', 'signal', 'wrong-version']) {
+    f.output.length = 0
+    f.context.launch = () => {
+      const child = new EventEmitter()
+      child.stdout = new PassThrough(); child.stderr = new PassThrough()
+      queueMicrotask(() => {
+        if (result === 'spawn-error') return child.emit('error', new Error('private diagnostic'))
+        child.stdout.write('AGENTSDOCK_SETUP_RESULT=' + JSON.stringify({
+          server_version: result === 'wrong-version' ? '1.2.3-beta.3' : f.runtime.version,
+          server_url: 'http://127.0.0.1:7850', access_token: 'private-token',
+        }) + '\n')
+        child.emit('close', result === 'signal' ? null : 0)
+      })
+      return child
+    }
+    await assert.rejects(postinstall(f.context), error =>
+      /Could not launch|did not complete/.test(error.message) && !error.message.includes('private'))
+    assert.doesNotMatch(f.output.join('\n'), /ready|private-token/)
+  }
 })
 
 test('uncertain preflight, root and custom selectors do not get mistaken for installed/healthy', async t => {

@@ -555,18 +555,20 @@ def server_work_snapshot(
                 "server health response is missing its service-cgroup admission proof"
             )
         raw_count = cgroup.get("unknown_descendant_count")
+        inspection = cgroup.get("inspection")
         if (
             cgroup.get("safe") is not True
             or isinstance(raw_count, bool)
             or not isinstance(raw_count, int)
-            or raw_count != 0
+            or raw_count < 0
+            or (raw_count != 0 and inspection != "verified-preserved")
         ):
             raise RuntimeError(
                 "AgentsServer has an unverified or nonempty service cgroup"
             )
         if (
             require_verified_service_cgroup
-            and cgroup.get("inspection") != "verified"
+            and inspection not in {"verified", "verified-preserved"}
         ):
             raise RuntimeError(
                 "AgentsServer did not return a verified systemd service-cgroup proof"

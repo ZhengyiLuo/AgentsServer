@@ -27689,6 +27689,40 @@ def linux_process_still_exists(
     return True
 
 
+def systemd_worker_preserves_descendants(service_cgroup: str) -> bool:
+    """Prove the effective stop policy of this exact native worker, read-only.
+
+    Never infer policy from an on-disk unit: runtime drop-ins and an unloaded
+    replacement can differ. Unknown/malformed ownership retains the existing
+    requirement that the service cgroup contain no other processes.
+    """
+
+    if not sys.platform.startswith("linux"):
+        return False
+    properties = {"LoadState", "ActiveState", "MainPID", "ControlGroup", "KillMode", "SendSIGKILL"}
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show", AGENTS_SERVER_SYSTEMD_UNIT, "--no-pager",
+             "--property=" + ",".join(sorted(properties))],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=2.0, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if result.returncode != 0 or len(result.stdout) > 16_384:
+        return False
+    values: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or key in values or key not in properties:
+            return False
+        values[key] = value
+    return values == {
+        "LoadState": "loaded", "ActiveState": "active", "MainPID": str(os.getpid()),
+        "ControlGroup": service_cgroup, "KillMode": "process", "SendSIGKILL": "no",
+    } and agents_server_systemd_cgroup() == service_cgroup
+
+
 def managed_update_service_cgroup_state(
     *,
     service_cgroup: str | None = None,
@@ -27760,10 +27794,11 @@ def managed_update_service_cgroup_state(
         })
         return state
     unknown = tuple(sorted(service_pids - {os.getpid()}))
+    preserved = bool(unknown) and systemd_worker_preserves_descendants(selected_cgroup)
     state.update({
-        "safe": not unknown,
+        "safe": not unknown or preserved,
         "unknown_descendant_count": len(unknown),
-        "inspection": "verified",
+        "inspection": "verified-preserved" if preserved else "verified",
         "_unknown_descendant_pids": unknown,
     })
     return state
@@ -77243,7 +77278,7 @@ def ensure_managed_update_service_cgroup_clear(
     *,
     service_cgroup: str | None = None,
 ) -> dict[str, Any]:
-    """Fail closed unless only this server remains in its service cgroup."""
+    """Require no children, or prove this worker's stop policy preserves them."""
 
     state = managed_update_service_cgroup_state(
         service_cgroup=service_cgroup,

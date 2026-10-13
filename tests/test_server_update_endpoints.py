@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import os
 import sqlite3
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -284,6 +285,70 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(verified, cgroup)
 
+    def test_worker_preservation_proof_requires_exact_live_native_ownership(self):
+        cgroup = "/user.slice/user@1000.service/app.slice/agents-server.service"
+        properties = {
+            "LoadState": "loaded", "ActiveState": "active", "MainPID": str(os.getpid()),
+            "ControlGroup": cgroup, "KillMode": "process", "SendSIGKILL": "no",
+        }
+        output = lambda values: "\n".join(f"{key}={value}" for key, value in values.items()) + "\n"
+        with patch.object(agent_server.sys, "platform", "linux"), \
+             patch.object(agent_server, "process_cgroup_paths", return_value=(cgroup,)), \
+             patch.object(agent_server.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, output(properties), "")
+            self.assertTrue(agent_server.systemd_worker_preserves_descendants(cgroup))
+            self.assertEqual(run.call_args.args[0][:4], [
+                "systemctl", "--user", "show", agent_server.AGENTS_SERVER_SYSTEMD_UNIT,
+            ])
+            self.assertEqual(run.call_args.kwargs["timeout"], 2.0)
+            for key, invalid in (
+                ("LoadState", "not-found"), ("ActiveState", "deactivating"),
+                ("MainPID", "0"), ("MainPID", str(os.getpid() + 1)),
+                ("ControlGroup", cgroup + "-other"), ("KillMode", "control-group"),
+                ("KillMode", "mixed"), ("SendSIGKILL", "yes"),
+            ):
+                with self.subTest(key=key, invalid=invalid):
+                    run.return_value = subprocess.CompletedProcess([], 0, output({**properties, key: invalid}), "")
+                    self.assertFalse(agent_server.systemd_worker_preserves_descendants(cgroup))
+            run.return_value = subprocess.CompletedProcess([], 0, output(properties), "")
+            with patch.object(agent_server, "process_cgroup_paths", return_value=(cgroup + "-other",)):
+                self.assertFalse(agent_server.systemd_worker_preserves_descendants(cgroup))
+            for malformed in (output(properties) + "KillMode=process\n", output(properties) + "unexpected=value\n",
+                              output({key: value for key, value in properties.items() if key != "MainPID"}), "x" * 16_385):
+                run.return_value = subprocess.CompletedProcess([], 0, malformed, "")
+                self.assertFalse(agent_server.systemd_worker_preserves_descendants(cgroup))
+            run.return_value = subprocess.CompletedProcess([], 1, output(properties), "")
+            self.assertFalse(agent_server.systemd_worker_preserves_descendants(cgroup))
+            for error in (FileNotFoundError(), subprocess.TimeoutExpired("systemctl", 2)):
+                run.side_effect = error
+                self.assertFalse(agent_server.systemd_worker_preserves_descendants(cgroup))
+
+    def test_update_preserves_children_only_while_effective_worker_policy_proves_it(self):
+        cgroup = "/user.slice/user@1000.service/app.slice/agents-server.service"
+        paths = {os.getpid(): (cgroup,), 4242: (cgroup,), 5151: ("/other.service",)}
+        properties = (
+            f"LoadState=loaded\nActiveState=active\nMainPID={os.getpid()}\n"
+            f"ControlGroup={cgroup}\nKillMode=process\nSendSIGKILL=no\n"
+        )
+        with patch.object(agent_server.sys, "platform", "linux"), \
+             patch.object(agent_server, "linux_process_ids", return_value=tuple(paths)), \
+             patch.object(agent_server, "process_cgroup_paths", side_effect=lambda pid: paths[pid]), \
+             patch.object(agent_server.subprocess, "run", side_effect=[
+                 subprocess.CompletedProcess([], 0, properties, ""),
+                 subprocess.CompletedProcess([], 0, properties.replace("KillMode=process", "KillMode=control-group"), ""),
+             ]) as run:
+            state = agent_server.ensure_managed_update_service_cgroup_clear(service_cgroup=cgroup)
+            self.assertEqual(agent_server.public_managed_update_service_cgroup_state(state), {
+                "safe": True, "unknown_descendant_count": 1, "inspection": "verified-preserved",
+            })
+            # A reload can change the effective policy. The next admission must
+            # prove it again, never reuse a stale child-preservation exception.
+            with self.assertRaises(HTTPException) as raised:
+                agent_server.ensure_managed_update_service_cgroup_clear(service_cgroup=cgroup)
+            self.assertEqual(raised.exception.detail["code"], "unsafe_update_service_cgroup")
+            self.assertEqual(run.call_count, 2)
+            self.assertTrue(all(call.args[0][2] == "show" for call in run.call_args_list))
+
     def test_service_cgroup_probe_fails_closed_on_a_stubborn_descendant(self):
         cgroup = "/user.slice/user@1000.service/app.slice/agents-server.service"
         server_pid = os.getpid()
@@ -302,7 +367,8 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                  agent_server,
                  "process_cgroup_paths",
                  side_effect=lambda pid: paths[pid],
-             ):
+             ), \
+             patch.object(agent_server, "systemd_worker_preserves_descendants", return_value=False):
             state = agent_server.managed_update_service_cgroup_state(
                 service_cgroup=cgroup,
             )

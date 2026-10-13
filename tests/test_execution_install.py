@@ -82,7 +82,8 @@ class ExecutionInstallTests(unittest.TestCase):
         for body in (worker, gateway):
             self.assertNotIn("PartOf=", body)
             self.assertNotIn("BindsTo=", body)
-            self.assertNotIn("KillMode=process", body)
+        self.assertIn("KillMode=process", worker)
+        self.assertNotIn("KillMode=process", gateway)
         self.assertNotIn("--callback-port", gateway)
         self.assertIn("TimeoutStopSec=180s", worker)
         self.assertIn("SendSIGKILL=no", worker)

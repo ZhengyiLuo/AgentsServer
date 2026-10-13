@@ -34,7 +34,7 @@ NEW_MODULES = {
     "opencode_agent_client.py",
     "team_mail_runtime.py", "team_mail_websocket.py",
     "team_mail_grants.py",
-    "claude_history_repair.py", "claude_history_provenance.py", "codex_history_repair.py", "public_chat_shares.py",
+    "transcript_reader.py", "claude_history_repair.py", "claude_history_provenance.py", "codex_history_repair.py", "public_chat_shares.py",
     "public_chat_transcript.py", "public_chat_share_routes.py",
     "interactive_chat_shares.py", "interactive_chat_share_routes.py",
     "interactive_chat_share_web.py", "interactive_chat_projection.py", "interactive_chat_runtime.py",

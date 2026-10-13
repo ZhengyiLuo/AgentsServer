@@ -151,15 +151,25 @@ class CodexSubagentsAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone((await self.put(None))["max_concurrent_threads_per_session"])
         self.assertEqual(json.loads(self.settings.read_text())["thread_config"], {"agents": {"enabled": False}})
 
-    async def test_goals_writer_preserves_subagent_and_other_settings(self):
+    async def test_retired_goal_switch_does_not_mutate_subagent_settings(self):
         await self.put(24)
-        goal_req = self.ns["CodexGoalsAdminRequest"](enabled=False)
-        await self.ns["put_codex_goals_admin"](goal_req)
-        stored = json.loads(self.settings.read_text())
-        self.assertFalse(stored["goals_enabled"])
-        self.assertEqual(stored["thread_config"]["agents"]["max_concurrent_threads_per_session"], 24)
+        before = self.settings.read_bytes()
+        for enabled in (True, False):
+            goal_req = self.ns["CodexGoalsAdminRequest"](enabled=enabled)
+            if enabled:
+                result = await self.ns["put_codex_goals_admin"](goal_req)
+                self.assertTrue(result["enabled"])
+                self.assertFalse(result["configurable"])
+            else:
+                with self.assertRaises(HTTPException) as raised:
+                    await self.ns["put_codex_goals_admin"](goal_req)
+                self.assertEqual(raised.exception.status_code, 409)
+            self.assertEqual(self.settings.read_bytes(), before)
+        self.ns["close_codex_app_server_manager"].assert_not_called()
+        self.ns["reserve_codex_goals_reconfiguration"].assert_not_called()
+        self.ns["pause_idle_codex_goals_before_disable"].assert_not_called()
         await self.put(32)
-        self.assertFalse(json.loads(self.settings.read_text())["goals_enabled"])
+        self.assertEqual(json.loads(self.settings.read_text())["thread_config"]["agents"]["max_concurrent_threads_per_session"], 32)
 
     async def test_settings_write_waits_on_shared_goals_lock(self):
         lock = self.ns["CODEX_GOALS_CONFIG_LOCK"]

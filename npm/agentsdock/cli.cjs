@@ -13,6 +13,7 @@ const HELP = `Usage: agentsdock setup [--port PORT] [--bind IP] [--non-interacti
        agentsdock new [NAME] [--port PORT] [--bind IP]
        agentsdock start|stop|restart|remove NAME
        agentsdock token [NAME]
+       agentsdock pair [NAME] [--network auto|tailscale|lan|local] [--url URL] [--output FILE.png] [--link]
        agentsdock status [NAME]
        agentsdock update --server-url URL --server-identity ID --server-instance-id ID
          --token-file PATH --manifest PATH --signature PATH
@@ -22,6 +23,7 @@ const HELP = `Usage: agentsdock setup [--port PORT] [--bind IP] [--non-interacti
 setup/install creates a fresh default server. Use new for another instance.
 remove (also uninstall) asks for confirmation and preserves history by default.
 token lists existing servers; use Up/Down and Enter to choose, or token NAME for direct access. Keep tokens private.
+pair displays a connection QR for mobile (default instance if NAME is omitted); qrcode is an alias.
 status shows each instance's status, addresses, installed version and port; add NAME for one instance.
 update uses the signed managed updater; npm installation alone never upgrades a running server.
 start/stop/restart/remove also accept --all [--exclude NAME]; an omitted target never selects all.
@@ -73,6 +75,7 @@ function parse(argv) {
       ? { kind: 'local', script: 'install.sh', args: ['--instance', name, '--show-token'] }
       : { kind: 'local', script: 'instances.sh', args: ['token'] }
   }
+  if (['pair', 'qrcode'].includes(command)) return require('./pair.cjs').parsePair(args)
   if (command === 'status') {
     const name = selector(args)
     return { kind: 'local', script: 'instances.sh', args: name ? ['status', name] : ['status'] }
@@ -148,6 +151,7 @@ async function run(argv, overrides = {}) {
     }
   }
   const env = localEnvironment(context, runtime)
+  if (request.kind === 'pair') return require('./pair.cjs').pair(request, runtime, context, env)
   const script = path.join(runtime.payload, request.script)
   if (!fs.lstatSync(script).isFile()) throw new Error('The installed server helper is not a regular file.')
   // Preserve the terminal for confirmation/clipboard prompts. Never interpolate

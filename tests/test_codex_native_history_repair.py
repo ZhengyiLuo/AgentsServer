@@ -172,6 +172,24 @@ class CodexNativeHistoryRepairTests(unittest.TestCase):
         self.assertTrue(all(self.cache.project_event("chat", row) is None for row in self.native))
         self.assertEqual(before, (self.events.read_bytes(), self.source.read_bytes()))
 
+    def test_large_tool_record_keeps_native_replay_proof_and_genuine_user(self):
+        self.raw.append({**self.raw[0], "timestamp": "2026-09-11T12:09:00Z", "payload": {
+            **self.raw[0]["payload"], "id": "genuine-user-item",
+            "internal_chat_message_metadata_passthrough": {"turn_id": "new-human-turn", "content_item_kinds": ["user.text"]}}})
+        self.fixture(source_headers=[
+            {"type": "session_meta", "payload": {"id": PROVIDER}},
+            {"type": "response_item", "payload": {"type": "function_call_output", "output": "x" * (40 * 1024 * 1024)}},
+        ])
+        before = self.source.read_bytes(), self.events.read_bytes()
+        self.prepare()
+        self.assertIsNotNone(self.cache.project_event("chat", self.imports[0]))
+        self.assertIsNone(self.cache.project_event("chat", self.imports[-1]))
+        filtered = filter_native_codex_history_items("chat", PROVIDER, self.events, [self.parse(row) for row in self.raw])
+        # Proven assistant replays are omitted; user inputs retain silent boundaries.
+        self.assertEqual([(item["kind"], item["text"]) for item in filtered[:-1]], [("user", ""), ("user", "")])
+        self.assertEqual(filtered[-1]["text"], "Genuine human request")
+        self.assertEqual(before, (self.source.read_bytes(), self.events.read_bytes()))
+
     def recovered_stop_fixture(self):
         # Restart recovery has no native completion/turn-ID receipt. The public
         # commentary already delivered by this run still has its exact item ID.

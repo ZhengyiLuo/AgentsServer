@@ -72,6 +72,7 @@ agentsdock new work --port 7854 --bind 127.0.0.1
 agentsdock status work
 agentsdock token
 agentsdock token work
+agentsdock pair work
 agentsdock restart work
 agentsdock remove work
 ```
@@ -124,6 +125,36 @@ start/stop/restart, uninstall cancellation and removal/name-release checks.
 Saved test data remained in its private backup. This does not close the
 fresh-default or split-service acceptance gaps above.
 
+## Connect a phone by QR
+
+```sh
+agentsdock pair                      # default instance
+agentsdock pair work                 # terminal QR, Tailscale preferred then LAN
+agentsdock pair work --network lan   # same Wi-Fi/LAN
+agentsdock pair work --output connection.png
+```
+
+In a mobile build with pairing support, open **Servers → Scan connection QR**,
+scan the terminal or choose the saved image, and tap **Connect and save**. URL and
+token are filled automatically; authenticated health and server identity must
+match before the profile is saved. A repeat scan reuses the existing server.
+
+If several LAN addresses exist, the command asks you to select a listed address
+with `--url http://192.168.1.20:7851`; it never guesses between a Wi-Fi interface
+and a virtual-machine bridge. Arbitrary URLs are rejected.
+
+`qrcode` is an alias for `pair`. `--link` explicitly prints the credential-bearing
+`agentsdock://connect#...` URL instead of a QR. Treat the link/image like the
+server's access token. The command never contacts an online QR service and does
+not rotate tokens, reinstall, restart, or change network settings. Saved PNGs are
+owner-only and existing files are never overwritten.
+
+Both devices must be on a reachable LAN or private Tailscale network. A server
+bound only to localhost cannot connect to a physical phone; automatic selection
+refuses that case. `--network local` is an explicit same-computer/simulator test
+option. `--network tailscale` requires a confirmed Tailscale address and binding.
+The QR includes the identity returned by authenticated health at the chosen URL.
+
 ## Complete public command comparison
 
 `work` is an example instance name; `default` selects the original instance.
@@ -144,6 +175,7 @@ mailbox/jobs/team tools supplied to agents inside an authorized chat.
 | Stop one | `./instances.sh stop work` | `agentsdock stop work` |
 | Restart one | `./instances.sh restart work` | `agentsdock restart work` |
 | Choose an existing server and read its token | `./instances.sh token` | `agentsdock token` |
+| Scan a server connection | No previous short command | `agentsdock pair [NAME]` / `agentsdock qrcode [NAME]` |
 | Read default token directly | `./install.sh --show-token` | `agentsdock token default` |
 | Read named token | `./install.sh --instance work --show-token` | `agentsdock token work` |
 | Uninstall one, preserve history | `./uninstall.sh --instance work` / `./instances.sh remove work` | `agentsdock remove work` or `agentsdock uninstall work` |

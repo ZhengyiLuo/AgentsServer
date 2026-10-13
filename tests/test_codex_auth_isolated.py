@@ -63,8 +63,10 @@ class CodexAuthTests(unittest.IsolatedAsyncioTestCase):
         exec(OPERATION_CODE, self.ns)
         self.app = FastAPI()
         self.app.middleware("http")(self.ns["require_agent_token"])
+        self.reload_login = AsyncMock(return_value=True)
         self.auth_router = codex_auth.create_router(authorize=self.ns["require_native_admin_control"],
-            operation=self.ns["codex_auth_operation"], available=lambda: self.ns["CODEX_TRANSPORT"] != "exec")
+            operation=self.ns["codex_auth_operation"], available=lambda: self.ns["CODEX_TRANSPORT"] != "exec",
+            reload_login=self.reload_login)
         self.app.include_router(self.auth_router)
         self.client = TestClient(self.app)
         self.addCleanup(self.client.close)
@@ -72,6 +74,43 @@ class CodexAuthTests(unittest.IsolatedAsyncioTestCase):
     def login(self, body=None, headers=None):
         return self.client.post("/api/admin/codex/auth/api-key", headers=NATIVE if headers is None else headers,
             json={"api_key": SECRET} if body is None else body)
+
+    def test_reload_is_explicit_native_post_not_account_read(self):
+        self.manager.request.return_value = {"account": None, "requiresOpenaiAuth": True}
+        response = self.client.get("/api/admin/codex/auth", headers=NATIVE)
+        self.assertTrue(response.json()["login_reload_available"])
+        self.reload_login.assert_not_awaited()
+        response = self.client.post("/api/admin/codex/auth/reload", headers=NATIVE, json={})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["login_reload_pending"])
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.reload_login.assert_awaited_once_with()
+
+    def test_reload_rejects_non_native_requests_and_input_without_handoff(self):
+        for headers, status in [({}, 401), ({"Authorization": "Bearer synthetic-native-token"}, 401),
+                ({**NATIVE, "Origin": "https://example.invalid"}, 403),
+                ({**NATIVE, "Cookie": "a=1"}, 403), ({**NATIVE, "Sec-Fetch-Mode": "cors"}, 403)]:
+            response = self.client.post("/api/admin/codex/auth/reload", headers=headers, json={})
+            self.assertEqual(response.status_code, status, response.text)
+        response = self.client.post("/api/admin/codex/auth/reload", headers=NATIVE, json={"key": SECRET})
+        self.assertEqual(response.status_code, 400)
+        self.assertNotIn(SECRET, response.text)
+        self.assertEqual(self.client.get("/api/admin/codex/auth/reload", headers=NATIVE).status_code, 405)
+        self.assertEqual(self.client.post("/api/admin/codex/auth/reload", headers=NATIVE, content=SECRET).status_code, 415)
+        self.reload_login.assert_not_awaited()
+        self.manager.request.assert_not_awaited()
+
+    def test_reload_unavailable_or_busy_does_not_read_or_close_provider(self):
+        self.ns["CODEX_TRANSPORT"] = "exec"
+        response = self.client.post("/api/admin/codex/auth/reload", headers=NATIVE, json={})
+        self.assertEqual(response.status_code, 501)
+        self.reload_login.assert_not_awaited()
+        self.ns["CODEX_TRANSPORT"] = "app-server"
+        self.reload_login.side_effect = HTTPException(409, "unavailable")
+        response = self.client.post("/api/admin/codex/auth/reload", headers=NATIVE, json={})
+        self.assertEqual(response.status_code, 409)
+        self.manager.request.assert_not_awaited()
+        self.ns["close_codex_app_server_manager"].assert_not_called()
 
     def test_legacy_login_rejected_without_native_access_or_restart(self):
         result = self.login()

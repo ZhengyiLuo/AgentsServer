@@ -109,13 +109,21 @@ the original server-generated wake identity and full input hash. The provider's
 `user.text` label alone does not mean a server-authored cron/wake was a new human
 message. Genuine same-text input in an unrelated turn remains visible.
 
-The reader still bounds individual records (4 MiB), retained proof keys/targets,
-and elapsed work (30 seconds by default). Callers can supply a cooperative
-cancellation callback or an absolute monotonic deadline. Regular-file identity,
-size and modification time must remain unchanged throughout each read; altered,
-malformed, unavailable or incomplete evidence cannot produce a partial proof.
-These changes are confined to native Codex replay proof; the separate legacy
-goal/Claude readers and their budgets are unchanged.
+The reader bounds retained text/metadata per record (32 MiB), retained proof
+keys/targets, and elapsed work (30 seconds by default). Native media/tool bytes
+are parsed in chunks without a raw-record size cutoff. Callers can supply a
+cooperative cancellation callback or an absolute monotonic deadline, checked
+between chunks as well as records. Raw source ranges, not projected records,
+supply checkpoint hashes. Regular-file identity, size and modification time
+must remain unchanged; altered, unavailable or incomplete evidence cannot
+produce a partial proof. Malformed provider lines retain their established
+skip semantics and still participate in the raw digest; malformed private
+ledger evidence remains an error.
+
+The native reader is shared with import and incremental synchronization,
+including Claude proof reads. Proof text retains its separate 4 Mi-character
+cap; private-ledger and legacy goal-proof aggregate budgets are unchanged.
+See [large transcript import](LARGE_TRANSCRIPT_IMPORT.md).
 
 `CodexNativeHistoryProofUnavailable` distinguishes incomplete work from a
 completed negative result. Import callers must defer the whole batch without

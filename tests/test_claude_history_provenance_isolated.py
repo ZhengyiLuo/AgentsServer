@@ -7,6 +7,8 @@ import asyncio
 from collections import defaultdict, deque
 from datetime import datetime
 import io
+import os
+from transcript_reader import jsonl_records
 import hashlib
 import hmac
 import json
@@ -97,7 +99,7 @@ def load_projection() -> dict:
         "ClaudeInterruptionTracker": ClaudeInterruptionTracker,
         "normalize_claude_interruption_context": normalize_claude_interruption_context,
         "MAX_LOCAL_TRANSCRIPT_SCAN_LINES": 10_000, "MAX_LOCAL_TRANSCRIPT_BYTES": 100_000_000,
-        "MAX_LOCAL_TRANSCRIPT_LINE_BYTES": 4 * 1024 * 1024, "stat": stat,
+        "MAX_LOCAL_TRANSCRIPT_LINE_BYTES": 4 * 1024 * 1024, "stat": stat, "os": os, "jsonl_records": jsonl_records,
         "MAX_WORKSPACE_PATH_CHARS": 4096, "HISTORY_SYNC_CURSOR_VERSION": 1,
         "MAX_IMPORTED_TEXT_CHARS": 100_000, "MAX_IMPORT_MESSAGES": 400,
         "BACKEND_CLAUDE": "claude", "BACKEND_CODEX": "codex", "DEFAULT_BACKEND": "claude",
@@ -392,11 +394,11 @@ class ClaudeHistoryProvenanceTests(unittest.TestCase):
 
     def test_bounded_generators_preserve_invalid_only_when_opted_in(self) -> None:
         data = b'{"type":"user"}\n{invalid}\n[]\n\n'
-        path = Mock()
-        path.stat.return_value = SimpleNamespace(st_size=len(data))
-        path.open.side_effect = lambda *_args: io.BytesIO(data)
-        self.assertEqual(list(self.projection["bounded_jsonl_events"](path)), [{"type": "user"}])
-        self.assertEqual(list(self.projection["bounded_jsonl_events"](path, preserve_invalid=True)), [{"type": "user"}, None, None])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.jsonl"
+            path.write_bytes(data)
+            self.assertEqual(list(self.projection["bounded_jsonl_events"](path)), [{"type": "user"}])
+            self.assertEqual(list(self.projection["bounded_jsonl_events"](path, preserve_invalid=True)), [{"type": "user"}, None, None])
         for preserve, expected in ((False, [{"type": "user"}]), (True, [{"type": "user"}, None])):
             self.projection["bounded_jsonl_records_range"] = Mock(return_value=iter([({"type": "user"}, 10), (None, 20)]))
             self.assertEqual(list(self.projection["bounded_jsonl_events_range"](path, 0, 20, expected_stat={}, preserve_invalid=preserve)), expected)

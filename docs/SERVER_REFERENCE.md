@@ -1459,6 +1459,27 @@ The endpoint uses the same bearer-token authentication as the rest of the API.
 Binary changes remain compact Git binary markers rather than being copied into
 the event log.
 
+## Dismissing emergency alerts
+
+`POST /api/sessions/{session_id}/emergency/acknowledge` accepts exactly one
+of these fields:
+
+- `expected_alert_id`: acknowledge that one alert (existing behavior).
+- `through_alert_id`: acknowledge every still-active alert raised through
+  that alert's durable position, including the boundary alert itself.
+
+Clients discover the batch option through
+`capabilities.agent_emergency_alerts_v1.acknowledge_through_alert_id`. Capture
+the displayed alert ID when the user clicks; alerts raised after that boundary
+remain active. The boundary remains valid after another device acknowledges
+it, and repeating the request is harmless. An unknown boundary returns 409;
+a missing chat returns 404; both fields or neither field returns 422.
+
+Batch responses contain `session`, `acknowledged`, and `acknowledged_count`.
+The server persists ordinary acknowledgement events together and broadcasts
+the resulting summary. Reopening the chat or connecting another device sees
+the same result. Dismissal retains alert history and does not stop running work.
+
 ## Public API Sketch
 
 The server exposes JSON endpoints under `/api`.

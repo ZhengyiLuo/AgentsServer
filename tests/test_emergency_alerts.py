@@ -6,7 +6,9 @@ from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import httpx
 from fastapi import HTTPException
+from pydantic import ValidationError
 from starlette.requests import Request
 
 import agent_server
@@ -647,6 +649,174 @@ class EmergencyAlertServerTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(denied.exception.status_code, 403)
         self.assertFalse(self.event_records())
+
+    async def test_frozen_alert_batch_preserves_concurrent_alert_and_survives_reload(self) -> None:
+        first = await self.raise_alert("request.batch.0001", "First existing alert.")
+        second = await self.raise_alert("request.batch.0002", "Second existing alert.")
+        # The existing raw history contract supplies an exact, pageable boundary.
+        tail, boundary, _count, omitted_before, _omitted_after = agent_server.read_client_events_page(
+            "source", limit=1, tail=True,
+        )
+        self.assertEqual(omitted_before, 1)
+        self.assertEqual(tail[0]["emergency_alert"]["id"], second["alert"]["id"])
+        newer = await self.raise_alert("request.batch.0003", "New alert during dismissal.")
+        earlier, _latest, _count, remaining, _omitted_after = agent_server.read_client_events_page(
+            "source", before=tail[0]["seq"], limit=1, tail=True,
+        )
+        self.assertEqual(remaining, 0)
+        snapshot = []
+        for event in [*earlier, *tail]:
+            self.assertLessEqual(event["seq"], boundary)
+            snapshot = agent_server.apply_emergency_lifecycle_event(snapshot, event)
+        frozen_ids = [alert["id"] for alert in snapshot]
+        self.assertEqual(frozen_ids, [first["alert"]["id"], second["alert"]["id"]])
+        # Another device may acknowledge one of the frozen IDs before the batch.
+        await agent_server.acknowledge_session_emergency(
+            "source", agent_server.AcknowledgeEmergencyRequest(expected_alert_id=frozen_ids[0]),
+        )
+        for index, alert_id in enumerate(frozen_ids):
+            result = await agent_server.acknowledge_session_emergency(
+                "source", agent_server.AcknowledgeEmergencyRequest(expected_alert_id=alert_id),
+            )
+            self.assertEqual(result["acknowledged"], index == 1)
+        self.assertEqual(result["session"]["unacknowledged_emergency_count"], 1)
+        self.assertEqual(result["session"]["emergency_alert"]["id"], newer["alert"]["id"])
+        self.assertEqual(agent_server.ACTIVE["source"], {"run_id": "run_active", "stop_requested": False})
+        self.assertIn("source", agent_server.BUSY_SESSIONS)
+        self.assertEqual(agent_server.STORE.sessions["other"], self.other)
+        events = self.event_records()
+        self.assertEqual(sum(event["type"] == "emergency_alert_raised" for event in events), 3)
+        self.assertEqual(sum(event["type"] == "emergency_alert_acknowledged" for event in events), 2)
+        stream = agent_server.HUB.broadcast.await_args_list[-1].args
+        self.assertEqual(stream[0], agent_server.EMERGENCY_HUB_KEY)
+        self.assertEqual(stream[1]["session"]["emergency_alert"]["id"], newer["alert"]["id"])
+        restored = agent_server.SessionStore()
+        with patch.object(agent_server, "STORE", restored):
+            await restored.load()
+        summary = agent_server.public_session(restored.sessions["source"])
+        self.assertEqual(summary["unacknowledged_emergency_count"], 1)
+        self.assertEqual(summary["emergency_alert"]["id"], newer["alert"]["id"])
+
+    async def test_dismiss_through_acknowledged_boundary_preserves_newer_alert_and_retries(self) -> None:
+        first = await self.raise_alert("request.through.0001", "First alert.")
+        boundary = await self.raise_alert("request.through.0002", "Click boundary.")
+        await agent_server.acknowledge_session_emergency(
+            "source", agent_server.AcknowledgeEmergencyRequest(expected_alert_id=boundary["alert"]["id"]),
+        )
+        newer = await self.raise_alert("request.through.0003", "After the click.")
+        request = agent_server.AcknowledgeEmergencyRequest(through_alert_id=boundary["alert"]["id"])
+        result = await agent_server.acknowledge_session_emergency("source", request)
+        self.assertTrue(result["acknowledged"])
+        self.assertEqual(result["acknowledged_count"], 1)
+        self.assertEqual(result["session"]["emergency_alert"]["id"], newer["alert"]["id"])
+        self.assertEqual(result["session"]["unacknowledged_emergency_count"], 1)
+        self.assertFalse(agent_server.ACTIVE["source"]["stop_requested"])
+        self.assertIn("source", agent_server.BUSY_SESSIONS)
+        self.assertEqual(agent_server.STORE.sessions["other"], self.other)
+        before = self.event_records()
+        repeated = await agent_server.acknowledge_session_emergency("source", request)
+        self.assertFalse(repeated["acknowledged"])
+        self.assertEqual(repeated["acknowledged_count"], 0)
+        self.assertEqual(before, self.event_records())
+        acknowledgements = [event["emergency_alert_id"] for event in before
+                            if event["type"] == "emergency_alert_acknowledged"]
+        self.assertEqual(acknowledgements, [boundary["alert"]["id"], first["alert"]["id"]])
+        restored = agent_server.SessionStore()
+        with patch.object(agent_server, "STORE", restored):
+            await restored.load()
+        self.assertEqual([alert["id"] for alert in agent_server.active_emergency_alerts(restored.sessions["source"])],
+                         [newer["alert"]["id"]])
+
+    async def test_dismiss_all_serializes_new_raise_after_one_durable_batch(self) -> None:
+        first = await self.raise_alert("request.race.0001", "First alert.")
+        boundary = await self.raise_alert("request.race.0002", "Second alert.")
+        entered, release = asyncio.Event(), asyncio.Event()
+        original_append = agent_server.append_durable_event_batch
+
+        async def hold_batch(session_id, event_specs):
+            if event_specs[0][0] == "emergency_alert_acknowledged":
+                entered.set()
+                await release.wait()
+            return await original_append(session_id, event_specs)
+
+        with patch.object(agent_server, "append_durable_event_batch", side_effect=hold_batch) as append:
+            dismissal = asyncio.create_task(agent_server.acknowledge_session_emergency(
+                "source", agent_server.AcknowledgeEmergencyRequest(through_alert_id=boundary["alert"]["id"]),
+            ))
+            await entered.wait()
+            raising = asyncio.create_task(self.raise_alert("request.race.0003", "Concurrent new alert."))
+            await asyncio.sleep(0)
+            self.assertFalse(raising.done())
+            release.set()
+            result, newer = await asyncio.gather(dismissal, raising)
+            batches = [call.args[1] for call in append.await_args_list
+                       if call.args[1][0][0] == "emergency_alert_acknowledged"]
+        self.assertEqual(len(batches), 1)
+        self.assertEqual([payload["emergency_alert_id"] for _kind, payload in batches[0]],
+                         [first["alert"]["id"], boundary["alert"]["id"]])
+        self.assertEqual(result["acknowledged_count"], 2)
+        self.assertEqual(result["session"]["unacknowledged_emergency_count"], 0)
+        self.assertEqual([event["type"] for event in self.event_records()], [
+            "emergency_alert_raised", "emergency_alert_raised", "emergency_alert_acknowledged",
+            "emergency_alert_acknowledged", "emergency_alert_raised",
+        ])
+        self.assertEqual(agent_server.emergency_summary(agent_server.STORE.sessions["source"])[0]["id"],
+                         newer["alert"]["id"])
+
+    async def test_dismiss_all_rejects_unknown_foreign_boundary_and_missing_chat(self) -> None:
+        raised = await self.raise_alert("request.invalid.0001", "Known alert.")
+        before = self.event_records()
+        for session_id, alert_id, status in (
+            ("source", "emergency_" + "0" * 32, 409),
+            ("other", raised["alert"]["id"], 409),
+            ("missing", raised["alert"]["id"], 404),
+        ):
+            with self.subTest(session_id=session_id), self.assertRaises(HTTPException) as caught:
+                await agent_server.acknowledge_session_emergency(
+                    session_id, agent_server.AcknowledgeEmergencyRequest(through_alert_id=alert_id),
+                )
+            self.assertEqual(caught.exception.status_code, status)
+        self.assertEqual(before, self.event_records())
+        self.assertEqual(self.event_records("other"), [])
+        alert_id = raised["alert"]["id"]
+        for payload in ({}, {"expected_alert_id": alert_id, "through_alert_id": alert_id},
+                        {"through_alert_id": "not-an-alert"}, {"through_alert_id": alert_id, "all": True}):
+            with self.subTest(payload=payload), self.assertRaises(ValidationError):
+                agent_server.AcknowledgeEmergencyRequest(**payload)
+
+    async def test_dismiss_all_retry_recovers_committed_batch_after_projection_failure(self) -> None:
+        await self.raise_alert("request.recover.0001", "First alert.")
+        boundary = await self.raise_alert("request.recover.0002", "Second alert.")
+        request = agent_server.AcknowledgeEmergencyRequest(through_alert_id=boundary["alert"]["id"])
+        with patch.object(agent_server.STORE, "apply_emergency_event", AsyncMock(side_effect=OSError("fixture projection failure"))):
+            with self.assertRaises(OSError):
+                await agent_server.acknowledge_session_emergency("source", request)
+        self.assertEqual(len(agent_server.active_emergency_alerts(agent_server.STORE.sessions["source"])), 2)
+        result = await agent_server.acknowledge_session_emergency("source", request)
+        self.assertEqual(result["acknowledged_count"], 0)
+        self.assertIsNone(result["session"]["emergency_alert"])
+        self.assertEqual(result["session"]["unacknowledged_emergency_count"], 0)
+        self.assertEqual(sum(event["type"] == "emergency_alert_acknowledged" for event in self.event_records()), 2)
+
+    async def test_dismiss_all_http_contract_keeps_auth_and_validation(self) -> None:
+        raised = await self.raise_alert("request.http.0001", "HTTP boundary alert.")
+        path = "/api/sessions/source/emergency/acknowledge"
+        payload = {"through_alert_id": raised["alert"]["id"]}
+        headers = {"Authorization": "Bearer server-token"}
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=agent_server.app),
+                                     base_url="http://test") as client:
+            denied = await client.post(path, json=payload)
+            self.assertEqual(denied.status_code, 401)
+            self.assertEqual(len(self.event_records()), 1)
+            invalid = await client.post(path, json={**payload, "expected_alert_id": raised["alert"]["id"]}, headers=headers)
+            self.assertEqual(invalid.status_code, 422)
+            response = await client.post(path, json=payload, headers=headers)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["acknowledged_count"], 1)
+            self.assertIsNone(response.json()["session"]["emergency_alert"])
+            repeated = await client.post(path, json=payload, headers=headers)
+            self.assertEqual(repeated.status_code, 200, repeated.text)
+            self.assertEqual(repeated.json()["acknowledged_count"], 0)
 
     async def test_restart_reconciles_raise_and_ack_from_durable_events(self) -> None:
         raised = await self.raise_alert(

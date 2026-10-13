@@ -6555,11 +6555,24 @@ class EmergencyAlertRequest(BaseModel):
 class AcknowledgeEmergencyRequest(BaseModel):
     model_config = {"extra": "forbid"}
 
-    expected_alert_id: str = Field(
+    expected_alert_id: str | None = Field(
+        default=None,
         min_length=8,
         max_length=80,
         pattern=r"^emergency_[0-9a-f]{32}$",
     )
+    through_alert_id: str | None = Field(
+        default=None,
+        min_length=8,
+        max_length=80,
+        pattern=r"^emergency_[0-9a-f]{32}$",
+    )
+
+    @model_validator(mode="after")
+    def exactly_one_alert_boundary(self):
+        if (self.expected_alert_id is None) == (self.through_alert_id is None):
+            raise ValueError("provide exactly one of expected_alert_id or through_alert_id")
+        return self
 
 
 class ChatReference(BaseModel):
@@ -44233,6 +44246,39 @@ def find_emergency_acknowledgement_event(
         ):
             return event
     return None
+
+
+def emergency_alert_batch_through(
+    session_id: str,
+    through_alert_id: str,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Freeze active IDs at an exact durable raise boundary, including retries.
+
+    Read lifecycle facts rather than a potentially interrupted summary save.
+    Reverse order lets each alert's newest fact determine whether it is active.
+    A previously acknowledged boundary remains a valid, immutable cut-off.
+    """
+    settled: set[str] = set()
+    active: list[tuple[int, str]] = []
+    boundary = None
+    for event in reversed_jsonl_events(events_path(session_id)):
+        if event.get("type") == "emergency_alert_acknowledged":
+            settled.add(str(event.get("emergency_alert_id") or ""))
+        elif event.get("type") == "emergency_alert_raised":
+            alert = normalized_emergency_alert(event.get("emergency_alert"))
+            seq = int(event.get("seq") or 0)
+            if alert is None or seq <= 0:
+                continue
+            alert_id = alert["id"]
+            if alert_id == through_alert_id:
+                boundary = event
+            if alert_id not in settled:
+                active.append((seq, alert_id))
+                settled.add(alert_id)
+    if boundary is None:
+        return None, []
+    boundary_seq = int(boundary["seq"])
+    return boundary, [alert_id for seq, alert_id in reversed(active) if seq <= boundary_seq]
 
 
 def emergency_alert_response(
@@ -82146,6 +82192,7 @@ async def health() -> dict[str, Any]:
                 "max_active_alerts": EMERGENCY_ACTIVE_ALERT_LIMIT,
                 "stream_path": "/api/emergency-alerts/events",
                 "stream_protocol": EMERGENCY_WEBSOCKET_PROTOCOL,
+                "acknowledge_through_alert_id": True,
             },
             "cross_chat_handoffs_v1": cross_chat_handoffs_capability(),
             "codex_controls": {
@@ -90047,6 +90094,26 @@ async def acknowledge_session_emergency(
         sess = STORE.sessions.get(session_id)
         if not sess:
             raise HTTPException(status_code=404, detail="session not found")
+        if req.through_alert_id is not None:
+            boundary, alert_ids = await asyncio.to_thread(
+                emergency_alert_batch_through, session_id, req.through_alert_id,
+            )
+            if boundary is None:
+                raise HTTPException(status_code=409, detail="that emergency alert boundary was not found")
+            if alert_ids:
+                events = await append_durable_event_batch(session_id, [
+                    ("emergency_alert_acknowledged", {
+                        "emergency_alert_id": alert_id,
+                        "message": "Emergency acknowledged by the user.",
+                    })
+                    for alert_id in alert_ids
+                ])
+                committed = events[-1]
+            else:
+                committed = boundary
+            sess = await project_committed_emergency_event(session_id, committed)
+            return {"session": public_session(sess), "acknowledged": bool(alert_ids),
+                    "acknowledged_count": len(alert_ids)}
         alert_id = req.expected_alert_id
         acknowledged_event = await asyncio.to_thread(
             find_emergency_acknowledgement_event,

@@ -913,18 +913,22 @@ def control(instance: Instance, action: str, platform: str = sys.platform):
         status = service_status(instance, platform)
         if status == "unknown":
             raise ValueError("Cannot establish service state; no service changes made.")
-        if action == "stop":
-            if status != "stopped":
-                run(["launchctl", "bootout", target])
-        elif status == "stopped":
-            run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(instance.service_file(platform))])
-        elif action == "restart":
+        if action in {"stop", "restart"} and status != "stopped":
             run(["launchctl", "bootout", target])
+            # bootout may return before launchd has removed the job. Returning
+            # early lets a following start see the old job as running and
+            # silently do nothing. Stop and restart need the same unload gate.
             deadline = time.monotonic() + 180
-            while service_status(instance, platform) != "stopped":
+            while True:
+                status = service_status(instance, platform)
+                if status == "stopped":
+                    break
+                if status == "unknown":
+                    raise ValueError("Cannot confirm service stopped; no replacement process was started.")
                 if time.monotonic() >= deadline:
                     raise ValueError("Service did not stop; refusing to start a second process.")
                 time.sleep(0.1)
+        if action != "stop" and status == "stopped":
             run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(instance.service_file(platform))])
     else:
         run(["systemctl", "--user", action, service_name(instance.name) + ".service"])

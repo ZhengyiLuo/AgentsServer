@@ -26,6 +26,7 @@ import importlib.util
 import inspect
 import io
 import json
+from transcript_reader import jsonl_records, scan_check, SCAN_SECONDS
 import logging
 import logging.handlers
 import math
@@ -1296,8 +1297,9 @@ HISTORY_SYNC_EVENT_SCAN_LIMIT = int(
 MAX_IMPORTED_TEXT_CHARS = int(agentsdock_setting("HISTORY_IMPORT_TEXT_CHARS", "12000"))
 MAX_LOCAL_SESSION_LIST_ITEMS = 500
 MAX_LOCAL_SESSION_SCAN_FILES = 10_000
-MAX_LOCAL_TRANSCRIPT_BYTES = 256 * 1024 * 1024
-MAX_LOCAL_TRANSCRIPT_LINE_BYTES = 4 * 1024 * 1024
+# Retained text/metadata budget. Opaque native media/tool bytes are streamed.
+# Private timeline/index readers still use this as their raw record bound.
+MAX_LOCAL_TRANSCRIPT_LINE_BYTES = 32 * 1024 * 1024
 MAX_LOCAL_TRANSCRIPT_SCAN_LINES = 250_000
 MAX_CODEX_SESSION_INDEX_BYTES = 16 * 1024 * 1024
 MAX_CODEX_SESSION_INDEX_LINES = 100_000
@@ -46173,98 +46175,44 @@ def bounded_jsonl_paths(
                     continue
 
 
-def bounded_jsonl_events(path: Path, *, preserve_invalid: bool = False) -> Iterator[dict[str, Any] | None]:
-    """Parse a transcript with hard byte, line-size, and line-count bounds."""
 
-    size = path.stat().st_size
-    if size > MAX_LOCAL_TRANSCRIPT_BYTES:
-        raise ValueError(
-            f"transcript exceeds the {MAX_LOCAL_TRANSCRIPT_BYTES}-byte import limit"
-        )
-    consumed = 0
+
+def bounded_jsonl_events(path: Path, *, preserve_invalid: bool = False) -> Iterator[dict[str, Any] | None]:
+    """Project native records with bounded memory, not a source-byte cap."""
+    initial = path.stat()
+    expected = {field: int(getattr(initial, field)) for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns")}
     with path.open("rb") as stream:
-        for line_number in range(1, MAX_LOCAL_TRANSCRIPT_SCAN_LINES + 1):
-            raw_line = stream.readline(MAX_LOCAL_TRANSCRIPT_LINE_BYTES + 1)
-            if not raw_line:
-                return
-            consumed += len(raw_line)
-            if consumed > MAX_LOCAL_TRANSCRIPT_BYTES:
-                raise ValueError("transcript changed while it was being imported")
-            if len(raw_line) > MAX_LOCAL_TRANSCRIPT_LINE_BYTES:
-                raise ValueError(f"transcript line {line_number} exceeds the import limit")
-            if not raw_line.strip():
-                continue
-            try:
-                event = json.loads(raw_line)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                if preserve_invalid:
-                    yield None
-                continue
-            if isinstance(event, dict):
+        opened = os.fstat(stream.fileno())
+        if any(int(getattr(opened, field)) != expected[field] for field in expected):
+            raise ValueError("transcript changed before parsing")
+        for event, _end, raw in jsonl_records(stream, end=initial.st_size,
+                require_newline=False, max_records=MAX_LOCAL_TRANSCRIPT_SCAN_LINES,
+                max_retained_bytes=MAX_LOCAL_TRANSCRIPT_LINE_BYTES):
+            if not raw.blank and (event is not None or preserve_invalid):
                 yield event
-            elif preserve_invalid:
-                yield None
-        if stream.read(1):
-            raise ValueError(
-                f"transcript exceeds the {MAX_LOCAL_TRANSCRIPT_SCAN_LINES}-line import limit"
-            )
+        finished = os.fstat(stream.fileno())
+        if any(int(getattr(finished, field)) != expected[field] for field in expected):
+            raise ValueError("transcript changed during parsing")
 
 
 def bounded_jsonl_records_range(
-    path: Path,
-    start: int,
-    end: int,
-    *,
-    expected_stat: dict[str, int],
+    path: Path, start: int, end: int, *, expected_stat: dict[str, int],
+    require_newline: bool = True,
 ) -> Iterator[tuple[dict[str, Any] | None, int]]:
     """Read every record and ending offset in one immutable JSONL range."""
-
-    if start < 0 or end < start or end > MAX_LOCAL_TRANSCRIPT_BYTES:
+    if start < 0 or end < start or end > expected_stat["st_size"]:
         raise ValueError("transcript cursor range is invalid")
-    remaining = end - start
-    if remaining == 0:
-        return
     with path.open("rb") as stream:
         before = os.fstat(stream.fileno())
-        if any(
-            int(getattr(before, field)) != int(expected_stat[field])
-            for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns")
-        ):
+        if any(int(getattr(before, field)) != int(expected_stat[field]) for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns")):
             raise ValueError("transcript changed before cursor parsing")
         stream.seek(start)
-        for line_number in range(1, MAX_LOCAL_TRANSCRIPT_SCAN_LINES + 1):
-            if remaining <= 0:
-                break
-            raw_line = stream.readline(
-                min(MAX_LOCAL_TRANSCRIPT_LINE_BYTES + 1, remaining)
-            )
-            if not raw_line:
-                raise ValueError("transcript was truncated during cursor parsing")
-            remaining -= len(raw_line)
-            if len(raw_line) > MAX_LOCAL_TRANSCRIPT_LINE_BYTES:
-                raise ValueError(
-                    f"transcript cursor line {line_number} exceeds the import limit"
-                )
-            if not raw_line.endswith(b"\n"):
-                raise ValueError("transcript cursor does not end on a complete line")
-            event: dict[str, Any] | None = None
-            if raw_line.strip():
-                try:
-                    loaded = json.loads(raw_line)
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    loaded = None
-                if isinstance(loaded, dict):
-                    event = loaded
-            yield event, int(stream.tell())
-        if remaining > 0:
-            raise ValueError(
-                f"transcript cursor range exceeds the {MAX_LOCAL_TRANSCRIPT_SCAN_LINES}-line import limit"
-            )
+        for event, offset, _raw in jsonl_records(stream, end=end,
+                require_newline=require_newline, max_records=MAX_LOCAL_TRANSCRIPT_SCAN_LINES,
+                max_retained_bytes=MAX_LOCAL_TRANSCRIPT_LINE_BYTES):
+            yield event, offset
         after = os.fstat(stream.fileno())
-        if any(
-            int(getattr(after, field)) != int(expected_stat[field])
-            for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns")
-        ):
+        if any(int(getattr(after, field)) != int(expected_stat[field]) for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns")):
             raise ValueError("transcript changed during cursor parsing")
 
 
@@ -48726,7 +48674,6 @@ def normalized_history_sync_cursor(
             or int(raw.get(field, 0)) < 0
             for field in optional_integer_fields
         )
-        or int(raw["source_size"]) > MAX_LOCAL_TRANSCRIPT_BYTES
         or int(raw["source_offset"]) > int(raw["source_size"])
         or (
             timeline_pending_active
@@ -48907,10 +48854,6 @@ def provider_history_source_snapshot(
     """Hash a stable transcript through its last complete JSONL record."""
 
     initial = path.stat()
-    if initial.st_size > MAX_LOCAL_TRANSCRIPT_BYTES:
-        raise ValueError(
-            f"transcript exceeds the {MAX_LOCAL_TRANSCRIPT_BYTES}-byte import limit"
-        )
     # Provider CLIs may rotate a JSONL file with atomic replacement or move it
     # between dated directories. Backend/provider identity is validated before
     # this helper; byte-for-byte prefix continuity is authoritative across a
@@ -48925,7 +48868,8 @@ def provider_history_source_snapshot(
     prefix_digest = hashlib.sha256() if verify_offset is not None else None
     prefix_hashed = 0
     complete_size = 0
-    pending = b""
+    running_digest = hashlib.sha256()
+    deadline = time.monotonic() + SCAN_SECONDS
     with path.open("rb") as stream:
         opened = os.fstat(stream.fileno())
         expected_identity = (
@@ -48951,15 +48895,15 @@ def provider_history_source_snapshot(
                 take = min(len(chunk), int(verify_offset) - prefix_hashed)
                 prefix_digest.update(chunk[:take])
                 prefix_hashed += take
-            pending += chunk
-            newline = pending.rfind(b"\n")
+            scan_check(deadline, budget_seconds=SCAN_SECONDS)
+            newline = chunk.rfind(b"\n")
             if newline >= 0:
-                complete = pending[:newline + 1]
-                complete_digest.update(complete)
-                complete_size += len(complete)
-                pending = pending[newline + 1:]
-            if len(pending) > MAX_LOCAL_TRANSCRIPT_LINE_BYTES:
-                raise ValueError("incomplete transcript line exceeds the import limit")
+                running_digest.update(chunk[:newline + 1])
+                complete_digest = running_digest.copy()
+                complete_size = int(initial.st_size) - remaining - len(chunk) + newline + 1
+                running_digest.update(chunk[newline + 1:])
+            else:
+                running_digest.update(chunk)
         finished = os.fstat(stream.fileno())
         if (
             int(finished.st_dev),
@@ -90725,19 +90669,20 @@ def claude_imported_fork_boundary(
     digest = hashlib.sha256()
     last_message: dict[str, Any] = {}
     with path.open("rb") as stream:
-        for _line in range(MAX_LOCAL_TRANSCRIPT_SCAN_LINES):
-            if not remaining:
-                break
-            raw = stream.readline(min(MAX_LOCAL_TRANSCRIPT_LINE_BYTES + 1, remaining))
-            if not raw or not raw.endswith(b"\n") or len(raw) > MAX_LOCAL_TRANSCRIPT_LINE_BYTES:
-                raise ValueError("imported history checkpoint has an incomplete transcript record")
-            remaining -= len(raw)
-            digest.update(raw)
-            if not raw.strip():
+        original = os.fstat(stream.fileno())
+        for record, offset, raw in jsonl_records(stream, end=remaining,
+                max_records=MAX_LOCAL_TRANSCRIPT_SCAN_LINES):
+            raw.update_hash(digest)
+            remaining = int(cursor["source_offset"]) - offset
+            if raw.blank:
                 continue
-            record = json.loads(raw)
-            if isinstance(record, dict) and record.get("type") in {"user", "assistant"} and not record.get("isSidechain"):
+            if record is None:
+                raise ValueError("imported history checkpoint has a malformed transcript record")
+            if record.get("type") in {"user", "assistant"} and not record.get("isSidechain"):
                 last_message = record
+        current = os.fstat(stream.fileno())
+        if (original.st_dev, original.st_ino, original.st_size, original.st_mtime_ns) != (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns):
+            raise ValueError("imported history checkpoint changed during reading")
     if remaining or not hmac.compare_digest(digest.hexdigest(), cursor["source_digest"]):
         raise ValueError("imported history checkpoint no longer matches its native prefix")
     message = last_message.get("message")

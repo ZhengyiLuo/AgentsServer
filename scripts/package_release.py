@@ -70,6 +70,7 @@ FILES = (
     "cursor_provider_mcp.py",
     "opencode_agent_client.py",
     "cursor_process_guard.py",
+    "transcript_reader.py",
     "claude_history_repair.py",
     "claude_history_provenance.py",
     "codex_history_repair.py",

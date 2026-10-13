@@ -312,6 +312,26 @@ if (require.main === module) {
         named_status = invoke(["agentsdock", "status", "work"])
         self.assertIn("Server (work):", named_status)
         self.assertNotIn("Server (default):", named_status)
+        # Exercise packaged logs through the public executable, with no service
+        # installation. Native Linux journal behavior has separate argv tests.
+        if sys.platform == "darwin":
+            logs = home / "Library/Logs/AgentsServer-instances/work"
+            logs.mkdir(parents=True, mode=0o700)
+            (logs / "server.log").write_text("old entry\nrecent entry\n")
+            (logs / "server-error.log").write_text("error entry\n")
+            snapshot = invoke(["agentsdock", "logs", "work", "--lines", "1"])
+            self.assertIn("Logs (work):", snapshot)
+            self.assertIn("recent entry", snapshot)
+            self.assertIn("error entry", snapshot)
+            self.assertNotIn("old entry", snapshot)
+            self.assertNotIn("separate-fixture-token", snapshot)
+            empty = invoke(["agentsdock", "logs", "--instance", "work", "-n", "0"])
+            self.assertNotIn("recent entry", empty)
+            self.assertIn("Logs (default):", invoke(["agentsdock", "logs", "-n", "0"]))
+        for arguments in (["missing"], ["work", "-n", "10001"], ["--all"]):
+            rejected = subprocess.run(["agentsdock", "logs", *arguments], cwd=outside,
+                                      env=env, capture_output=True, text=True, timeout=20)
+            self.assertNotEqual(rejected.returncode, 0)
         before = private_env.read_bytes()
         rejected = subprocess.run(["agentsdock", "install", "--dry-run"], cwd=outside,
                                   env=env, capture_output=True, text=True, timeout=20)

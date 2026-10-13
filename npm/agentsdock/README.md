@@ -61,6 +61,7 @@ agentsdock list
 agentsdock status
 agentsdock new work --port 7854 --bind 127.0.0.1
 agentsdock status work
+agentsdock logs work
 agentsdock token
 agentsdock token work
 agentsdock pair work
@@ -110,6 +111,31 @@ start/stop/restart, uninstall cancellation and removal/name-release checks.
 Saved test data remained in its private backup. This does not close the
 fresh-default or split-service acceptance gaps above.
 
+## Read service logs
+
+This command is new in source and is not included in the published 1.0.10 or
+1.0.11-beta.1 packages yet.
+
+```sh
+agentsdock logs                       # Default server: recent entries, then exit
+agentsdock logs work                  # One named server; find names with agentsdock list
+agentsdock logs work --lines 20       # -n 20 also works
+agentsdock logs work --follow         # -f also works; Ctrl+C stops only this viewer
+agentsdock logs work -n 0 -f           # Only entries arriving after viewing starts
+```
+
+Run on the server machine as its OS user; this is not a remote log-download API.
+The default is 100 lines, with a range of 0–10,000. macOS shows separate stdout
+and stderr sections (the last N lines per file, with a 1 MiB initial-read cap).
+Split default installations include both gateway and worker logs. Linux uses
+the current user's journal and shows the last N entries across the selected
+instance's units, without a pager. Log sources follow the installed layout,
+not the CLI's version. Missing/empty Mac log files are reported and watched if
+following; unsafe paths fail rather than being followed. Nothing is restarted
+or installed, and no token/configuration file is printed. Service log entries
+can still contain private data; review them before sharing. macOS control
+characters are escaped for terminal safety, not credential redaction.
+
 ## Connect a phone by QR
 
 ```sh
@@ -154,6 +180,7 @@ mailbox/jobs/team tools supplied to agents inside an authorized chat.
 | All instance statuses, addresses, versions and ports | `./instances.sh status` | `agentsdock status` (separate blocks) |
 | One instance's readable status | `./instances.sh status work` | `agentsdock status work` |
 | One instance's details as JSON | `./instances.sh info work` | `agentsdock info work` |
+| Recent service logs | Platform-specific `tail` / `journalctl` | `agentsdock logs [NAME]` |
 | New automatic name/free port | `./instances.sh new` | `agentsdock new` |
 | New named instance | `./instances.sh new --name work --port 7854` | `agentsdock new work --port 7854` |
 | Start one | `./instances.sh start work` | `agentsdock start work` |
@@ -182,6 +209,8 @@ Supported options retain their native meanings:
 - `remove`/`uninstall`: also `--yes` and `--purge-state`. Purge retains the native
   interactive confirmation and cannot be made unattended with `--yes`.
 - `token`/`status`: positional name or `--instance NAME`, never both.
+- `logs`: optional name or `--instance NAME` (default: `default`), `-n`/`--lines`
+  and `-f`/`--follow`. No bulk selector or arbitrary log path.
 - `update`: the six required arguments in the example below. Bare `update` or
   `update work` does not select a registry tag or silently restart a server.
 
@@ -198,7 +227,7 @@ Differences from the old source scripts:
   changing the port of an existing installation; manifest-based bulk creation
   (`./instances.sh install --manifest ...`); Team Hub configuration/reactivation;
   foreground development `python agent_server.py serve`. There are no implemented
-  `agentsdock configure`, `agentsdock logs`, `agentsdock login`, or `agentsdock serve`
+  `agentsdock configure`, `agentsdock login`, or `agentsdock serve`
   commands in this package.
 - Direct checkout reinstalls (`./instances.sh update`, installer's version or
   custom-root overrides) are not aliases for the signed `update` command. Split

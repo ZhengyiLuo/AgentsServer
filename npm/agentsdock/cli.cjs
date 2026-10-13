@@ -15,6 +15,7 @@ const HELP = `Usage: agentsdock setup [--port PORT] [--bind IP] [--non-interacti
        agentsdock token [NAME]
        agentsdock pair [NAME] [--network auto|tailscale|lan|local] [--url URL] [--output FILE.png] [--link]
        agentsdock status [NAME]
+       agentsdock logs [NAME] [--lines N] [--follow]
        agentsdock update --server-url URL --server-identity ID --server-instance-id ID
          --token-file PATH --manifest PATH --signature PATH
        agentsdock recover
@@ -25,6 +26,7 @@ remove (also uninstall) asks for confirmation and preserves history by default.
 token lists existing servers; use Up/Down and Enter to choose, or token NAME for direct access. Keep tokens private.
 pair displays a connection QR for mobile (default instance if NAME is omitted); qrcode is an alias.
 status shows each instance's status, addresses, installed version and port; add NAME for one instance.
+logs shows recent local service logs (default instance when NAME is omitted); -n sets the line count and -f follows. Review logs before sharing.
 update uses the signed managed updater; npm installation alone never upgrades a running server.
 start/stop/restart/remove also accept --all [--exclude NAME]; an omitted target never selects all.
 new --name NAME, token/status --instance NAME, and servers/instances ACTION remain supported.
@@ -44,10 +46,10 @@ function selector(args, fallback) {
   return name
 }
 
-const INSTANCE_ACTIONS = ['list', 'info', 'new', 'start', 'stop', 'restart', 'remove']
+const INSTANCE_ACTIONS = ['list', 'info', 'new', 'start', 'stop', 'restart', 'remove', 'logs']
 function instanceRequest(action, args) {
   if (!INSTANCE_ACTIONS.includes(action)) {
-    throw new Error('Use list, info, new, start, stop, restart, or remove. Use agentsdock update for signed updates.')
+    throw new Error('Use list, info, new, start, stop, restart, remove, or logs. Use agentsdock update for signed updates.')
   }
   if (action === 'new' && args[0] && !args[0].startsWith('-')) {
     const name = selector([args[0]])

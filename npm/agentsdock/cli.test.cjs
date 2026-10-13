@@ -124,6 +124,19 @@ test('flat destructive controls preserve explicit selectors and never infer a bu
   assert.throws(() => parse(['servers', 'install', '--manifest', 'batch.json']), /signed updates/)
 })
 
+test('logs preserves read-only native arguments and does not use the installer', async t => {
+  const f = fixture(t)
+  for (const args of [[], ['work'], ['work', '--lines', '20', '--follow'],
+    ['--instance', 'work', '-n', '0', '-f']]) {
+    assert.equal(await run(['logs', ...args], f.context), 0)
+    assert.deepEqual(f.calls.at(-1), ['/bin/bash',
+      [path.join(f.payload, 'instances.sh'), 'logs', ...args],
+      { stdio: 'inherit', env: { HOME: f.root } }])
+    assert.deepEqual(parse(['logs', ...args]), parse(['servers', 'logs', ...args]))
+  }
+  await assert.rejects(run(['logs', 'work\nstop'], f.context), /control character/)
+})
+
 test('local helpers reject root/custom selectors and strip shell/Python startup and credentials', async t => {
   const f = fixture(t)
   for (const env of [{ AGENTSDOCK_STATE_DIR: '/other' }, { AGENTS_SERVER_INSTANCE: 'other' },

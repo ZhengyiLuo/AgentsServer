@@ -654,6 +654,13 @@ On macOS, the installer creates the LaunchAgent
 `com.agentsdock.server` and writes logs under
 `~/Library/Logs/AgentsServer/`.
 
+The source CLI also provides `agentsdock logs [NAME]` (`default` when omitted),
+with `--lines N` and `--follow`. It selects the installed service layout,
+including both gateway and worker logs for split default installations. This
+command is not in the published 1.0.10 / 1.0.11-beta.1 packages yet; use the
+platform commands above until a CLI release includes it. See
+[the log command guide](../npm/agentsdock/README.md#read-service-logs).
+
 ### Managed updates from AgentsDock
 
 Managed update endpoints use the same access token as the rest of the API.

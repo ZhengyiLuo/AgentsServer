@@ -109,12 +109,15 @@ class RawRecord:
 
 
 class _RecordParser:
-    def __init__(self, stream, end, deadline, cancelled, project, maximum, budget_seconds):
+    def __init__(self, stream, end, deadline, cancelled, project, maximum, budget_seconds, retained_fields=None, max_nodes=-1, max_depth=None):
         self.stream, self.end = stream, end
         self.deadline, self.cancelled, self.project = deadline, cancelled, project
         self.buffer, self.index, self.final, self.complete = b'', 0, False, False
         self.retained, self.nodes, self.maximum = 0, 0, maximum
         self.budget_seconds = budget_seconds
+        self.retained_fields = retained_fields
+        self.max_nodes = MAX_NODES if max_nodes == -1 else max_nodes
+        self.max_depth = MAX_DEPTH if max_depth is None else max_depth
 
     def fill(self):
         if self.index < len(self.buffer):
@@ -207,15 +210,17 @@ class _RecordParser:
 
     def value(self, path=(), retain=True, depth=0):
         self.nodes += 1
-        if depth > MAX_DEPTH:
+        if depth > self.max_depth:
             raise TranscriptBudgetExceeded(
                 'Single transcript record exceeds the JSON nesting limit: '
-                f'observed depth {depth:,}; limit {MAX_DEPTH:,}.')
-        if self.nodes > MAX_NODES:
+                f'observed depth {depth:,}; limit {self.max_depth:,}.')
+        if self.max_nodes is not None and self.nodes > self.max_nodes:
             raise TranscriptBudgetExceeded(
                 'Single transcript record exceeds the JSON value-count limit: '
-                f'observed at least {self.nodes:,} values; limit {MAX_NODES:,}.')
+                f'observed at least {self.nodes:,} values; limit {self.max_nodes:,}.')
         self.space()
+        if path and self.retained_fields is not None and path[0] not in self.retained_fields:
+            retain = False
         if self.project and opaque_path(path):
             retain = False
         if retain:
@@ -235,7 +240,11 @@ class _RecordParser:
             while True:
                 if obj:
                     self.space()
-                    key = self.string(True, key=True)
+                    # Explicit metadata projection does not need keys inside
+                    # discarded subtrees. Do not charge transient key bytes as
+                    # retained metadata (native import behavior is unchanged).
+                    keep_key = retain or self.retained_fields is None or self.project
+                    key = self.string(keep_key, key=True)
                     self.space()
                     if self.take() != 58:
                         raise InvalidRecord('JSON colon expected')
@@ -271,12 +280,15 @@ class _RecordParser:
 
 def jsonl_records(stream: BinaryIO, *, end: int, project=True, strict=False,
                   require_newline=True, max_records=250_000, deadline=None,
-                  cancelled=None, max_retained_bytes=MAX_RETAINED_BYTES):
+                  cancelled=None, max_retained_bytes=MAX_RETAINED_BYTES, retained_fields=None,
+                  max_nodes=-1, max_depth=None):
     """Yield (projected object or None, ending offset, RawRecord).
 
     Malformed provider lines may be represented by None, as before. Resource
     exhaustion always raises, so callers never commit a partial-success cursor.
     A fixed end excludes concurrent appends; callers own file identity checks.
+    Native-import work budgets remain the default. Durable metadata-only scans
+    can supply separate structural limits without imposing import caps on logs.
     """
     # Externally supplied deadlines can belong to a larger operation. Do not
     # invent a duration for them; the caller can provide its own timeout detail.
@@ -291,7 +303,7 @@ def jsonl_records(stream: BinaryIO, *, end: int, project=True, strict=False,
                 'Transcript scan exceeds the record-count limit: '
                 f'observed at least {count:,} records; limit {max_records:,}. '
                 'This counts JSONL records, not chat messages.').at_record(count, start)
-        parser = _RecordParser(stream, end, deadline, cancelled, project, max_retained_bytes, budget_seconds)
+        parser = _RecordParser(stream, end, deadline, cancelled, project, max_retained_bytes, budget_seconds, retained_fields, max_nodes, max_depth)
         blank = False
         malformed = False
         try:

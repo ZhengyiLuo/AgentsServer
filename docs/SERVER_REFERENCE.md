@@ -1629,3 +1629,19 @@ An unsupported endpoint, stale session or failed proof preserves the chat. The
 new client never falls back to DELETE or the legacy `discard-empty` route.
 Explicit user deletion retains its existing behavior. Updating only the server
 or only an older client does not provide the complete new cleanup workflow.
+
+### Chat readiness after restart
+
+`GET /api/health` keeps transport health (`ok`) available for diagnostics and
+recovery controls. `chat_readiness` separately reports `ready`, `recovering`, or
+`failed`, with a boolean `ready` and a bounded, non-private message. Queue
+restoration must succeed before new turns can be admitted. A failed restoration
+remains closed to protect durable message ordering; restarting the managed
+server retries the restoration. Repeated failures require server log diagnosis,
+not repeated message submissions. A completed recovery task's own timeout is a
+failure, not a still-running scan.
+
+Emergency acknowledgement reads lifecycle metadata without retaining unrelated
+message/media bodies, and scans outside the global session-store lock. Exact
+alert IDs, durable acknowledgement receipts and cancellation-safe projection
+remain unchanged.

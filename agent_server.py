@@ -9648,35 +9648,66 @@ def normalized_emergency_alert(value: Any) -> dict[str, Any] | None:
     }
 
 
-def reversed_jsonl_events(path: Path) -> Iterator[dict[str, Any]]:
-    """Yield durable JSONL records newest-first without a lossy line cap."""
+def reversed_jsonl_events(
+    path: Path, *, retained_fields: frozenset[str] | None = None,
+) -> Iterator[dict[str, Any]]:
+    """Read newest-first in linear work, without accumulating a giant line.
+
+    Find offsets in fixed blocks. Emergency readers only retain lifecycle
+    fields; unrelated text/media is validated and skipped in bounded chunks.
+    Other consumers retain the full event contract.
+    """
 
     if not path.exists():
         return
     chunk_size = 256 * 1024
     with path.open("rb") as source:
         source.seek(0, os.SEEK_END)
-        position = source.tell()
-        remainder = b""
+        position = end = source.tell()
+
+        def read_event(start: int, stop: int) -> dict[str, Any] | None:
+            if stop <= start:
+                return None
+            source.seek(start)
+            if retained_fields is not None:
+                for event, _, _ in jsonl_records(
+                    source, end=stop, project=False, require_newline=False,
+                    retained_fields=retained_fields, deadline=float("inf"),
+                    # This is a server-owned journal, not a native import.
+                    # A tool payload can legitimately contain many values.
+                    # Keep retained metadata bounded; scan omitted values in
+                    # linear time without the importer's value-count ceiling.
+                    max_nodes=None, max_depth=512,
+                ):
+                    return event
+                return None
+            with suppress(ValueError, UnicodeError):
+                event = json.loads(source.read(stop - start).decode("utf-8", "replace"))
+                if isinstance(event, dict):
+                    return event
+            return None
+
         while position > 0:
             read_size = min(chunk_size, position)
             position -= read_size
             source.seek(position)
-            block = source.read(read_size) + remainder
-            lines = block.split(b"\n")
-            remainder = lines[0]
-            for raw_line in reversed(lines[1:]):
-                if not raw_line.strip():
-                    continue
-                with suppress(Exception):
-                    event = json.loads(raw_line.decode("utf-8", "replace"))
-                    if isinstance(event, dict):
-                        yield event
-        if remainder.strip():
-            with suppress(Exception):
-                event = json.loads(remainder.decode("utf-8", "replace"))
-                if isinstance(event, dict):
+            block = source.read(read_size)
+            offset = len(block)
+            while (offset := block.rfind(b"\n", 0, offset)) >= 0:
+                start = position + offset + 1
+                event = read_event(start, end)
+                if event is not None:
                     yield event
+                end = start - 1
+        event = read_event(0, end)
+        if event is not None:
+            yield event
+
+
+EMERGENCY_EVENT_FIELDS = frozenset({
+    "id", "seq", "type", "ts", "session_id", "run_id",
+    "emergency_alert", "emergency_alert_id", "emergency_request_id", "emergency_request_digest",
+})
 
 
 def emergency_lifecycle_events_after(
@@ -9687,7 +9718,9 @@ def emergency_lifecycle_events_after(
 
     newest_seq = max(0, int(after_seq or 0))
     events: list[dict[str, Any]] = []
-    for event in reversed_jsonl_events(events_path(session_id)):
+    for event in reversed_jsonl_events(
+        events_path(session_id), retained_fields=EMERGENCY_EVENT_FIELDS,
+    ):
         seq = int(event.get("seq") or 0)
         newest_seq = max(newest_seq, seq)
         if seq <= after_seq:
@@ -11200,9 +11233,18 @@ class SessionStore:
         sid: str,
         event: dict[str, Any],
     ) -> dict[str, Any]:
+        # Disk replay must not hold the global sessions lock: other chats and
+        # health/recovery controls must remain usable during a large scan.
+        snapshot = self.sessions.get(sid)
+        if not snapshot:
+            raise HTTPException(status_code=404, detail="session not found")
+        scan_after = max(0, int(snapshot.get("_emergency_reconciled_through_seq") or 0))
+        lifecycle_events, reconciled_through = await asyncio.to_thread(
+            emergency_lifecycle_events_after, sid, scan_after,
+        )
         async with self._lock:
             sess = self.sessions.get(sid)
-            if not sess:
+            if not sess or sess is not snapshot:
                 raise HTTPException(status_code=404, detail="session not found")
             previous_present = "_emergency_alerts" in sess
             previous = sess.get("_emergency_alerts")
@@ -11212,11 +11254,10 @@ class SessionStore:
                 0,
                 int(sess.get("_emergency_reconciled_through_seq") or 0),
             )
-            lifecycle_events, reconciled_through = await asyncio.to_thread(
-                emergency_lifecycle_events_after,
-                sid,
-                previous_reconciled_through,
-            )
+            # A concurrent projection may have advanced while we read. Never
+            # replay an older raise over a newer acknowledgement.
+            lifecycle_events = [candidate for candidate in lifecycle_events
+                                if int(candidate.get("seq") or 0) > previous_reconciled_through]
             event_seq = int(event.get("seq") or 0)
             if (
                 event_seq > previous_reconciled_through
@@ -17488,51 +17529,49 @@ async def update_session_event_metadata(session_id: str, event: dict[str, Any]) 
         await STORE.save(flush=False)
 
 
+def queue_recovery_readiness() -> dict[str, Any]:
+    recovery = QUEUE_RECOVERY_TASK
+    if recovery is None or (recovery.done() and not recovery.cancelled() and recovery.exception() is None):
+        return {"ready": True, "state": "ready", "message": None}
+    if not recovery.done():
+        return {
+            "ready": False, "state": "recovering",
+            "message": "Queued messages are being restored after restart. Retry shortly; do not resend accepted messages.",
+        }
+    return {
+        "ready": False, "state": "failed",
+        "message": "Queued message recovery failed. Chat admission remains closed to preserve saved messages. Restart the managed server; if it repeats, inspect server logs.",
+    }
+
+
 async def wait_for_queue_recovery_admission() -> None:
-    """Wait briefly for the one startup queue scan, then fail retryably.
-
-    The shared recovery task is shielded because disconnecting one request
-    must never cancel the only owner of the durable queue rebuild. A failed
-    scan remains authoritative until process restart rather than opening an
-    ordering hole with only a partial in-memory queue.
-    """
-
+    """Wait for startup replay without cancelling it or masking its failure."""
     recovery = QUEUE_RECOVERY_TASK
     if recovery is None or recovery is asyncio.current_task():
         return
-    try:
-        await asyncio.wait_for(
-            asyncio.shield(recovery),
-            timeout=max(0.0, QUEUE_RECOVERY_ADMISSION_WAIT_SECONDS),
-        )
-    except asyncio.TimeoutError as exc:
+    # asyncio.wait does not propagate the task's own TimeoutError and never
+    # cancels the shared recovery when this request times out/disconnects.
+    done, _ = await asyncio.wait(
+        {recovery}, timeout=max(0.0, QUEUE_RECOVERY_ADMISSION_WAIT_SECONDS),
+    )
+    if not done:
         raise TransientAdmissionWait(
             status_code=503,
-            detail=(
-                "queued turn recovery is still in progress; retry this "
-                "request shortly"
-            ),
-        ) from exc
+            detail="queued turn recovery is still in progress; retry this request shortly",
+        )
+    try:
+        recovery.result()
     except asyncio.CancelledError:
-        # Caller cancellation propagates normally. If the shared task itself
-        # was cancelled outside shutdown, convert that failed recovery into a
-        # retryable fail-closed admission result.
-        if recovery.cancelled() and not SERVER_SHUTTING_DOWN:
-            raise TransientAdmissionWait(
-                status_code=503,
-                detail=(
-                    "queued turn recovery did not complete; restart or retry "
-                    "the managed server"
-                ),
-            ) from None
-        raise
+        if SERVER_SHUTTING_DOWN:
+            raise
+        raise TransientAdmissionWait(
+            status_code=503,
+            detail="queued turn recovery did not complete; restart the managed server; if it repeats, inspect server logs",
+        ) from None
     except Exception as exc:
         raise TransientAdmissionWait(
             status_code=503,
-            detail=(
-                "queued turn recovery did not complete; restart or retry the "
-                "managed server"
-            ),
+            detail="queued turn recovery did not complete; restart the managed server; if it repeats, inspect server logs",
         ) from exc
 
 
@@ -44208,7 +44247,9 @@ def find_emergency_request_event(
     request_id: str,
     source_run_id: str,
 ) -> dict[str, Any] | None:
-    for event in reversed_jsonl_events(events_path(session_id)):
+    for event in reversed_jsonl_events(
+        events_path(session_id), retained_fields=EMERGENCY_EVENT_FIELDS,
+    ):
         if (
             event.get("type") == "emergency_alert_raised"
             and event.get("emergency_request_id") == request_id
@@ -44223,7 +44264,9 @@ def emergency_alert_was_acknowledged(
     alert_id: str,
     raised_seq: int,
 ) -> bool:
-    for event in reversed_jsonl_events(events_path(session_id)):
+    for event in reversed_jsonl_events(
+        events_path(session_id), retained_fields=EMERGENCY_EVENT_FIELDS,
+    ):
         seq = int(event.get("seq") or 0)
         if seq <= raised_seq:
             return False
@@ -44239,7 +44282,9 @@ def find_emergency_acknowledgement_event(
     session_id: str,
     alert_id: str,
 ) -> dict[str, Any] | None:
-    for event in reversed_jsonl_events(events_path(session_id)):
+    for event in reversed_jsonl_events(
+        events_path(session_id), retained_fields=EMERGENCY_EVENT_FIELDS,
+    ):
         if (
             event.get("type") == "emergency_alert_acknowledged"
             and event.get("emergency_alert_id") == alert_id
@@ -44261,7 +44306,9 @@ def emergency_alert_batch_through(
     settled: set[str] = set()
     active: list[tuple[int, str]] = []
     boundary = None
-    for event in reversed_jsonl_events(events_path(session_id)):
+    for event in reversed_jsonl_events(
+        events_path(session_id), retained_fields=EMERGENCY_EVENT_FIELDS,
+    ):
         if event.get("type") == "emergency_alert_acknowledged":
             settled.add(str(event.get("emergency_alert_id") or ""))
         elif event.get("type") == "emergency_alert_raised":
@@ -81815,6 +81862,7 @@ async def health() -> dict[str, Any]:
     team_hub_capability = await team_hub_capability_for_health()
     return {
         "ok": True,
+        "chat_readiness": queue_recovery_readiness(),
         "server_version": SERVER_VERSION,
         "api_contract_version": API_CONTRACT_VERSION,
         "server_identity": server_identity(),

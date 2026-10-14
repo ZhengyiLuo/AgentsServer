@@ -628,11 +628,8 @@ def show(instance: Instance, *, network: dict[str, str] | None = None):
     print()
 
 
-def show_status(instance: Instance, *, network: dict[str, str]) -> None:
-    """Read-only per-instance summary; never print configuration or tokens."""
-    item = describe(instance)
-    print(terminal_color(f"Server ({item['name']}):", "34"))
-    print(f"  Status:   {item['status']}")
+def show_connection_addresses(instance: Instance, item: dict, network: dict[str, str]) -> None:
+    """Use the same binding-aware address order for status and token display."""
     addresses = []
     if item["port"]:
         choices = connection_choices(read_config(instance).get("AGENTSDOCK_AGENT_BIND", "0.0.0.0"),
@@ -645,6 +642,14 @@ def show_status(instance: Instance, *, network: dict[str, str]) -> None:
     print("  Address:  " + (addresses[0] if addresses else "Not configured"))
     for address in addresses[1:]:
         print("            " + address)
+
+
+def show_status(instance: Instance, *, network: dict[str, str]) -> None:
+    """Read-only per-instance summary; never print configuration or tokens."""
+    item = describe(instance)
+    print(terminal_color(f"Server ({item['name']}):", "34"))
+    print(f"  Status:   {item['status']}")
+    show_connection_addresses(instance, item, network)
     print(f"  Version:  {item['version'] or 'unknown'}")
     print(f"  Port:     {item['port'] or 'Not configured'}")
     print()
@@ -847,9 +852,10 @@ def arrow_token_choice(rows: list[str], fd: int, settings: list) -> int | None:
         sys.stdout.flush()
 
 
-def choose_token_instance(registry: Registry) -> Instance | None:
+def choose_token_instance(registry: Registry, items: list[Instance] | None = None) -> Instance | None:
     """Select by stable instance name; never default or expose unselected tokens."""
-    items = registry.instances()
+    if items is None:
+        items = registry.instances()
     if not items:
         print("No installations found. Run agentsdock setup to create your first server.")
         return None
@@ -898,6 +904,34 @@ def choose_token_instance(registry: Registry) -> Instance | None:
                 raise ValueError("That server is no longer available. Run agentsdock token again. No token was shown.")
             return selected
         print(f"Please enter a number from 1 to {len(items)} or a listed server name (Enter cancels).")
+
+
+def show_instance_token(instance: Instance, *, network: dict[str, str] | None = None) -> int:
+    # Redirected explicit token commands retain their raw, single-token output.
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        print(terminal_color(f"\nServer ({instance.name}):", "34"))
+        show_connection_addresses(instance, describe(instance), network if network is not None else tailscale_status())
+        sys.stdout.flush()  # Keep the URL before the child helper's token/prompt.
+    try:
+        run(["/bin/bash", str(ROOT / "install.sh"), "--instance", instance.name, "--show-token"],
+            env=clean_environment(instance), cwd=ROOT)
+        return 0
+    except subprocess.CalledProcessError as exc:
+        return exc.returncode if exc.returncode > 0 else 1
+
+
+def offer_status_token(registry: Registry, items: list[Instance], network: dict[str, str]) -> int:
+    if not items or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return 0
+    try:
+        answer = input("View a server's URL and access token? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 0
+    if answer not in {"y", "yes"}:
+        return 0
+    selected = choose_token_instance(registry, items)
+    return show_instance_token(selected, network=network) if selected is not None else 0
 
 
 def terminal_color(text: str, code: str) -> str:
@@ -1036,7 +1070,8 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="Independent AgentsServer instances for the current OS user. Defaults to list.")
     commands = result.add_subparsers(dest="command")
     commands.add_parser("list")
-    commands.add_parser("token", help="Choose an existing server and display only its access token")
+    token = commands.add_parser("token", help="Choose an existing server and display its URL and access token")
+    token.add_argument("name", nargs="?", type=instance_name)
     info = commands.add_parser("info")
     info.add_argument("name", type=instance_name)
     pairing = commands.add_parser("_pair-info", help=argparse.SUPPRESS)
@@ -1099,15 +1134,15 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError(f"Unknown instance {name!r}. Use agentsdock list to find its name.")
             return show_logs(selected, lines=args.lines, follow=args.follow)
         if args.command == "token":
-            selected = choose_token_instance(registry)
+            if args.name:
+                # The installer retains read-only legacy token discovery even
+                # when an old default install is absent from the new registry.
+                selected = Instance(args.name, registry.home)
+            else:
+                selected = choose_token_instance(registry)
             if selected is None:
                 return 0
-            try:
-                run(["/bin/bash", str(ROOT / "install.sh"), "--instance", selected.name, "--show-token"],
-                    env=clean_environment(selected), cwd=ROOT)
-                return 0
-            except subprocess.CalledProcessError as exc:
-                return exc.returncode if exc.returncode > 0 else 1
+            return show_instance_token(selected)
         if args.command in {None, "list", "info", "status"}:
             items = registry.instances()
             if args.command in {"info", "status"} and args.name:
@@ -1122,6 +1157,7 @@ def main(argv: list[str] | None = None) -> int:
                     show_status(item, network=network)
                 if not items:
                     print("No installations found. Run agentsdock setup to create your first server.")
+                return offer_status_token(registry, items, network)
             else:
                 network = tailscale_status() if items else None
                 print("NAME                 STATUS     PORT")

@@ -8,6 +8,13 @@ supported.
 
 ## Install the command
 
+First install [uv](https://docs.astral.sh/uv/getting-started/installation/) on
+the **server machine** to manage its Python environment. On macOS with Homebrew,
+run `brew install uv`, then confirm `uv --version` works in the same terminal.
+Client-only devices do not need uv. npm setup does not install uv automatically;
+if this prerequisite fails, the error gives installation and version-pinned
+retry commands without printing private installer logs.
+
 ```sh
 npm install -g agentsdock
 agentsdock list
@@ -39,10 +46,14 @@ refuses to overwrite an existing default installation or history. Global auto
 setup uses the same `uv` and native service prerequisites; it does not install
 Homebrew, provider CLIs or Tailscale without a separate user action.
 
-The npm lifecycle may hide successful script output. Add `--foreground-scripts`
-to the npm command if you want to see its status messages. Automatic setup never
-copies raw installer output or access tokens into npm logs. Use `agentsdock list`
-for connection addresses and `agentsdock token` to view/copy the token afterward.
+After a successful first setup, the installer shows the default server URL and
+access token together directly in your terminal, even when npm hides successful
+lifecycle output. Keep the token private. Raw installer output and access tokens
+are not copied into npm's captured output/debug logs. Headless installations
+without a controlling terminal show only a non-secret summary; use
+`agentsdock token default` explicitly to retrieve a token later. Reinstalling
+over existing server state remains a no-op, not a setup or restart.
+`--foreground-scripts` can still help display non-secret lifecycle diagnostics.
 A failed auto setup makes npm report failure instead of claiming the server is
 ready. To obtain interactive diagnostics or choose a custom port/bind:
 
@@ -80,7 +91,9 @@ Without a name, `agentsdock token` lists this OS user's existing servers on the
 machine (including stopped instances). Use Up/Down arrows to highlight a server
 and Enter to select it; Esc, Ctrl+C or Ctrl+D cancels without showing a token.
 The menu scrolls when needed and restores terminal input before showing a token.
-It displays only the selected token, retaining the optional clipboard prompt.
+It displays the selected server's connection URLs alongside its token, retaining
+the optional clipboard prompt. Verified Tailscale addresses appear first;
+local-only bindings are never advertised as reachable from another device.
 Basic terminals without cursor control retain the numbered/name prompt, where
 empty input cancels. Even a single server requires confirmation. In a script or with
 redirected output, select explicitly: `agentsdock token default` or
@@ -88,7 +101,12 @@ redirected output, select explicitly: `agentsdock token default` or
 explicitly if another device needs access.
 
 `agentsdock status` prints a separate readable block for every instance: status,
-addresses, installed version and port. `agentsdock status work` selects just one.
+addresses, installed version and port. In an interactive terminal it then asks
+whether to view a token. Answer `y`, use Up/Down and Enter to select a server,
+and its URL/token appear together. Declining or cancelling shows no token.
+`agentsdock status work` limits both the summary and picker to that instance.
+Redirected/non-interactive status never prompts or prints tokens; explicitly
+named `agentsdock token work` still outputs only the token when redirected.
 The status is the native service-manager state, not an authenticated health probe;
 the version comes from that instance's installed runtime, not the npm CLI package.
 `agentsdock info work` retains JSON output. If `setup` finds an existing default

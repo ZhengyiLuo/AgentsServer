@@ -23,9 +23,9 @@ const HELP = `Usage: agentsdock setup [--port PORT] [--bind IP] [--non-interacti
 
 setup/install creates a fresh default server. Use new for another instance.
 remove (also uninstall) asks for confirmation and preserves history by default.
-token lists existing servers; use Up/Down and Enter to choose, or token NAME for direct access. Keep tokens private.
+token lists existing servers; use Up/Down and Enter to see its URL and token, or token NAME for direct access. Keep tokens private.
 pair displays a connection QR for mobile (default instance if NAME is omitted); qrcode is an alias.
-status shows each instance's status, addresses, installed version and port; add NAME for one instance.
+status shows each instance's status, addresses, installed version and port; add NAME for one instance. In a terminal, it offers a token picker afterward.
 logs shows recent local service logs (default instance when NAME is omitted); -n sets the line count and -f follows. Review logs before sharing.
 update uses the signed managed updater; npm installation alone never upgrades a running server.
 start/stop/restart/remove also accept --all [--exclude NAME]; an omitted target never selects all.
@@ -73,9 +73,7 @@ function parse(argv) {
   }
   if (command === 'token') {
     const name = selector(args)
-    return name
-      ? { kind: 'local', script: 'install.sh', args: ['--instance', name, '--show-token'] }
-      : { kind: 'local', script: 'instances.sh', args: ['token'] }
+    return { kind: 'local', script: 'instances.sh', args: name ? ['token', name] : ['token'] }
   }
   if (['pair', 'qrcode'].includes(command)) return require('./pair.cjs').parsePair(args)
   if (command === 'status') {

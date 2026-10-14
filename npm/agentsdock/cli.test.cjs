@@ -47,8 +47,8 @@ test('bare token opens the chooser; explicit token selects exactly one instance 
   assert.deepEqual(f.calls.at(-1).slice(0, 2), ['/bin/bash', [path.join(f.payload, 'instances.sh'), 'token']])
   for (const [args, name] of [[['default'], 'default'], [['work'], 'work'], [['--instance', 'work'], 'work']]) {
     assert.equal(await run(['token', ...args], f.context), 0)
-    assert.deepEqual(f.calls.at(-1).slice(0, 2), ['/bin/bash', [path.join(f.payload, 'install.sh'),
-      '--instance', name, '--show-token']])
+    assert.deepEqual(f.calls.at(-1).slice(0, 2), ['/bin/bash', [path.join(f.payload, 'instances.sh'),
+      'token', name]])
   }
   for (const args of [['--default'], ['--instance'], ['--instance', 'work', '--bind', '0.0.0.0']]) {
     await assert.rejects(run(['token', ...args], f.context))

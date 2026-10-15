@@ -8,16 +8,20 @@ supported.
 
 ## Install the command
 
-First install [uv](https://docs.astral.sh/uv/getting-started/installation/) on
-the **server machine** to manage its Python environment. On macOS with Homebrew,
-run `brew install uv`, then confirm `uv --version` works in the same terminal.
-Client-only devices do not need uv. npm setup does not install uv automatically;
-if this prerequisite fails, the error gives installation and version-pinned
-retry commands without printing private installer logs.
+Run these commands on the **server machine**, which can be the same computer as
+your desktop app. Use Apple silicon macOS with a desktop login, or Linux with a
+working user systemd session. Install [Node.js 22.14 or later with npm](https://nodejs.org/en/download)
+and [uv](https://docs.astral.sh/uv/getting-started/installation/) for the Python
+environment. Install **tmux** for persistent terminals and in-app managed
+updates; basic chats work without it. On macOS with Homebrew, use
+`brew install node uv tmux`. Run npm as the server owner without `sudo`.
+Client-only devices do not need these prerequisites. The npm server installer
+does not run natively on Windows.
 
 ```sh
 npm install -g agentsdock
 agentsdock list
+agentsdock token default
 ```
 
 On a fresh machine, the global install automatically sets up and starts the
@@ -27,10 +31,20 @@ state, including named instances; repeat installs leave these unchanged and do
 not restart, overwrite or upgrade a running service. The runtime lives in its
 managed installation directory, independently of the npm package/cache.
 
-For a beta, select `npm install -g agentsdock@beta`. This documentation describes
-the package being prepared; commands are available from the registry only after
-that package/channel has been published. Do not infer name ownership from an npm
-404 response.
+Wait for installation to finish, then confirm `default` is `running` in
+`agentsdock list`. No npm account is needed to install the public package.
+Add its URL and the token from `agentsdock token default` in the separately
+downloaded [AgentsDock app](https://agentsdock.net/#downloads). Keep the token
+private. Use the listed local URL on the same computer, a LAN URL on the same
+network, or a Tailscale URL on your private tailnet. `127.0.0.1` cannot reach
+the server from another device.
+
+Install and sign in to your preferred provider CLI on the server before
+starting a chat. npm setup does not install provider CLIs or authenticate them.
+
+For a beta, select `npm install -g agentsdock@beta`. Stable and beta packages are
+published on npm. Features explicitly marked as source-only below may require a
+later package release.
 
 `-g` makes the command available outside the current project when npm's global
 bin directory is on your PATH. A local `npm install agentsdock` is also supported;
@@ -39,14 +53,18 @@ installs, linked source checkouts, CI installs and npx do not automatically star
 a service. Use `npx agentsdock setup` when you deliberately want a server from a
 local install. No installation changes shell configuration or logs into a provider.
 
-Use Node >=22.14, `uv`, and Apple silicon macOS with a desktop login or Linux with
-a working user systemd session. Run as the server owner without `sudo`. Install
-and authenticate your preferred provider CLI separately. `setup` (also `install`)
-refuses to overwrite an existing default installation or history. Global auto
-setup uses the same `uv` and native service prerequisites; it does not install
-Homebrew, provider CLIs or Tailscale without a separate user action.
+`setup` (also `install`) refuses to overwrite an existing default installation
+or history. Global auto setup uses the same prerequisites; it does not install
+uv, Homebrew, provider CLIs or Tailscale automatically. If a prerequisite is
+missing, install it and check it in the same terminal before retrying
+`agentsdock setup`; if the CLI was not installed, rerun the npm install command.
 
-After a successful first setup, the installer shows the default server URL and
+The connection-output improvements in the next paragraph are source-only and
+are not included in the published 1.0.10 or 1.0.11-beta.1 packages. With those
+packages, use `agentsdock list` and `agentsdock token default` even if npm's
+installation output does not show connection details.
+
+With the improved output, a successful first setup shows the default server URL and
 access token together directly in your terminal, even when npm hides successful
 lifecycle output. Keep the token private. Raw installer output and access tokens
 are not copied into npm's captured output/debug logs. Headless installations

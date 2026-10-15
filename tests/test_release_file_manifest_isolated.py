@@ -31,6 +31,7 @@ NEW_MODULES = {
     "claude_model_catalog.py",
     "claude_goals.py",
     "opencode_agent_client.py",
+    "gemini_acp_client.py", "gemini_history.py", "gemini_runtime.py", "gemini_runner.py", "gemini_api.py",
     "team_mail_runtime.py", "team_mail_websocket.py",
     "team_mail_grants.py",
     "transcript_reader.py", "claude_history_repair.py", "claude_history_provenance.py", "codex_history_repair.py", "public_chat_shares.py",

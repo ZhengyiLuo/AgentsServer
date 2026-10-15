@@ -63,7 +63,7 @@ def make_namespace(root: Path):
         "HTTPException": HTTPException, "codex_provider": codex_provider,
         "MAX_SESSION_SYSTEM_PROMPT_CHARS": 10000, "DEFAULT_BACKEND": "codex",
         "BACKEND_CODEX": "codex", "BACKEND_CLAUDE": "claude", "BACKEND_CURSOR": "cursor",
-        "BACKEND_OPENCODE": "opencode",
+        "BACKEND_OPENCODE": "opencode", "BACKEND_GEMINI": "gemini",
         "VALID_BACKENDS": {"codex", "claude", "cursor", "opencode"}, "DEFAULT_CWD": str(root),
         "CODEX_TRANSPORT": "app-server", "CODEX_TRANSPORT_EXEC": "exec",
         "CODEX_PROVIDER_STORE": codex_provider.ProviderStore(root / "providers"),

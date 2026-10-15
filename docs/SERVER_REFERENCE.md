@@ -1529,6 +1529,20 @@ The server exposes JSON endpoints under `/api`.
 
 The event stream is append-only JSONL on disk and paged through the events API.
 Large clients should page history instead of loading every event at once.
+
+Servers advertising `event_stream_liveness_v1` (available, version 1) support
+`liveness=true` on `/api/sessions/{session_id}/events`. After complete catch-up
+and live registration, the socket sends
+`{"type":"event_stream_status","version":1,"session_id":"…","phase":"ready"}`.
+Idle sockets then receive the same control shape with `phase:"heartbeat"`
+every 15 seconds. These opt-in frames are ephemeral: they have no event `seq`,
+never change history, and do not invoke an agent or scan its transcript.
+Clients must not advance their durable cursor from a control frame. A quiet
+model is not a broken connection. Desktop uses a 45-second no-progress deadline
+and resumes after its last successfully accepted event; it never resends a turn
+to repair a disconnected stream. Older clients and servers retain their existing
+protocol, without imposing heartbeat expectations on servers lacking this capability.
+
 The subagents endpoint folds Claude local-agent lifecycle records into bounded
 `subagent_state` snapshots without returning provider prompts, raw events,
 tool-result output, commands, or output-file paths.

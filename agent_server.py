@@ -81899,6 +81899,7 @@ async def health() -> dict[str, Any]:
                 "event_protocol": EVENTS_WEBSOCKET_PROTOCOL,
                 "terminal_protocol": TERMINAL_WEBSOCKET_PROTOCOL,
             },
+            "event_stream_liveness_v1": {"available": True, "version": 1},
             "team_hub_v1": team_hub_capability,
             "team_hub_host_control_v1": team_hub_host_control_capability(),
             "agent_team_mail_routes_v1": {
@@ -96695,6 +96696,17 @@ async def session_terminal(
             await ws.close()
 
 
+EVENT_STREAM_HEARTBEAT_SECONDS = 15.0
+
+
+async def send_event_stream_status(ws: WebSocket, session_id: str, phase: str) -> None:
+    # Ephemeral, opt-in control frames: never persisted or assigned a seq.
+    await asyncio.wait_for(ws.send_json({
+        "type": "event_stream_status", "version": 1,
+        "session_id": session_id, "phase": phase,
+    }), timeout=WEBSOCKET_SEND_TIMEOUT_SECONDS)
+
+
 @app.websocket("/api/sessions/{session_id}/events")
 async def session_events(
     session_id: str,
@@ -96703,6 +96715,7 @@ async def session_events(
     visible: bool | None = None,
     reasoning_stream: bool = False,
     reasoning_text: bool = False,
+    liveness: bool = False,
 ) -> None:
     selected_subprotocol = websocket_endpoint_subprotocol(
         ws,
@@ -96783,12 +96796,24 @@ async def session_events(
                     return
                 if reasoning_snapshot is not None:
                     await asyncio.wait_for(ws.send_json(reasoning_snapshot), timeout=WEBSOCKET_SEND_TIMEOUT_SECONDS)
+                if liveness:
+                    await send_event_stream_status(ws, session_id, "ready")
                 break
             boundary = gap_boundary
         while True:
-            await ws.receive_text()
+            if not liveness:
+                await ws.receive_text()
+                continue
+            try:
+                await asyncio.wait_for(ws.receive_text(), timeout=EVENT_STREAM_HEARTBEAT_SECONDS)
+            except asyncio.TimeoutError:
+                # No history scan, provider call, or sequence acknowledgement.
+                # This confirms that the application event path is still alive.
+                await send_event_stream_status(ws, session_id, "heartbeat")
     except WebSocketDisconnect:
         pass
+    except (asyncio.TimeoutError, ConnectionError):
+        await close_event_websocket_after_delivery_failure(ws)
     finally:
         await HUB.unsubscribe(session_id, ws)
 

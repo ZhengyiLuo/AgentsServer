@@ -49,6 +49,12 @@ class ServerContract(unittest.TestCase):
                             time.sleep(.1)
                         else:
                             log.seek(0); self.fail("isolated test server did not start: " + log.read()[-3000:].replace(token, "[token]"))
+                        features = client.get("/api/health").json()["capabilities"]["gemini_backend"]["features"]
+                        for enabled in ("scheduled_jobs", "interactive_shares", "approvals", "skills_picker"):
+                            self.assertIs(features[enabled], True)
+                        for unsupported in ("fork", "native_goals", "native_side_questions", "managed_subagents",
+                                            "history_reconciliation", "native_compaction_control", "permission_mode_control"):
+                            self.assertIs(features[unsupported], False)
                         endpoint = {"base_url": f"http://127.0.0.1:{fixture.server_port}", "api_key": "local-fixture-key",
                             "model": "gemini-2.5-flash", "protocol": "gemini", "auth_header": "x-goog-api-key", "expected_revision": 0}
                         response = client.put("/api/admin/provider-connections/gemini", json=endpoint)

@@ -69,6 +69,9 @@ require an explicit model check. Manual model selection remains available.
   an untrusted workspace. An explicit handoff fails with a folder-trust/MCP
   instruction if the tool was not loaded; AgentsDock never grants folder trust
   or substitutes shell helpers. Review trust in the native CLI yourself.
+  Additional real-CLI fixtures reject an unissued recipient and a route revoked
+  between list/send, deduplicate retried delivery, and leave a busy recipient's
+  existing turn uninterrupted. Authority-file paths are not put in the prompt.
 - Gemini sparkle mark and separate native/API choices in the desktop picker.
   Slim session polling retains custom model lists instead of replacing them
   with a model-less summary. Gemini errors are not labeled as Codex errors.
@@ -88,8 +91,9 @@ require an explicit model check. Manual model selection remains available.
 - Small registered text/image/audio attachments reach native ACP. Limits are
   eight files, 512 KiB each and 2 MiB total; images are PNG/JPEG/WebP/GIF, audio is
   WAV/MP3/OGG/FLAC, other files must be UTF-8 text without NUL. Mixed text/image
-  and subsequent resume are checked against the actual CLI. Audio transport has
-  mapping coverage, not real-model/audio-understanding acceptance. Arbitrary
+  and subsequent resume are checked against the actual CLI. WAV bytes also reach
+  the actual CLI/API boundary, but this is not real-model/audio-understanding
+  acceptance. Arbitrary
   file URLs, PDF/video and larger attachments are not advertised as supported.
 - Adopt the native transcript `summary` as an automatic title when it exists;
   manual names win. Native summary generation is not guaranteed on a chat's
@@ -105,15 +109,33 @@ require an explicit model check. Manual model selection remains available.
 - Provider-reported token/context usage is retained without invented costs.
   ACP plan-update mapping is bounded and unit-tested, but the pinned CLI has not
   demonstrated a dedicated native plan stream. Native todo tools remain tool
-  activity; this is not an accepted goals/scheduling implementation.
+  activity; this is not a native goals implementation.
+- Server-provided scheduled jobs can use Gemini in chat and standalone context.
+  They now carry the required client capability; standalone execution does not
+  replace the parent's native identity. Scheduling is AgentsDock behavior, not
+  a claimed Gemini ACP scheduling feature.
+- Interactive shared chats can send/queue messages and approve or deny Gemini
+  tools using their existing single-chat grant, cookie and CSRF boundary. The
+  same exact session/run checks apply as in the desktop. Shared runtime updates
+  refresh the mounted approval shelf; no polling or fabricated chat events are
+  added. Revoking the share removes access. No server-wide authority is exposed.
 - Failed first generation without any resumable model record may retry fresh;
   visible output/tool activity or an existing UUID prevents silent replacement.
   Missing/corrupt history then fails closed. Queue promotion and restart resume
-  preserve the same provider UUID.
+  preserve the same provider UUID. Bind identity before exposing output or
+  approving tools, not only after completion.
 - Delete retains provider-native history. Idle and pending-tool deletion,
   unrelated-chat isolation, stale-approval rejection and direct native ACP
-  continuation after Delete pass in disposable fixtures. Cleanup failure and
-  escaped descendants still need their separate acceptance cases.
+  continuation after Delete pass in disposable fixtures, including queued work.
+  An owned parent-death guard cleans up on abrupt server exit. A real tool with
+  a sampled detached descendant is terminated after server SIGKILL; restart
+  resumes the same UUID. Failed cleanup keeps the chat fenced and Delete fails
+  without erasing it; Stop/Delete can retry the owned cleanup. A process exit
+  alone is not accepted as proof of cleanup. Process sampling is not an OS
+  sandbox and does not prove containment of arbitrary unobserved double-forks.
+  The failure fence is durable: restarting does not clear it. If the live owned
+  cleanup handle has been lost, an operator must verify the old runtime's exit
+  before repairing the fence; there is no automatic unlock or public bypass.
 
 ### Important native replay behavior
 
@@ -130,7 +152,10 @@ are recognized. Native tool-response placeholders are included in the replay
 fence, never emitted as new user turns. The pinned loader itself normalizes
 model/tool parts and inserts deterministic response records during load; the
 second snapshot accepts only that predicted conversion, not arbitrary new or
-changed messages. Inline media placeholders use the exact pinned native format;
+changed messages. It also permits the pinned loader to refresh only its first
+exact native `session_context` header, with identity/metadata unchanged: a tool
+creating a file changes that header's directory listing. Actual user messages
+and tool history remain exact. Inline media placeholders use the exact pinned native format;
 unknown history formats, ambiguous files, symlinks,
 changed snapshots and limits fail closed. Limits are 16 MiB per transcript and
 10,000 scanned entries/replay events. This private-format dependency is one
@@ -170,51 +195,70 @@ signal or equivalent before broad compatibility can be promised.
 - Actual offscreen Electron window using the production preload, IPC, service,
   HTTP and built renderer: configure API without an initial model ID, display
   discovered model options, save a default via the manual-model form, refresh
-  the chat list, send four UI turns, select a native skill from the slash picker,
+  the chat list, create the Gemini API chat through New Chat, select its model
+  through the composer menu, send four UI turns, select a native skill from the slash picker,
   approve its activation in the App, and resume afterward with no duplicated
-  user/reply events. The
-  disposable chat was arranged through the actual HTTP client, not the new-chat
-  dialog. Screenshots were visually checked in English/dark mode. The native
+  user/reply events. Screenshots were visually checked in English/dark and
+  Chinese/light/narrow modes; keyboard focus and the expandable settings row
+  were exercised. The native
   select popup was not operable offscreen, so popup interaction itself is not
-  accepted by this test. The visible desktop separately exercised the composer
-  model menu and refresh. Chinese labels have component coverage, not full visual
-  acceptance. No real Google credentials or model service were used.
+  accepted by this test. The composer model popup is a different, exercised
+  control. No real Google credentials or model service were used.
 - Extended actual offscreen desktop acceptance: see the live answer before its
   terminal event, open the grouped import picker, find the native Gemini title,
   resume the detected ID and render its initial user/assistant text. Fixture
   setup and native metadata are synthetic; rendering, IPC, HTTP and CLI are real.
-- The extended Gemini test batch has 72 passing cases, including native
+- Actual shared webpage in a separate offscreen Chromium session: enter the
+  invitation token, send a skill request, approve its native activation, receive
+  two consecutive replies without replay duplicates, then revoke access. Light/
+  narrow and dark layouts were visually checked. This runs the packaged web
+  asset, real HTTP/SSE authorization and actual CLI, with a loopback fake API.
+- The extended Gemini tests include native
   queue/restart/resume, Stop, denied write, active Delete, API Forget/reconnect,
-  attachments, cross-chat and title adoption/manual-title protection. An
-  additional 247 related server regressions pass. Desktop: 5,191 tests pass,
-  five skip; type checking, production compilation, eight package checks and
-  nine server release-manifest checks pass. These are not real Google account
-  acceptance or a full server-suite/release validation claim.
+  attachments, cross-chat and title adoption/manual-title protection, plus
+  crash-mid-tool recovery, cleanup failure, scheduled jobs, shared approvals and
+  three concurrent chats with three resumed turns each. The latter is bounded
+  concurrency acceptance, not a low-memory or production-load certification.
+  Related server regressions, desktop checks and build results are recorded in
+  the development log. None substitutes for real Google account acceptance.
 
 ## Remaining before a merge/release recommendation
+
+### Checklist disposition
+
+| Checklist area | Current disposition |
+| --- | --- |
+| Runtime/auth/models | Native CLI + separate API profiles; local runtime/API fixtures pass. Real Google-account acceptance deferred. |
+| New/resume/Stop/Delete | Native UUID, queue, crash recovery, retained history and truthful cleanup tested. No native Fork. |
+| Reasoning/trace/usage | Exposed native ACP events retained; fixture ordering/reconnect pass. Full real-model parity still unverified. |
+| Titles | Native summary adoption + first-user fallback; manual names win. No guaranteed first-turn generated title. |
+| Agent-to-agent | Server-provided, run-bound MCP; allowed/denied/revoked/busy/retry cases tested without blanket approvals. |
+| Import/sync | Native discovery and initial text snapshot implemented; exact identity, workspace and ownership checked. Later native edits are not reconciled. |
+| Existing skills | Native inventory/activation, trust, precedence, stale selection and approval tested; extension/hook parity not claimed. |
+| Jobs/shares/media | Server-provided jobs and interactive shares tested. Text/image/WAV transport tested; media understanding not accepted. |
+| Other native features | Fork, managed subagents, goals, side questions and explicit compaction control unsupported; non-default permission modes unverified. |
+| Client/release | Desktop and shared web exercised with actual transports/local API fixture. Mobile separate; real-account/platform and release validation pending. |
 
 Apply the [complete provider checklist](PROVIDER_INTEGRATION_CHECKLIST.md), not
 just the successful text fixture. In particular:
 
 1. Real Google OAuth and real Developer API key requests, expired credentials,
    organization policy, proxies and billing/model availability.
-2. Full desktop new-chat/model-popup and Chinese/narrow visual acceptance;
-   complete native tool/trace parity with a usable real account. The implemented
+2. Complete native tool/trace parity with a usable real account. The implemented
    live text path is accepted through the actual App and local API fixture, not
    as proof of all native rendering behavior.
-3. Gemini-specific live unauthorized-recipient, revoked-pair, busy-mailbox and
-   retry/replay combinations. Shared authorization regressions pass, but do not
-   replace every native integration scenario.
-4. Server crash during tool execution, cleanup failure, escaped descendants,
-   queued Delete and stress/memory bounds. Graceful restart and pending-tool
-   Delete passing do not establish those cases.
-5. External-history reconciliation is unsupported. Native Fork is unsupported:
+3. Broader long-duration/resource-pressure and platform acceptance, including
+   unobserved escaping processes. Do not interpret a three-chat concurrency
+   fixture or bounded protocol-output tests as a memory sizing recommendation.
+4. External-history reconciliation is unsupported. Native Fork is unsupported:
    the pinned ACP implementation does not implement `session/fork`; a copied
    transcript is not a substitute. Native summary adoption does not promise
    immediate generation of a title.
-6. Extension customization parity, subagents, jobs/goals, side questions,
-   shared chats and non-default permission profiles remain individually
-   unverified/unsupported. No native `/btw` interaction is claimed. Mobile
+5. Extension/hook customization parity and non-default permission profiles remain
+   unverified. Managed subagents, native goals, explicit compaction control and
+   side questions are unsupported; health capabilities say so. Actual ACP
+   `session/fork` returns method-not-found, while default `session/set_mode`
+   succeeds in the contract probe. No native `/btw` interaction is claimed. Mobile
    requires its own implementation task.
 
 Full suite/release packaging validation and a real account acceptance record

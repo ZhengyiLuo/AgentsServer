@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import secrets
 import socket
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -35,7 +36,7 @@ class Fixture(BaseHTTPRequestHandler):
             self.send_response(400); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw); return
         responses = [p for c in body.get("contents", []) for p in c.get("parts", []) if "functionResponse" in p]
         parts = [{"text": "Fixture complete."}]
-        if cls.mode == "mail":
+        if cls.mode in {"mail", "unauthorized_mail", "retry_mail"}:
             text = "\n".join(p.get("text", "") for c in body.get("contents", []) for p in c.get("parts", []))
             names = [f["name"] for tool in body.get("tools", []) for f in tool.get("functionDeclarations", [])]
             tool_name = next((name for name in names if name == "run" or ("agentsdock_" in name and name.endswith("run"))), None)
@@ -52,10 +53,12 @@ class Fixture(BaseHTTPRequestHandler):
                     except ValueError: return
                     if not isinstance(parsed, str): yield from objects(parsed)
             argument = None
-            if "MAIL_SEND" in text:
+            if cls.mode == "unauthorized_mail" and not responses:
+                argument = {"helper": "chats", "arguments": ["send", "--route", "route-not-issued-to-this-run", "--message", "Denied mail"]}
+            elif "MAIL_SEND" in text:
                 if not responses:
                     argument = {"helper": "chats", "arguments": ["list"]}
-                elif not any(row.get("accepted") is True for row in objects(responses)):
+                elif not any(row.get("accepted") is True for row in objects(responses)) or (cls.mode == "retry_mail" and len(responses) < 3):
                     route = next((row for row in objects(responses) if row.get("route_id") and row.get("allowed_actions")), None)
                     if route:
                         argument = {"helper": "chats", "arguments": ["send", "--route", route["route_id"], "--message", "MAIL_RECEIVE: reply MAIL_ACK", "--idempotency-key", "gemini-mail-fixture"]}
@@ -74,6 +77,10 @@ class Fixture(BaseHTTPRequestHandler):
                 parts = [{"functionCall": {"name": tool_name, "args": argument}}]
         if cls.mode == "tool" and not responses:
             parts = [{"functionCall": {"name": "write_file", "args": {"file_path": str(cls.project / "must-not-exist.txt"), "content": "test"}}}]
+        if cls.mode == "shell" and not responses:
+            parts = [{"functionCall": {"name": "run_shell_command", "args": {
+                "command": shlex.join([sys.executable, str(cls.project / "owned-tool.py")]),
+                "description": "Disposable crash-cleanup test"}}}]
         stream = "streamGenerateContent" in self.path
         def record(parts, final=True):
             value = {"candidates": [{"index": 0, "content": {"role": "model", "parts": parts}, **({"finishReason": "STOP"} if final else {})}],
@@ -117,7 +124,9 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(response.status_code, 200); self.assertTrue(response.json()["ok"])
 
     def start_server(self):
-        self.server = subprocess.Popen([sys.executable, "-m", "uvicorn", "agent_server:app", "--host", "127.0.0.1", "--port", str(self.port)],
+        command = [sys.executable, "-m", "uvicorn", "agent_server:app", "--host", "127.0.0.1", "--port", str(self.port)]
+        if getattr(self, "bootstrap", None): command = [sys.executable, "-c", self.bootstrap]
+        self.server = subprocess.Popen(command,
             cwd=Path(__file__).resolve().parents[1], env=self.env, stdout=self.log, stderr=self.log)
 
     def ready(self):
@@ -371,3 +380,250 @@ class Lifecycle(unittest.TestCase):
         self.finished(other)
         self.assertFalse((self.project / "must-not-exist.txt").exists())
         self.assertTrue(any(e["type"] == "tool_finished" and e["tool"].get("is_error") for e in self.events(other)))
+
+    def test_native_cli_skills_do_not_require_api_connection(self):
+        skill = self.root / ".gemini/skills/native-skill/SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("---\nname: native-skill\ndescription: Disposable native-only skill\n---\nReply OK.")
+        # Cached-auth presence only; skills listing must not make a Google call.
+        (self.root / ".gemini/settings.json").write_text('{"security":{"auth":{"selectedType":"oauth-personal"}}}')
+        (self.root / ".gemini/oauth_creds.json").write_text("{}")
+        result = self.client.post("/api/sessions", json={"backend": "gemini", "cwd": str(self.project)})
+        self.assertEqual(result.status_code, 200, result.text)
+        sid = result.json()["session"]["id"]
+        response = self.client.get(f"/api/sessions/{sid}/provider-commands")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["support"]["available"], response.text)
+        self.assertIn("native-skill", [item["name"] for item in response.json()["commands"]])
+
+    def test_scheduled_chat_and_standalone_jobs_preserve_parent_identity(self):
+        sid = self.new(); self.send(sid); self.finished(sid)
+        native_id = json.loads((self.state / "sessions.json").read_text())[sid]["gemini_session_id"]
+        for count, mode in enumerate(("chat", "standalone"), 2):
+            response = self.client.post(f"/api/sessions/{sid}/jobs", json={"title": "Gemini fixture job",
+                "prompt": "Disposable job", "context_mode": mode, "backend": "gemini",
+                "interval_seconds": 3600, "enabled": False})
+            self.assertEqual(response.status_code, 200, response.text)
+            jid = response.json()["job"]["id"]
+            response = self.client.post(f"/api/jobs/{jid}/run", json={})
+            self.assertEqual(response.status_code, 200, response.text)
+            terminal = self.finished(sid, count)[-1]
+            self.assertFalse(terminal["is_error"], [e for e in self.events(sid) if e["type"] == "error"])
+            self.assertEqual(terminal["job_id"], jid)
+            self.assertEqual(terminal["purpose"], "scheduled_job")
+            self.assertEqual(json.loads((self.state / "sessions.json").read_text())[sid]["gemini_session_id"], native_id)
+            self.assertEqual(self.client.delete(f"/api/jobs/{jid}").status_code, 200)
+
+    def test_delete_discards_queue_without_starting_second_model_request(self):
+        sid = self.new(); neighbor = self.new()
+        self.fixture_type.mode = "tool"; self.send(sid)
+        pending = self.wait(lambda: self.client.get(f"/api/sessions/{sid}/gemini/runtime").json()["pending_interactions"])
+        self.assertTrue(self.send(sid, prompt="Must never execute queued input")["queued"])
+        before = len(self.fixture_type.bodies)
+        self.assertEqual(self.client.delete(f"/api/sessions/{sid}").status_code, 200)
+        self.assertEqual(len(self.fixture_type.bodies), before)
+        self.assertFalse((self.project / "must-not-exist.txt").exists())
+        self.assertEqual(self.client.post(f"/api/sessions/{sid}/gemini/interactions/{pending[0]['id']}/resolve",
+            json={"response": {"decision": "accept"}}).status_code, 409)
+        self.fixture_type.mode = "normal"; self.send(neighbor)
+        self.assertFalse(self.finished(neighbor)[-1]["is_error"])
+
+    def test_crash_during_tool_reaps_detached_descendant_and_retains_identity(self):
+        pid_file = self.project / "owned-child.pid"
+        (self.project / "owned-tool.py").write_text(
+            "import subprocess, sys, time\nfrom pathlib import Path\n"
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(90)'], "
+            "start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+            f"Path({str(pid_file)!r}).write_text(str(child.pid))\n"
+            "time.sleep(90)\n")
+        sid = self.new(); self.fixture_type.mode = "shell"; self.send(sid)
+        pending = self.wait(lambda: self.client.get(f"/api/sessions/{sid}/gemini/runtime").json()["pending_interactions"])
+        self.assertEqual(self.client.post(f"/api/sessions/{sid}/gemini/interactions/{pending[0]['id']}/resolve",
+            json={"response": {"decision": "accept"}}).status_code, 200)
+        self.wait(pid_file.exists)
+        child_pid = int(pid_file.read_text())
+        def dead():
+            try: os.kill(child_pid, 0)
+            except ProcessLookupError: return True
+            return False
+        try:
+            # Allow the bounded guard snapshot to observe this fixture's child.
+            time.sleep(.4)
+            native_id = json.loads((self.state / "sessions.json").read_text())[sid].get("gemini_session_id")
+            self.assertTrue(native_id, "Visible tool activity must bind identity before a crash")
+            self.server.kill(); self.server.wait(timeout=5)
+            self.wait(dead, timeout=10)
+            self.fixture_type.mode = "normal"; self.start_server(); self.wait(self.ready)
+            self.assertTrue(any(e["type"] == "turn_stopped" and e.get("recovered_after_restart") for e in self.events(sid)))
+            self.send(sid); self.assertFalse(self.finished(sid)[-1]["is_error"],
+                [e.get("message") for e in self.events(sid) if e["type"] == "error"])
+            self.assertEqual(json.loads((self.state / "sessions.json").read_text())[sid]["gemini_session_id"], native_id)
+        finally:
+            if not dead(): os.kill(child_pid, 9)
+
+    def test_audio_reaches_native_transport_without_file_url(self):
+        import base64
+        import io
+        import wave
+        output = io.BytesIO()
+        with wave.open(output, "wb") as wav:
+            wav.setparams((1, 2, 8000, 0, "NONE", "not compressed")); wav.writeframes(b"\0" * 160)
+        data = output.getvalue(); sid = self.new()
+        response = self.client.post(f"/api/sessions/{sid}/files", files={"file": ("sample.wav", data, "audio/wav")})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.send(sid, file_ids=[response.json()["file"]["id"]])
+        self.assertFalse(self.finished(sid)[-1]["is_error"])
+        parts = [part for body in self.fixture_type.bodies for c in body.get("contents", []) for part in c.get("parts", [])]
+        self.assertTrue(any(p.get("inlineData", {}).get("data") == base64.b64encode(data).decode() for p in parts))
+        self.send(sid); self.assertFalse(self.finished(sid, 2)[-1]["is_error"])
+
+    def trust_fixture(self):
+        trust = self.root / ".gemini/trustedFolders.json"; trust.parent.mkdir(exist_ok=True)
+        trust.write_text(json.dumps({str(self.project): "TRUST_FOLDER"}))
+        self.assertEqual(self.client.get("/api/runtime/catalog").status_code, 200)
+
+    def approve_next(self, sid, handled):
+        def approve():
+            pending = self.client.get(f"/api/sessions/{sid}/gemini/runtime").json()["pending_interactions"]
+            item = next((item for item in pending if item["id"] not in handled), None)
+            if not item: return False
+            handled.add(item["id"])
+            self.assertEqual(self.client.post(f"/api/sessions/{sid}/gemini/interactions/{item['id']}/resolve",
+                json={"response": {"decision": "accept"}}).status_code, 200)
+            return True
+        self.wait(approve)
+
+    def send_route_fixture(self, sender, receiver):
+        self.send(sender, prompt="@Receiver MAIL_SEND: send once using AgentsDock.",
+            client_capabilities=["gemini_acp_v1", "chat_conversation_async_route_v1", "agent_cross_chat_routes_v2", "cross_chat_handoffs_v2"],
+            chat_references=[{"session_id": receiver, "display_title_snapshot": "Receiver", "source_text_start": 0,
+                              "source_text_end": 9, "action": "route", "grant_intent": True}])
+
+    def test_native_mcp_approval_does_not_authorize_unknown_recipient(self):
+        self.trust_fixture(); sender, receiver = self.new(), self.new()
+        self.fixture_type.mode = "unauthorized_mail"; self.send(sender)
+        self.approve_next(sender, set()); self.finished(sender)
+        self.assertTrue(any(e["type"] == "tool_finished" and e["tool"].get("is_error") for e in self.events(sender)))
+        self.assertFalse(any(e["type"] == "turn_started" for e in self.events(receiver)))
+        bodies = json.dumps(self.fixture_type.bodies)
+        self.assertNotIn("--authority-file", bodies)
+        self.assertNotIn(str(self.state / "cross_chat_authority"), bodies)
+
+    def test_native_mcp_revocation_between_list_and_send(self):
+        self.trust_fixture(); sender, receiver = self.new(), self.new()
+        self.fixture_type.mode = "mail"; self.send_route_fixture(sender, receiver)
+        handled = set(); self.approve_next(sender, handled)  # list, not send
+        self.wait(lambda: any(item["id"] not in handled for item in self.client.get(
+            f"/api/sessions/{sender}/gemini/runtime").json()["pending_interactions"]))
+        routes = self.client.get(f"/api/sessions/{sender}/agent-handoff-routes").json()["routes"]
+        self.assertEqual(len(routes), 1)
+        self.assertEqual(self.client.delete(f"/api/sessions/{sender}/agent-handoff-routes/{routes[0]['route_id']}",
+            params={"expected_revision": routes[0]["revision"]}).status_code, 200)
+        self.fixture_type.mode = "normal"  # Do not loop after the rejected call.
+        self.approve_next(sender, handled); self.finished(sender)
+        self.assertTrue(any(e["type"] == "tool_finished" and e["tool"].get("is_error") for e in self.events(sender)))
+        self.assertFalse(any(e.get("source_session_id") == sender for e in self.events(receiver)))
+
+    def test_busy_recipient_not_interrupted_and_retry_does_not_duplicate_mail(self):
+        self.trust_fixture(); sender, receiver = self.new(), self.new()
+        self.fixture_type.mode = "stream"; self.send(receiver)
+        self.assertTrue(self.fixture_type.entered.wait(20))
+        first_run = next(e["run_id"] for e in self.events(receiver) if e["type"] == "turn_started")
+        self.fixture_type.mode = "retry_mail"; self.send_route_fixture(sender, receiver)
+        handled = set()
+        # Retry of the exact native call may reuse Gemini's once-approved tool
+        # decision, but the server still deduplicates the message itself.
+        def sender_done():
+            for item in self.client.get(f"/api/sessions/{sender}/gemini/runtime").json()["pending_interactions"]:
+                if item["id"] not in handled:
+                    handled.add(item["id"])
+                    self.assertEqual(self.client.post(f"/api/sessions/{sender}/gemini/interactions/{item['id']}/resolve",
+                        json={"response": {"decision": "accept"}}).status_code, 200)
+            return any(e["type"] == "turn_finished" for e in self.events(sender))
+        self.wait(sender_done)
+        incoming = [e for e in self.events(receiver) if e.get("source_session_id") == sender and e.get("message_id")]
+        self.assertEqual(len({e["message_id"] for e in incoming}), 1)
+        self.assertFalse(any(e["type"] in {"turn_finished", "turn_stopped"} and e.get("run_id") == first_run for e in self.events(receiver)))
+        self.assertEqual(sum(e["type"] == "turn_started" for e in self.events(receiver)), 1)
+        self.fixture_type.mode = "normal"; self.fixture_type.release.set()
+        self.assertFalse(self.finished(receiver)[-1]["is_error"])
+        self.wait(lambda: any(e["type"] == "turn_started" and e.get("purpose") == "chat_mailbox_wake" for e in self.events(receiver)))
+
+    def test_delete_keeps_chat_when_cleanup_cannot_be_confirmed(self):
+        self.cleanup_failure_scenario()
+
+    def test_failed_cleanup_fence_survives_server_restart(self):
+        self.cleanup_failure_scenario(restart=True)
+
+    def cleanup_failure_scenario(self, *, restart=False):
+        marker = self.root / "cleanup-failure"; marker.touch()
+        self.server.terminate(); self.server.wait(timeout=15)
+        self.bootstrap = ("from pathlib import Path\nimport gemini_acp_client as m\nimport uvicorn\n"
+            "original = m.GeminiACPClient.close\n"
+            "async def fail_closed(self):\n"
+            " await original(self)\n"
+            f" if Path({str(marker)!r}).exists(): raise m.GeminiProtocolError('Synthetic cleanup failure')\n"
+            "m.GeminiACPClient.close = fail_closed\n"
+            f"uvicorn.run('agent_server:app', host='127.0.0.1', port={self.port})\n")
+        self.start_server(); self.wait(self.ready)
+        sid = self.new(); self.send(sid)
+        self.wait(lambda: any(e["type"] == "error" and "cleanup" in e.get("message", "") for e in self.events(sid)))
+        response = self.client.delete(f"/api/sessions/{sid}")
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertIn(sid, json.loads((self.state / "sessions.json").read_text()))
+        self.assertFalse(any(e["type"] == "turn_finished" for e in self.events(sid)))
+        stopped = self.client.post(f"/api/sessions/{sid}/stop").json()
+        self.assertFalse(stopped["ok"]); self.assertFalse(stopped["stopped"])
+        self.assertTrue(json.loads((self.state / "sessions.json").read_text())[sid]["gemini_cleanup_pending_run_id"])
+        if restart:
+            self.server.terminate(); self.server.wait(timeout=15)
+            self.start_server(); self.wait(self.ready)
+            self.assertEqual(self.client.delete(f"/api/sessions/{sid}").status_code, 409)
+            self.assertEqual(self.client.post(f"/api/sessions/{sid}/turns", json={"prompt": "Must not run",
+                "client_capabilities": ["gemini_acp_v1"]}).status_code, 409)
+            self.assertFalse(self.client.post(f"/api/sessions/{sid}/stop").json()["ok"])
+            self.assertIn(sid, json.loads((self.state / "sessions.json").read_text()))
+            return
+        marker.unlink()  # Remove only this disposable failure injection.
+        self.assertEqual(self.client.delete(f"/api/sessions/{sid}").status_code, 200)
+        self.assertNotIn(sid, json.loads((self.state / "sessions.json").read_text()))
+
+    def test_three_concurrent_chats_repeated_resume_remain_isolated(self):
+        chats = [self.new() for _ in range(3)]
+        for turn in range(1, 4):
+            for sid in chats: self.send(sid, prompt=f"Fixture {sid} turn {turn}")
+            for sid in chats:
+                self.assertFalse(self.finished(sid, turn)[-1]["is_error"])
+                self.assertEqual(sum(e["type"] == "assistant_text" for e in self.events(sid)), turn)
+        records = json.loads((self.state / "sessions.json").read_text())
+        self.assertEqual(len({records[sid]["gemini_session_id"] for sid in chats}), 3)
+        for sid in chats: self.assertEqual(self.client.delete(f"/api/sessions/{sid}").status_code, 200)
+
+    def test_interactive_share_sends_and_approves_only_its_gemini_chat(self):
+        sid = self.new(); other = self.new()
+        response = self.client.post(f"/api/admin/interactive-chat-shares/{sid}", json={"confirmed_interactive": True})
+        self.assertEqual(response.status_code, 201)
+        share = response.json()
+        with httpx.Client(base_url=str(self.client.base_url), headers={"Origin": str(self.client.base_url).rstrip("/")}, trust_env=False) as guest:
+            prefix = share["path"]
+            response = guest.post(prefix + "/redeem", json={"invitation_token": share["access_token"]})
+            self.assertEqual(response.status_code, 200, response.text)
+            guest.headers["X-Chat-CSRF"] = response.json()["csrf"]
+            self.fixture_type.mode = "tool"
+            response = guest.post(prefix + "/prompts", json={"request_id": "gemini-share-fixture-1", "prompt": "Fixture shared write", "upload_ids": []})
+            self.assertEqual(response.status_code, 202, response.text)
+            def shared_approval():
+                state = guest.get(prefix + "/state")
+                self.assertEqual(state.status_code, 200, state.text)
+                failures = [e for e in self.events(sid) if e["type"] in {"error", "turn_finished"}]
+                self.assertFalse(failures, failures)
+                return state.json().get("gemini_runtime", {}).get("pending_interactions")
+            pending = self.wait(shared_approval)
+            response = guest.post(prefix + "/controls", json={"request_id": "gemini-share-fixture-2", "action": "approval.respond",
+                "payload": {"backend": "gemini", "id": pending[0]["id"], "response": {"decision": "decline"}}})
+            self.assertEqual(response.status_code, 202, response.text)
+            self.assertFalse(self.finished(sid)[-1]["is_error"])
+            self.assertFalse((self.project / "must-not-exist.txt").exists())
+            self.assertEqual(guest.get(f"/api/sessions/{other}").status_code, 401)
+            self.assertEqual(self.client.delete(f"/api/admin/interactive-chat-shares/{sid}/{share['id']}").status_code, 200)
+            self.assertIn(guest.get(prefix + "/state").status_code, (403, 404, 410))

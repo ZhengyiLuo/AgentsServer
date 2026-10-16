@@ -13148,9 +13148,10 @@ class JobStore:
                 job_title=str(job.get("title") or jid),
                 job_scheduled_run_at=scheduled_run_at,
                 client_capabilities=(
-                    [CROSS_CHAT_HANDOFFS_V2_CLIENT_CAPABILITY]
-                    if chat_references
-                    else []
+                    ([CROSS_CHAT_HANDOFFS_V2_CLIENT_CAPABILITY] if chat_references else [])
+                    + ([GEMINI_CLIENT_CAPABILITY] if (
+                        job.get("backend") or (parent_session or {}).get("backend")
+                    ) == BACKEND_GEMINI else [])
                 ),
                 chat_references=chat_references,
                 team_references=team_references,
@@ -30191,6 +30192,14 @@ async def reconcile_provider_task_exit(
     prevents delayed cleanup from touching a replacement turn.
     """
 
+    if backend == BACKEND_GEMINI:
+        async with ACTIVE_LOCK:
+            active = ACTIVE.get(session_id) or {}
+            if active.get("run_id") == run_id and active.get("gemini_cleanup_failed"):
+                # Keep the exact owner fenced. A dead consumer is not proof
+                # that its editing tool processes stopped; Stop/Delete retry
+                # the owned cleanup before releasing this slot.
+                return False
     persisted_active = (STORE.sessions.get(session_id) or {}).get("active_run")
     terminal_missing = bool(
         isinstance(persisted_active, dict)
@@ -61226,7 +61235,8 @@ async def discover_session_provider_commands(
             connection = PROVIDER_CONNECTION_STORE.for_session(session)
             profile = PROVIDER_CONNECTION_STORE.root / ("gemini-runtime-" + connection["credential_id"]) if connection else None
             env = build_environment(runner_env(), cwd=cwd, api_home=profile,
-                api_key=connection.get("api_key"), base_url=connection.get("base_url"))
+                api_key=connection.get("api_key") if connection else None,
+                base_url=connection.get("base_url") if connection else None)
             executable = resolve_executable(env)
             if not executable:
                 raise GeminiConfigurationError("Install Gemini CLI to discover its skills.")
@@ -72955,6 +72965,8 @@ async def _start_turn_locked(
         raise HTTPException(status_code=404, detail="session not found")
     if sess.get("archived"):
         raise HTTPException(status_code=409, detail="archived chats cannot start turns")
+    if sess.get("gemini_cleanup_pending_run_id"):
+        raise HTTPException(status_code=409, detail="Gemini runtime cleanup is unconfirmed. Retry Stop; after a server restart, server-side runtime verification is required before this chat can continue.")
     if req.purpose == "chat_mailbox_wake" or mailbox_wake_claim is not None:
         if (req.purpose != "chat_mailbox_wake" or mailbox_wake_claim is None
                 or mailbox_wake_claim.get("target_session_id") != session_id
@@ -73925,7 +73937,7 @@ async def _start_turn_locked(
             ),
         )
         provider_authority_context = ""
-        if backend in {BACKEND_OPENCODE, BACKEND_GEMINI}:
+        if backend == BACKEND_OPENCODE:
             provider_authority_context = cross_chat_provider_authority_block(
                 req.chat_references,
                 authority_path,
@@ -82222,7 +82234,11 @@ async def health() -> dict[str, Any]:
                 "features": {"resume": True, "external_import": True, "fork": False,
                              "history_reconciliation": False,
                              "approvals": True, "skills_picker": True, "custom_api": True,
-                             "attachments": True, "live_text": True, "token_usage": True},
+                             "attachments": True, "live_text": True, "token_usage": True,
+                             "scheduled_jobs": True, "interactive_shares": True,
+                             "native_goals": False, "native_side_questions": False,
+                             "managed_subagents": False, "native_compaction_control": False,
+                             "permission_mode_control": False},
             },
             "opencode_backend": {
                 # ``available`` advertises the server contract. Runtime
@@ -83854,6 +83870,7 @@ async def submit_interactive_chat_prompt(
     result = await post_turn(session_id, TurnRequest(
         prompt=prompt, file_ids=file_ids, shared_chat_id=share_id,
         shared_chat_request_id=request_id,
+        client_capabilities=(["gemini_acp_v1"] if (STORE.sessions.get(session_id) or {}).get("backend") == "gemini" else []),
     ))
     if not isinstance(result, dict) or type(result.get("queued")) is not bool:
         raise HTTPException(503, "Message acceptance could not be confirmed")
@@ -83960,13 +83977,21 @@ async def interactive_chat_native_snapshot(session_id: str) -> dict[str, Any]:
                 projected[key] = strip_agentsdock_generated_user_text(projected[key], expected_session_id=session_id)
         queue.append(projected)
     model, effort = str(session.get("model") or ""), str(session.get("effort") or "")
+    gemini_fields = {}
+    if backend == "gemini":
+        from gemini_runner import PERMISSIONS, owns
+        gemini_fields["gemini_runtime"] = {"available": GEMINI_PREVIEW_ENABLED, "pending_interactions": [
+            shared_native_value(row["public"]) for row in PERMISSIONS.values()
+            if row["public"]["session_id"] == session_id and owns(sys.modules[__name__], session_id, row["run_id"])]}
     snapshot = shared_native_value({
         "session": public, "events": page["events"], "queue": queue, "active": active,
         "hasMoreEvents": page["has_more"], "nextTimelineBefore": page.get("next_before"),
         "eventsTotal": page.get("semantic_total"), "goal": goal,
         "jobs": (await list_session_jobs(session_id))["jobs"],
         "codex_runtime": codex_runtime, "claude_runtime": claude_runtime,
+        **gemini_fields,
         "health": {"capabilities": {
+            **({"gemini_backend": {"available": GEMINI_PREVIEW_ENABLED, "version": 1}} if backend == "gemini" else {}),
             "codex_controls": {"available": codex_available},
             "claude_controls": {"available": claude_available,
                                 "interactive_client_capability": CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY},
@@ -83997,6 +84022,7 @@ async def interactive_chat_native_snapshot(session_id: str) -> dict[str, Any]:
 async def steer_interactive_chat_prompt(session_id: str, prompt: str, *, share_id: str, request_id: str) -> dict[str, Any]:
     receipt = await post_turn(session_id, TurnRequest(
         prompt=prompt, shared_chat_id=share_id, shared_chat_request_id=request_id,
+        client_capabilities=(["gemini_acp_v1"] if (STORE.sessions.get(session_id) or {}).get("backend") == "gemini" else []),
     ))
     if not isinstance(receipt, dict) or type(receipt.get("queued")) is not bool:
         raise HTTPException(503, "Message acceptance could not be confirmed")
@@ -84093,6 +84119,9 @@ async def control_interactive_chat(session_id: str, action: str, payload: dict[s
                     INTERACTIVE_CHAT_CATALOG = (time.monotonic(), shared_native_value(await runtime_catalog()))
                 value = INTERACTIVE_CHAT_CATALOG[1]
         return shared_native_value(value)
+    async def shared_gemini_approval(sid, interaction_id, response):
+        from gemini_runner import resolve_permission
+        return await resolve_permission(sys.modules[__name__], sid, interaction_id, response)
     callbacks = {
         "turn.stop": stop_turn_endpoint, "turn.steer": steer_interactive_chat_prompt,
         "queue.run_now": post_run_queued_turn_now, "queue.edit": patch_queued_turn,
@@ -84102,6 +84131,7 @@ async def control_interactive_chat(session_id: str, action: str, payload: dict[s
         "job.create": create_session_job, "job.update": update_session_job,
         "job.toggle": update_session_job, "job.delete": delete_session_job, "job.run": run_interactive_chat_job,
         "approval.codex": post_codex_interaction_response, "approval.claude": post_claude_interaction_response,
+        "approval.gemini": shared_gemini_approval,
     }
     models = {model.__name__: model for model in (
         UpdateSessionRequest, CodexGoalRequest, CreateScopedJobRequest, UpdateJobRequest,
@@ -90477,6 +90507,13 @@ async def discard_empty_session(session_id: str, expected_updated_at: str) -> di
 async def delete_session(session_id: str, discard_updated_at: str | None = None) -> dict[str, Any]:
     async with session_lifecycle_lock(session_id):
         ensure_session_not_initializing(session_id)
+        pending_gemini_cleanup = (STORE.sessions.get(session_id) or {}).get("gemini_cleanup_pending_run_id")
+        live_gemini_owner = ACTIVE.get(session_id) or {}
+        if pending_gemini_cleanup and (
+            live_gemini_owner.get("run_id") != pending_gemini_cleanup
+            or not callable(live_gemini_owner.get("gemini_cleanup"))
+        ):
+            raise HTTPException(409, "Gemini runtime cleanup requires server-side verification after restart; the chat and native history were not deleted.")
         if session_id in DELETED_SESSION_TOMBSTONES:
             # A previous delete can have committed before its request was
             # canceled. Retry any tracked bridge retirement on idempotent
@@ -90742,6 +90779,17 @@ async def delete_session(session_id: str, discard_updated_at: str | None = None)
             # initial session record but before its task acknowledges stop.
             # The task registry is now drained, so this reread is stable.
             late_session = STORE.sessions.get(session_id) or {}
+            gemini_active = ACTIVE.get(session_id) or {}
+            if gemini_active.get("backend") == BACKEND_GEMINI and gemini_active.get("gemini_cleanup_failed"):
+                # A completed consumer task does not prove its owned runtime
+                # was reaped. Retry only this chat's cleanup, before deletion.
+                try:
+                    await gemini_active["gemini_cleanup"]()
+                    from gemini_runner import clear_cleanup_fence
+                    await clear_cleanup_fence(sys.modules[__name__], session_id, str(gemini_active.get("run_id") or ""))
+                except Exception:
+                    raise HTTPException(409, "Gemini runtime cleanup is incomplete; the chat was not deleted. Retry after stopping its runtime.") from None
+                gemini_active["gemini_cleanup_failed"] = False
             late_provider_thread_id = str(
                 session_provider_id(late_session) or ""
             )
@@ -95212,6 +95260,12 @@ async def stop_turn(
                     "superseded": True,
                     "message": "The requested run no longer owns this chat.",
                 }
+        if ((STORE.sessions.get(session_id) or {}).get("gemini_cleanup_pending_run_id")
+                and (not active or not callable(active.get("gemini_cleanup")))):
+            if _admission_ready is not None:
+                _admission_ready.set()
+            return {"ok": False, "stopped": False, "pending": True,
+                    "message": "Gemini runtime cleanup requires server-side verification after restart; this chat remains fenced."}
         if preserve_active_goal and codex_goal_followup_requires_native(
             STORE.sessions.get(session_id) or {}, active or {}, current_turn,
         ):
@@ -96002,6 +96056,18 @@ async def stop_turn(
                 and not owner_task.done()
             ):
                 dynamic_tasks.add(owner_task)
+        if (current is active and active.get("backend") == BACKEND_GEMINI
+                and active.get("gemini_cleanup_failed") and not dynamic_tasks):
+            try:
+                await active["gemini_cleanup"]()
+                from gemini_runner import clear_cleanup_fence
+                await clear_cleanup_fence(sys.modules[__name__], session_id, str(active.get("run_id") or ""))
+            except Exception:
+                return {"ok": False, "stopped": False, "pending": True,
+                        "message": "Gemini runtime cleanup is incomplete. Retry Stop; this chat remains fenced."}
+            active["gemini_cleanup_failed"] = False
+            await reconcile_provider_task_exit(session_id, str(active.get("run_id") or ""), BACKEND_GEMINI)
+            return {"ok": True, "stopped": True, "pending": False}
         if current is not active:
             if not goal_pause_ok:
                 return await terminal_goal_pause_failure_result(native_interrupt)

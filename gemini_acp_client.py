@@ -13,7 +13,8 @@ from contextlib import suppress
 import json
 import os
 import re
-import signal
+import sys
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 MAX_LINE_BYTES = 4 * 1024 * 1024
@@ -147,6 +148,8 @@ class GeminiACPClient:
         self.permissions: dict[Any, asyncio.Task] = {}
         self.write_lock = asyncio.Lock()
         self.closed = False
+        self.cleanup_complete = False
+        self.close_lock = asyncio.Lock()
         self.failure: Exception | None = None
         self.capabilities: dict = {}
 
@@ -155,7 +158,9 @@ class GeminiACPClient:
         if self.process is not None or self.closed:
             raise GeminiProtocolError("Gemini client cannot be started twice.")
         self.process = await asyncio.create_subprocess_exec(
-            *command, cwd=cwd, env=env, stdin=asyncio.subprocess.PIPE,
+            sys.executable, str(Path(__file__).with_name("cursor_process_guard.py")),
+            "--verify-cleanup", "--parent-pid", str(os.getpid()), "--", *command,
+            cwd=cwd, env=env, stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             limit=MAX_LINE_BYTES, start_new_session=True,
         )
@@ -340,7 +345,11 @@ class GeminiACPClient:
             pass
 
     async def close(self) -> None:
-        if self.closed:
+        async with self.close_lock:
+            await self._close_owned()
+
+    async def _close_owned(self) -> None:
+        if self.cleanup_complete:
             return
         self.closed = True
         tasks = [task for task in (self.reader, self.stderr, *self.permissions.values()) if task]
@@ -355,14 +364,15 @@ class GeminiACPClient:
         if proc:
             if proc.stdin:
                 proc.stdin.close()
-            # The CLI wrapper and its tools can outlive their parent. Target only
-            # the new process group created by this client, including on failure.
+            # The guard owns the CLI's separate group, tracks detached children
+            # and survives an abrupt server death. Give it time to verify exit;
+            # killing the guard itself is NOT evidence that tools have stopped.
             with suppress(ProcessLookupError):
-                os.killpg(proc.pid, signal.SIGTERM)
+                proc.terminate()
             try:
-                await asyncio.wait_for(proc.wait(), 3)
+                await asyncio.wait_for(proc.wait(), 5)
             except asyncio.TimeoutError:
-                pass
-            with suppress(ProcessLookupError):
-                os.killpg(proc.pid, signal.SIGKILL)
-            await asyncio.wait_for(proc.wait(), 3)
+                raise GeminiProtocolError("Gemini runtime cleanup has not completed.") from None
+            if proc.returncode not in {0, 71, 143}:
+                raise GeminiProtocolError("Gemini runtime cleanup could not be verified.")
+        self.cleanup_complete = True

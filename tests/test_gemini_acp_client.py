@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from gemini_acp_client import GeminiACPClient, GeminiProtocolError, normalize_update, session_models, safe_rpc_error
 from gemini_runtime import build_environment, GeminiConfigurationError, native_credentials_present, probe
@@ -126,6 +127,27 @@ class GeminiTransportTests(unittest.IsolatedAsyncioTestCase):
         proc = self.client.process
         await self.client.close()
         self.assertIsNotNone(proc.returncode)
+
+    async def test_overlong_stdout_is_bounded_and_secret_safe(self):
+        self.script.write_text('import sys\nsys.stdin.readline()\nprint("private" * 800000, flush=True)\n')
+        with self.assertRaises(GeminiProtocolError): await self.start()
+        self.assertNotIn("private", str(self.client.failure))
+
+    async def test_request_timeout_and_cleanup_failure_are_not_success(self):
+        await self.start()
+        self.script.write_text(FIXTURE)  # This process already owns its program.
+        with patch.object(self.client, "_send", return_value=None):
+            with self.assertRaises(asyncio.TimeoutError):
+                await self.client.request("fixture/no-response", {}, timeout=.01)
+        self.assertFalse(self.client.pending)
+        await self.client.close()
+        self.client.cleanup_complete = False
+        with patch.object(type(self.client.process), "returncode", new_callable=lambda: property(lambda _: 70)):
+            with self.assertRaisesRegex(GeminiProtocolError, "could not be verified"):
+                await self.client.close()
+            self.assertFalse(self.client.cleanup_complete)
+        await self.client.close()  # Cleanup is retryable, not an early-return no-op.
+        self.assertTrue(self.client.cleanup_complete)
 
 
 class GeminiMappingTests(unittest.TestCase):

@@ -216,6 +216,20 @@ def verify_resume_snapshot(before: dict, after: dict) -> None:
     # native loader drops precisely these records, not user text/tool history.
     expected = [row for row in records if row["id"] not in ordered and row["id"] not in empty_model_ids] + list(ordered.values())
     actual = deepcopy(after["messages"])
+    # Pinned startChat rebuilds its leading environment header (directory tree,
+    # date, etc.) on resume. A tool that created a file legitimately changes it.
+    # Only that first, exact native context row is allowed to refresh; real user
+    # content, tool results, identities, metadata and additional rows stay exact.
+    def environment_header(row):
+        parts = row.get("content")
+        return (row.get("type") == "user" and isinstance(parts, list) and len(parts) == 1
+                and isinstance(parts[0], dict) and set(parts[0]) == {"text"}
+                and isinstance(parts[0]["text"], str)
+                and parts[0]["text"].startswith("<session_context>\n")
+                and parts[0]["text"].endswith("\n</session_context>"))
+    if expected and actual and environment_header(expected[0]) and environment_header(actual[0]):
+        if {k: v for k, v in expected[0].items() if k != "content"} == {k: v for k, v in actual[0].items() if k != "content"}:
+            actual[0]["content"] = expected[0]["content"]
     for rows in (expected, actual):
         for row in rows:
             if row["id"] in generated and row["id"] not in by_id:

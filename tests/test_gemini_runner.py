@@ -13,6 +13,20 @@ ID = "12345678-1234-1234-1234-123456789abc"
 
 
 class Runner(unittest.IsolatedAsyncioTestCase):
+    async def test_cleanup_fence_only_clears_exact_owner_after_durable_save(self):
+        row = {"gemini_cleanup_pending_run_id": "owned-run"}
+        store = SimpleNamespace(sessions={"s": row}, save=AsyncMock(side_effect=OSError("disk full")))
+        api = SimpleNamespace(STORE=store)
+        await gemini_runner.clear_cleanup_fence(api, "s", "another-run")
+        store.save.assert_not_awaited()
+        with self.assertRaises(OSError):
+            await gemini_runner.clear_cleanup_fence(api, "s", "owned-run")
+        self.assertEqual(row["gemini_cleanup_pending_run_id"], "owned-run")
+        store.save = AsyncMock()
+        await gemini_runner.clear_cleanup_fence(api, "s", "owned-run")
+        self.assertNotIn("gemini_cleanup_pending_run_id", row)
+        store.save.assert_awaited_once_with(durable=True)
+
     async def scenario(self, *, updates=(), history=None, failure=False, history_error=None):
         with tempfile.TemporaryDirectory() as directory:
             api = SimpleNamespace(

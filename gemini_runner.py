@@ -18,6 +18,18 @@ PERMISSIONS: dict[str, dict] = {}
 MODEL_CATALOG: dict[str, dict] = {}
 
 
+async def clear_cleanup_fence(api, session_id: str, run_id: str):
+    session = api.STORE.sessions.get(session_id) or {}
+    if session.get("gemini_cleanup_pending_run_id") != run_id:
+        return
+    session.pop("gemini_cleanup_pending_run_id")
+    try:
+        await api.STORE.save(durable=True)
+    except BaseException:
+        session["gemini_cleanup_pending_run_id"] = run_id
+        raise
+
+
 def owns(api, session_id, run_id):
     active = api.ACTIVE.get(session_id) or {}
     return (session_id in api.STORE.sessions and session_id not in api.DELETING_SESSIONS
@@ -57,6 +69,25 @@ async def ask_permission(api, session_id: str, run_id: str, params: dict) -> dic
             await api.append_event(session_id, "gemini_interaction_resolved", {"interaction": public, "run_id": run_id})
 
 
+async def resolve_permission(api, session_id: str, interaction_id: str, response: dict) -> dict:
+    """Exact run/chat ownership shared by native and authenticated share controls."""
+    if (not isinstance(response, dict) or set(response) != {"decision"}
+            or not isinstance(response["decision"], str)
+            or response["decision"] not in {"accept", "decline", "cancel"}):
+        raise HTTPException(400, "Invalid approval decision.")
+    async with api.session_lifecycle_lock(session_id):
+        api.ensure_session_not_deleting(session_id)
+        row = PERMISSIONS.get(interaction_id)
+        if (not row or row["public"]["session_id"] != session_id or row["future"].done()
+                or not owns(api, session_id, row["run_id"])):
+            raise HTTPException(409, "This Gemini approval is no longer active.")
+        choice = {"accept": "allow_once", "decline": "reject_once", "cancel": "cancelled"}[response["decision"]]
+        if choice != "cancelled" and choice not in row["options"]:
+            raise HTTPException(400, "This decision is unavailable for the tool.")
+        row["future"].set_result(choice)
+        return {"interaction": row["public"]}
+
+
 def router(api) -> APIRouter:
     routes = APIRouter()
 
@@ -88,20 +119,7 @@ def router(api) -> APIRouter:
             raise HTTPException(400, "Invalid approval response.") from None
         if not isinstance(payload, dict) or set(payload) != {"response"} or not isinstance(payload["response"], dict):
             raise HTTPException(400, "Provide an approval response.")
-        response = payload["response"]
-        if set(response) != {"decision"} or not isinstance(response["decision"], str) or response["decision"] not in {"accept", "decline", "cancel"}:
-            raise HTTPException(400, "Invalid approval decision.")
-        async with api.session_lifecycle_lock(session_id):
-            api.ensure_session_not_deleting(session_id)
-            row = PERMISSIONS.get(interaction_id)
-            if (not row or row["public"]["session_id"] != session_id or row["future"].done()
-                    or not owns(api, session_id, row["run_id"])):
-                raise HTTPException(409, "This Gemini approval is no longer active.")
-            choice = {"accept": "allow_once", "decline": "reject_once", "cancel": "cancelled"}[response["decision"]]
-            if choice != "cancelled" and choice not in row["options"]:
-                raise HTTPException(400, "This decision is unavailable for the tool.")
-            row["future"].set_result(choice)
-            return {"interaction": row["public"]}
+        return await resolve_permission(api, session_id, interaction_id, payload["response"])
 
     return routes
 
@@ -128,6 +146,7 @@ async def run(api, session_id: str, run_id: str, prompt: str, sess: dict,
     token_usage = {}
     last_plan = None
     context_usage = None
+    identity_bound = False
     runtime_env = api.validate_provider_runtime_env(_kwargs.get("provider_runtime_env"))
     helper_redactor = api.opencode_helper_output_redactor(session_id, run_id, runtime_env)
     private_values = [owner]
@@ -140,6 +159,16 @@ async def run(api, session_id: str, run_id: str, prompt: str, sess: dict,
         for private in private_values:
             if private: text = text.replace(private, "<provider-private>")
         return text
+
+    async def bind_visible_identity():
+        # Persist BEFORE exposing output or approving a tool. A server crash
+        # must never turn an already-observed first turn into a fresh chat.
+        # A merely allocated UUID on an auth/model failure is still retryable.
+        nonlocal identity_bound
+        if not identity_bound and client.session_id:
+            await api.persist_run_provider_session(session_id, run_id, "gemini", client.session_id,
+                cwd=cwd, standalone_provider_context=standalone_provider_context)
+            identity_bound = True
 
     async def flush():
         nonlocal block, block_kind, block_index
@@ -165,6 +194,8 @@ async def run(api, session_id: str, run_id: str, prompt: str, sess: dict,
         if not owns(api, session_id, run_id):
             return
         kind = event["type"]
+        if kind in {"text", "reasoning", "tool", "plan"}:
+            await bind_visible_identity()
         if kind in {"text", "reasoning"}:
             if kind != block_kind:
                 await flush()
@@ -217,9 +248,18 @@ async def run(api, session_id: str, run_id: str, prompt: str, sess: dict,
                 context_usage = {"used": value["used"], "size": value["size"]}
 
     async def permission(params):
+        await bind_visible_identity()
         return await ask_permission(api, session_id, run_id, redact(params))
 
     client = GeminiACPClient(on_update=update, on_permission=permission)
+
+    async def cleanup():
+        try:
+            await client.close()
+        finally:
+            # Even a surviving process must lose its helper transport.
+            if broker:
+                await broker.close()
     try:
         cwd = str(Path(str(sess.get("cwd") or api.DEFAULT_CWD)).expanduser().resolve(strict=True))
         if not Path(cwd).is_dir():
@@ -276,7 +316,14 @@ async def run(api, session_id: str, run_id: str, prompt: str, sess: dict,
             # --policy allow could outrank the user's existing deny rule.
             # Native permission requests go through the explicit approval UI;
             # the broker separately enforces AgentsDock's run/task authority.
-            prompt += f"\nUse the run-bound AgentsDock MCP tool from {name} for authorized chat/mail operations; do not use shell helpers."
+            # No shell authority-file paths or credentials belong in the model
+            # prompt/native transcript. The broker binds those out of band.
+            instructions = api.PROVIDER_AUTHORITY_USAGE_INSTRUCTIONS.split("- Print-only provider fallback:", 1)[0]
+            prompt += ("\n\n[AgentsDock provider authority]\n" + instructions
+                + api.CROSS_CHAT_DELIVERY_INSTRUCTIONS
+                + f"\nUse the run-bound AgentsDock MCP tool from {name} for authorized helper operations. "
+                "There is no shell-helper fallback for this integration."
+                "\n[End AgentsDock provider authority]")
         if sess.get("model"):
             command += ["--model", str(sess["model"])]
 
@@ -287,6 +334,7 @@ async def run(api, session_id: str, run_id: str, prompt: str, sess: dict,
                 "started_at": time.time(), "started_at_iso": api.now_iso(),
                 "gemini_mcp_owner_token": owner, "provider_turn_ready": False,
                 "provider_tools_ready": asyncio.Event(),
+                "gemini_cleanup": cleanup,
             })
             if not bound or stop:
                 raise asyncio.CancelledError()
@@ -340,16 +388,22 @@ async def run(api, session_id: str, run_id: str, prompt: str, sess: dict,
         # owner; do not publish raw stderr or protocol payloads.
         with suppress(Exception):
             await flush()
-        async def cleanup():
-            await client.close()
-            if broker:
-                await broker.close()
         try:
             await api.join_task_despite_caller_cancellation(asyncio.create_task(cleanup()))
         except Exception:
             # Do not release the slot or report a successful terminal event if
             # the owned provider process could not be reaped.
             if await api.turn_slot_is_owned(session_id, run_id):
+                async with api.ACTIVE_LOCK:
+                    active = api.ACTIVE.get(session_id) or {}
+                    if active.get("run_id") == run_id:
+                        active["gemini_cleanup_failed"] = True
+                        # A restart must not erase an unconfirmed cleanup and
+                        # allow new workspace edits. Without the live owned
+                        # cleanup closure, recovery needs operator verification.
+                        api.STORE.sessions[session_id]["gemini_cleanup_pending_run_id"] = run_id
+                        with suppress(Exception):
+                            await api.STORE.save(durable=True)
                 await api.append_event(session_id, "error", {"run_id": run_id, "backend": "gemini",
                     "message": "Gemini cleanup did not complete. Stop this chat before retrying."})
             return

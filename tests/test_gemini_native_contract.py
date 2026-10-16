@@ -12,7 +12,7 @@ import tempfile
 import threading
 import unittest
 
-from gemini_acp_client import GeminiACPClient, session_models
+from gemini_acp_client import GeminiACPClient, GeminiRPCError, session_models
 from gemini_runtime import build_environment
 from gemini_history import replay_snapshot
 
@@ -63,6 +63,15 @@ class NativeContract(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(len(events), previous, "history replay must not create live user/assistant turns")
                         self.assertTrue(session_models(opened)["models"])
                         provider_id = client.session_id
+                        if previous == 0:
+                            # Probe actual protocol support, not an SDK method
+                            # declaration or a copied-history substitute.
+                            modes = {row["id"] for row in opened["modes"]["availableModes"]}
+                            self.assertIn("default", modes)
+                            await client.request("session/set_mode", {"sessionId": provider_id, "modeId": "default"})
+                            with self.assertRaises(GeminiRPCError) as unsupported:
+                                await client.request("session/fork", {"sessionId": provider_id, "cwd": str(cwd), "mcpServers": []})
+                            self.assertEqual(unsupported.exception.code, -32601)
                         result = await client.prompt([{"type": "text", "text": "Reply OK; use no tools."}], timeout=30)
                         self.assertEqual(result["stopReason"], "end_turn")
                         self.assertEqual([e["text"] for e in events[previous:] if e["type"] == "text"], ["Gemini local contract OK"])

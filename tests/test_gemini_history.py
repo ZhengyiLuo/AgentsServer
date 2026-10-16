@@ -140,3 +140,17 @@ class ReplaySnapshot(unittest.TestCase):
         self.write()
         with self.assertRaises(GeminiProtocolError):
             read_snapshot(self.path)
+
+    def test_resume_accepts_only_leading_native_environment_header_refresh(self):
+        before = {**self.meta, "messages": [
+            {"id": "ctx", "type": "user", "content": [{"text": "<session_context>\nold tree\n</session_context>"}]},
+            {"id": "u", "type": "user", "content": [{"text": "create file"}]},
+        ]}
+        after = deepcopy(before)
+        after["messages"][0]["content"][0]["text"] = "<session_context>\nnew tree\n</session_context>"
+        verify_resume_snapshot(before, after)
+        for field, value in (("id", "replaced"), ("type", "gemini"), ("content", [{"text": "user changed"}])):
+            changed = deepcopy(after); changed["messages"][0][field] = value
+            with self.subTest(field=field), self.assertRaises(GeminiProtocolError): verify_resume_snapshot(before, changed)
+        after["messages"][1]["content"] = [{"text": "another request"}]
+        with self.assertRaises(GeminiProtocolError): verify_resume_snapshot(before, after)

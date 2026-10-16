@@ -24,9 +24,12 @@ class API(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         if length > 4 * 1024 * 1024:
             self.send_error(413); return
-        self.rfile.read(length)
+        body = json.loads(self.rfile.read(length))
         self.calls.append(self.path)
-        result = {"candidates": [{"content": {"role": "model", "parts": [{"text": "Gemini local contract OK"}]},
+        parts = [p for c in body.get("contents", []) for p in c.get("parts", [])]
+        activate = any("FIXTURE_SKILL" in p.get("text", "") for p in parts) and not any("functionResponse" in p for p in parts)
+        answer = [{"functionCall": {"name": "activate_skill", "args": {"name": "fixture-skill"}}}] if activate else [{"text": "Gemini local contract OK"}]
+        result = {"candidates": [{"content": {"role": "model", "parts": answer},
                     "finishReason": "STOP", "index": 0}], "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 4, "totalTokenCount": 5}}
         stream = "streamGenerateContent" in self.path
         raw = ("data: " + json.dumps(result) + "\n\n").encode() if stream else json.dumps(result).encode()

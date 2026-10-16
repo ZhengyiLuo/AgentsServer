@@ -1,11 +1,12 @@
 import hashlib
+from copy import deepcopy
 import json
 from pathlib import Path
 import tempfile
 import unittest
 
 from gemini_acp_client import GeminiProtocolError
-from gemini_history import fingerprint, replay_snapshot
+from gemini_history import fingerprint, replay_snapshot, replay_text, verify_resume_snapshot, read_snapshot
 
 SESSION = "12345678-1234-1234-1234-123456789abc"
 
@@ -63,3 +64,67 @@ class ReplaySnapshot(unittest.TestCase):
         self.records.append({"$set":{"messages":[{"id":"new", "type":"user", "content":"Restart"}]}})
         self.write()
         self.assertEqual(len(replay_snapshot(self.env, self.cwd, SESSION)), 1)
+
+    def test_native_tool_response_placeholder_is_fenced_not_imported(self):
+        self.records.append({"id": "tool-result", "type": "user", "content": [
+            {"functionResponse": {"name": "activate_skill", "response": {"output": "private skill body"}}}
+        ]})
+        self.write()
+        result = replay_snapshot(self.env, self.cwd, SESSION)
+        self.assertEqual(result[-1], fingerprint({"sessionUpdate": "user_message_chunk",
+            "content": {"type": "text", "text": "[Function Response: activate_skill]"}}))
+        self.assertNotIn("private skill body", repr(result))
+        self.assertEqual(replay_text(["prefix", {"text": " text"},
+            {"functionCall": {"name": "write_file", "args": {}}, "thoughtSignature": "opaque"}]),
+            "prefix text[Function Call: write_file]")
+
+    def test_malformed_or_ambiguous_tool_parts_fail_closed(self):
+        for value in [False, 0, {}, [[{"text": "nested"}]],
+                      {"functionResponse": {"name": ""}},
+                      {"functionCall": {"name": "call"}, "text": "ambiguous"}]:
+            with self.subTest(value=value), self.assertRaises(GeminiProtocolError):
+                replay_text(value)
+
+    def test_resume_accepts_only_exact_native_tool_conversion(self):
+        tool = {"id": "call-1", "name": "activate_skill", "args": {"name": "test"}, "result": "fixture output"}
+        before = {**self.meta, "messages": [
+            {"id": "context", "type": "user", "content": [{"text": "<session_context>context"}]},
+            {"id": "u", "type": "user", "content": "use skill"},
+            {"id": "a", "type": "gemini", "content": "", "toolCalls": [tool]},
+            {"id": "final", "type": "gemini", "content": "done"},
+        ]}
+        after = deepcopy(before)
+        after["messages"][1]["content"] = [{"text": "use skill"}]
+        after["messages"][2]["content"] = [{"functionCall": {key: tool[key] for key in ("id", "name", "args")}}]
+        after["messages"][3]["content"] = [{"text": "done"}]
+        after["messages"].insert(3, {"id": "a_response", "type": "user", "timestamp": "native-generated",
+            "content": [{"functionResponse": {"id": "call-1", "name": "activate_skill", "response": {"output": "fixture output"}}}]})
+        after["messages"][2]["toolCalls"][0]["result"] = deepcopy(after["messages"][3]["content"])
+        verify_resume_snapshot(before, after)
+        verify_resume_snapshot(after, deepcopy(after))
+        for change in ("extra", "user", "result", "tool", "workspace"):
+            broken = deepcopy(after)
+            if change == "extra": broken["messages"].append({"id": "other", "type": "user", "content": "external"})
+            if change == "user": broken["messages"][1]["content"] = [{"text": "changed"}]
+            if change == "result": broken["messages"][3]["content"][0]["functionResponse"]["response"]["output"] = "changed"
+            if change == "tool": broken["messages"][2]["toolCalls"][0]["args"] = {"name": "other"}
+            if change == "workspace": broken["projectHash"] = "other"
+            with self.subTest(change=change), self.assertRaisesRegex(GeminiProtocolError, "changed during resume"):
+                verify_resume_snapshot(before, broken)
+
+    def test_resume_thought_conversion_keeps_exposed_thoughts_and_text(self):
+        before = {**self.meta, "messages": [{"id": "a", "type": "gemini", "content": "answer",
+                  "thoughts": [{"subject": "Plan", "description": "Exposed"}]}]}
+        after = deepcopy(before)
+        after["messages"][0]["content"] = [{"text": "**Plan** Exposed", "thought": True}, {"text": "answer"}]
+        verify_resume_snapshot(before, after)
+        self.assertEqual(replay_text(after["messages"][0]["content"]), "[Thought: true]answer")
+
+    def test_tool_result_patch_is_loaded_but_identity_patch_is_rejected(self):
+        self.records.append({"$patch": {"updates": [{"id": "a", "toolCalls": [{"id": "tool-1", "result": "updated"}]}]}})
+        self.write()
+        self.assertEqual(read_snapshot(self.path)["messages"][1]["toolCalls"][0]["result"], "updated")
+        self.records[-1]["$patch"]["updates"][0]["toolCalls"][0]["name"] = "different"
+        self.write()
+        with self.assertRaises(GeminiProtocolError):
+            read_snapshot(self.path)

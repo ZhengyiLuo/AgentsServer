@@ -21,6 +21,9 @@ class ServerContract(unittest.TestCase):
     def test_api_chat_resume_forget_reconnect_delete(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); project = root / "project"; project.mkdir()
+            skill = root / '.gemini/skills/fixture-skill/SKILL.md'
+            skill.parent.mkdir(parents=True)
+            skill.write_text('---\nname: fixture-skill\ndescription: Harmless HTTP acceptance skill.\n---\nReply OK only.')
             state = root / "state"
             with socket.socket() as sock:
                 sock.bind(("127.0.0.1", 0)); port = sock.getsockname()[1]
@@ -74,6 +77,25 @@ class ServerContract(unittest.TestCase):
                         self.assertEqual(len([e for e in events if e.get("type") == "turn_started"]), 2)
                         self.assertEqual(len([e for e in events if e.get("type") == "assistant_text"]), 2)
                         self.assertEqual([e["text"] for e in events if e.get("type") == "assistant_text"], ["Gemini local contract OK"] * 2)
+                        commands = client.get(route + '/provider-commands').json()
+                        self.assertTrue(commands['support']['available'], commands)
+                        self.assertEqual(commands['commands'][0]['name'], 'fixture-skill')
+                        selected = {'id': commands['commands'][0]['id'], 'revision': commands['revision']}
+                        skill_prompt = {**prompt, 'prompt': '/fixture-skill FIXTURE_SKILL', 'skill_selection': selected}
+                        original = skill.read_text(); skill.write_text(original + '\nChanged')
+                        self.assertEqual(client.post(route + '/turns', json=skill_prompt).status_code, 409)
+                        skill.write_text(original)
+                        response = client.post(route + '/turns', json=skill_prompt)
+                        self.assertEqual(response.status_code, 200, response.text)
+                        for _ in range(150):
+                            pending = client.get(route + '/gemini/runtime').json()['pending_interactions']
+                            if pending: break
+                            time.sleep(.1)
+                        else: self.fail('Native skill activation did not reach the server approval boundary')
+                        self.assertEqual(pending[0]['params']['availableDecisions'], ['accept', 'decline'])
+                        response = client.post(route + '/gemini/interactions/' + pending[0]['id'] + '/resolve', json={'response': {'decision': 'accept'}})
+                        self.assertEqual(response.status_code, 200, response.text)
+                        completed(3)
                         sessions = json.loads((state / "sessions.json").read_text())
                         session = sessions[sid] if isinstance(sessions, dict) and sid in sessions else next(s for s in sessions if s["id"] == sid)
                         native_id = session["gemini_session_id"]
@@ -84,7 +106,13 @@ class ServerContract(unittest.TestCase):
                         endpoint["expected_revision"] = 2
                         self.assertTrue(client.put("/api/admin/provider-connections/gemini", json=endpoint).json()["ok"])
                         self.assertEqual(client.post(route + "/turns", json=prompt).status_code, 200)
-                        completed(3)
+                        events = completed(4)
+                        self.assertEqual(len([e for e in events if e.get('type') == 'turn_started']), 4)
+                        self.assertEqual(len([e for e in events if e.get('type') == 'assistant_text']), 4)
+                        self.assertEqual(client.post(route + "/turns", json=prompt).status_code, 200)
+                        events = completed(5)
+                        self.assertEqual(len([e for e in events if e.get('type') == 'turn_started']), 5)
+                        self.assertEqual(len([e for e in events if e.get('type') == 'assistant_text']), 5)
                         histories = list((state / "admin/provider-connections").rglob("session-*"))
                         self.assertTrue(histories)
                         self.assertEqual(client.delete(route).status_code, 200)

@@ -92,7 +92,11 @@ workspace, then verifies the expected replay sequence before sending a prompt.
 It checks the snapshot again after load. This is not fuzzy content deduplication:
 matching takes place before the new prompt, so legitimate identical new replies
 remain distinct. JSON/JSONL text records and native patch/reset/rewind ordering
-are recognized. Unknown multimodal/history formats, ambiguous files, symlinks,
+are recognized. Native tool-response placeholders are included in the replay
+fence, never emitted as new user turns. The pinned loader itself normalizes
+model/tool parts and inserts deterministic response records during load; the
+second snapshot accepts only that predicted conversion, not arbitrary new or
+changed messages. Unknown multimodal/history formats, ambiguous files, symlinks,
 changed snapshots and limits fail closed. Limits are 16 MiB per transcript and
 10,000 scanned entries/replay events. This private-format dependency is one
 reason for the exact CLI version fence; it needs an upstream protocol completion
@@ -108,7 +112,9 @@ signal or equivalent before broad compatibility can be promised.
   replay, process cleanup and retained native transcripts.
 - Actual AgentsServer HTTP boundary with that CLI/API fixture: API configuration,
   old-client rejection, repeated turns, Forget blocking an existing chat,
-  reconnecting that binding, and Delete retaining native transcripts.
+  reconnecting that binding, and Delete retaining native transcripts. Skill
+  inventory and stale-selection rejection, explicit native activation approval,
+  and two subsequent resumed turns also pass without duplicate user/reply events.
 - Actual CLI/local API skill contract: installed user skills appear in the API
   profile, native `activate_skill` requests approval, denied writes leave no
   file, approved writes produce the file, and owned processes exit. Native
@@ -119,14 +125,24 @@ signal or equivalent before broad compatibility can be promised.
   prevented successful real-account acceptance; login/key presence alone is
   not a successful model request. Known eligibility, credits and model-removal
   errors now have actionable, secret-safe messages.
+- The visible development desktop was restarted against the Gemini-enabled
+  server: New Chat shows both native and API Gemini choices with the sparkle
+  mark, the slash picker lists installed skills, and an explicit model refresh
+  retains the returned model list through subsequent compact session polling.
+  An account with a failed first generation also encountered a missing native
+  resume snapshot; that failure-path recovery remains unaccepted. Do not silently
+  substitute a fresh native session for a missing one.
 - Actual offscreen Electron window using the production preload, IPC, service,
   HTTP and built renderer: configure API without an initial model ID, display
   discovered model options, save a default via the manual-model form, refresh
-  the chat list, send two UI turns and render two nonduplicated replies. The
+  the chat list, send four UI turns, select a native skill from the slash picker,
+  approve its activation in the App, and resume afterward with no duplicated
+  user/reply events. The
   disposable chat was arranged through the actual HTTP client, not the new-chat
   dialog. Screenshots were visually checked in English/dark mode. The native
   select popup was not operable offscreen, so popup interaction itself is not
-  accepted by this test. Chinese labels have component coverage, not full visual
+  accepted by this test. The visible desktop separately exercised the composer
+  model menu and refresh. Chinese labels have component coverage, not full visual
   acceptance. No real Google credentials or model service were used.
 
 ## Remaining before a merge/release recommendation

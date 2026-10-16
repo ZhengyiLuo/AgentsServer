@@ -264,11 +264,12 @@ async def run(api, session_id: str, run_id: str, prompt: str, sess: dict,
                 raise asyncio.CancelledError()
 
         await client.start(command, cwd=cwd, env=env, on_started=started)
-        from gemini_history import replay_snapshot
-        replay = await asyncio.to_thread(replay_snapshot, env, cwd, provider_id) if provider_id else None
+        from gemini_history import native_snapshot, snapshot_replay, verify_resume_snapshot
+        snapshot = await asyncio.to_thread(native_snapshot, env, cwd, provider_id) if provider_id else None
+        replay = snapshot_replay(snapshot) if snapshot is not None else None
         opened = await client.open_session(cwd=cwd, session_id=provider_id, mcp_servers=mcp, replay=replay)
-        if provider_id and await asyncio.to_thread(replay_snapshot, env, cwd, provider_id) != replay:
-            raise GeminiProtocolError("Gemini history changed during resume; close the other client before retrying.")
+        if snapshot is not None:
+            verify_resume_snapshot(snapshot, await asyncio.to_thread(native_snapshot, env, cwd, provider_id))
         if not connection:
             MODEL_CATALOG["default"] = session_models(opened)
         await api.persist_run_provider_session(session_id, run_id, "gemini", client.session_id,

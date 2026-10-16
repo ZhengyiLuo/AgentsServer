@@ -7,6 +7,7 @@ Unknown formats fail closed; this is not an import/reconciliation API.
 from __future__ import annotations
 
 import hashlib
+from copy import deepcopy
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,36 @@ from gemini_runtime import native_home
 
 MAX_BYTES = 16 * 1024 * 1024
 MAX_ENTRIES = 10000
+
+
+def replay_text(value) -> str:
+    """Match pinned partListUnionToString for supported text/tool history.
+
+    Native skill/tool responses are user-role functionResponse parts. They
+    replay as placeholders, not additional user turns. This is only a replay
+    fence: do not import those placeholders into the AgentsDock timeline.
+    Unknown media/part shapes still fail closed.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        if len(value) > MAX_ENTRIES or any(isinstance(part, list) for part in value):
+            raise GeminiProtocolError("Unsupported Gemini replay part list.")
+        return "".join(replay_text(part) for part in value)
+    if isinstance(value, dict):
+        if set(value) <= {"text", "thought", "thoughtSignature"} and isinstance(value.get("text"), str):
+            if "thought" in value:
+                if not isinstance(value["thought"], bool):
+                    raise GeminiProtocolError("Invalid Gemini native thought part.")
+                return "[Thought: true]" if value["thought"] else "[Thought: false]"
+            return value["text"]
+        for key, label in (("functionCall", "Function Call"), ("functionResponse", "Function Response")):
+            if set(value) <= {key, "thoughtSignature"} and isinstance(value.get(key), dict):
+                name = identifier(value[key].get("name"))
+                return f"[{label}: {name}]"
+    raise GeminiProtocolError("This Gemini history format needs a newer resume adapter; continue it in Gemini CLI.")
 
 
 def fingerprint(update: dict) -> tuple[str, str]:
@@ -31,7 +62,7 @@ def fingerprint(update: dict) -> tuple[str, str]:
     raise GeminiProtocolError("Unsupported Gemini replay event.")
 
 
-def replay_snapshot(env: dict[str, str], cwd: str, session_id: str) -> list[tuple[str, str]]:
+def native_snapshot(env: dict[str, str], cwd: str, session_id: str) -> dict:
     identifier(session_id, session=True)
     root = native_home(env) / ".gemini" / "tmp"
     found = []
@@ -63,18 +94,22 @@ def replay_snapshot(env: dict[str, str], cwd: str, session_id: str) -> list[tupl
         raise GeminiProtocolError("Gemini native history cannot be safely read for resume.") from None
     if len(found) != 1 or found[0].get("projectHash") != hashlib.sha256(cwd.encode()).hexdigest():
         raise GeminiProtocolError("Gemini native history does not uniquely match this chat and workspace.")
+    return found[0]
+
+
+def replay_snapshot(env: dict[str, str], cwd: str, session_id: str) -> list[tuple[str, str]]:
+    return snapshot_replay(native_snapshot(env, cwd, session_id))
+
+
+def snapshot_replay(snapshot: dict) -> list[tuple[str, str]]:
     result = []
-    for message in found[0]["messages"]:
+    for message in snapshot["messages"]:
         if not isinstance(message, dict):
             raise GeminiProtocolError("Invalid Gemini native message.")
         kind = message.get("type")
         if kind not in {"user", "gemini"}:
             continue  # Pinned streamHistory ignores native info/error records.
-        content = message.get("content") or ""
-        if isinstance(content, list) and all(isinstance(part, dict) and set(part) <= {"text"} and isinstance(part.get("text"), str) for part in content):
-            content = "".join(part["text"] for part in content)
-        if not isinstance(content, str):
-            raise GeminiProtocolError("This Gemini history format needs a newer resume adapter; continue it in Gemini CLI.")
+        content = replay_text(message.get("content"))
         if kind == "gemini":
             for thought in message.get("thoughts") or []:
                 if not isinstance(thought, dict) or not all(isinstance(thought.get(key), str) for key in ("subject", "description")):
@@ -88,6 +123,88 @@ def replay_snapshot(env: dict[str, str], cwd: str, session_id: str) -> list[tupl
         if len(result) > MAX_ENTRIES:
             raise GeminiProtocolError("Gemini replay exceeds the preview limit.")
     return result
+
+
+def verify_resume_snapshot(before: dict, after: dict) -> None:
+    """Allow only the pinned loader's exact text/tool normalization.
+
+    streamHistory emits the pre-normalization messages, while resumeChat writes
+    converted model parts and deterministic *_response rows back to disk. Merely
+    comparing replay fingerprints therefore rejects every resumed tool turn.
+    Preserve the concurrency fence by predicting those mutations, not by
+    dropping it or allowing arbitrary appended records.
+    """
+    failure = "Gemini history changed during resume; close the other client before retrying."
+    if any(before.get(key) != after.get(key) for key in ("sessionId", "projectHash")):
+        raise GeminiProtocolError(failure)
+    if before["messages"] == after["messages"]:
+        return
+    records = deepcopy(before["messages"])
+    by_id = {row["id"]: row for row in records}
+    if len(by_id) != len(records):
+        raise GeminiProtocolError(failure)
+    converted = []
+    generated = set()
+
+    def parts(value):
+        values = value if isinstance(value, list) else [value]
+        return [{"text": part} if isinstance(part, str) else deepcopy(part) for part in values]
+
+    for row in records:
+        kind, content = row.get("type"), row.get("content")
+        if kind == "user":
+            text = replay_text(content).strip()
+            if not text or text.startswith(("/", "?", "<session_context>", "<hook_context>")):
+                continue
+            row["content"] = parts(content)
+            converted.append(row)
+        elif kind == "gemini":
+            model_parts = parts(content) if content else []
+            if not any(p.get("functionCall") or p.get("thought") for p in model_parts):
+                thoughts = [{"text": f"**{t['subject']}** {t['description']}" if t.get("subject") else t["description"],
+                             "thought": True} for t in row.get("thoughts", [])]
+                calls = [{"functionCall": {key: tool[key] for key in ("id", "name", "args")}}
+                         for tool in row.get("toolCalls", [])]
+                model_parts = thoughts + model_parts + calls
+            if not model_parts:
+                continue
+            row["content"] = model_parts
+            converted.append(row)
+            responses = []
+            for tool in row.get("toolCalls", []):
+                value = tool.get("result")
+                if not value:
+                    continue
+                if isinstance(value, str):
+                    responses.append({"functionResponse": {"id": tool["id"], "name": tool["name"], "response": {"output": value}}})
+                else:
+                    responses.extend(parts(value))
+            if responses:
+                key = row["id"] + "_response"
+                response = deepcopy(by_id.get(key, {"id": key, "type": "user"}))
+                if response.get("type") != "user":
+                    raise GeminiProtocolError(failure)
+                response["content"] = responses
+                generated.add(key)
+                converted.append(response)
+    # updateMessagesFromHistory keeps ignored native context/info records, then
+    # writes converted orderIds. Native JSONL loading de-duplicates those IDs.
+    ordered = {row["id"]: row for row in converted}
+    tools = {tool["id"]: tool for row in records for tool in row.get("toolCalls", [])}
+    for row in converted:
+        if row.get("type") == "user":
+            for part in row["content"]:
+                response = part.get("functionResponse", {})
+                if response.get("id") in tools:
+                    tools[response["id"]]["result"] = deepcopy(row["content"])
+    expected = [row for row in records if row["id"] not in ordered] + list(ordered.values())
+    actual = deepcopy(after["messages"])
+    for rows in (expected, actual):
+        for row in rows:
+            if row["id"] in generated and row["id"] not in by_id:
+                row.pop("timestamp", None)  # The only newly generated metadata.
+    if expected != actual:
+        raise GeminiProtocolError(failure)
 
 
 def read_snapshot(path: Path) -> dict:
@@ -118,11 +235,17 @@ def read_snapshot(path: Path) -> dict:
             if not isinstance(patch, dict) or set(patch) - {"id", "content", "toolCalls", "updates", "removeIds", "orderIds"}:
                 raise GeminiProtocolError("Unsupported Gemini history patch.")
             for update in ([patch] if "id" in patch else []) + patch.get("updates", []):
+                if not isinstance(update, dict) or set(update) - {"id", "content", "toolCalls"}:
+                    raise GeminiProtocolError("Unsupported Gemini message patch.")
                 existing = messages.get(update.get("id"))
                 if existing and "content" in update:
                     existing["content"] = update["content"]
-                # Native tool-result patches cannot change tool identities or
-                # the number/order of replay notifications.
+                for tool_patch in update.get("toolCalls", []):
+                    if not isinstance(tool_patch, dict) or set(tool_patch) - {"id", "result"}:
+                        raise GeminiProtocolError("Unsupported Gemini tool-result patch.")
+                    tool = next((row for row in (existing or {}).get("toolCalls", []) if row.get("id") == tool_patch.get("id")), None)
+                    if tool is not None and "result" in tool_patch:
+                        tool["result"] = tool_patch["result"]
             for key in patch.get("removeIds", []):
                 messages.pop(key, None)
             order = patch.get("orderIds", [])

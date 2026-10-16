@@ -142,6 +142,21 @@ class CodexNativeHistoryRepairTests(unittest.TestCase):
                 items = [self.parse(row) for row in self.raw]
                 self.assertEqual(filter_native_codex_history_items("chat", PROVIDER, self.events, items)[0], items[0])
 
+    def test_large_compaction_source_record_retains_native_ownership_proof(self):
+        self.fixture(source_headers=[{"type": "session_meta", "payload": {"id": PROVIDER}},
+            {"type": "compacted", "payload": {"replacement_history": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "x" * (5 * 1024 * 1024)}]}]}}])
+        self.prepare()
+        self.assertEqual(self.cache.project_event("chat", self.imports[0])["prompt"], "")
+        self.assertIsNone(self.cache.project_event("chat", self.native[0]))
+
+    def test_source_record_budget_still_fails_closed(self):
+        with mock.patch.object(repair, "NATIVE_PROOF_LINE_BYTES", 100):
+            with self.assertRaises(CodexNativeHistoryProofUnavailable):
+                self.prepare()
+        self.assertFalse(self.cache.is_prepared("chat", PROVIDER))
+
     def test_unowned_same_text_different_turn_and_changed_import_stay_visible(self):
         self.raw.append({**self.raw[0], "timestamp": "2026-09-11T12:09:00Z", "payload": {**self.raw[0]["payload"],
             "id": "other-source-item", "internal_chat_message_metadata_passthrough": {"turn_id": "unowned-turn", "content_item_kinds": ["user.text"]}}})
@@ -171,6 +186,25 @@ class CodexNativeHistoryRepairTests(unittest.TestCase):
         self.cache.forget("chat")
         self.prepare()
         self.assertEqual(len(self.cache.signature("chat")), 4)
+
+    def test_import_proof_does_not_retain_unrelated_native_text_keys(self):
+        # A large chat can have more text keys than the proof's memory budget;
+        # only exact candidate bodies need retention, while sequence validation
+        # and all native ownership/ambiguity checks still cover the full ledger.
+        rows = [json.loads(line) for line in self.events.read_text().splitlines()]
+        for index in range(40):
+            rows.append({"seq": 201 + index, "id": f"unrelated-{index}", "session_id": "chat",
+                         "run_id": "native-1", "type": "assistant_text", "text": f"unrelated body {index}"})
+        self.events.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        items = [self.parse(row) for row in self.raw]
+        with mock.patch("codex_history_repair.MAX_KEYS", 12):
+            result = filter_native_codex_history_items("chat", PROVIDER, self.events, items)
+        self.assertEqual([item["text"] for item in result], ["", ""])
+
+    def test_legacy_repair_capacity_failure_is_not_retried_on_unchanged_input(self):
+        with mock.patch("codex_history_repair.MAX_KEYS", 1), self.assertRaises(CodexNativeHistoryProofUnavailable) as error:
+            self.prepare()
+        self.assertTrue(getattr(error.exception, "deterministic", False))
 
     def test_assistant_normalization_matches_actual_native_cleaner(self):
         tree = ast.parse((Path(__file__).resolve().parents[1] / "agent_server.py").read_text())

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from collections import Counter, OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import hashlib
 import hmac
@@ -135,6 +136,11 @@ class CodexCompactionSummaryTracker:
 
 class CodexNativeHistoryProofUnavailable(ValueError):
     """Incomplete evidence must defer import, not become a new human message."""
+
+
+class CodexNativeHistoryProofCapacityExceeded(CodexNativeHistoryProofUnavailable):
+    """The same unchanged input cannot fit; require changed input or manual retry."""
+    deterministic = True
 
 
 @dataclass
@@ -917,7 +923,7 @@ def _prove_native_replays(session_id: str, provider_id: str, events: Path, sourc
             continue
         deliveries.observe(event)
         if len(candidates) + len(batches) + len(terminals) + retained + deliveries.count > MAX_KEYS:
-            raise _Unproven()
+            raise CodexNativeHistoryProofCapacityExceeded("native history proof key budget exceeded")
         run = event.get("run_id")
         if not isinstance(run, str) or not 0 < len(run) <= 256:
             continue
@@ -951,7 +957,7 @@ def _prove_native_replays(session_id: str, provider_id: str, events: Path, sourc
                 native.setdefault((run, kind, wake_hash), []).append(_native_event_identity(event))
                 retained += 1
         if len(candidates) + len(batches) + len(terminals) + retained + deliveries.count > MAX_KEYS:
-            raise _Unproven()
+            raise CodexNativeHistoryProofCapacityExceeded("native history proof key budget exceeded")
     if not candidates:
         return _NativeProof(provider_id)
     groups = {}
@@ -1198,18 +1204,33 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
     return proofs
 
 
+@contextmanager
+def _native_prepare_lock(lock, budget):
+    # The budget starts before waiting, not after another chat releases it.
+    while True:
+        budget.check()
+        if lock.acquire(timeout=min(0.05, max(0, budget.deadline - time.monotonic()))):
+            break
+    try:
+        budget.check()
+        yield
+    finally:
+        lock.release()
+
+
 class CodexNativeHistoryRepairCache(CodexGoalHistoryRepairCache):
     """An explicit history boundary prepares proof; per-event projection does no IO."""
     def prepare(self, session_id: str, provider_id: str, events_path: Path, source_path: Path | None,
                 root: Path, parse_item: Callable[[dict], dict | None], *,
                 cancelled: Callable[[], bool] | None = None, deadline: float | None = None) -> bool:
-        with self._prepare_lock:
+        budget = _NativeReadBudget(cancelled, deadline)
+        with _native_prepare_lock(self._prepare_lock, budget):
             with self._lock:
                 previous = self._proofs.get(session_id)
                 if previous and previous.provider_id == provider_id:
                     return False
                 self._preparing, self._cancelled = session_id, False
-            budget = _NativeReadBudget(lambda: self._cancelled or bool(cancelled and cancelled()), deadline)
+            budget.cancelled = lambda: self._cancelled or bool(cancelled and cancelled())
             try:
                 proof = _prove_native_replays(
                     session_id, provider_id, events_path, source_path, root, parse_item,
@@ -1219,6 +1240,8 @@ class CodexNativeHistoryRepairCache(CodexGoalHistoryRepairCache):
             except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
                 with self._lock:
                     self._preparing = None
+                if isinstance(exc, CodexNativeHistoryProofCapacityExceeded):
+                    raise
                 # Unavailable proof is neither a negative answer nor a prepared
                 # cache entry. The explicit worker decides when to retry it.
                 raise CodexNativeHistoryProofUnavailable("Codex native history proof is incomplete") from exc
@@ -1333,6 +1356,16 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
             raise _Unproven()
         budget = _NativeReadBudget(cancelled, deadline)
         stamp = _native_stamp(events)
+        # The import batch defines which bodies can possibly be replayed.
+        # Keep all ownership/ambiguity evidence and validate every journal
+        # record, but do not retain keys for unrelated historical text.
+        candidate_keys = {(item.get("kind"), _text_key(item["text"])) for item in items
+                          if isinstance(item.get("text"), str)}
+        source_keys = {(item.get("kind"), item["source_text_sha256"]) for item in items
+                       if isinstance(item.get("source_text_sha256"), str)}
+        candidate_keys.update(("assistant", _text_key(_native_assistant_text(item["text"])))
+                              for item in items if item.get("kind") == "assistant"
+                              and isinstance(item.get("text"), str))
         owners, native, assistant_items, wake_keys, native_count = {}, {}, {}, set(), 0
         deliveries = _AsyncDeliveryIndex()
         prove_deliveries = (source_path is not None and root is not None
@@ -1363,17 +1396,21 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
             kind = "user" if event.get("type") == "turn_started" else "assistant" if event.get("type") in ("assistant_text", "reasoning_summary", "turn_finished") else None
             body = event.get("prompt") if kind == "user" else event.get("result_text") if event.get("type") == "turn_finished" else event.get("text")
             wake_hash = _native_mailbox_wake_hash(event) if kind == "user" else None
-            if kind and (isinstance(body, str) and body or wake_hash):
+            key = (kind, wake_hash or _text_key(body)) if kind and (isinstance(body, str) and body or wake_hash) else None
+            if key in candidate_keys or (isinstance(body, str) and
+                    (kind, _text_key(" ".join(body.split()))) in source_keys):
                 keys = native.setdefault(run, {})
-                key = (kind, wake_hash or _text_key(body))
                 native_count += key not in keys
                 if isinstance(event.get("id"), str) and 0 < len(event["id"]) <= 256:
                     keys.setdefault(key, event["id"])
                     if wake_hash:
                         wake_keys.add((run, wake_hash))
-                    item_id = _public_assistant_item_id(event)
-                    if item_id is not None:
-                        assistant_items[(run, item_id, key[1])] = _native_event_identity(event)
+            # Public assistant identities can prove an earlier goal turn
+            # even when this batch contains only a user follow-up. Retain
+            # that ownership evidence independently of candidate text keys.
+            item_id = _public_assistant_item_id(event)
+            if item_id is not None and key is not None:
+                assistant_items[(run, item_id, key[1])] = _native_event_identity(event)
             if native_count + owner_count + len(assistant_items) + deliveries.count > MAX_KEYS:
                 raise _Unproven()
         assistant_item_owners = _native_assistant_item_owners(

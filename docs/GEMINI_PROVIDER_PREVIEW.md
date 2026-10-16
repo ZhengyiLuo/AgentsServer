@@ -221,6 +221,20 @@ signal or equivalent before broad compatibility can be promised.
   concurrency acceptance, not a low-memory or production-load certification.
   Related server regressions, desktop checks and build results are recorded in
   the development log. None substitutes for real Google account acceptance.
+- Additional bounded stress acceptance: an installed development instance served
+  8,515 authenticated HTTP reads and 1,854 WebSocket catch-up/reconnections over
+  60 seconds with 16 workers of each kind and no request failures or restart.
+  This used four disposable empty chats; existing event logs and configuration
+  were unchanged. It is a loopback connection test, not remote-network or
+  large-history acceptance.
+- Separately, four concurrent real CLI chats completed ten turns each against a
+  loopback fake model API. Each streamed reply contained 134,890 UTF-8 bytes,
+  including Chinese. Forty event-stream reconnects, exact reply retention,
+  distinct/stable native UUIDs and Delete preserving native history passed.
+  A repeated-text fixture triggered native loop protection; a direct CLI probe
+  also returned `max_turn_requests`. The protection was retained and the long
+  success fixture uses nonrepeating text. These short bounded runs are not
+  long-duration, low-memory or successful Google-account acceptance.
 
 ## Remaining before a merge/release recommendation
 

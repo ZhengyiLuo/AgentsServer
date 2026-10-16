@@ -55,12 +55,20 @@ require an explicit model check. Manual model selection remains available.
 - Owned ACP process per turn, explicit workspace, persisted native session UUID,
   continuation in the same workspace, bounded protocol input/output and probes.
 - Native text/thought/tool event mapping; exposed thoughts only, no inference of
-  hidden reasoning. Assistant text is currently buffered until a block boundary
-  or completion, so streaming parity is **not yet complete**.
+  hidden reasoning. Live assistant deltas use a reconnectable stream snapshot,
+  displayed as answers rather than thinking; durable blocks replace that
+  snapshot without a second copy. Stop preserves already exposed thoughts/text.
+  Native diff/location content is retained in tool traces even when ACP omits
+  raw arguments; omitted arguments are not invented.
 - Run-owned approve-once/deny-once requests through native desktop IPC. No
   persistent blanket shell or MCP grant. Server task authorization is separate.
-- Run-bound AgentsDock MCP wiring using the existing authenticated broker and
-  server capability checks. Complete real cross-chat acceptance is still pending.
+- Run-bound AgentsDock MCP using the existing authenticated broker and server
+  capability checks. Real CLI/loopback-API acceptance covers authorized send,
+  idle mailbox wake, inbox/read, bounded user delegation and reply, with native
+  one-time approvals and no user-role reinjection. Gemini does not load MCP in
+  an untrusted workspace. An explicit handoff fails with a folder-trust/MCP
+  instruction if the tool was not loaded; AgentsDock never grants folder trust
+  or substitutes shell helpers. Review trust in the native CLI yourself.
 - Gemini sparkle mark and separate native/API choices in the desktop picker.
   Slim session polling retains custom model lists instead of replacing them
   with a model-less summary. Gemini errors are not labeled as Codex errors.
@@ -77,9 +85,35 @@ require an explicit model check. Manual model selection remains available.
   retained. This is not a claim of parity for every native customization/hook.
 - Strict API protocol/header validation, separate model discovery, existing
   per-chat connection snapshots, Forget/reconnect, and secret-safe diagnostics.
-- Delete retains provider-native history. Idle process cleanup and retained
-  files were tested; live-tool/queued deletion and native CLI continuation after
-  Delete still need their separate acceptance cases.
+- Small registered text/image/audio attachments reach native ACP. Limits are
+  eight files, 512 KiB each and 2 MiB total; images are PNG/JPEG/WebP/GIF, audio is
+  WAV/MP3/OGG/FLAC, other files must be UTF-8 text without NUL. Mixed text/image
+  and subsequent resume are checked against the actual CLI. Audio transport has
+  mapping coverage, not real-model/audio-understanding acceptance. Arbitrary
+  file URLs, PDF/video and larger attachments are not advertised as supported.
+- Adopt the native transcript `summary` as an automatic title when it exists;
+  manual names win. Native summary generation is not guaranteed on a chat's
+  first turn. No separate title-model request or hidden user prompt is added.
+- Opt-in native discovery and initial **text-only** history import, preserving
+  exact UUID/workspace and title (first actual human message when absent).
+  Child, archived, deleted, unavailable, ambiguous and already-owned identities
+  are excluded. This lists the ordinary native profile, not private API profiles.
+  `.project_root` and the native hash must agree; never infer a path from a slug.
+  Earlier media/tools/thoughts and later native edits are not reconciled.
+  The desktop requests `include_gemini=true` only with the negotiated capability;
+  older clients retain their existing candidate set.
+- Provider-reported token/context usage is retained without invented costs.
+  ACP plan-update mapping is bounded and unit-tested, but the pinned CLI has not
+  demonstrated a dedicated native plan stream. Native todo tools remain tool
+  activity; this is not an accepted goals/scheduling implementation.
+- Failed first generation without any resumable model record may retry fresh;
+  visible output/tool activity or an existing UUID prevents silent replacement.
+  Missing/corrupt history then fails closed. Queue promotion and restart resume
+  preserve the same provider UUID.
+- Delete retains provider-native history. Idle and pending-tool deletion,
+  unrelated-chat isolation, stale-approval rejection and direct native ACP
+  continuation after Delete pass in disposable fixtures. Cleanup failure and
+  escaped descendants still need their separate acceptance cases.
 
 ### Important native replay behavior
 
@@ -96,7 +130,8 @@ are recognized. Native tool-response placeholders are included in the replay
 fence, never emitted as new user turns. The pinned loader itself normalizes
 model/tool parts and inserts deterministic response records during load; the
 second snapshot accepts only that predicted conversion, not arbitrary new or
-changed messages. Unknown multimodal/history formats, ambiguous files, symlinks,
+changed messages. Inline media placeholders use the exact pinned native format;
+unknown history formats, ambiguous files, symlinks,
 changed snapshots and limits fail closed. Limits are 16 MiB per transcript and
 10,000 scanned entries/replay events. This private-format dependency is one
 reason for the exact CLI version fence; it needs an upstream protocol completion
@@ -129,9 +164,9 @@ signal or equivalent before broad compatibility can be promised.
   server: New Chat shows both native and API Gemini choices with the sparkle
   mark, the slash picker lists installed skills, and an explicit model refresh
   retains the returned model list through subsequent compact session polling.
-  An account with a failed first generation also encountered a missing native
-  resume snapshot; that failure-path recovery remains unaccepted. Do not silently
-  substitute a fresh native session for a missing one.
+  First-generation failure recovery is now separately covered with a real CLI
+  and synthetic model failure. Existing/mutated UUIDs still fail closed rather
+  than silently substituting a new conversation.
 - Actual offscreen Electron window using the production preload, IPC, service,
   HTTP and built renderer: configure API without an initial model ID, display
   discovered model options, save a default via the manual-model form, refresh
@@ -144,6 +179,17 @@ signal or equivalent before broad compatibility can be promised.
   accepted by this test. The visible desktop separately exercised the composer
   model menu and refresh. Chinese labels have component coverage, not full visual
   acceptance. No real Google credentials or model service were used.
+- Extended actual offscreen desktop acceptance: see the live answer before its
+  terminal event, open the grouped import picker, find the native Gemini title,
+  resume the detected ID and render its initial user/assistant text. Fixture
+  setup and native metadata are synthetic; rendering, IPC, HTTP and CLI are real.
+- The extended Gemini test batch has 72 passing cases, including native
+  queue/restart/resume, Stop, denied write, active Delete, API Forget/reconnect,
+  attachments, cross-chat and title adoption/manual-title protection. An
+  additional 247 related server regressions pass. Desktop: 5,191 tests pass,
+  five skip; type checking, production compilation, eight package checks and
+  nine server release-manifest checks pass. These are not real Google account
+  acceptance or a full server-suite/release validation claim.
 
 ## Remaining before a merge/release recommendation
 
@@ -152,18 +198,24 @@ just the successful text fixture. In particular:
 
 1. Real Google OAuth and real Developer API key requests, expired credentials,
    organization policy, proxies and billing/model availability.
-2. Actual desktop new-chat/model-popup workflow and native tool approval/denial;
-   real tools, thinking order/retention, live assistant deltas and trace parity.
-3. Two real chats with request/reply, normal permissions, unauthorized recipient,
-   revocation, replay and busy mailbox delivery; no user-role reinjection.
-4. Stop/cancel, queued follow-up, disconnect/reconnect, server restart, active
-   Delete/cleanup failure, escaped descendants and unrelated-chat isolation.
-5. Native titles and external discovery/import/reconciliation. External import,
-   attachments and fork are currently rejected, not silently substituted.
-6. Complete skill-picker/tool acceptance with a usable real account, extension
-   customization parity, plans/usage, subagents, jobs/goals, side questions,
-   shared chats and permission profiles. Do not claim support from
-   another provider's tests. Mobile requires its own implementation task.
+2. Full desktop new-chat/model-popup and Chinese/narrow visual acceptance;
+   complete native tool/trace parity with a usable real account. The implemented
+   live text path is accepted through the actual App and local API fixture, not
+   as proof of all native rendering behavior.
+3. Gemini-specific live unauthorized-recipient, revoked-pair, busy-mailbox and
+   retry/replay combinations. Shared authorization regressions pass, but do not
+   replace every native integration scenario.
+4. Server crash during tool execution, cleanup failure, escaped descendants,
+   queued Delete and stress/memory bounds. Graceful restart and pending-tool
+   Delete passing do not establish those cases.
+5. External-history reconciliation is unsupported. Native Fork is unsupported:
+   the pinned ACP implementation does not implement `session/fork`; a copied
+   transcript is not a substitute. Native summary adoption does not promise
+   immediate generation of a title.
+6. Extension customization parity, subagents, jobs/goals, side questions,
+   shared chats and non-default permission profiles remain individually
+   unverified/unsupported. No native `/btw` interaction is claimed. Mobile
+   requires its own implementation task.
 
 Full suite/release packaging validation and a real account acceptance record
 are still required. This branch is a starting implementation, not a release.

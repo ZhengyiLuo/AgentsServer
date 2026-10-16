@@ -120,6 +120,18 @@ class ReplaySnapshot(unittest.TestCase):
         verify_resume_snapshot(before, after)
         self.assertEqual(replay_text(after["messages"][0]["content"]), "[Thought: true]answer")
 
+    def test_stop_empty_model_record_is_removed_but_real_output_is_not(self):
+        before = {**self.meta, "messages": [
+            {"id": "u", "type": "user", "content": [{"text": "hello"}]},
+            {"id": "a", "type": "gemini", "content": "", "thoughts": []},
+        ]}
+        after = deepcopy(before)
+        after["messages"].pop()
+        verify_resume_snapshot(before, after)
+        before["messages"][1]["content"] = "Already exposed"
+        with self.assertRaises(GeminiProtocolError):
+            verify_resume_snapshot(before, after)
+
     def test_tool_result_patch_is_loaded_but_identity_patch_is_rejected(self):
         self.records.append({"$patch": {"updates": [{"id": "a", "toolCalls": [{"id": "tool-1", "result": "updated"}]}]}})
         self.write()

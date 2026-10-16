@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import math
 
 from gemini_acp_client import GeminiProtocolError, identifier
 from gemini_runtime import native_home
@@ -47,6 +48,14 @@ def replay_text(value) -> str:
             if set(value) <= {key, "thoughtSignature"} and isinstance(value.get(key), dict):
                 name = identifier(value[key].get("name"))
                 return f"[{label}: {name}]"
+        if set(value) <= {"inlineData", "thoughtSignature"} and isinstance(value.get("inlineData"), dict):
+            media = value["inlineData"]
+            mime, data = media.get("mimeType"), media.get("data")
+            if isinstance(mime, str) and isinstance(data, str):
+                category = next((label for prefix, label in (("audio/", "Audio"), ("video/", "Video"), ("image/", "Image")) if mime.startswith(prefix)), "Media")
+                # Match JS toFixed(1), including its half-up behavior.
+                kb = math.floor(math.ceil(len(data) * 3 / 4) / 1024 * 10 + .5) / 10
+                return f"[{category}: {mime}, {kb:.1f} KB]"
     raise GeminiProtocolError("This Gemini history format needs a newer resume adapter; continue it in Gemini CLI.")
 
 
@@ -62,7 +71,7 @@ def fingerprint(update: dict) -> tuple[str, str]:
     raise GeminiProtocolError("Unsupported Gemini replay event.")
 
 
-def native_snapshot(env: dict[str, str], cwd: str, session_id: str) -> dict:
+def native_snapshot(env: dict[str, str], cwd: str, session_id: str, *, missing_ok: bool = False) -> dict | None:
     identifier(session_id, session=True)
     root = native_home(env) / ".gemini" / "tmp"
     found = []
@@ -78,6 +87,8 @@ def native_snapshot(env: dict[str, str], cwd: str, session_id: str) -> dict:
                     raise GeminiProtocolError("Gemini history exceeds the preview scan limit.")
                 yield entry
     try:
+        if missing_ok and not root.exists():
+            return None
         for project in entries(root):
             if not project.is_dir(follow_symlinks=False):
                 continue
@@ -92,6 +103,8 @@ def native_snapshot(env: dict[str, str], cwd: str, session_id: str) -> dict:
                         found.append(value)
     except (OSError, ValueError, TypeError, RecursionError):
         raise GeminiProtocolError("Gemini native history cannot be safely read for resume.") from None
+    if not found and missing_ok:
+        return None
     if len(found) != 1 or found[0].get("projectHash") != hashlib.sha256(cwd.encode()).hexdigest():
         raise GeminiProtocolError("Gemini native history does not uniquely match this chat and workspace.")
     return found[0]
@@ -145,6 +158,7 @@ def verify_resume_snapshot(before: dict, after: dict) -> None:
         raise GeminiProtocolError(failure)
     converted = []
     generated = set()
+    empty_model_ids = set()
 
     def parts(value):
         values = value if isinstance(value, list) else [value]
@@ -167,6 +181,7 @@ def verify_resume_snapshot(before: dict, after: dict) -> None:
                          for tool in row.get("toolCalls", [])]
                 model_parts = thoughts + model_parts + calls
             if not model_parts:
+                empty_model_ids.add(row["id"])
                 continue
             row["content"] = model_parts
             converted.append(row)
@@ -197,7 +212,9 @@ def verify_resume_snapshot(before: dict, after: dict) -> None:
                 response = part.get("functionResponse", {})
                 if response.get("id") in tools:
                     tools[response["id"]]["result"] = deepcopy(row["content"])
-    expected = [row for row in records if row["id"] not in ordered] + list(ordered.values())
+    # Cancelling while awaiting approval can leave an empty model record. The
+    # native loader drops precisely these records, not user text/tool history.
+    expected = [row for row in records if row["id"] not in ordered and row["id"] not in empty_model_ids] + list(ordered.values())
     actual = deepcopy(after["messages"])
     for rows in (expected, actual):
         for row in rows:
@@ -208,7 +225,7 @@ def verify_resume_snapshot(before: dict, after: dict) -> None:
 
 
 def read_snapshot(path: Path) -> dict:
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(descriptor, "rb") as handle:
         before = os.fstat(handle.fileno())
         if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_BYTES:

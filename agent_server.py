@@ -6339,7 +6339,7 @@ PROVIDER_SESSION_IDENTIFIER_RE = re.compile(
 
 class BulkImportSessionItem(BaseModel):
     provider_session_id: str = Field(min_length=1, max_length=256)
-    backend: Literal["claude", "codex", "cursor"]
+    backend: Literal["claude", "codex", "cursor", "gemini"]
     cwd: str | None = Field(default=None, max_length=MAX_WORKSPACE_PATH_CHARS)
     title: str | None = Field(default=None, max_length=MAX_LOCAL_SESSION_LABEL_CHARS)
 
@@ -10593,10 +10593,16 @@ class SessionStore:
         model, effort = runtime["model"], runtime["effort"]
         session_cwd = req.cwd or DEFAULT_CWD
         if backend == BACKEND_GEMINI:
-            # External import is separately gated until history/ownership
-            # acceptance is complete. Ordinary turns retain their native UUID.
             if req.provider_session_id or req.session_id or req.import_history:
-                raise HTTPException(400, "Gemini external history import is not available yet.")
+                from gemini_import import initial_history
+                from gemini_acp_client import GeminiProtocolError
+                if runtime.get("provider_connection") == "custom":
+                    raise HTTPException(400, "Gemini external imports use the original CLI connection, not a custom API profile.")
+                try:
+                    await asyncio.to_thread(initial_history, sys.modules[__name__], runner_env(),
+                        req.provider_session_id or req.session_id or "", str(Path(session_cwd).expanduser().resolve()))
+                except (GeminiProtocolError, OSError, ValueError):
+                    raise HTTPException(400, "Gemini history does not uniquely match this session ID and workspace.") from None
             if not Path(session_cwd).expanduser().is_dir():
                 raise HTTPException(400, "Gemini requires an existing workspace directory.")
             session_cwd = str(Path(session_cwd).expanduser().resolve())
@@ -10636,6 +10642,7 @@ class SessionStore:
             claude_session_id if backend == BACKEND_CLAUDE
             else codex_thread_id if backend == BACKEND_CODEX
             else cursor_session_id if backend == BACKEND_CURSOR
+            else provider_id if backend == BACKEND_GEMINI
             else opencode_session_id
         )
         # A Claude chat can park an inactive Codex identity for later backend
@@ -10702,6 +10709,8 @@ class SessionStore:
             "claude_session_id": claude_session_id,
             "codex_thread_id": codex_thread_id,
             "cursor_session_id": cursor_session_id,
+            "gemini_session_id": provider_id if backend == BACKEND_GEMINI else None,
+            "gemini_session_cwd": session_cwd if backend == BACKEND_GEMINI and provider_id else None,
             "opencode_session_id": opencode_session_id,
             "opencode_session_cwd": (
                 session_cwd
@@ -48080,6 +48089,14 @@ def read_native_session_title(sess: dict[str, Any]) -> str | None:
         return native_session_title(codex_session_index_thread_names().get(provider_id))
     if backend == BACKEND_CURSOR:
         return cursor_native_session_title(provider_id, sess.get("cwd"))
+    if backend == BACKEND_GEMINI:
+        from gemini_history import native_snapshot
+        env = runner_env()
+        if sess.get("provider_connection") == "custom":
+            connection = PROVIDER_CONNECTION_STORE.for_session(sess)
+            env["GEMINI_CLI_HOME"] = str(PROVIDER_CONNECTION_STORE.root / ("gemini-runtime-" + connection["credential_id"]))
+        record = native_snapshot(env, str(sess.get("cwd") or ""), provider_id)
+        return native_session_title(record.get("summary"))
     if backend == "opencode":
         # Current native storage. A schema change, missing store, or busy DB
         # fails closed. mode=ro must never create or migrate a provider DB.
@@ -48626,6 +48643,7 @@ def local_session_candidates(
     known_provider_keys: set[tuple[str, str]] | None = None,
     *,
     include_cursor: bool = False,
+    include_gemini: bool = False,
 ) -> list[dict[str, Any]]:
     """Enumerate sessions not already used by this or another local instance."""
 
@@ -48653,6 +48671,11 @@ def local_session_candidates(
     if include_cursor:
         candidates.extend(local_cursor_session_candidates({
             provider_id for backend, provider_id in known_provider_keys if backend == BACKEND_CURSOR
+        }))
+    if include_gemini and GEMINI_PREVIEW_ENABLED:
+        from gemini_import import candidates as gemini_candidates
+        candidates.extend(gemini_candidates(sys.modules[__name__], runner_env(), {
+            provider_id for backend, provider_id in known_provider_keys if backend == BACKEND_GEMINI
         }))
     candidates.sort(key=lambda c: c["updated_at"], reverse=True)
     return candidates[:max(1, min(limit, MAX_LOCAL_SESSION_LIST_ITEMS))]
@@ -50533,6 +50556,12 @@ async def import_session_history(sess: dict[str, Any], *, force: bool = False, l
     backend = (sess.get("backend") or DEFAULT_BACKEND).lower()
     if not provider_id:
         return {"imported": 0, "source_path": None, "message": "No provider session ID set."}
+    if backend == BACKEND_GEMINI:
+        if await asyncio.to_thread(lambda: any(event.get("type") == "history_imported" for event in iter_session_events(session_id))):
+            return {"imported": 0, "source_path": None, "message": "Gemini initial text history already imported; automatic reconciliation is not supported."}
+        from gemini_import import initial_history
+        source, items = await asyncio.to_thread(initial_history, sys.modules[__name__], runner_env(), provider_id, str(sess.get("cwd") or ""), limit)
+        return await append_imported_history(sess, source, items)
     if backend == BACKEND_CURSOR:
         # Initial public-text snapshot only. The private native store, not these
         # display messages, supplies resume context. Cursor exports are rewritable
@@ -61725,7 +61754,9 @@ async def update_reasoning_summary_stream(
     phase: str = "summary",
 ) -> None:
     """Keep provider-exposed summary and plaintext reasoning channels distinct."""
-    if phase not in {"summary", "reasoning"}:
+    if phase not in {"summary", "reasoning", "assistant"}:
+        return
+    if phase == "assistant" and (metadata or {}).get("backend") != "gemini":
         return
     index = params.get("contentIndex" if phase == "reasoning" else "summaryIndex", 0)
     delta = params.get("delta", "")
@@ -73306,8 +73337,6 @@ async def _start_turn_locked(
     if runtime_preview_session.get("backend") == BACKEND_GEMINI:
         if GEMINI_CLIENT_CAPABILITY not in req.client_capabilities:
             raise HTTPException(409, "Update AgentsDock to a Gemini-capable client before sending messages.")
-        if req.file_ids:
-            raise HTTPException(400, "Gemini attachments are not supported in this preview yet.")
     if str(runtime_preview_session.get("backend") or DEFAULT_BACKEND).strip().lower() == BACKEND_CODEX:
         await prepare_codex_login_turn(runtime_preview_session)
     opencode_cwd: str | None = None
@@ -73354,6 +73383,10 @@ async def _start_turn_locked(
             session_id,
             list(item.get("file_ids") or []),
         )
+    if runtime_preview_session.get("backend") == BACKEND_GEMINI:
+        from gemini_content import attachments as gemini_attachments
+        await asyncio.to_thread(gemini_attachments, sys.modules[__name__], session_id,
+            list(normalized_lineage[-1].get("file_ids") or []) if len(normalized_lineage) >= 2 else list(req.file_ids))
     # OpenCode's native --file path has no provider-side size ceiling and can
     # eagerly ingest local data. Resolve and bound the exact current message
     # before either reserving a slot or durably accepting it into the queue.
@@ -74270,6 +74303,7 @@ async def _start_turn_locked(
             from gemini_runner import run as run_gemini
             task = run_gemini(sys.modules[__name__], session_id, run_id, provider_prompt,
                              dict(sess), manifest_path,
+                             file_ids=prompt_file_ids,
                              provider_command=resolved_provider_command,
                              provider_runtime_env=provider_turn_payload.runtime_env,
                              standalone_provider_context=provider_context_mode == "standalone")
@@ -82184,8 +82218,11 @@ async def health() -> dict[str, Any]:
                 "available": GEMINI_PREVIEW_ENABLED, "required": False, "version": 1, "transport": "acp",
                 "message": "Experimental Gemini CLI integration; full provider acceptance is pending.", "action": None,
                 "client_capability": GEMINI_CLIENT_CAPABILITY,
-                "features": {"resume": True, "external_import": False, "fork": False,
-                             "approvals": True, "skills_picker": False, "custom_api": True},
+                "history_mode": "initial_text_snapshot",
+                "features": {"resume": True, "external_import": True, "fork": False,
+                             "history_reconciliation": False,
+                             "approvals": True, "skills_picker": True, "custom_api": True,
+                             "attachments": True, "live_text": True, "token_usage": True},
             },
             "opencode_backend": {
                 # ``available`` advertises the server contract. Runtime
@@ -86857,6 +86894,7 @@ async def create_session_with_history(req: CreateSessionRequest) -> dict[str, An
 async def get_local_sessions(
     limit: int = Query(default=200, ge=1, le=MAX_LOCAL_SESSION_LIST_ITEMS),
     include_cursor: bool = False,
+    include_gemini: bool = False,
 ) -> dict[str, Any]:
     """List main conversations unused by any installed same-user local instance."""
 
@@ -86867,6 +86905,8 @@ async def get_local_sessions(
             for key in local_session_ownership.provider_session_keys(session, DEFAULT_BACKEND)
         }
     options = {"include_cursor": True} if include_cursor else {}
+    if include_gemini:
+        options["include_gemini"] = True
     sessions = await asyncio.to_thread(local_session_candidates, limit, known_provider_keys, **options)
     return {"sessions": sessions}
 
@@ -86940,6 +86980,7 @@ async def bulk_import_sessions_guarded(
             MAX_LOCAL_SESSION_LIST_ITEMS,
             set(),
             **({"include_cursor": True} if any(item.backend == BACKEND_CURSOR for item in req.items) else {}),
+            **({"include_gemini": True} if any(item.backend == BACKEND_GEMINI for item in req.items) else {}),
         )
         candidate_by_key = {
             (str(candidate["backend"]), str(candidate["provider_session_id"])): candidate
@@ -86989,7 +87030,11 @@ async def bulk_import_sessions_guarded(
 
             staged_session: dict[str, Any] | None = None
             try:
-                if item.backend == BACKEND_CURSOR:
+                if item.backend == BACKEND_GEMINI:
+                    from gemini_import import initial_history
+                    source_path, history_items = await asyncio.to_thread(initial_history,
+                        sys.modules[__name__], runner_env(), item.provider_session_id, candidate_cwd or "")
+                elif item.backend == BACKEND_CURSOR:
                     source_path, history_items = await asyncio.to_thread(
                         cursor_initial_history, item.provider_session_id, candidate_cwd or "",
                     )

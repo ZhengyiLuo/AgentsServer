@@ -157,6 +157,7 @@ def exclusive_lock(path: Path):
 PROVIDER_ID_FIELDS = {
     "claude": "claude_session_id", "codex": "codex_thread_id",
     "cursor": "cursor_session_id", "opencode": "opencode_session_id",
+    "gemini": "gemini_session_id",
 }
 MAX_IMPORT_INDEX_BYTES = 64 * 1024 * 1024
 MAX_IMPORT_INDEX_TOTAL_BYTES = 128 * 1024 * 1024

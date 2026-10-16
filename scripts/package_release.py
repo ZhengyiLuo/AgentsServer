@@ -71,6 +71,8 @@ FILES = (
     "opencode_agent_client.py",
     "gemini_acp_client.py",
     "gemini_history.py",
+    "gemini_content.py",
+    "gemini_import.py",
     "gemini_runtime.py",
     "gemini_runner.py",
     "gemini_api.py",

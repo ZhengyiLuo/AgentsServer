@@ -11,7 +11,7 @@ import time
 
 from fastapi import APIRouter, HTTPException, Request
 
-from gemini_acp_client import GeminiACPClient, GeminiProtocolError, identifier, session_models, text_content
+from gemini_acp_client import GeminiACPClient, GeminiProtocolError, identifier, session_models
 from gemini_runtime import build_environment, GeminiConfigurationError, resolve_executable
 
 PERMISSIONS: dict[str, dict] = {}
@@ -123,6 +123,11 @@ async def run(api, session_id: str, run_id: str, prompt: str, sess: dict,
     stopped = False
     owner = secrets.token_urlsafe(48)
     completed_reasoning = set()
+    env = None
+    provider_id = None
+    token_usage = {}
+    last_plan = None
+    context_usage = None
     runtime_env = api.validate_provider_runtime_env(_kwargs.get("provider_runtime_env"))
     helper_redactor = api.opencode_helper_output_redactor(session_id, run_id, runtime_env)
     private_values = [owner]
@@ -148,12 +153,15 @@ async def run(api, session_id: str, run_id: str, prompt: str, sess: dict,
                    **api.run_event_metadata(run_id)}
         if block_kind == "text":
             text_parts.append(text)
-            await api.append_event(session_id, "assistant_text", payload)
+            async def commit():
+                await api.append_event(session_id, "assistant_text", payload)
+                await api.clear_reasoning_summary_stream(session_id, run_id, item_id, "assistant")
+            await api.join_task_despite_caller_cancellation(asyncio.create_task(commit()))
         else:
             await api.persist_reasoning_summary(session_id, {**payload, "phase": "summary"}, completed_reasoning)
 
     async def update(event):
-        nonlocal block_kind, char_count
+        nonlocal block_kind, char_count, last_plan, context_usage
         if not owns(api, session_id, run_id):
             return
         kind = event["type"]
@@ -166,10 +174,10 @@ async def run(api, session_id: str, run_id: str, prompt: str, sess: dict,
             if char_count > 2 * 1024 * 1024:
                 raise GeminiProtocolError("Gemini output exceeded the per-turn limit.")
             block.append(text)
-            if kind == "reasoning":
-                await api.update_reasoning_summary_stream(session_id, run_id,
-                    f"gemini-{run_id}-{block_index}", {"delta": text},
-                    {**api.run_event_metadata(run_id), "backend": "gemini"})
+            await api.update_reasoning_summary_stream(session_id, run_id,
+                f"gemini-{run_id}-{block_index}", {"delta": text},
+                {**api.run_event_metadata(run_id), "backend": "gemini"},
+                phase="assistant" if kind == "text" else "summary")
         elif kind == "tool":
             await flush()
             call_id = event["call_id"]
@@ -179,17 +187,34 @@ async def run(api, session_id: str, run_id: str, prompt: str, sess: dict,
                 if len(tool_calls) + len(finished_tools) >= 4096:
                     raise GeminiProtocolError("Gemini exceeded the per-turn tool limit.")
                 tool_calls[call_id] = {"id": call_id, "name": redact(event.get("title") or event.get("kind") or "Tool")[:512],
-                    "input": redact(api.bounded_codex_interaction_value(event.get("input") or {}))}
+                    # ACP does not always expose raw tool arguments. Preserve
+                    # its actual diff/location content without inventing args.
+                    "input": redact(api.bounded_codex_interaction_value(event.get("input") if event.get("input") is not None else {
+                        "acp_content": event.get("content") or [], "locations": event.get("locations") or []}))}
                 await api.append_event(session_id, "tool_started", {"run_id": run_id, "tool": tool_calls[call_id]})
             if event.get("status") in {"completed", "failed"}:
                 content = event.get("output")
                 if content is None:
-                    content = "\n".join(text_content(item.get("content")) for item in (event.get("content") or [])
-                                        if isinstance(item, dict) and item.get("type") == "content")
+                    from gemini_content import tool_output
+                    content = tool_output(api.bounded_codex_interaction_value(event.get("content") or []))
                 await api.append_event(session_id, "tool_finished", {"run_id": run_id,
                     "tool": {**tool_calls.pop(call_id), "output": redact(str(content))[:24000],
                              "is_error": event.get("status") == "failed"}})
                 finished_tools.add(call_id)
+        elif kind == "plan":
+            from gemini_content import plan_entries
+            entries = plan_entries(event.get("entries"))
+            if entries != last_plan:
+                await flush()
+                last_plan = entries
+                await api.append_event(session_id, "reasoning_summary", {
+                    "run_id": run_id, "backend": "gemini", "phase": "plan",
+                    "text": "\n".join(f"[{entry['status']}] {redact(entry['content'])}" for entry in entries),
+                    **api.run_event_metadata(run_id)})
+        elif kind == "usage":
+            value = event.get("usage") or {}
+            if all(type(value.get(key)) is int and 0 <= value[key] <= 2**53 - 1 for key in ("used", "size")):
+                context_usage = {"used": value["used"], "size": value["size"]}
 
     async def permission(params):
         return await ask_permission(api, session_id, run_id, redact(params))
@@ -206,7 +231,8 @@ async def run(api, session_id: str, run_id: str, prompt: str, sess: dict,
         if connection: private_values.append(connection["api_key"])
         profile = api.PROVIDER_CONNECTION_STORE.root / ("gemini-runtime-" + connection["credential_id"]) if connection else None
         env = build_environment(api.runner_env(), cwd=cwd, api_home=profile,
-            api_key=connection.get("api_key"), base_url=connection.get("base_url"))
+            api_key=connection.get("api_key") if connection else None,
+            base_url=connection.get("base_url") if connection else None)
         selected_skill = _kwargs.get("provider_command")
         if selected_skill is not None:
             # Recheck immediately before launching, including after queueing.
@@ -227,8 +253,10 @@ async def run(api, session_id: str, run_id: str, prompt: str, sess: dict,
         mcp = []
         command = [str(executable), "--acp"]
         async with api.CROSS_CHAT_CAPABILITY_LOCK:
-            has_authority = any(c.get("source_session_id") == session_id and c.get("source_run_id") == run_id
-                                for c in api.CROSS_CHAT_CAPABILITIES.values())
+            capabilities = [c for c in api.CROSS_CHAT_CAPABILITIES.values()
+                            if c.get("source_session_id") == session_id and c.get("source_run_id") == run_id]
+            has_authority = bool(capabilities)
+            needs_chat_tool = any(c.get("provider_route_grants") for c in capabilities)
         if has_authority:
             async def execute(value, key):
                 try:
@@ -268,12 +296,22 @@ async def run(api, session_id: str, run_id: str, prompt: str, sess: dict,
         snapshot = await asyncio.to_thread(native_snapshot, env, cwd, provider_id) if provider_id else None
         replay = snapshot_replay(snapshot) if snapshot is not None else None
         opened = await client.open_session(cwd=cwd, session_id=provider_id, mcp_servers=mcp, replay=replay)
+        if broker and not broker.definition_requested.is_set():
+            # Native Gemini refuses MCP discovery in an untrusted workspace.
+            # Never grant folder trust or weaken an existing MCP policy here.
+            if needs_chat_tool:
+                raise GeminiConfigurationError("Gemini did not load the AgentsDock communication tool. Open Gemini CLI in this chat's workspace and review its folder trust and MCP settings, then retry. AgentsDock does not grant folder trust automatically.")
+            prompt += "\nThe native AgentsDock MCP tool was not loaded. Do not use shell helpers as a substitute; report unavailable helper operations instead."
         if snapshot is not None:
             verify_resume_snapshot(snapshot, await asyncio.to_thread(native_snapshot, env, cwd, provider_id))
         if not connection:
             MODEL_CATALOG["default"] = session_models(opened)
-        await api.persist_run_provider_session(session_id, run_id, "gemini", client.session_id,
-            cwd=cwd, standalone_provider_context=standalone_provider_context)
+        # session/new allocates a UUID before any resumable history exists.
+        # Commit new identities only after the native recorder has flushed.
+        # Existing identities must never be cleared/replaced after a failure.
+        if provider_id:
+            await api.persist_run_provider_session(session_id, run_id, "gemini", client.session_id,
+                cwd=cwd, standalone_provider_context=standalone_provider_context)
         await api.mark_provider_turn_ready(session_id, run_id, client.session_id)
         async with api.ACTIVE_LOCK:
             active = api.ACTIVE.get(session_id) or {}
@@ -281,7 +319,10 @@ async def run(api, session_id: str, run_id: str, prompt: str, sess: dict,
                 active["provider_tools_ready"].set()
         if not owns(api, session_id, run_id):
             raise asyncio.CancelledError()
-        result = await client.prompt([{"type": "text", "text": prompt + api.session_prompt_addendum(sess)}])
+        from gemini_content import attachments, usage
+        content = await asyncio.to_thread(attachments, api, session_id, list(_kwargs.get("file_ids") or []))
+        result = await client.prompt([{"type": "text", "text": prompt + api.session_prompt_addendum(sess)}, *content])
+        token_usage = usage(result.get("usage"))
         stopped = result.get("stopReason") == "cancelled"
         if result.get("stopReason") not in {"end_turn", "cancelled"}:
             raise GeminiProtocolError("Gemini stopped before completing the turn (limit or refusal).")
@@ -312,6 +353,28 @@ async def run(api, session_id: str, run_id: str, prompt: str, sess: dict,
                 await api.append_event(session_id, "error", {"run_id": run_id, "backend": "gemini",
                     "message": "Gemini cleanup did not complete. Stop this chat before retrying."})
             return
+        if not provider_id and client.session_id and env is not None:
+            # Never silently replace a conversation that exposed output or
+            # executed a tool, even if the recorder subsequently fails. Keeping
+            # its UUID makes the next attempt fail closed on missing history.
+            preserve_identity = bool(char_count or tool_calls or finished_tools or last_plan)
+            try:
+                from gemini_history import native_snapshot
+                history = await asyncio.to_thread(native_snapshot, env, cwd, client.session_id, missing_ok=True)
+                # The pinned CLI prunes sessions containing only user/context
+                # records on its next startup. An allocated file alone is not
+                # proof that this UUID can be resumed after a model failure.
+                if history is not None and any(row.get("type") == "gemini" for row in history["messages"]):
+                    preserve_identity = True
+                elif not error and not stopped:
+                    error = "Gemini did not save resumable history for this turn. Check its native history before retrying."
+            except Exception:
+                preserve_identity = True  # Unreadable is not evidence of empty history.
+                error = "Gemini history could not be verified after this turn. Check the server's Gemini history before retrying."
+            if preserve_identity:
+                await api.persist_run_provider_session(session_id, run_id, "gemini", client.session_id,
+                    cwd=cwd, standalone_provider_context=standalone_provider_context)
+        await api.clear_reasoning_summary_stream(session_id, run_id)
         for call_id, tool in tool_calls.items():
             if session_id in api.STORE.sessions and await api.turn_slot_is_owned(session_id, run_id):
                 await api.append_event(session_id, "tool_finished", {"run_id": run_id,
@@ -323,4 +386,6 @@ async def run(api, session_id: str, run_id: str, prompt: str, sess: dict,
             "run_id": run_id, "backend": "gemini", "exit_code": 1 if error else 0,
             "is_error": bool(error and not stopped), "stopped": stopped,
             "result_text": "\n\n".join(text_parts), **api.run_event_metadata(run_id),
+            **token_usage,
+            **({"gemini_context_usage": context_usage} if context_usage is not None else {}),
         })

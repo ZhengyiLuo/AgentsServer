@@ -61,6 +61,20 @@ require an explicit model check. Manual model selection remains available.
   persistent blanket shell or MCP grant. Server task authorization is separate.
 - Run-bound AgentsDock MCP wiring using the existing authenticated broker and
   server capability checks. Complete real cross-chat acceptance is still pending.
+- Gemini sparkle mark and separate native/API choices in the desktop picker.
+  Slim session polling retains custom model lists instead of replacing them
+  with a model-less summary. Gemini errors are not labeled as Codex errors.
+- Skills are discovered by the pinned native `gemini skills list`, including
+  its trust, precedence and disabled-skill decisions. The slash picker uses
+  opaque chat-bound IDs and revalidates the file fingerprint at admission and
+  launch. Selection is a **native activation request**, not a native slash
+  command: Gemini must call `activate_skill`; ordinary approvals still apply.
+  Its current text-only inventory is bounded and parsed strictly. Ambiguous
+  output fails closed; names outside the safe slash grammar are not listed.
+- Private API profiles reference the existing user skill/extension directories,
+  trust file and policies without copying/installing skills or linking login
+  credentials. Skill disables and relevant user security/tool settings are
+  retained. This is not a claim of parity for every native customization/hook.
 - Strict API protocol/header validation, separate model discovery, existing
   per-chat connection snapshots, Forget/reconnect, and secret-safe diagnostics.
 - Delete retains provider-native history. Idle process cleanup and retained
@@ -95,6 +109,16 @@ signal or equivalent before broad compatibility can be promised.
 - Actual AgentsServer HTTP boundary with that CLI/API fixture: API configuration,
   old-client rejection, repeated turns, Forget blocking an existing chat,
   reconnecting that binding, and Delete retaining native transcripts.
+- Actual CLI/local API skill contract: installed user skills appear in the API
+  profile, native `activate_skill` requests approval, denied writes leave no
+  file, approved writes produce the file, and owned processes exit. Native
+  project/user precedence, trust and disabled-skill handling have a separate
+  contract fixture. No Google model service is involved in these fixtures.
+- Real Google OAuth and Developer API requests were attempted through desktop
+  and directly through the pinned CLI. Upstream eligibility and billing errors
+  prevented successful real-account acceptance; login/key presence alone is
+  not a successful model request. Known eligibility, credits and model-removal
+  errors now have actionable, secret-safe messages.
 - Actual offscreen Electron window using the production preload, IPC, service,
   HTTP and built renderer: configure API without an initial model ID, display
   discovered model options, save a default via the manual-model form, refresh
@@ -120,8 +144,9 @@ just the successful text fixture. In particular:
    Delete/cleanup failure, escaped descendants and unrelated-chat isolation.
 5. Native titles and external discovery/import/reconciliation. External import,
    attachments and fork are currently rejected, not silently substituted.
-6. Native skills, the skills picker, plans/usage, subagents, jobs/goals, side
-   questions, shared chats and permission profiles. Do not claim support from
+6. Complete skill-picker/tool acceptance with a usable real account, extension
+   customization parity, plans/usage, subagents, jobs/goals, side questions,
+   shared chats and permission profiles. Do not claim support from
    another provider's tests. Mobile requires its own implementation task.
 
 Full suite/release packaging validation and a real account acceptance record

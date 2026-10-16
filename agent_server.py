@@ -125,6 +125,7 @@ from provider_commands import (
     claude_provider_command_inventory,
     codex_provider_command_inventory,
     empty_provider_command_inventory,
+    gemini_provider_skill_inventory,
     opencode_provider_skill_inventory,
     validate_opencode_provider_skill_record,
 )
@@ -61042,7 +61043,7 @@ async def discover_session_provider_commands(
 
     backend = str(session.get("backend") or DEFAULT_BACKEND).strip().lower()
     requested_cwd = str(session.get("cwd") or DEFAULT_CWD)
-    if backend == BACKEND_OPENCODE:
+    if backend in {BACKEND_OPENCODE, BACKEND_GEMINI}:
         try:
             cwd = validated_opencode_cwd(requested_cwd)
         except HTTPException:
@@ -61056,7 +61057,7 @@ async def discover_session_provider_commands(
             support = provider_command_support(
                 False,
                 "unavailable",
-                "OpenCode local skills require the chat working directory to be available.",
+                f"{'Gemini' if backend == BACKEND_GEMINI else 'OpenCode'} local skills require the chat working directory to be available.",
             )
             return provider_command_snapshot(fallback_empty, support), fallback_empty
     else:
@@ -61096,7 +61097,7 @@ async def discover_session_provider_commands(
                 provider_command_snapshot(fallback_empty, support),
                 fallback_empty,
             )
-    elif backend == BACKEND_OPENCODE:
+    elif backend in {BACKEND_OPENCODE, BACKEND_GEMINI}:
         pass
     else:
         support = provider_command_support(
@@ -61190,6 +61191,24 @@ async def discover_session_provider_commands(
                 f"Showing the first {MAX_PROVIDER_COMMANDS} provider commands."
             )
         return provider_command_snapshot(inventory, support), inventory
+    if backend == BACKEND_GEMINI:
+        from gemini_runtime import build_environment, list_native_skills, resolve_executable, GeminiConfigurationError
+        def discover_gemini():
+            connection = PROVIDER_CONNECTION_STORE.for_session(session)
+            profile = PROVIDER_CONNECTION_STORE.root / ("gemini-runtime-" + connection["credential_id"]) if connection else None
+            env = build_environment(runner_env(), cwd=cwd, api_home=profile,
+                api_key=connection.get("api_key"), base_url=connection.get("base_url"))
+            executable = resolve_executable(env)
+            if not executable:
+                raise GeminiConfigurationError("Install Gemini CLI to discover its skills.")
+            return gemini_provider_skill_inventory(list_native_skills(executable, env, cwd),
+                cwd=cwd, selector_secret=identity, binding_context=session_id)
+        try:
+            inventory = await asyncio.to_thread(discover_gemini)
+        except (GeminiConfigurationError, ProviderCommandDiscoveryError, HTTPException, OSError, ValueError):
+            return provider_command_snapshot(empty, provider_command_support(False, "unavailable",
+                "Gemini skills could not be read. Check gemini skills list in this workspace and refresh.")), empty
+        return provider_command_snapshot(inventory, provider_command_support(True, "native_activation_request")), inventory
     if backend == BACKEND_OPENCODE:
         try:
             env = runner_env()
@@ -61267,6 +61286,8 @@ async def resolve_provider_command_selection(
         if backend == BACKEND_CLAUDE
         else OPENCODE_PROVIDER_COMMANDS_CLIENT_CAPABILITY
         if backend == BACKEND_OPENCODE
+        else GEMINI_CLIENT_CAPABILITY
+        if backend == BACKEND_GEMINI
         else None
     )
     if required_capability is None:
@@ -74249,6 +74270,7 @@ async def _start_turn_locked(
             from gemini_runner import run as run_gemini
             task = run_gemini(sys.modules[__name__], session_id, run_id, provider_prompt,
                              dict(sess), manifest_path,
+                             provider_command=resolved_provider_command,
                              provider_runtime_env=provider_turn_payload.runtime_env,
                              standalone_provider_context=provider_context_mode == "standalone")
         elif backend == BACKEND_OPENCODE:
@@ -82075,16 +82097,19 @@ async def health() -> dict[str, Any]:
                     BACKEND_CODEX,
                     BACKEND_CLAUDE,
                     BACKEND_OPENCODE,
+                    *([BACKEND_GEMINI] if GEMINI_PREVIEW_ENABLED else []),
                 ],
                 "client_capability_by_backend": {
                     BACKEND_CODEX: CODEX_INTERACTIVE_CLIENT_CAPABILITY,
                     BACKEND_CLAUDE: CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY,
                     BACKEND_OPENCODE: OPENCODE_PROVIDER_COMMANDS_CLIENT_CAPABILITY,
+                    **({BACKEND_GEMINI: GEMINI_CLIENT_CAPABILITY} if GEMINI_PREVIEW_ENABLED else {}),
                 },
                 "supported_kinds_by_backend": {
                     BACKEND_CODEX: ["skill"],
                     BACKEND_CLAUDE: ["command"],
                     BACKEND_OPENCODE: ["skill"],
+                    **({BACKEND_GEMINI: ["skill"]} if GEMINI_PREVIEW_ENABLED else {}),
                 },
                 "opencode_scope": {
                     "discovery": "bounded_documented_default_skill_roots",

@@ -7,7 +7,7 @@ import sys
 import tempfile
 import unittest
 
-from gemini_acp_client import GeminiACPClient, GeminiProtocolError, normalize_update, session_models
+from gemini_acp_client import GeminiACPClient, GeminiProtocolError, normalize_update, session_models, safe_rpc_error
 from gemini_runtime import build_environment, GeminiConfigurationError, native_credentials_present, probe
 from gemini_history import fingerprint
 
@@ -129,6 +129,13 @@ class GeminiTransportTests(unittest.IsolatedAsyncioTestCase):
 
 
 class GeminiMappingTests(unittest.TestCase):
+    def test_known_restriction_is_actionable_without_echoing_credentials(self):
+        message = safe_rpc_error({"code": -32000, "message": "This client is no longer supported for Gemini Code Assist for individuals. secret-key user@example.com"})
+        self.assertIn("Developer API", message)
+        self.assertNotIn("secret-key", message)
+        self.assertNotIn("user@example.com", message)
+        self.assertNotIn("secret", safe_rpc_error({"message": "unexpected secret"}))
+
     def test_wrong_session_fails_closed(self):
         with self.assertRaises(GeminiProtocolError):
             normalize_update({"sessionId":"other", "update":{}}, SESSION)
@@ -215,4 +222,7 @@ class GeminiIsolationTests(unittest.TestCase):
                                ("import time; time.sleep(10)", "error")]:
             wrapper.write_text(f"#!{sys.executable}\n{code}\n")
             wrapper.chmod(0o700)
-            self.assertEqual(probe({**self.env, "AGENTSDOCK_GEMINI_BIN": str(wrapper)}, timeout=.5)["status"], expected)
+            # A cold Python wrapper can take >0.5s on a loaded build host.
+            # Keep the timeout failure case short without racing valid startup.
+            timeout = .5 if 'sleep' in code else 3
+            self.assertEqual(probe({**self.env, "AGENTSDOCK_GEMINI_BIN": str(wrapper)}, timeout=timeout)["status"], expected)

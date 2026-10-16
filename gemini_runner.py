@@ -207,6 +207,20 @@ async def run(api, session_id: str, run_id: str, prompt: str, sess: dict,
         profile = api.PROVIDER_CONNECTION_STORE.root / ("gemini-runtime-" + connection["credential_id"]) if connection else None
         env = build_environment(api.runner_env(), cwd=cwd, api_home=profile,
             api_key=connection.get("api_key"), base_url=connection.get("base_url"))
+        selected_skill = _kwargs.get("provider_command")
+        if selected_skill is not None:
+            # Recheck immediately before launching, including after queueing.
+            snapshot, inventory = await api.discover_session_provider_commands(session_id, sess)
+            current = inventory.resolve(selected_skill.public["id"])
+            if snapshot["support"].get("available") is not True or current != selected_skill:
+                raise GeminiConfigurationError("The selected Gemini skill changed. Refresh skills and select it again.")
+            invocation = selected_skill.public["invocation"]
+            task = prompt[len(invocation):].lstrip() if api.provider_command_prompt_matches(prompt, invocation) else prompt
+            prompt = ("The user explicitly selected the installed Gemini skill "
+                + json.dumps(selected_skill.native["name"]) + ". Use the native activate_skill tool to activate it, "
+                "then follow its instructions for the task below. If activation is unavailable or denied, "
+                "report that instead of pretending the skill ran. This selection grants no additional tool or chat permissions.\n\n"
+                + task)
         executable = sess.get("_gemini_executable") or resolve_executable(env)
         if not executable:
             raise GeminiConfigurationError("Gemini CLI is not installed on the server.")

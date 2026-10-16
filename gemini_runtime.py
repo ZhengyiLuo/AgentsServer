@@ -6,6 +6,8 @@ Custom API profiles never reuse the native Google credential directory.
 from __future__ import annotations
 
 import json
+import copy
+from contextlib import suppress
 import os
 from pathlib import Path
 import shutil
@@ -146,7 +148,10 @@ def build_environment(base: dict[str, str], *, cwd: str, api_home: Path | None =
         raise GeminiConfigurationError("Invalid managed Gemini authentication settings.") from exc
     project = read_settings(Path(cwd) / ".gemini/settings.json")
     try:
-        project_auth = project.get("security", {}).get("auth", {}).get("selectedType")
+        auth = project.get("security", {}).get("auth", {})
+        project_auth = auth.get("selectedType")
+        if auth.get("enforcedType") not in {None, expected_auth}:
+            raise GeminiConfigurationError("The workspace enforces a different Gemini authentication method.")
     except AttributeError as exc:
         raise GeminiConfigurationError("Invalid project Gemini authentication settings.") from exc
     if api_home is None:
@@ -175,6 +180,7 @@ def build_environment(base: dict[str, str], *, cwd: str, api_home: Path | None =
         raise GeminiConfigurationError("The Gemini API profile is not private.")
     settings_path = directory / "settings.json"
     settings = read_settings(settings_path)
+    inherit_skill_configuration(original, api_home, settings)
     # Only this private profile is changed; project and global settings remain
     # untouched. Preserve existing skills, policies and user choices here.
     settings.setdefault("security", {}).setdefault("auth", {})["selectedType"] = "gemini-api-key"
@@ -197,3 +203,85 @@ def build_environment(base: dict[str, str], *, cwd: str, api_home: Path | None =
     env.update({"GEMINI_CLI_HOME": str(api_home), "GEMINI_API_KEY": api_key,
                 "GOOGLE_GEMINI_BASE_URL": normalized_base})
     return env
+
+
+def inherit_skill_configuration(original: Path, profile: Path, settings: dict) -> None:
+    """Reference installed skills/extensions, never copy or reinstall them.
+
+    Share only named non-login assets, NOT the Gemini home, settings or credential
+    files. Native trust/skill disables and tool policies remain authoritative.
+    Auth and history stay in the private API profile. Existing private assets
+    are not overwritten silently.
+    """
+    native = read_settings(original / ".gemini/settings.json")
+    try:
+        if native.get("security", {}).get("auth", {}).get("enforcedType") not in {None, "gemini-api-key"}:
+            raise GeminiConfigurationError("Native Gemini settings enforce a different authentication method.")
+    except AttributeError:
+        raise GeminiConfigurationError("Invalid Gemini authentication settings.") from None
+    for key in ("skills", "tools", "policy", "extensions", "admin"):
+        if key in native:
+            settings[key] = copy.deepcopy(native[key])
+        else:
+            settings.pop(key, None)
+    security = copy.deepcopy(native.get("security") or {})
+    if not isinstance(security, dict):
+        raise GeminiConfigurationError("Invalid Gemini security settings.")
+    security.pop("auth", None)
+    settings["security"] = security
+    for relative in (".gemini/skills", ".agents/skills", ".gemini/extensions",
+                     ".gemini/policies", ".gemini/trustedFolders.json"):
+        source, target = original / relative, profile / relative
+        if target.is_symlink():
+            if os.readlink(target) != str(source):
+                raise GeminiConfigurationError("Gemini API skill configuration changed; inspect the private profile before retrying.")
+            continue
+        if not source.exists():
+            continue
+        if target.exists():
+            raise GeminiConfigurationError("Gemini API profile has separate skill configuration; reconcile it before retrying.")
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if target.parent.is_symlink():
+            raise GeminiConfigurationError("The Gemini API profile is not private.")
+        try:
+            target.symlink_to(source, target_is_directory=source.is_dir())
+        except FileExistsError:
+            # Concurrent discovery and a turn may initialize the same profile.
+            if not target.is_symlink() or os.readlink(target) != str(source):
+                raise GeminiConfigurationError("Gemini API skill configuration changed.") from None
+
+
+def list_native_skills(executable: str, env: dict[str, str], cwd: str, timeout: float = 15) -> str:
+    """Pinned native discovery, including enabled extension skills and trust.
+
+    This is the CLI's local `skills list`, not an ACP model prompt/authenticate.
+    Kill the owned group on timeout/output overflow; never publish stderr.
+    """
+    process = subprocess.Popen([executable, "skills", "list"], cwd=cwd,
+        env={**env, "NO_COLOR": "1", "FORCE_COLOR": "0"}, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)
+    data = bytearray()
+    deadline = time.monotonic() + timeout
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    raise GeminiConfigurationError("Gemini skill discovery timed out.")
+                chunk = os.read(process.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if len(data) > 1024 * 1024:
+                    raise GeminiConfigurationError("Gemini skill discovery exceeded its output limit.")
+        if process.wait(timeout=max(.01, deadline - time.monotonic())) != 0:
+            raise GeminiConfigurationError("Gemini skill discovery failed.")
+        return data.decode("utf-8", errors="strict")
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        raise GeminiConfigurationError("Gemini skill discovery failed.") from None
+    finally:
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=2)
+        process.stdout.close()

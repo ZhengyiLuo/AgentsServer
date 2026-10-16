@@ -34,6 +34,24 @@ class GeminiRPCError(GeminiProtocolError):
         self.code = code
 
 
+def safe_rpc_error(error: dict) -> str:
+    """Classify known failures without echoing gateway text or credentials."""
+    message = str(error.get("message", "")).lower()
+    if "no longer supported" in message and "code assist for individuals" in message:
+        return ("Google no longer supports this Gemini CLI connection for Code Assist for individuals. "
+                "Use a Gemini Developer API key in My Agents, or an eligible organization account. "
+                "Signing in to the same personal account again will not resolve this restriction.")
+    if error.get("code") == 402 or "prepayment credits are depleted" in message:
+        return "Gemini API project credits are depleted. Add credits or check billing in Google AI Studio, then retry."
+    if "no longer available" in message or "modelnotfound" in message:
+        return "This Gemini model is unavailable for the selected account. Choose another current model in the chat's model menu."
+    if "quota" in message or "resource_exhausted" in message or "rate limit" in message:
+        return "Gemini's selected account or API project has reached its quota. Check its billing/quota or retry later."
+    if error.get("code") == -32000 and ("auth" in message or "api key" in message):
+        return "Gemini authentication is required. Sign in on the server or configure its API connection."
+    return "Gemini rejected the request. Check the selected account, model and workspace."
+
+
 def identifier(value: Any, *, session: bool = False) -> str:
     pattern = SESSION_ID if session else IDENTIFIER
     if not isinstance(value, str) or not pattern.fullmatch(value):
@@ -280,10 +298,7 @@ class GeminiACPClient:
                 if isinstance(error, dict):
                     code = error.get("code")
                     # Do not include raw RPC messages: gateways can echo keys.
-                    future.set_exception(GeminiRPCError(code if type(code) is int else -32000,
-                        "Gemini authentication is required. Sign in on the server or configure its API connection."
-                        if code == -32000 and "auth" in str(error.get("message", "")).lower()
-                        else "Gemini rejected the request. Check the selected account, model and workspace."))
+                    future.set_exception(GeminiRPCError(code if type(code) is int else -32000, safe_rpc_error(error)))
                 elif isinstance(event.get("result"), dict):
                     future.set_result(event["result"])
                 else:

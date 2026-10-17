@@ -32395,6 +32395,9 @@ SEMANTIC_TIMELINE_EVENT_BUDGET_PER_ITEM = 4
 SEMANTIC_TIMELINE_ESSENTIAL_LIMIT_PER_ITEM = 32
 SEMANTIC_TIMELINE_ESSENTIAL_PAGE_OVERFLOW_LIMIT = 128
 SEMANTIC_TIMELINE_TRACE_ANCHOR_PAGE_OVERFLOW_LIMIT = 128
+# Same-ID history corrections clear previously cached replay bubbles. They
+# need their own bounded allowance, not the slots reserved for chat content.
+SEMANTIC_TIMELINE_REPAIR_PAGE_OVERFLOW_LIMIT = 256
 JOB_RUN_HISTORY_TEXT_LIMIT = 64 * 1024
 SEMANTIC_TIMELINE_ESSENTIAL_DETAIL_TYPES = {
     "artifact_created",
@@ -35778,9 +35781,6 @@ def collect_semantic_timeline_events(
         deduplicated[identity] = event
         return True
 
-    for event in page_repairs:
-        append_with_limit(event, event_limit)
-
     # Every selected semantic item gets one representative before any item
     # receives detail. The page-size clamp in read_semantic_timeline_page()
     # guarantees that this baseline always fits.
@@ -35794,6 +35794,22 @@ def collect_semantic_timeline_events(
     for _primary, secondary, _essential, _optional in reversed(bundles):
         for event in secondary:
             append_with_limit(event, event_limit)
+
+    # Reserve both sides of ordinary turns before emitting repair receipts.
+    # A single imported run can contain hundreds of corrected boundaries:
+    # charging them to the ordinary budget used to leave only trace anchors
+    # for recent turns. Extend that budget only by receipts actually added,
+    # retaining its remaining detail capacity and the absolute response cap.
+    repair_allowance = min(
+        SEMANTIC_TIMELINE_REPAIR_PAGE_OVERFLOW_LIMIT,
+        MAX_EVENT_RESPONSE_LIMIT - event_limit,
+    )
+    repair_limit = len(deduplicated) + repair_allowance
+    repair_count = 0
+    for event in page_repairs:
+        if append_with_limit(event, repair_limit):
+            repair_count += 1
+    event_limit += repair_count
 
     # Files and reviewable diffs are semantic output, not optional trace
     # detail. Give each selected item a generous but bounded overflow and also

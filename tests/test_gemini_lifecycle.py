@@ -75,7 +75,8 @@ class Fixture(BaseHTTPRequestHandler):
                         argument = {"helper": "chats", "arguments": ["read", "--sender", sender["source_session_id"], "--request-id", "gemini-mail-read"]}
             if argument and tool_name:
                 parts = [{"functionCall": {"name": tool_name, "args": argument}}]
-        if cls.mode == "tool" and not responses:
+        ui_tool = cls.mode == "permission_ui" and any("PERMISSION_TOOL" in p.get("text", "") for c in body.get("contents", []) for p in c.get("parts", []))
+        if (cls.mode == "tool" or ui_tool) and not responses:
             parts = [{"functionCall": {"name": "write_file", "args": {"file_path": str(cls.project / "must-not-exist.txt"), "content": "test"}}}]
         if cls.mode == "shell" and not responses:
             parts = [{"functionCall": {"name": "run_shell_command", "args": {

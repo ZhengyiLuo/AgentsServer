@@ -13,6 +13,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from gemini_acp_client import GeminiACPClient, GeminiProtocolError, identifier, session_models
 from gemini_runtime import build_environment, GeminiConfigurationError, resolve_executable
+from gemini_permissions import effective_mode, startup_mode, apply_mode, available_modes, INITIAL_MODES
 
 PERMISSIONS: dict[str, dict] = {}
 MODEL_CATALOG: dict[str, dict] = {}
@@ -110,7 +111,10 @@ def router(api) -> APIRouter:
             raise HTTPException(404, "Gemini chat not found.")
         return {"pending_interactions": [row["public"] for row in PERMISSIONS.values()
                     if row["public"]["session_id"] == session_id and owns(api, session_id, row["run_id"])],
-                "available": True}
+                "available": True,
+                "permission_modes": sess.get("gemini_permission_modes") or list(INITIAL_MODES),
+                "permission_mode": effective_mode(sess),
+                "active_permission_mode": (api.ACTIVE.get(session_id) or {}).get("gemini_permission_mode")}
 
     @routes.post("/api/sessions/{session_id}/gemini/interactions/{interaction_id}/resolve")
     async def respond(session_id: str, interaction_id: str, request: Request):
@@ -206,6 +210,12 @@ async def run(api, session_id: str, run_id: str, prompt: str, sess: dict,
         if not owns(api, session_id, run_id):
             return
         kind = event["type"]
+        if kind == "permission_mode":
+            # Native plan tools can change the current mode. Report it without
+            # changing the saved next-turn preference or another run's state.
+            api.ACTIVE[session_id]["gemini_permission_mode"] = event["mode"]
+            await api.append_event(session_id, "gemini_permission_mode", {
+                "run_id": run_id, "backend": "gemini", "mode": event["mode"]})
         if kind in {"text", "reasoning", "tool", "plan"}:
             await bind_visible_identity()
         if kind in {"text", "reasoning"}:
@@ -303,7 +313,8 @@ async def run(api, session_id: str, run_id: str, prompt: str, sess: dict,
         if not executable:
             raise GeminiConfigurationError("Gemini CLI is not installed on the server.")
         mcp = []
-        command = [str(executable), "--acp"]
+        permission_mode = effective_mode(sess)
+        command = [str(executable), "--acp", "--approval-mode", startup_mode(permission_mode)]
         async with api.CROSS_CHAT_CAPABILITY_LOCK:
             capabilities = [c for c in api.CROSS_CHAT_CAPABILITIES.values()
                             if c.get("source_session_id") == session_id and c.get("source_run_id") == run_id]
@@ -362,6 +373,20 @@ async def run(api, session_id: str, run_id: str, prompt: str, sess: dict,
         snapshot = await asyncio.to_thread(native_snapshot, env, cwd, provider_id) if provider_id else None
         replay = snapshot_replay(snapshot) if snapshot is not None else None
         opened = await client.open_session(cwd=cwd, session_id=provider_id, mcp_servers=mcp, replay=replay)
+        modes = available_modes(opened)
+        if not owns(api, session_id, run_id):
+            raise asyncio.CancelledError()
+        # Save only native capability evidence, never overwrite a newer user's
+        # next-turn mode choice with this run's immutable snapshot.
+        api.STORE.sessions[session_id]["gemini_permission_modes"] = modes
+        await api.STORE.save(durable=True)
+        await apply_mode(client, opened, permission_mode)
+        if not owns(api, session_id, run_id):
+            raise asyncio.CancelledError()
+        if api.ACTIVE[session_id].get("gemini_permission_mode") != permission_mode:
+            api.ACTIVE[session_id]["gemini_permission_mode"] = permission_mode
+            await api.append_event(session_id, "gemini_permission_mode", {
+                "run_id": run_id, "backend": "gemini", "mode": permission_mode})
         if broker and not broker.definition_requested.is_set():
             # Native Gemini refuses MCP discovery in an untrusted workspace.
             # Never grant folder trust or weaken an existing MCP policy here.

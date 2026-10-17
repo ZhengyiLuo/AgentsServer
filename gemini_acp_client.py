@@ -38,6 +38,10 @@ class GeminiRPCError(GeminiProtocolError):
 def safe_rpc_error(error: dict) -> str:
     """Classify known failures without echoing gateway text or credentials."""
     message = str(error.get("message", "")).lower()
+    if "privileged approval modes in an untrusted folder" in message:
+        return "Gemini cannot enable this permission mode in an untrusted workspace. Review folder trust in native Gemini or choose Default; no prompt was sent."
+    if "invalid or unavailable mode" in message:
+        return "This Gemini permission mode is not enabled in the workspace. Choose an available native mode; no prompt was sent."
     if "no longer supported" in message and "code assist for individuals" in message:
         return ("Google no longer supports this Gemini CLI connection for Code Assist for individuals. "
                 "Use a Gemini Developer API key in My Agents, or an eligible organization account. "
@@ -99,6 +103,11 @@ def normalize_update(params: Any, session_id: str) -> dict | None:
         return {"type": "plan", "entries": update.get("entries")}
     if kind == "usage_update":
         return {"type": "usage", "usage": update}
+    if kind == "current_mode_update":
+        mode = update.get("currentModeId")
+        if mode not in {"default", "autoEdit", "yolo", "plan"}:
+            raise GeminiProtocolError("Gemini reported an unknown permission mode.")
+        return {"type": "permission_mode", "mode": mode}
     # Model/mode/command notifications aren't conversation text.
     return None
 
@@ -152,6 +161,7 @@ class GeminiACPClient:
         self.close_lock = asyncio.Lock()
         self.failure: Exception | None = None
         self.capabilities: dict = {}
+        self.requested_mode: str | None = None
 
     async def start(self, command: list[str], *, cwd: str, env: dict[str, str],
                     on_started: Callable[[asyncio.subprocess.Process], Awaitable[None]] | None = None) -> dict:
@@ -226,6 +236,10 @@ class GeminiACPClient:
         # admission/recheck step. A dedicated isolated API profile is required.
         if method == "authenticate":
             raise GeminiProtocolError("Authentication mutation is not allowed on this transport.")
+        if method == "session/set_mode":
+            if self.requested_mode is not None or params.get("modeId") not in {"default", "autoEdit", "yolo", "plan"}:
+                raise GeminiProtocolError("Invalid or overlapping Gemini mode change.")
+            self.requested_mode = params["modeId"]
         self.counter += 1
         request_id = self.counter
         future = asyncio.get_running_loop().create_future()
@@ -235,6 +249,8 @@ class GeminiACPClient:
             return await asyncio.wait_for(future, timeout)
         finally:
             self.pending.pop(request_id, None)
+            if method == "session/set_mode":
+                self.requested_mode = None
             if not future.done():
                 future.cancel()
 
@@ -282,6 +298,13 @@ class GeminiACPClient:
                         # no model is prompted until open_session has completed.
                         if self.session_id is not None:
                             update = normalize_update(params, self.session_id)
+                            # Pinned CLI emits its set_mode acknowledgement as
+                            # text rather than ACP current_mode_update. Correlate
+                            # only the exact notice during our own RPC, never
+                            # suppress matching model replies or history replay.
+                            if (self.requested_mode is not None and not self.replaying
+                                    and update == {"type": "text", "text": f"[MODE_UPDATE] {self.requested_mode}"}):
+                                update = {"type": "permission_mode", "mode": self.requested_mode}
                             if self.replaying and params["update"].get("sessionUpdate") in {
                                 "user_message_chunk", "agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update"
                             }:

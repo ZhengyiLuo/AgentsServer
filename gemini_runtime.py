@@ -229,6 +229,14 @@ def inherit_skill_configuration(original: Path, profile: Path, settings: dict) -
         raise GeminiConfigurationError("Invalid Gemini security settings.")
     security.pop("auth", None)
     settings["security"] = security
+    # Plan availability is native configuration, not a different login type.
+    # Copy only this non-auth subtree, not global default approval preferences.
+    general = native.get("general") or {}
+    if not isinstance(general, dict):
+        raise GeminiConfigurationError("Invalid Gemini general settings.")
+    settings.setdefault("general", {}).pop("plan", None)
+    if "plan" in general:
+        settings["general"]["plan"] = copy.deepcopy(general["plan"])
     for relative in (".gemini/skills", ".agents/skills", ".gemini/extensions",
                      ".gemini/policies", ".gemini/trustedFolders.json"):
         source, target = original / relative, profile / relative

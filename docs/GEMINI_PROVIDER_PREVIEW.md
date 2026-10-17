@@ -72,8 +72,9 @@ require an explicit model check. Manual model selection remains available.
   snapshot without a second copy. Stop preserves already exposed thoughts/text.
   Native diff/location content is retained in tool traces even when ACP omits
   raw arguments; omitted arguments are not invented.
-- Run-owned approve-once/deny-once requests through native desktop IPC. No
-  persistent blanket shell or MCP grant. Server task authorization is separate.
+- Run-owned approve-once/deny-once requests through native desktop IPC. Normal
+  approvals remain the default; per-chat native modes are described below.
+  Server task authorization is separate from provider tool approval.
 - Run-bound AgentsDock MCP using the existing authenticated broker and server
   capability checks. Real CLI/loopback-API acceptance covers authorized send,
   idle mailbox wake, inbox/read, bounded user delegation and reply, with native
@@ -161,6 +162,50 @@ require an explicit model check. Manual model selection remains available.
   The failure fence is durable: restarting does not clear it. If the live owned
   cleanup handle has been lost, an operator must verify the old runtime's exit
   before repairing the fence; there is no automatic unlock or public bypass.
+
+### Native permission modes
+
+The desktop composer offers Gemini's own **Default**, **Auto Edit**, **YOLO**
+and **Plan**, for both Google-login and API connections. These are not Codex
+sandbox/access profiles. New chats inherit the last selected Gemini chat's
+mode; absent a saved preference, they use Default. YOLO selection requires an
+explicit risk confirmation. A change applies at the next turn's start and
+does not release a current approval or replace the native session UUID.
+
+Create/PATCH accepts `gemini_permission_mode` with exact ACP IDs `default`,
+`autoEdit`, `yolo`, `plan`. Health advertises `permission_mode_control` and the
+baseline three modes. Detailed sessions and Gemini runtime responses include
+`gemini_permission_modes` / `permission_modes` after a native handshake; runtime
+also distinguishes the saved `permission_mode` from `active_permission_mode`.
+Plan only appears after Gemini reports it enabled for that workspace during a
+turn. This capability read does not launch another CLI or check credentials.
+Workspace/connection changes invalidate the saved mode-list evidence.
+
+Every turn passes an explicit startup approval mode and confirms it using
+`session/set_mode` before sending the prompt. Native trust, administrator
+settings and deny policies remain authoritative. In the pinned CLI, ACP mode
+switching alone does not enforce the administrator's YOLO-disable flag, so
+YOLO must also go through the CLI's startup validation. Conversely, disabled
+Plan silently falls back to Default through the CLI flag: we start in Default,
+require Plan in the actual ACP mode list and select it explicitly. Unavailable
+modes fail closed, without sending the prompt. API profiles preserve native
+Plan enable/disable settings without changing login or native settings.
+
+Default requests tool approval according to native policy. Auto Edit approves
+edits but still requests approval for non-allowed commands. YOLO can run commands
+without confirmation, subject to native restrictions. Plan blocks ordinary
+project writes, but may save native plan artifacts; it is not an OS sandbox.
+Neither mode grants AgentsDock route/task authority. Shared-chat viewers do not
+receive this admin permission editor. Ordinary answer text is retained; only
+the exact pinned `[MODE_UPDATE]` notice correlated with our pending mode-change
+RPC is treated as runtime state rather than a model answer.
+
+Acceptance: real CLI/HTTP fixtures verify tool execution/denial and next-turn
+ownership, and actual offscreen Electron uses production IPC/HTTP to save modes,
+confirm/cancel YOLO, preserve pending approvals and block a project write in
+Plan. A separate actual-App run with Google's Developer API completes Default
+then Plan with the same native identity. Google OAuth mode acceptance, broader
+organization policies and other platforms are not claimed by these checks.
 
 ### Important native replay behavior
 
@@ -275,7 +320,8 @@ signal or equivalent before broad compatibility can be promised.
 | Import/sync | Native discovery and initial text snapshot implemented; exact identity, workspace and ownership checked. Later native edits are not reconciled. |
 | Existing skills | Native inventory/activation, trust, precedence, stale selection and approval tested; extension/hook parity not claimed. |
 | Jobs/shares/media | Server-provided jobs and interactive shares tested. Text/image/WAV transport tested; media understanding not accepted. |
-| Other native features | Fork, managed subagents, goals, side questions and explicit compaction control unsupported; non-default permission modes unverified. |
+| Permission modes | Native Default/Auto Edit/YOLO/Plan wired through desktop and ACP, with explicit startup checks, native denial, next-turn semantics and same-session resume tested. Google OAuth mode acceptance remains pending. |
+| Other native features | Fork, managed subagents, goals, side questions and explicit compaction control unsupported. |
 | Client/release | Desktop and shared web exercised with actual transports/local API fixture. Mobile separate; real-account/platform and release validation pending. |
 
 Apply the [complete provider checklist](PROVIDER_INTEGRATION_CHECKLIST.md), not
@@ -293,11 +339,12 @@ just the successful text fixture. In particular:
    the pinned ACP implementation does not implement `session/fork`; a copied
    transcript is not a substitute. Native summary adoption does not promise
    immediate generation of a title.
-5. Extension/hook customization parity and non-default permission profiles remain
-   unverified. Managed subagents, native goals, explicit compaction control and
+5. Extension/hook customization parity remains unverified. Native permission
+   modes have isolated native CLI and actual desktop boundary tests, not full
+   organization/platform policy coverage. Managed subagents, native goals, explicit compaction control and
    side questions are unsupported; health capabilities say so. Actual ACP
-   `session/fork` returns method-not-found, while default `session/set_mode`
-   succeeds in the contract probe. No native `/btw` interaction is claimed. Mobile
+   `session/fork` returns method-not-found, while supported `session/set_mode`
+   selections succeed in the contract probe. No native `/btw` interaction is claimed. Mobile
    requires its own implementation task.
 
 Full suite/release packaging validation and a real account acceptance record

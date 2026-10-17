@@ -75,6 +75,7 @@ FILES = (
     "gemini_import.py",
     "gemini_runtime.py",
     "gemini_runner.py",
+    "gemini_permissions.py",
     "gemini_api.py",
     "cursor_process_guard.py",
     "transcript_reader.py",

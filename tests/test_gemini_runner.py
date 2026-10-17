@@ -41,7 +41,7 @@ class Runner(unittest.IsolatedAsyncioTestCase):
     async def scenario(self, *, updates=(), history=None, failure=False, history_error=None, connection=None, model=None):
         with tempfile.TemporaryDirectory() as directory:
             api = SimpleNamespace(
-                STORE=SimpleNamespace(sessions={"s": {"backend": "gemini"}}),
+                STORE=SimpleNamespace(sessions={"s": {"backend": "gemini"}}, save=AsyncMock()),
                 ACTIVE={"s": {"run_id": "r", "backend": "gemini", "provider_tools_ready": asyncio.Event()}},
                 DELETING_SESSIONS=set(), STOPPED_RUNS=set(), DEFAULT_CWD=directory,
                 CROSS_CHAT_CAPABILITY_LOCK=asyncio.Lock(), CROSS_CHAT_CAPABILITIES={}, ACTIVE_LOCK=asyncio.Lock(),
@@ -60,7 +60,10 @@ class Runner(unittest.IsolatedAsyncioTestCase):
                 session_id = ID
                 def __init__(self, *, on_update, **_): self.update = on_update
                 async def start(self, command, **__): api.started_command = command
-                async def open_session(self, **_): return {}
+                async def open_session(self, **_): return {"modes": {"availableModes": [{"id": "default"}]}}
+                async def request(self, method, params):
+                    api.mode_request = (method, params)
+                    return {}
                 async def prompt(self, *_):
                     for update in updates: await self.update(update)
                     if failure: raise GeminiProtocolError("Synthetic failure")
@@ -85,10 +88,11 @@ class Runner(unittest.IsolatedAsyncioTestCase):
         for default, model, expected in ((None, None, "auto"), ("gemini-saved", None, "gemini-saved"),
                                          ("gemini-saved", "gemini-chosen", "gemini-chosen")):
             api = await self.scenario(connection={**connection, "model": default}, model=model)
-            self.assertEqual(api.started_command, ["fixture", "--acp", "--model", expected])
+            self.assertEqual(api.started_command, ["fixture", "--acp", "--approval-mode", "default", "--model", expected])
             self.assertNotIn(connection["api_key"], str(api.started_command))
         native = await self.scenario()
-        self.assertEqual(native.started_command, ["fixture", "--acp"])
+        self.assertEqual(native.started_command, ["fixture", "--acp", "--approval-mode", "default"])
+        self.assertEqual(native.mode_request, ("session/set_mode", {"sessionId": ID, "modeId": "default"}))
 
     async def test_native_connection_runs_without_custom_api_object(self):
         api = await self.scenario(updates=[{"type": "text", "text": "answer"}], history={"messages": [{"type": "gemini"}]})

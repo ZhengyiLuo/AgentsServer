@@ -34,7 +34,14 @@ for line in sys.stdin:
         update("user_message_chunk", "old user text")
         update("agent_message_chunk", "old answer")
         result = {}
+    elif method == "session/set_mode":
+        update("agent_message_chunk", "[MODE_UPDATE] " + request["params"]["modeId"])
+        result = {}
     elif method == "session/prompt":
+        if request["params"]["prompt"][0].get("text") == "literal mode text":
+            update("agent_message_chunk", "[MODE_UPDATE] plan")
+            emit({"id":key,"result":{"stopReason":"end_turn"}})
+            continue
         update("agent_thought_chunk", "native thought")
         emit({"id":"permission-1","method":"session/request_permission", "params":{
             "sessionId":session,"options":[{"optionId":"once","kind":"allow_once"}]}})
@@ -50,6 +57,14 @@ for line in sys.stdin:
 
 
 class GeminiTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_mode_ack_is_runtime_state_but_identical_model_text_is_kept(self):
+        await self.client.start([sys.executable, str(self.script)], cwd=str(self.root), env=dict(os.environ))
+        await self.client.open_session(cwd=str(self.root))
+        await self.client.request("session/set_mode", {"sessionId": SESSION, "modeId": "plan"})
+        self.assertEqual(self.events, [{"type": "permission_mode", "mode": "plan"}])
+        await self.client.prompt([{"type": "text", "text": "literal mode text"}])
+        self.assertEqual(self.events[-1], {"type": "text", "text": "[MODE_UPDATE] plan"})
+
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)

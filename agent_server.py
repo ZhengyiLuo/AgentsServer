@@ -6328,6 +6328,7 @@ class CreateSessionRequest(BaseModel):
     # Same three names as Cursor, but "default" means OpenCode's own
     # permissions, which do allow shell.
     opencode_permission_mode: Literal["default", "full_access", "plan"] | None = None
+    gemini_permission_mode: Literal["default", "autoEdit", "yolo", "plan"] | None = None
 
 
 MAX_BULK_IMPORT_ITEMS = 25
@@ -6393,6 +6394,7 @@ class UpdateSessionRequest(BaseModel):
     provider_jobs_access: Literal["full", "read_only", "blocked"] | None = None
     cursor_permission_mode: Literal["default", "full_access", "plan"] | None = None
     opencode_permission_mode: Literal["default", "full_access", "plan"] | None = None
+    gemini_permission_mode: Literal["default", "autoEdit", "yolo", "plan"] | None = None
 
 
 SESSION_LIFECYCLE_UPDATE_FIELDS = frozenset({
@@ -6411,6 +6413,7 @@ SESSION_LIFECYCLE_UPDATE_FIELDS = frozenset({
     "provider_jobs_access",
     "cursor_permission_mode",
     "opencode_permission_mode",
+    "gemini_permission_mode",
     "archived",
 })
 
@@ -10221,6 +10224,9 @@ class SessionStore:
             if reconcile_session_emergency_alerts(session_id, sess):
                 runtime_changed = True
             backend = str(sess.get("backend") or DEFAULT_BACKEND).strip().lower()
+            if not sess.get("gemini_permission_mode"):
+                sess["gemini_permission_mode"] = "default"
+                runtime_changed = True
             claude_permission_mode = effective_claude_permission_mode(sess)
             if sess.get("claude_permission_mode") != claude_permission_mode:
                 sess["claude_permission_mode"] = claude_permission_mode
@@ -10730,6 +10736,7 @@ class SessionStore:
             "opencode_permission_mode": (
                 req.opencode_permission_mode or OPENCODE_DEFAULT_PERMISSION_MODE
             ),
+            "gemini_permission_mode": req.gemini_permission_mode or "default",
             "codex_approval_policy": (
                 req.codex_approval_policy or CODEX_DEFAULT_APPROVAL_POLICY
             ),
@@ -10926,6 +10933,7 @@ class SessionStore:
             if patch.get("auto_title_enabled") is not None:
                 sess["auto_title_enabled"] = bool(patch["auto_title_enabled"])
             for key, default, allowed in (
+                ("gemini_permission_mode", "default", {"default", "autoEdit", "yolo", "plan"}),
                 (
                     "claude_permission_mode",
                     CLAUDE_DEFAULT_PERMISSION_MODE,
@@ -11006,6 +11014,8 @@ class SessionStore:
                 sess["subagent_limit"] = patch["subagent_limit"]
             if "system_prompt" in patch:
                 sess["system_prompt"] = clean_session_system_prompt(patch["system_prompt"])
+            if {"cwd", "backend", "provider_connection"}.intersection(patch):
+                sess.pop("gemini_permission_modes", None)
             for key in ("model", "effort"):
                 if key in patch:
                     value = patch[key]
@@ -51611,6 +51621,7 @@ def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, 
         "cursor_session_id", "opencode_session_id", "gemini_session_id",
         "claude_permission_mode", "cursor_permission_mode",
         "opencode_permission_mode",
+        "gemini_permission_mode", "gemini_permission_modes",
         "codex_approval_policy", "codex_sandbox_mode",
         "codex_permission_profile", "codex_approvals_reviewer",
         "provider_jobs_access",
@@ -82239,6 +82250,8 @@ async def health() -> dict[str, Any]:
             },
             "gemini_backend": {
                 "available": GEMINI_PREVIEW_ENABLED, "required": False, "version": 1, "transport": "acp",
+                "permission_modes": ["default", "autoEdit", "yolo"],
+                "default_permission_mode": "default",
                 "message": "Experimental Gemini CLI integration; full provider acceptance is pending.", "action": None,
                 "client_capability": GEMINI_CLIENT_CAPABILITY,
                 "history_mode": "initial_text_snapshot",
@@ -82249,7 +82262,7 @@ async def health() -> dict[str, Any]:
                              "scheduled_jobs": True, "interactive_shares": True,
                              "native_goals": False, "native_side_questions": False,
                              "managed_subagents": False, "native_compaction_control": False,
-                             "permission_mode_control": False},
+                             "permission_mode_control": True},
             },
             "opencode_backend": {
                 # ``available`` advertises the server contract. Runtime

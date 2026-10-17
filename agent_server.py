@@ -661,6 +661,7 @@ def codex_effective_thread_config(sess: dict[str, Any]) -> dict[str, Any]:
 CODEX_GOALS_ENABLED = read_codex_goals_enabled()
 
 CODEX_FALLBACK_MODELS = (
+    ("gpt-6-luna", "GPT-6-Luna"),
     ("gpt-5.6-sol", "GPT-5.6-Sol"),
     ("gpt-5.6-terra", "GPT-5.6-Terra"),
     ("gpt-5.6-luna", "GPT-5.6-Luna"),
@@ -671,6 +672,7 @@ CODEX_FALLBACK_MODELS = (
 CODEX_FALLBACK_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 CODEX_EFFORT_ORDER = ("none", "minimal", *CODEX_FALLBACK_EFFORTS)
 CODEX_FALLBACK_MODEL_EFFORTS = {
+    "gpt-6-luna": ("low", "medium", "high", "xhigh", "max"),
     "gpt-5.6-sol": ("low", "medium", "high", "xhigh", "max", "ultra"),
     "gpt-5.6-terra": ("low", "medium", "high", "xhigh", "max", "ultra"),
     "gpt-5.6-luna": ("low", "medium", "high", "xhigh", "max"),
@@ -7215,11 +7217,21 @@ def preview_session_runtime_update(
         if "model" in patch
         else None if backend_changed or provider_changed else sess.get("model")
     )
+    previous_model = prospective_model
+    if prospective_backend == BACKEND_CODEX and prospective_provider == "default" and prospective_model:
+        prospective_model = codex_available_model(str(prospective_model))
     prospective_effort = (
         patch.get("effort")
         if "effort" in patch
         else None if backend_changed or provider_changed else sess.get("effort")
     )
+    if prospective_model != previous_model and prospective_effort:
+        # Saved/queued settings may contain a level unsupported by the new
+        # model. Validate the vocabulary, then preserve the nearest level.
+        prospective_effort = clamp_codex_runtime_effort(
+            str(prospective_model),
+            normalize_runtime_effort(BACKEND_CODEX, prospective_effort, strict="effort" in patch),
+        )
     normalized_effort = (
         normalize_runtime_effort(prospective_backend, prospective_effort, strict="effort" in patch)
         if prospective_provider == "custom" else
@@ -10987,8 +10999,7 @@ class SessionStore:
                     if key == "effort":
                         sess[key] = normalized_prospective_effort
                     else:
-                        clean = str(value).strip() if value is not None else ""
-                        sess[key] = clean or None
+                        sess[key] = runtime_preview["model"]
             if reset_implicit_incompatible_effort:
                 # Older clients update the model and effort in separate
                 # requests. Let that model change succeed while clearing a
@@ -16602,6 +16613,7 @@ HANDOFF_DIGEST_FINALIZING: set[str] = set()
 RUNTIME_DIAGNOSTICS: dict[str, dict[str, Any]] = {}
 RUNTIME_DIAGNOSTICS_LOCK = threading.RLock()
 RUNTIME_DIAGNOSTIC_GENERATIONS: dict[str, int] = {}
+CODEX_MODEL_MIGRATION_TARGET = "gpt-6-luna"
 ABANDONED_FORK_PROVIDER_THREADS: set[str] = set()
 ABANDONED_FORK_PROVIDER_THREADS_LOCK = asyncio.Lock()
 
@@ -59097,7 +59109,14 @@ def probe_runtime(backend: str) -> dict[str, Any]:
 
     combined = f"{auth_result.stdout}\n{auth_result.stderr}"
     if auth_result.returncode == 0:
-        return runtime_diagnostic_payload(backend, "ready", installed=True, authenticated=True, version=version)
+        result = runtime_diagnostic_payload(backend, "ready", installed=True, authenticated=True, version=version)
+        if backend == BACKEND_CODEX:
+            # Retain only the kind, never login-status output (which may show a
+            # masked API key). No additional auth/refresh subprocess is needed.
+            text = combined.lower()
+            result["_codex_auth_mode"] = "apiKey" if "api key" in text else "chatgpt" if "chatgpt" in text else "unknown"
+            result["_codex_auth_mode_checked_at_epoch"] = result["checked_at_epoch"]
+        return result
     if auth_failure_text(combined):
         return runtime_diagnostic_payload(backend, "unauthenticated", installed=True, authenticated=False, version=version)
     return runtime_diagnostic_payload(backend, "error", installed=True, authenticated=None, version=version)
@@ -59120,10 +59139,14 @@ def store_runtime_diagnostic(diagnostic: dict[str, Any], *, preserve_last_error:
 
 def expire_codex_login_diagnostic() -> None:
     """A login hint requires new native evidence, never reuse a cached denial."""
+    global CODEX_MODEL_MIGRATION_TARGET
     with RUNTIME_DIAGNOSTICS_LOCK:
+        CODEX_MODEL_MIGRATION_TARGET = "gpt-6-luna"
         current = dict(RUNTIME_DIAGNOSTICS.get(BACKEND_CODEX) or runtime_diagnostic_payload(
             BACKEND_CODEX, "unknown", installed=None, authenticated=None))
         current["checked_at_epoch"] = 0.0
+        current.pop("_codex_auth_mode", None)
+        current.pop("_codex_auth_mode_checked_at_epoch", None)
         store_runtime_diagnostic(current)
 
 
@@ -59132,6 +59155,8 @@ def runtime_diagnostic(backend: str, *, force: bool = False) -> dict[str, Any]:
         cached = dict(RUNTIME_DIAGNOSTICS.get(backend) or {})
         generation = RUNTIME_DIAGNOSTIC_GENERATIONS.get(backend, 0)
     checked_at = cached.get("_installation_checked_at_epoch", cached.get("checked_at_epoch"))
+    if backend == BACKEND_CODEX and cached.get("_codex_auth_mode_checked_at_epoch") is not None:
+        checked_at = min(checked_at or 0, cached["_codex_auth_mode_checked_at_epoch"])
     if not force and isinstance(checked_at, (int, float)) and time.time() - checked_at < RUNTIME_DIAGNOSTIC_TTL_SECONDS:
         return cached
     try:
@@ -59280,6 +59305,13 @@ def record_runtime_success(backend: str) -> None:
             else None
         ),
     )
+    if backend == BACKEND_CODEX and previous.get("_codex_auth_mode"):
+        # A successful turn does not establish which login kind was used.
+        # Preserve the existing observation without extending its lifetime.
+        current["_codex_auth_mode"] = previous["_codex_auth_mode"]
+        current["_codex_auth_mode_checked_at_epoch"] = previous.get(
+            "_codex_auth_mode_checked_at_epoch", previous.get("checked_at_epoch", 0),
+        )
     store_runtime_diagnostic(current, preserve_last_error=False)
 
 
@@ -59439,6 +59471,26 @@ def codex_default_service_tier(model: str) -> str:
     return CODEX_FALLBACK_SERVICE_TIERS.get(str(model or "").strip(), "")
 
 
+def codex_retired_model_replacements() -> dict[str, str]:
+    """Scope retirement to native ChatGPT auth, never API/custom endpoints."""
+    with RUNTIME_DIAGNOSTICS_LOCK:
+        diagnostic = RUNTIME_DIAGNOSTICS.get(BACKEND_CODEX) or {}
+        checked_at = diagnostic.get("_codex_auth_mode_checked_at_epoch", diagnostic.get("checked_at_epoch")) or 0
+        observed = (str(diagnostic.get("_codex_auth_mode") or "")
+                    if time.time() - checked_at < RUNTIME_DIAGNOSTIC_TTL_SECONDS else "")
+        replacement = CODEX_MODEL_MIGRATION_TARGET
+    mode = codex_auth.native_model_auth_mode(
+        codex_app_server_env(), cwd=existing_cwd(DEFAULT_CWD), observed_mode=observed,
+    )
+    if mode != "chatgpt":
+        return {}
+    return {model: replacement for model in sorted(codex_auth.CHATGPT_RETIRED_MODELS)}
+
+
+def codex_available_model(model: str) -> str:
+    return codex_retired_model_replacements().get(model, model)
+
+
 # The Codex app-server's thread/start and turn-override JSON-RPC params only
 # accept a narrower serviceTier enum ("fast"/"flex") than the canonical
 # service_tier values used for `codex exec` CLI config overrides (see
@@ -59455,6 +59507,7 @@ def codex_app_server_service_tier(service_tier: str) -> str:
 
 
 def discover_codex_catalog() -> dict[str, Any]:
+    global CODEX_MODEL_MIGRATION_TARGET
     models: list[dict[str, Any]] = []
     model_options: list[dict[str, Any]] = []
     effort_options: list[dict[str, Any]] = []
@@ -59477,16 +59530,29 @@ def discover_codex_catalog() -> dict[str, Any]:
         model_source = f"{model_source} failed"
         effort_source = f"{effort_source} failed"
 
+    replacements = codex_retired_model_replacements()
     visible_models = [
         model for model in models
         if str(model.get("visibility") or "list") == "list" and model.get("supported_in_api", True) is not False
+        and str(model.get("slug") or model.get("id") or "").strip() not in replacements
     ]
     visible_models.sort(key=runtime_priority)
+    if replacements and visible_models:
+        # Use an available configured default, then the native default/priority.
+        # The fallback is only needed when the CLI cannot return a catalog.
+        slugs = [str(entry.get("slug") or entry.get("id") or "").strip() for entry in visible_models]
+        preferred = next((slug for slug in (configured_model, CODEX_DEFAULT_MODEL) if slug in slugs), None)
+        if preferred is None:
+            preferred = next((str(entry.get("slug") or entry.get("id")) for entry in visible_models if entry.get("is_default") is True or entry.get("isDefault") is True), slugs[0])
+        if preferred:
+            with RUNTIME_DIAGNOSTICS_LOCK:
+                CODEX_MODEL_MIGRATION_TARGET = preferred
+            replacements = {model: preferred for model in replacements}
     # The selectable "Server default" must describe the exact settings that
     # codex_runtime_settings() launches for a chat with no explicit override.
     # The CLI's discovered list can omit a configured/custom default (or a
     # legacy fallback), so the first discovered model is not a safe proxy.
-    default_model = configured_model or CODEX_DEFAULT_MODEL
+    default_model = replacements.get(configured_model or CODEX_DEFAULT_MODEL, configured_model or CODEX_DEFAULT_MODEL)
     default_effort = clamp_codex_runtime_effort(
         default_model,
         configured_effort or CODEX_DEFAULT_EFFORT,
@@ -59533,6 +59599,8 @@ def discover_codex_catalog() -> dict[str, Any]:
 
     if not model_options:
         for slug, label in CODEX_FALLBACK_MODELS:
+            if slug in replacements:
+                continue
             fallback_efforts = [
                 runtime_option(effort, title_effort_label(effort))
                 for effort in CODEX_FALLBACK_MODEL_EFFORTS.get(slug, CODEX_FALLBACK_EFFORTS)
@@ -59542,7 +59610,7 @@ def discover_codex_catalog() -> dict[str, Any]:
             model_options.append(runtime_option(slug, label, efforts=fallback_efforts, service_tier=service_tier or None))
     if not effort_options:
         effort_options.extend(runtime_option(effort, title_effort_label(effort)) for effort in CODEX_FALLBACK_EFFORTS)
-    if configured_model and not any(option.get("value") == configured_model for option in model_options):
+    if configured_model and configured_model not in replacements and not any(option.get("value") == configured_model for option in model_options):
         model_options.insert(0, runtime_option(configured_model, title_model_label(configured_model)))
     if configured_effort and not any(option.get("value") == configured_effort for option in effort_options):
         effort_options.append(runtime_option(configured_effort, title_effort_label(configured_effort)))
@@ -59565,6 +59633,7 @@ def discover_codex_catalog() -> dict[str, Any]:
         "default_model": default_model or None,
         "default_effort": default_effort or None,
         "default_service_tier": default_service_tier or None,
+        "model_replacements": replacements,
     }
 
 
@@ -60152,13 +60221,46 @@ def codex_runtime_settings(sess: dict[str, Any]) -> tuple[str, str, str]:
         catalog = CODEX_PROVIDER_STORE.cached_catalog(selected)
         return model, codex_provider.runtime_effort(selected, catalog, sess.get("effort")), ""
     configured_model, configured_effort, configured_service_tier = codex_user_config_defaults()
-    model = str(sess.get("model") or configured_model or CODEX_DEFAULT_MODEL).strip()
+    model = codex_available_model(str(sess.get("model") or configured_model or CODEX_DEFAULT_MODEL).strip())
     effort = clamp_codex_runtime_effort(
         model,
         sess.get("effort") or configured_effort or CODEX_DEFAULT_EFFORT,
     )
     service_tier = configured_service_tier or codex_default_service_tier(model)
     return model, effort, service_tier
+
+
+async def migrate_retired_codex_selection(
+    session_id: str, sess: dict[str, Any], *, standalone: bool = False,
+    previous_model: str | None = None,
+) -> dict[str, Any]:
+    """Migrate future work under the existing admission lock; retain history.
+
+    No native transcript edits, forks, auth changes, or retries. Native
+    compaction/recovery remains Codex-owned and can still fail independently.
+    """
+    if sess.get("backend") != BACKEND_CODEX or sess.get("codex_provider") == "custom":
+        return sess
+    configured_model, _effort, _tier = codex_user_config_defaults()
+    previous = str(previous_model or sess.get("model") or configured_model or CODEX_DEFAULT_MODEL).strip()
+    replacement = codex_available_model(previous)
+    if previous == replacement:
+        return sess
+    patch = {"model": replacement, "effort": clamp_codex_runtime_effort(replacement, sess.get("effort") or _effort or CODEX_DEFAULT_EFFORT)}
+    if standalone:
+        migrated = {**sess, **patch}
+    elif all(sess.get(key) == value for key, value in patch.items()):
+        migrated = sess
+    else:
+        migrated = await STORE.update(session_id, patch)
+    await append_event(session_id, "runtime_model_migrated", {
+        "backend": BACKEND_CODEX, "previous_model": previous, "model": replacement,
+        "standalone": standalone,
+        "message": (f"{previous} is no longer available with ChatGPT sign-in. "
+                    f"This {'scheduled run' if standalone else 'chat'} will use {replacement}. "
+                    "Conversation history is unchanged."),
+    })
+    return migrated
 
 
 def codex_goal_time_budget_remaining(sess: dict[str, Any]) -> float | None:
@@ -73757,6 +73859,9 @@ async def _start_turn_locked(
             if team_mail_grant_mutation:
                 team_mail_route_snapshot = team_mail_grants.admission_snapshot(team_mail_grant_mutation, sess)
         fields_set = runtime_fields_set
+        migration_previous_model = str(
+            req.model if "model" in fields_set and req.model else sess.get("model") or ""
+        ).strip() or None
         runtime_patch: dict[str, Any] = {}
         if req.backend:
             runtime_patch["backend"] = req.backend
@@ -73785,6 +73890,11 @@ async def _start_turn_locked(
 
         backend = sess.get("backend") or DEFAULT_BACKEND
         runtime_status = await ensure_runtime_available(backend, session=sess)
+        if backend == BACKEND_CODEX:
+            sess = await migrate_retired_codex_selection(
+                session_id, sess, standalone=provider_context_mode == "standalone",
+                previous_model=migration_previous_model,
+            )
         if provider_context_mode == "chat":
             sess = await STORE.mark_backend_started(session_id, str(backend))
         if backend in (BACKEND_CURSOR, BACKEND_OPENCODE):

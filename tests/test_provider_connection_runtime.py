@@ -21,7 +21,7 @@ class CrossChatConnectionTests(unittest.TestCase):
                    "claude_sdk_dependency_available": lambda: True,
                    "BACKEND_CODEX": "codex", "BACKEND_CLAUDE": "claude",
                    "BACKEND_CURSOR": "cursor", "BACKEND_OPENCODE": "opencode",
-                   "BACKEND_GEMINI": "gemini", "GEMINI_PREVIEW_ENABLED": True,
+                   "BACKEND_GEMINI": "gemini",
                    "RUNTIME_DIAGNOSTICS": {}, "RUNTIME_DIAGNOSTICS_LOCK": threading.RLock(),
                    "PROVIDER_CONNECTION_STORE": self.store, "HTTPException": HTTPException}
         exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), self.ns)

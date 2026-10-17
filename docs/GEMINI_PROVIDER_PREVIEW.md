@@ -1,8 +1,10 @@
-# Gemini provider development preview
+# Gemini provider
 
-Status: **experimental, disabled by default, not release-ready**. The first
-implementation targets Gemini CLI **0.64.0**, ACP protocol version 1, and desktop.
-Do not enable it in a public build until the acceptance gaps below are closed.
+Gemini is a **built-in, enabled-by-default provider** in this source version.
+The integration targets Gemini CLI **0.64.0**, ACP protocol version 1, and desktop.
+API setup and a compatible installed CLI are still required to send messages.
+This source change does not itself publish a release; validation and known
+capability limits are recorded below.
 
 ## Authentication is separate from ACP
 
@@ -69,18 +71,21 @@ References: [Gemini authentication](https://geminicli.com/docs/get-started/authe
 [ACP mode](https://geminicli.com/docs/cli/acp-mode/),
 [Developer API models](https://ai.google.dev/api/models).
 
-## Enable only in an isolated development service
+## Set up Gemini
 
-Use a compatible desktop built from this branch and a disposable server state,
-workspace, token and port. Set `AGENTSDOCK_GEMINI_PREVIEW=1` for that service.
+Use matching desktop/server versions that include Gemini. No feature flag is
+required. Install `@google/gemini-cli@0.64.0` on the server machine, then configure
+your Gemini API connection in **Settings → My Agents → Gemini**.
 `AGENTSDOCK_GEMINI_BIN` may point to an isolated CLI 0.64.0 executable; otherwise
 the server discovers `gemini` on its executable search path. No automatic CLI
-installation or upgrade occurs. Existing services and user login profiles must
-not be repurposed as test fixtures.
+installation or upgrade occurs. For development tests, use disposable server
+state, workspaces, tokens and ports; do not repurpose existing services or user
+login profiles as fixtures.
 
 The health capability is `gemini_backend`, with required client capability
-`gemini_acp_v1` on turns. Without the preview flag the ordinary four-provider
-behavior remains. Old clients cannot send Gemini turns accidentally.
+`gemini_acp_v1` on turns. Server capability describes integration support, not
+CLI installation or successful authentication. Old clients cannot send Gemini
+turns accidentally, and old servers do not advertise Gemini support.
 
 My Agents gains a fifth, expandable Gemini row with an API card only.
 Initial API setup does not require guessing a model ID. It discovers
@@ -372,7 +377,7 @@ signal or equivalent before broad compatibility can be promised.
   success fixture uses nonrepeating text. These short bounded runs are not
   long-duration, low-memory or successful Google-account acceptance.
 
-## Remaining before a merge/release recommendation
+## Validation status and known limitations
 
 ### Checklist disposition
 
@@ -430,5 +435,5 @@ attempts; it does not authorize replacing existing conversation identity.
 
 Full suite/release packaging validation and completion of the declared
 real-account feature checks are still required. Bounded Developer API success
-is recorded above; it is not full-provider acceptance. This branch is a
-development preview, not a release.
+is recorded above; it is not full-provider acceptance. Default availability does
+not remove these limits or imply that a public release has been published.

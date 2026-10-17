@@ -4,8 +4,8 @@ Use this when adding a provider or upgrading its CLI/SDK. A successful text repl
 is not enough: verify the server contract and the behavior exposed by that
 provider's native runtime/client. This is a review template, not a support claim.
 
-Provider-specific development records: [Gemini preview](GEMINI_PROVIDER_PREVIEW.md)
-(experimental; not an accepted integration).
+Provider-specific implementation and validation records:
+[Gemini](GEMINI_PROVIDER_PREVIEW.md) (built in; API-only, with documented limits).
 
 Record: **provider · transport · CLI/SDK versions · model/endpoint · server commit
 · OS/client versions · reviewer/date**.

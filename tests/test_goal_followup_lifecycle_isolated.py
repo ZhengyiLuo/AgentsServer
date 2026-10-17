@@ -26,7 +26,7 @@ NAMES = {
     "turn_slot_is_owned", "codex_goal_followup_requires_native",
     "_run_queued_turn_now_once", "NonNativeForceSendRequiresLifecycleLock",
     "async_route_queue_fields", "await_native_steer_result",
-    "withdraw_unaccepted_native_steer",
+    "withdraw_unaccepted_native_steer", "codex_native_archive_rejection",
 }
 tree = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
 nodes = [node for node in tree.body if isinstance(node, (

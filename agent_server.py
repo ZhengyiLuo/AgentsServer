@@ -209,7 +209,7 @@ BACKEND_CODEX = "codex"
 BACKEND_CURSOR = "cursor"
 BACKEND_OPENCODE = "opencode"
 BACKEND_GEMINI = "gemini"
-VALID_BACKENDS = {BACKEND_CLAUDE, BACKEND_CODEX, BACKEND_CURSOR, BACKEND_OPENCODE}
+VALID_BACKENDS = {BACKEND_CLAUDE, BACKEND_CODEX, BACKEND_CURSOR, BACKEND_OPENCODE, BACKEND_GEMINI}
 CODEX_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
 CODEX_EFFORT_ALIASES = {
     "extra high": "xhigh",
@@ -353,9 +353,6 @@ def load_config_env_file(path: Path | None = None) -> list[str]:
 
 
 CONFIG_ENV_APPLIED = load_config_env_file()
-GEMINI_PREVIEW_ENABLED = os.environ.get("AGENTSDOCK_GEMINI_PREVIEW") == "1"
-if GEMINI_PREVIEW_ENABLED:
-    VALID_BACKENDS.add(BACKEND_GEMINI)
 
 
 def resolve_state_dir() -> Path:
@@ -38729,8 +38726,6 @@ def cross_chat_supported_target_backends() -> list[str]:
     # launch CLIs or authenticate remotely. Each target's actual turn admission
     # still checks its own binding, CLI compatibility and selected login mode.
     for backend in (BACKEND_CURSOR, BACKEND_OPENCODE, BACKEND_GEMINI):
-        if backend == BACKEND_GEMINI and not GEMINI_PREVIEW_ENABLED:
-            continue
         with RUNTIME_DIAGNOSTICS_LOCK:
             diagnostic = dict(RUNTIME_DIAGNOSTICS.get(backend) or {})
         ready = diagnostic.get("status") == "ready"
@@ -48866,7 +48861,7 @@ def local_session_candidates(
         candidates.extend(local_cursor_session_candidates({
             provider_id for backend, provider_id in known_provider_keys if backend == BACKEND_CURSOR
         }))
-    if include_gemini and GEMINI_PREVIEW_ENABLED:
+    if include_gemini:
         from gemini_import import candidates as gemini_candidates
         candidates.extend(gemini_candidates(sys.modules[__name__], runner_env(), {
             provider_id for backend, provider_id in known_provider_keys if backend == BACKEND_GEMINI
@@ -82394,7 +82389,7 @@ async def health() -> dict[str, Any]:
             "side_questions": side_questions.capability(),
             "codex_auth_v1": codex_auth.capability(available=bool(AGENT_TOKEN) and CODEX_TRANSPORT != CODEX_TRANSPORT_EXEC),
             "codex_provider_v1": {"available": bool(AGENT_TOKEN) and CODEX_TRANSPORT != CODEX_TRANSPORT_EXEC, "wire_api": "responses", "per_chat": True, "per_chat_models": True, "model_discovery": True, "model_compatibility": True},
-            "provider_connections_v1": {"available": bool(AGENT_TOKEN), "per_chat": True, "backends": [BACKEND_CLAUDE, BACKEND_OPENCODE, BACKEND_CURSOR] + ([BACKEND_GEMINI] if GEMINI_PREVIEW_ENABLED else [])},
+            "provider_connections_v1": {"available": bool(AGENT_TOKEN), "per_chat": True, "backends": [BACKEND_CLAUDE, BACKEND_OPENCODE, BACKEND_CURSOR, BACKEND_GEMINI]},
             "team_mail_hints_v1": SECURE_PEER_RUNTIME.team_mail_hint_capability(),
             "team_mail_hints_v2": SECURE_PEER_RUNTIME.team_notification_hint_capability(),
             "websocket_auth_v1": {
@@ -82516,19 +82511,19 @@ async def health() -> dict[str, Any]:
                     BACKEND_CODEX,
                     BACKEND_CLAUDE,
                     BACKEND_OPENCODE,
-                    *([BACKEND_GEMINI] if GEMINI_PREVIEW_ENABLED else []),
+                    BACKEND_GEMINI,
                 ],
                 "client_capability_by_backend": {
                     BACKEND_CODEX: CODEX_INTERACTIVE_CLIENT_CAPABILITY,
                     BACKEND_CLAUDE: CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY,
                     BACKEND_OPENCODE: OPENCODE_PROVIDER_COMMANDS_CLIENT_CAPABILITY,
-                    **({BACKEND_GEMINI: GEMINI_CLIENT_CAPABILITY} if GEMINI_PREVIEW_ENABLED else {}),
+                    BACKEND_GEMINI: GEMINI_CLIENT_CAPABILITY,
                 },
                 "supported_kinds_by_backend": {
                     BACKEND_CODEX: ["skill"],
                     BACKEND_CLAUDE: ["command"],
                     BACKEND_OPENCODE: ["skill"],
-                    **({BACKEND_GEMINI: ["skill"]} if GEMINI_PREVIEW_ENABLED else {}),
+                    BACKEND_GEMINI: ["skill"],
                 },
                 "opencode_scope": {
                     "discovery": "bounded_documented_default_skill_roots",
@@ -82600,10 +82595,12 @@ async def health() -> dict[str, Any]:
                 **port_tunnel_status,
             },
             "gemini_backend": {
-                "available": GEMINI_PREVIEW_ENABLED, "required": False, "version": 1, "transport": "acp",
+                # Server support is always advertised; CLI installation and
+                # API connection readiness are checked separately at runtime.
+                "available": True, "required": False, "version": 1, "transport": "acp",
                 "permission_modes": ["default", "autoEdit", "yolo"],
                 "default_permission_mode": "default",
-                "message": "Experimental Gemini CLI integration; full provider acceptance is pending.", "action": None,
+                "message": "Gemini requires a compatible Gemini CLI and a configured API connection in My Agents.", "action": None,
                 "client_capability": GEMINI_CLIENT_CAPABILITY,
                 "history_mode": "initial_text_snapshot",
                 "features": {"resume": True, "external_import": True, "fork": False,
@@ -84356,7 +84353,7 @@ async def interactive_chat_native_snapshot(session_id: str) -> dict[str, Any]:
     gemini_fields = {}
     if backend == "gemini":
         from gemini_runner import PERMISSIONS, owns
-        gemini_fields["gemini_runtime"] = {"available": GEMINI_PREVIEW_ENABLED, "pending_interactions": [
+        gemini_fields["gemini_runtime"] = {"available": True, "pending_interactions": [
             shared_native_value(row["public"]) for row in PERMISSIONS.values()
             if row["public"]["session_id"] == session_id and owns(sys.modules[__name__], session_id, row["run_id"])]}
     snapshot = shared_native_value({
@@ -84367,7 +84364,7 @@ async def interactive_chat_native_snapshot(session_id: str) -> dict[str, Any]:
         "codex_runtime": codex_runtime, "claude_runtime": claude_runtime,
         **gemini_fields,
         "health": {"capabilities": {
-            **({"gemini_backend": {"available": GEMINI_PREVIEW_ENABLED, "version": 1}} if backend == "gemini" else {}),
+            **({"gemini_backend": {"available": True, "version": 1}} if backend == "gemini" else {}),
             "codex_controls": {"available": codex_available},
             "claude_controls": {"available": claude_available,
                                 "interactive_client_capability": CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY},

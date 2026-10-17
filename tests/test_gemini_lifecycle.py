@@ -116,7 +116,7 @@ class Lifecycle(unittest.TestCase):
             # fixtures count model calls and must not race optional metadata work.
             "AGENTSDOCK_AUTO_TITLES": "1" if getattr(self, "auto_titles", False) else "0",
             "AGENTSDOCK_STATE_DIR": str(self.state), "AGENTSDOCK_AGENT_TOKEN": self.token, "AGENTSDOCK_AGENT_PORT": str(self.port),
-            "AGENTSDOCK_AGENT_CWD": str(self.project), "AGENTSDOCK_GEMINI_PREVIEW": "1",
+            "AGENTSDOCK_AGENT_CWD": str(self.project),
             "AGENTSDOCK_GEMINI_BIN": os.environ["AGENTSDOCK_TEST_GEMINI_BIN"], "AGENTSDOCK_CODEX_TRANSPORT": "exec", "AGENTSDOCK_CLAUDE_TRANSPORT": "print"}
         self.log = (self.root / "server.log").open("w")
         self.start_server()

@@ -16,6 +16,57 @@ import httpx
 from tests.test_gemini_native_contract import API
 
 
+class DefaultAvailability(unittest.TestCase):
+    def test_no_flag_required_but_missing_runtime_and_api_are_not_ready(self):
+        """A fresh ordinary server exposes setup without implying readiness."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0)); port = sock.getsockname()[1]
+            token = secrets.token_hex(32)
+            env = {"PATH": os.environ["PATH"], "HOME": str(root),
+                "PYTHONDONTWRITEBYTECODE": "1", "AGENTSDOCK_STATE_DIR": str(root / "state"),
+                "AGENTSDOCK_AGENT_TOKEN": token, "AGENTSDOCK_AGENT_CWD": str(root),
+                "AGENTSDOCK_GEMINI_BIN": str(root / "not-installed"),
+                "AGENTSDOCK_CODEX_TRANSPORT": "exec", "AGENTSDOCK_CLAUDE_TRANSPORT": "print"}
+            self.assertNotIn("AGENTSDOCK_GEMINI_PREVIEW", env)
+            with (root / "server.log").open("w+") as log:
+                process = subprocess.Popen([sys.executable, "-m", "uvicorn", "agent_server:app",
+                    "--host", "127.0.0.1", "--port", str(port)],
+                    cwd=Path(__file__).resolve().parents[1], env=env, stdout=log, stderr=log)
+                try:
+                    with httpx.Client(base_url=f"http://127.0.0.1:{port}",
+                            headers={"X-AgentsDock-Token": token}, timeout=30, trust_env=False) as client:
+                        for _ in range(150):
+                            if process.poll() is not None:
+                                self.fail("isolated server exited before health was ready")
+                            try:
+                                response = client.get("/api/health")
+                                if response.status_code == 200: break
+                            except httpx.HTTPError: pass
+                            time.sleep(.1)
+                        else: self.fail("isolated server did not start")
+                        caps = response.json()["capabilities"]
+                        self.assertTrue(caps["gemini_backend"]["available"])
+                        self.assertIn("gemini", caps["provider_connections_v1"]["backends"])
+                        catalog = client.get("/api/runtime/catalog")
+                        self.assertEqual(catalog.status_code, 200)
+                        gemini = catalog.json()["backends"]["gemini"]
+                        self.assertFalse(gemini["available"])
+                        self.assertEqual(gemini["diagnostic"]["status"], "missing")
+                        self.assertFalse(gemini["custom_provider"]["configured"])
+                        created = client.post("/api/sessions", json={"backend": "gemini", "cwd": str(root)})
+                        self.assertEqual(created.status_code, 200, created.text)
+                        sid = created.json()["session"]["id"]
+                        rejected = client.post(f"/api/sessions/{sid}/turns", json={
+                            "prompt": "Must not invoke a provider", "client_capabilities": ["gemini_acp_v1"]})
+                        self.assertEqual(rejected.status_code, 409, rejected.text)
+                finally:
+                    process.terminate()
+                    try: process.wait(timeout=15)
+                    except subprocess.TimeoutExpired: process.kill(); process.wait(timeout=5)
+
+
 @unittest.skipUnless(os.environ.get("AGENTSDOCK_TEST_GEMINI_BIN"), "optional real server/CLI contract")
 class ServerContract(unittest.TestCase):
     def test_api_chat_resume_forget_reconnect_delete(self):
@@ -33,7 +84,7 @@ class ServerContract(unittest.TestCase):
             env = {"PATH": os.environ["PATH"], "HOME": str(root), "LANG": "en_US.UTF-8",
                 "AGENTSDOCK_STATE_DIR": str(state), "AGENTSDOCK_AGENT_TOKEN": token,
                 "AGENTSDOCK_AGENT_PORT": str(port), "AGENTSDOCK_AGENT_CWD": str(project),
-                "AGENTSDOCK_GEMINI_PREVIEW": "1", "AGENTSDOCK_GEMINI_BIN": os.environ["AGENTSDOCK_TEST_GEMINI_BIN"],
+                "AGENTSDOCK_GEMINI_BIN": os.environ["AGENTSDOCK_TEST_GEMINI_BIN"],
                 "AGENTSDOCK_CODEX_TRANSPORT": "exec", "AGENTSDOCK_CLAUDE_TRANSPORT": "print"}
             with (root / "server.log").open("w+") as log:
                 process = subprocess.Popen([sys.executable, "-m", "uvicorn", "agent_server:app", "--host", "127.0.0.1", "--port", str(port)],
@@ -49,7 +100,9 @@ class ServerContract(unittest.TestCase):
                             time.sleep(.1)
                         else:
                             log.seek(0); self.fail("isolated test server did not start: " + log.read()[-3000:].replace(token, "[token]"))
-                        features = client.get("/api/health").json()["capabilities"]["gemini_backend"]["features"]
+                        capability = client.get("/api/health").json()["capabilities"]["gemini_backend"]
+                        self.assertTrue(capability["available"])
+                        features = capability["features"]
                         for enabled in ("scheduled_jobs", "interactive_shares", "approvals", "skills_picker", "permission_mode_control"):
                             self.assertIs(features[enabled], True)
                         for unsupported in ("fork", "native_goals", "native_side_questions", "managed_subagents",

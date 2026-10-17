@@ -79,12 +79,12 @@ def native_snapshot(env: dict[str, str], cwd: str, session_id: str, *, missing_o
     def entries(directory):
         nonlocal count
         if directory.is_symlink():
-            raise GeminiProtocolError("Linked Gemini history cannot be resumed in this preview.")
+            raise GeminiProtocolError("Linked Gemini history cannot be resumed safely.")
         with os.scandir(directory) as iterator:
             for entry in iterator:
                 count += 1
                 if count > MAX_ENTRIES:
-                    raise GeminiProtocolError("Gemini history exceeds the preview scan limit.")
+                    raise GeminiProtocolError("Gemini history exceeds the supported scan limit.")
                 yield entry
     try:
         if missing_ok and not root.exists():
@@ -134,7 +134,7 @@ def snapshot_replay(snapshot: dict) -> list[tuple[str, str]]:
             for tool in message.get("toolCalls") or []:
                 result.append(fingerprint({"sessionUpdate": "tool_call", "toolCallId": tool.get("id")}))
         if len(result) > MAX_ENTRIES:
-            raise GeminiProtocolError("Gemini replay exceeds the preview limit.")
+            raise GeminiProtocolError("Gemini replay exceeds the supported limit.")
     return result
 
 
@@ -243,7 +243,7 @@ def read_snapshot(path: Path) -> dict:
     with os.fdopen(descriptor, "rb") as handle:
         before = os.fstat(handle.fileno())
         if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_BYTES:
-            raise GeminiProtocolError("Gemini history exceeds the preview file limit.")
+            raise GeminiProtocolError("Gemini history exceeds the supported file limit.")
         raw = handle.read(MAX_BYTES + 1)
         after = os.fstat(handle.fileno())
         if len(raw) > MAX_BYTES or (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):

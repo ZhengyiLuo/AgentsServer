@@ -159,6 +159,8 @@ class GeminiACPClient:
         self.closed = False
         self.cleanup_complete = False
         self.close_lock = asyncio.Lock()
+        self.guard_ready = asyncio.Event()
+        self.guard_ready_verified = False
         self.failure: Exception | None = None
         self.capabilities: dict = {}
         self.requested_mode: str | None = None
@@ -167,15 +169,29 @@ class GeminiACPClient:
                     on_started: Callable[[asyncio.subprocess.Process], Awaitable[None]] | None = None) -> dict:
         if self.process is not None or self.closed:
             raise GeminiProtocolError("Gemini client cannot be started twice.")
-        self.process = await asyncio.create_subprocess_exec(
+        spawning = asyncio.create_task(asyncio.create_subprocess_exec(
             sys.executable, str(Path(__file__).with_name("cursor_process_guard.py")),
-            "--verify-cleanup", "--parent-pid", str(os.getpid()), "--", *command,
+            "--verify-cleanup", "--ready-notice", "--parent-pid", str(os.getpid()), "--", *command,
             cwd=cwd, env=env, stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             limit=MAX_LINE_BYTES, start_new_session=True,
-        )
+        ))
+        cancelled = False
+        while True:
+            try:
+                # Stop can arrive while asyncio is constructing the transport.
+                # Retain its process handle before propagating cancellation so
+                # the runner's finally block can verify owned-tree cleanup.
+                self.process = await asyncio.shield(spawning)
+                break
+            except asyncio.CancelledError:
+                if spawning.cancelled():
+                    raise
+                cancelled = True
         self.reader = asyncio.create_task(self._read())
         self.stderr = asyncio.create_task(self._drain_stderr())
+        if cancelled:
+            raise asyncio.CancelledError()
         if on_started:
             await on_started(self.process)
         result = await self.request("initialize", {
@@ -362,6 +378,11 @@ class GeminiACPClient:
 
     async def _drain_stderr(self) -> None:
         assert self.process and self.process.stderr
+        from cursor_process_guard import READY_NOTICE
+        try:
+            self.guard_ready_verified = await self.process.stderr.readline() == READY_NOTICE
+        finally:
+            self.guard_ready.set()
         # Native stderr can include credentials, browser URLs and prompts. Drain
         # without retaining or publishing it; use structured, sanitized errors.
         while await self.process.stderr.read(16 * 1024):
@@ -375,6 +396,16 @@ class GeminiACPClient:
         if self.cleanup_complete:
             return
         self.closed = True
+        if self.process:
+            # Never TERM the guard before its handlers are installed. An early
+            # Stop used to kill the wrapper with -SIGTERM and permanently fence
+            # the chat, with no trustworthy evidence about child cleanup.
+            try:
+                await asyncio.wait_for(self.guard_ready.wait(), 5)
+            except asyncio.TimeoutError:
+                raise GeminiProtocolError("Gemini runtime cleanup has not completed.") from None
+            if not self.guard_ready_verified:
+                raise GeminiProtocolError("Gemini runtime cleanup could not be verified.")
         tasks = [task for task in (self.reader, self.stderr, *self.permissions.values()) if task]
         for task in tasks:
             task.cancel()

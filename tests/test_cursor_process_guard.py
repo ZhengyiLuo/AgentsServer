@@ -11,6 +11,13 @@ import cursor_process_guard as guard_module
 
 
 class CursorProcessGuardTests(unittest.TestCase):
+    def test_spawn_failure_is_verified_without_changing_legacy_cursor_exit(self):
+        with patch.object(guard_module.signal, "signal"), \
+             patch.object(guard_module.subprocess, "Popen", side_effect=FileNotFoundError):
+            args = ["--parent-pid", str(os.getppid()), "--", "missing-fixture"]
+            self.assertEqual(guard_module.main(args), 127)
+            self.assertEqual(guard_module.main(["--verify-cleanup", *args]), 71)
+
     def test_required_process_inspection_never_treats_failure_as_empty(self):
         with patch.object(guard_module.os.path, "isfile", return_value=False):
             self.assertEqual(guard_module._process_snapshot(), {})

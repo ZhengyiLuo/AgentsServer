@@ -680,6 +680,39 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(len({records[sid]["gemini_session_id"] for sid in chats}), 3)
         for sid in chats: self.assertEqual(self.client.delete(f"/api/sessions/{sid}").status_code, 200)
 
+    def test_repeated_early_stop_retry_with_concurrent_neighbor(self):
+        from concurrent.futures import ThreadPoolExecutor
+        neighbor = self.new()
+        chats = [self.new() for _ in range(3)]
+        def stop_retry(sid):
+            for index, delay in enumerate((0, .01, .2, .6)):
+                self.send(sid, prompt=f"Early stop fixture {index}")
+                time.sleep(delay)
+                response = self.client.post(f"/api/sessions/{sid}/stop")
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertTrue(response.json()["ok"], response.text)
+                self.finished(sid, index * 2 + 1)
+                self.send(sid, prompt=f"Retry fixture {index}")
+                self.assertFalse(self.finished(sid, index * 2 + 2)[-1]["is_error"])
+            records = json.loads((self.state / "sessions.json").read_text())
+            self.assertNotIn("gemini_cleanup_pending_run_id", records[sid])
+            self.assertEqual(self.client.delete(f"/api/sessions/{sid}").status_code, 200)
+        self.send(neighbor, prompt="Concurrent neighbor must complete normally")
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            list(pool.map(stop_retry, chats))
+        self.assertFalse(self.finished(neighbor)[-1]["is_error"])
+        self.assertEqual(sum(e["type"] == "assistant_text" for e in self.events(neighbor)), 1)
+        self.assertEqual(self.client.delete(f"/api/sessions/{neighbor}").status_code, 200)
+
+    def test_early_delete_uses_owned_guard_not_generic_tree_termination(self):
+        for delay in (0, .01, .05, .2):
+            sid = self.new()
+            self.send(sid)
+            time.sleep(delay)
+            response = self.client.delete(f"/api/sessions/{sid}")
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertNotIn(sid, json.loads((self.state / "sessions.json").read_text()))
+
     def test_interactive_share_sends_and_approves_only_its_gemini_chat(self):
         sid = self.new(); other = self.new()
         response = self.client.post(f"/api/admin/interactive-chat-shares/{sid}", json={"confirmed_interactive": True})

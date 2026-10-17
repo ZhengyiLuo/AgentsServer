@@ -27,6 +27,7 @@ TERMINATE_GRACE_SECONDS = 0.5
 PROCESS_SNAPSHOT_TIMEOUT_SECONDS = 0.2
 MAX_PROCESS_SNAPSHOT_ROWS = 32_768
 MAX_CAPTURED_DESCENDANTS = 4_096
+READY_NOTICE = b"AGENTSDOCK_PROCESS_GUARD_READY\n"
 
 
 class _ProcessIdentity(NamedTuple):
@@ -293,6 +294,9 @@ def main(argv: list[str]) -> int:
     verify_cleanup = bool(argv and argv[0] == "--verify-cleanup")
     if verify_cleanup:
         argv = argv[1:]
+    ready_notice = bool(verify_cleanup and argv and argv[0] == "--ready-notice")
+    if ready_notice:
+        argv = argv[1:]
     if len(argv) < 4 or argv[0] != "--parent-pid" or argv[2] != "--":
         return 64
     try:
@@ -314,6 +318,12 @@ def main(argv: list[str]) -> int:
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGHUP, request_stop)
 
+    if ready_notice:
+        # Only the opt-in Gemini owner consumes this first stderr record.
+        # Publish it before launching native code, after TERM becomes a request
+        # for verified cleanup rather than an unhandled process-killing signal.
+        os.write(2, READY_NOTICE)
+
     # The server can disappear after spawning this wrapper but before Python
     # reaches Popen. Do not briefly launch an editing agent in that window.
     if stop.is_set() or os.getppid() != expected_parent:
@@ -322,7 +332,10 @@ def main(argv: list[str]) -> int:
     try:
         child = subprocess.Popen(command, start_new_session=True)
     except OSError:
-        return 127
+        # Popen did not return a child; it reaps a failed exec itself. Preserve
+        # the legacy Cursor code, but do not fence Gemini as though an editing
+        # process survived when no provider was launched.
+        return 71 if verify_cleanup else 127
 
     interrupted = False
     inspection_failed = False

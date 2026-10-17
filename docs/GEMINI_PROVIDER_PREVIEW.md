@@ -163,6 +163,37 @@ require an explicit model check. Manual model selection remains available.
   cleanup handle has been lost, an operator must verify the old runtime's exit
   before repairing the fence; there is no automatic unlock or public bypass.
 
+### Startup Stop and Delete regression
+
+Gemini's process guard now acknowledges readiness before the owner may signal
+it. Cancellation during subprocess creation retains the process handle so the
+runner can verify cleanup. Stop and Delete use that owned cleanup operation,
+not generic process-tree termination that can kill the guard before it reports
+the result. Failed native exec is distinguished from failed cleanup; legacy
+Cursor exit behavior is unchanged. Unverified cleanup still blocks reuse and
+Delete, including after restart. This fix does not automatically clear an old
+persisted cleanup fence.
+
+Regression coverage includes 20 simultaneous-start/Stop cases in bounded
+batches, cancellation while constructing the subprocess transport, 12 early
+Stop/retry cycles across three concurrent chats and an unaffected neighbor,
+four early Deletes, and five actual desktop Stop/retry/reopen cycles. The
+desktop uses production IPC/HTTP and the actual CLI with a loopback model.
+
+The repeatable long-message stress test uses four concurrent chats, ten turns
+each, 134,890 UTF-8 bytes per reply and 40 WebSocket reconnects. It checks exact
+content, stable native IDs and preserved native history after Delete. Run with
+an isolated test environment and the supported CLI:
+
+```sh
+AGENTSDOCK_TEST_GEMINI_BIN=/path/to/gemini \
+AGENTSDOCK_TEST_GEMINI_STRESS=1 \
+uv run --python 3.13 python -m unittest tests.test_gemini_stress -v
+```
+
+These tests create disposable state and a local model fixture; they neither
+exercise Google inference nor certify low-memory or sustained production load.
+
 ### Native permission modes
 
 The desktop composer offers Gemini's own **Default**, **Auto Edit**, **YOLO**
@@ -250,11 +281,12 @@ signal or equivalent before broad compatibility can be promised.
   file, approved writes produce the file, and owned processes exit. Native
   project/user precedence, trust and disabled-skill handling have a separate
   contract fixture. No Google model service is involved in these fixtures.
-- Real Google OAuth and Developer API requests were attempted through desktop
-  and directly through the pinned CLI. Upstream eligibility and billing errors
-  prevented successful real-account acceptance; login/key presence alone is
-  not a successful model request. Known eligibility, credits and model-removal
-  errors now have actionable, secret-safe messages.
+- Initial Google OAuth and Developer API attempts encountered upstream
+  eligibility and billing errors. Subsequent actual desktop Developer API
+  acceptance succeeds, including Default/Plan, skills and cross-chat flows
+  recorded above. Google OAuth-account acceptance remains pending; cached
+  login presence is not proof that inference works. Known eligibility, credits
+  and model-removal errors have actionable, secret-safe messages.
 - The visible development desktop was restarted against the Gemini-enabled
   server: New Chat shows both native and API Gemini choices with the sparkle
   mark, the slash picker lists installed skills, and an explicit model refresh
@@ -312,8 +344,8 @@ signal or equivalent before broad compatibility can be promised.
 
 | Checklist area | Current disposition |
 | --- | --- |
-| Runtime/auth/models | Native CLI + separate API profiles; local runtime/API fixtures pass. Real Google-account acceptance deferred. |
-| New/resume/Stop/Delete | Native UUID, queue, crash recovery, retained history and truthful cleanup tested. An extremely early startup Stop left a disposable live test fenced; that race remains under investigation. No native Fork. |
+| Runtime/auth/models | Native CLI + separate API profiles; local fixtures and bounded actual desktop Developer API requests pass. Google OAuth-account acceptance remains pending. |
+| New/resume/Stop/Delete | Native UUID, queue, crash recovery, retained history and truthful cleanup tested. Early startup Stop/Delete race fixed and exercised through the actual desktop; old persisted cleanup fences are not automatically cleared. No native Fork. |
 | Reasoning/trace/usage | Exposed native ACP events retained; fixture ordering/reconnect pass. Full real-model parity still unverified. |
 | Titles | Native summary adoption + first-user fallback; manual names win. No guaranteed first-turn generated title. |
 | Agent-to-agent | Server-provided, run-bound MCP; allowed/denied/revoked/busy/retry cases tested without blanket approvals. Actual offscreen App + Google API verifies queue/cancel, one message each way, purple cards, native IDs and reopen; automatic mailbox wakes do not create user bubbles. |
@@ -327,8 +359,8 @@ signal or equivalent before broad compatibility can be promised.
 Apply the [complete provider checklist](PROVIDER_INTEGRATION_CHECKLIST.md), not
 just the successful text fixture. In particular:
 
-1. Real Google OAuth and real Developer API key requests, expired credentials,
-   organization policy, proxies and billing/model availability.
+1. Real Google OAuth acceptance and broader Developer API failure coverage:
+   expired credentials, organization policy, proxies and billing/model availability.
 2. Complete native tool/trace parity with a usable real account. The implemented
    live text path is accepted through the actual App and local API fixture, not
    as proof of all native rendering behavior.

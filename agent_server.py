@@ -90705,6 +90705,16 @@ async def delete_session(session_id: str, discard_updated_at: str | None = None)
                                 "shortly."
                             ),
                         )
+                elif active.get("backend") == BACKEND_GEMINI:
+                    cleanup = active.get("gemini_cleanup")
+                    try:
+                        if not callable(cleanup):
+                            raise RuntimeError("Missing Gemini cleanup owner")
+                        await cleanup()
+                    except Exception:
+                        raise HTTPException(status_code=409, detail=(
+                            "Gemini runtime cleanup could not be verified; the chat was not deleted. Retry Stop."
+                        )) from None
                 elif proc:
                     await terminate_process_tree(proc)
 
@@ -96012,7 +96022,20 @@ async def stop_turn(
     # The app-server process may serve multiple Codex chats and must never be
     # terminated as a per-chat Stop action.
     if proc and active.get("transport") != CODEX_TRANSPORT_APP_SERVER:
-        await terminate_process_tree(proc)
+        if active.get("backend") == BACKEND_GEMINI:
+            # Gemini owns a verified-cleanup guard. Generic tree termination
+            # can kill it before startup or during verification, destroying the
+            # cleanup evidence and leaving the chat permanently fenced.
+            cleanup = active.get("gemini_cleanup")
+            try:
+                if not callable(cleanup):
+                    raise RuntimeError("Missing Gemini cleanup owner")
+                await cleanup()
+            except Exception:
+                return {"ok": False, "stopped": False, "pending": True,
+                        "message": "Gemini runtime cleanup is incomplete. Retry Stop; this chat remains fenced."}
+        else:
+            await terminate_process_tree(proc)
     if transition_ready is not None:
         try:
             await asyncio.wait_for(

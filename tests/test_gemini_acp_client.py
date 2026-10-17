@@ -143,6 +143,62 @@ class GeminiTransportTests(unittest.IsolatedAsyncioTestCase):
         await self.client.close()
         self.assertIsNotNone(proc.returncode)
 
+    async def test_stop_immediately_after_spawn_keeps_verified_cleanup(self):
+        async def stopped(_proc):
+            raise asyncio.CancelledError()
+        with self.assertRaises(asyncio.CancelledError):
+            await self.client.start([sys.executable, str(self.script)], cwd=str(self.root),
+                                    env=dict(os.environ), on_started=stopped)
+        await self.client.close()
+        self.assertTrue(self.client.cleanup_complete)
+        self.assertIn(self.client.process.returncode, {0, 71, 143})
+
+    async def test_cancel_during_spawn_retains_process_for_verified_cleanup(self):
+        original = asyncio.create_subprocess_exec
+        spawned = asyncio.Event()
+        release = asyncio.Event()
+        async def delayed(*args, **kwargs):
+            proc = await original(*args, **kwargs)
+            spawned.set()
+            await release.wait()
+            return proc
+        with patch("gemini_acp_client.asyncio.create_subprocess_exec", side_effect=delayed):
+            starting = asyncio.create_task(self.start())
+            await asyncio.wait_for(spawned.wait(), 5)
+            starting.cancel()
+            await asyncio.sleep(0)
+            starting.cancel()
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await starting
+        self.assertIsNotNone(self.client.process)
+        await self.client.close()
+        self.assertTrue(self.client.cleanup_complete)
+
+    async def test_provider_exec_failure_does_not_leave_a_cleanup_fence(self):
+        with self.assertRaises(GeminiProtocolError):
+            await self.client.start([str(self.root / "missing-provider")],
+                                    cwd=str(self.root), env=dict(os.environ))
+        await self.client.close()
+        self.assertTrue(self.client.cleanup_complete)
+        self.assertEqual(self.client.process.returncode, 71)
+
+    async def test_many_immediate_stops_never_accept_unverified_exit(self):
+        async def cycle():
+            client = GeminiACPClient(on_update=self.client.on_update)
+            async def stopped(_proc):
+                raise asyncio.CancelledError()
+            try:
+                with self.assertRaises(asyncio.CancelledError):
+                    await client.start([sys.executable, str(self.script)], cwd=str(self.root),
+                                       env=dict(os.environ), on_started=stopped)
+            finally:
+                await client.close()
+            self.assertTrue(client.cleanup_complete)
+            self.assertIn(client.process.returncode, {0, 71, 143})
+        for _ in range(5):
+            await asyncio.gather(*(cycle() for _ in range(4)))
+
     async def test_overlong_stdout_is_bounded_and_secret_safe(self):
         self.script.write_text('import sys\nsys.stdin.readline()\nprint("private" * 800000, flush=True)\n')
         with self.assertRaises(GeminiProtocolError): await self.start()

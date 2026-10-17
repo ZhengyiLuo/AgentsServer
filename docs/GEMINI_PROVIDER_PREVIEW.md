@@ -387,7 +387,7 @@ signal or equivalent before broad compatibility can be promised.
 | Existing skills | Native inventory/activation, trust, precedence, stale selection and approval tested; extension/hook parity not claimed. |
 | Jobs/shares/media | Server-provided jobs and interactive shares tested. Text/image/WAV transport tested; media understanding not accepted. |
 | Permission modes | Native Default/Auto Edit/YOLO/Plan wired through desktop and ACP, with explicit startup checks, native denial, next-turn semantics and same-session resume tested. Real Google API Default/Plan passed; broader organization/platform policy coverage remains unverified. |
-| Other native features | Fork, managed subagents, goals, side questions and explicit compaction control unsupported. |
+| Other native features | No native Fork/Goal/side-question controls in this integration. Gemini itself has subagents (`invoke_agent` is exposed to the model in ACP), but AgentsDock-managed child lifecycle controls are not implemented. Native terminal `/compress` exists; the pinned ACP command registry does not expose it. |
 | Client/release | Desktop and shared web exercised with actual transports/local API fixture. Mobile separate; real-account/platform and release validation pending. |
 
 Apply the [complete provider checklist](PROVIDER_INTEGRATION_CHECKLIST.md), not
@@ -409,11 +409,20 @@ just the successful text fixture. In particular:
    history reconciliation or native Fork support.
 5. Extension/hook customization parity remains unverified. Native permission
    modes have isolated native CLI and actual desktop boundary tests, not full
-   organization/platform policy coverage. Managed subagents, native goals, explicit compaction control and
-   side questions are unsupported; health capabilities say so. Actual ACP
-   `session/fork` returns method-not-found, while supported `session/set_mode`
-   selections succeed in the contract probe. No native `/btw` interaction is claimed. Mobile
-   requires its own implementation task.
+   organization/platform policy coverage. AgentsDock-managed subagent controls,
+   native goals, explicit compaction control and side questions are not exposed
+   by this integration; health capabilities say so. This does not mean Gemini
+   lacks native subagents or terminal compaction. Actual CLI 0.64.0 ACP probes
+   find `invoke_agent` among model tools; child lifecycle management is not
+   accepted merely because that tool exists. `session/fork` returns method-not-found,
+   while supported `session/set_mode` selections succeed. ACP `/help` lists no
+   `/compress`, `/agents`, `/fork`, `/goal` or `/btw` command; sending those strings
+   invokes ordinary model inference, not the terminal command. No native `/btw`
+   semantics or persistent Goal API is claimed. See the official
+   [subagent](https://geminicli.com/docs/core/subagents/),
+   [command](https://geminicli.com/docs/reference/commands/) and
+   [ACP](https://geminicli.com/docs/cli/acp-mode/) documentation. Mobile requires
+   its own implementation task.
 
 Old preview chats with an already-saved native UUID but missing native history
 are not automatically repaired. The first-failure prevention fix covers new

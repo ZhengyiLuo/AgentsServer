@@ -101,7 +101,10 @@ class Fixture(BaseHTTPRequestHandler):
 @unittest.skipUnless(os.environ.get("AGENTSDOCK_TEST_GEMINI_BIN"), "optional native lifecycle contract")
 class Lifecycle(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(); self.root = Path(self.temp.name)
+        self.temp = tempfile.TemporaryDirectory()
+        # macOS TMPDIR may use /var while native cwd resolves to /private/var.
+        # Both the CLI and HTTP fixture must use the same workspace identity.
+        self.root = Path(self.temp.name).resolve()
         self.project = self.root / "project"; self.project.mkdir(); self.state = self.root / "state"
         self.fixture_type = type("LocalAPI", (Fixture,), {"mode": "normal", "entered": threading.Event(), "release": threading.Event(), "bodies": [], "project": self.project})
         self.fixture = ThreadingHTTPServer(("127.0.0.1", 0), self.fixture_type)
@@ -447,7 +450,7 @@ class Lifecycle(unittest.TestCase):
         self.assertFalse((self.project / "must-not-exist.txt").exists())
         self.assertTrue(any(e["type"] == "tool_finished" and e["tool"].get("is_error") for e in self.events(other)))
 
-    def test_native_cli_skills_do_not_require_api_connection(self):
+    def test_api_skill_inventory_preserves_native_skills_without_cli_login_fallback(self):
         skill = self.root / ".gemini/skills/native-skill/SKILL.md"
         skill.parent.mkdir(parents=True)
         skill.write_text("---\nname: native-skill\ndescription: Disposable native-only skill\n---\nReply OK.")
@@ -459,8 +462,19 @@ class Lifecycle(unittest.TestCase):
         sid = result.json()["session"]["id"]
         response = self.client.get(f"/api/sessions/{sid}/provider-commands")
         self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(response.json()["support"]["available"], response.text)
+        self.assertEqual(response.json()["commands"], [])
+        # API-only preview: cached Google login cannot activate a legacy chat,
+        # but an explicit API connection can discover the same native assets.
+        api_sid = self.new()
+        before = len(self.fixture_type.bodies)
+        response = self.client.get(f"/api/sessions/{api_sid}/provider-commands")
+        self.assertEqual(response.status_code, 200, response.text)
         self.assertTrue(response.json()["support"]["available"], response.text)
         self.assertIn("native-skill", [item["name"] for item in response.json()["commands"]])
+        self.assertEqual(len(self.fixture_type.bodies), before, "Skill inventory must not invoke the model")
+        self.assertEqual(json.loads((self.root / ".gemini/settings.json").read_text())[
+            "security"]["auth"]["selectedType"], "oauth-personal")
 
     def test_scheduled_chat_and_standalone_jobs_preserve_parent_identity(self):
         sid = self.new(); self.send(sid); self.finished(sid)

@@ -264,10 +264,10 @@ signal or equivalent before broad compatibility can be promised.
 | Checklist area | Current disposition |
 | --- | --- |
 | Runtime/auth/models | Native CLI + separate API profiles; local runtime/API fixtures pass. Real Google-account acceptance deferred. |
-| New/resume/Stop/Delete | Native UUID, queue, crash recovery, retained history and truthful cleanup tested. No native Fork. |
+| New/resume/Stop/Delete | Native UUID, queue, crash recovery, retained history and truthful cleanup tested. An extremely early startup Stop left a disposable live test fenced; that race remains under investigation. No native Fork. |
 | Reasoning/trace/usage | Exposed native ACP events retained; fixture ordering/reconnect pass. Full real-model parity still unverified. |
 | Titles | Native summary adoption + first-user fallback; manual names win. No guaranteed first-turn generated title. |
-| Agent-to-agent | Server-provided, run-bound MCP; allowed/denied/revoked/busy/retry cases tested without blanket approvals. |
+| Agent-to-agent | Server-provided, run-bound MCP; allowed/denied/revoked/busy/retry cases tested without blanket approvals. Actual offscreen App + Google API verifies queue/cancel, one message each way, purple cards, native IDs and reopen; automatic mailbox wakes do not create user bubbles. |
 | Import/sync | Native discovery and initial text snapshot implemented; exact identity, workspace and ownership checked. Later native edits are not reconciled. |
 | Existing skills | Native inventory/activation, trust, precedence, stale selection and approval tested; extension/hook parity not claimed. |
 | Jobs/shares/media | Server-provided jobs and interactive shares tested. Text/image/WAV transport tested; media understanding not accepted. |

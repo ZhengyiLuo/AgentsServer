@@ -7244,7 +7244,7 @@ def preview_session_runtime_update(
     preview["model"] = prospective_model
     preview["effort"] = normalized_effort
     preview["provider_connection"] = connection
-    if connection_changed or connection == "default":
+    if backend_changed or connection_changed or connection == "default":
         preview.pop("provider_connection_revision", None)
     if connection == "custom":
         selected_connection = PROVIDER_CONNECTION_STORE.bind(preview)

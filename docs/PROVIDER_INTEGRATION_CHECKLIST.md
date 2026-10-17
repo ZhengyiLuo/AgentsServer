@@ -133,6 +133,10 @@ Describe differences and extra provider usage for server-provided equivalents.
 - [ ] Preserve discovery of the user's existing project, user and plugin skills
   under the provider's native scope/precedence rules. Use the correct working
   directory and configuration; do not copy, overwrite or reinstall their skills.
+- [ ] Include native built-in skills when available; check whether the provider's
+  default listing hides them behind an explicit flag. Test built-in markers,
+  same-name overrides and disabled entries. Do not advertise another provider's
+  private skills unless this runtime actually discovers and can activate them.
 - [ ] Verify runtime availability separately from AgentsDock's skill/command
   picker. Test explicit selection and automatic invocation where natively
   supported; do not assume every provider has the same syntax or discovery API.

@@ -25,8 +25,8 @@ class ToolAPI(BaseHTTPRequestHandler):
         prompt = ' '.join(p.get('text', '') for c in contents for p in c.get('parts', []))
         if responses:
             parts = [{'text': 'Fixture tool completed.'}]
-        elif 'FIXTURE_SKILL' in prompt:
-            parts = [{'functionCall': {'name': 'activate_skill', 'args': {'name': 'fixture-skill'}}}]
+        elif 'FIXTURE_SKILL' in prompt or 'BUILTIN_SKILL' in prompt:
+            parts = [{'functionCall': {'name': 'activate_skill', 'args': {'name': 'skill-creator' if 'BUILTIN_SKILL' in prompt else 'fixture-skill'}}}]
         else:
             parts = [{'functionCall': {'name': 'write_file', 'args': {'file_path': self.target, 'content': 'fixture only'}}}]
         result = {'candidates': [{'index': 0, 'content': {'role': 'model', 'parts': parts}, 'finishReason': 'STOP'}],
@@ -57,8 +57,9 @@ class NativeSkillContract(unittest.IsolatedAsyncioTestCase):
                 executable = os.environ['AGENTSDOCK_TEST_GEMINI_BIN']
                 raw = await asyncio.to_thread(list_native_skills, executable, env, str(project))
                 inventory = gemini_provider_skill_inventory(raw, cwd=str(project), selector_secret='test', binding_context='chat')
-                self.assertEqual([x['name'] for x in inventory.commands], ['fixture-skill'])
-                for prompt, decision in [('FIXTURE_SKILL', 'allow_once'), ('FIXTURE_WRITE', 'reject_once'), ('FIXTURE_WRITE', 'allow_once')]:
+                self.assertEqual([x['name'] for x in inventory.commands if x['scope'] == 'native'], ['fixture-skill'])
+                self.assertEqual({x['name'] for x in inventory.commands if x['scope'] == 'built-in'}, {'skill-creator', 'antigravity-support'})
+                for prompt, decision in [('FIXTURE_SKILL', 'allow_once'), ('BUILTIN_SKILL', 'allow_once'), ('FIXTURE_WRITE', 'reject_once'), ('FIXTURE_WRITE', 'allow_once')]:
                     events, permissions = [], []
                     async def update(value): events.append(value)
                     async def approve(value):
@@ -71,8 +72,12 @@ class NativeSkillContract(unittest.IsolatedAsyncioTestCase):
                         await client.open_session(cwd=str(project))
                         result = await client.prompt([{'type': 'text', 'text': prompt}], timeout=30)
                         self.assertEqual(result['stopReason'], 'end_turn')
-                        self.assertTrue(permissions, 'Native tool must request explicit approval')
+                        if prompt != 'BUILTIN_SKILL':
+                            self.assertTrue(permissions, 'Native tool must request explicit approval')
                         self.assertTrue(any(e['type'] == 'tool' for e in events))
+                        if prompt == 'BUILTIN_SKILL':
+                            self.assertTrue(any(e.get('status') == 'completed' for e in events if e['type'] == 'tool'))
+                            self.assertIn('skill-creator', json.dumps(ToolAPI.responses[-1]))
                         if prompt == 'FIXTURE_WRITE':
                             self.assertEqual(Path(ToolAPI.target).exists(), decision == 'allow_once')
                     finally:
@@ -105,4 +110,29 @@ class NativeSkillContract(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(trusted.records[0].native['path'], str(paths[3]))
             (project / '.gemini/settings.json').write_text('{"skills":{"disabled":["shared"]}}')
             disabled = await inventory({'GEMINI_CLI_TRUST_WORKSPACE': 'true'})
-            self.assertEqual(disabled.commands, [])
+            self.assertFalse(any(x['name'] == 'shared' for x in disabled.commands))
+            self.assertTrue(any(x['scope'] == 'built-in' for x in disabled.commands))
+
+    async def test_native_builtin_override_and_disable_without_scanning_foreign_provider(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); home = root / 'home'; project = root / 'project'
+            project.mkdir()
+            override = home / '.agents/skills/skill-creator/SKILL.md'
+            foreign = home / '.codex/skills/codex-only/SKILL.md'
+            for path, name in [(override, 'skill-creator'), (foreign, 'codex-only')]:
+                path.parent.mkdir(parents=True)
+                path.write_text(f'---\nname: {name}\ndescription: Native inventory boundary fixture\n---\nNo actions.')
+            async def inventory():
+                env = build_environment({'HOME': str(home), 'PATH': os.environ['PATH']}, cwd=str(project),
+                    api_home=root / 'api', api_key='synthetic-key', base_url='http://127.0.0.1:1')
+                raw = await asyncio.to_thread(list_native_skills, os.environ['AGENTSDOCK_TEST_GEMINI_BIN'], env, str(project))
+                return gemini_provider_skill_inventory(raw, cwd=str(project), selector_secret='test', binding_context='override')
+            selected = await inventory()
+            creator = [r for r in selected.records if r.public['name'] == 'skill-creator']
+            self.assertEqual(len(creator), 1)
+            self.assertEqual(creator[0].public['scope'], 'native')
+            self.assertEqual(creator[0].native['path'], str(override))
+            self.assertFalse(any(c['name'] == 'codex-only' for c in selected.commands))
+            (home / '.gemini').mkdir(exist_ok=True)
+            (home / '.gemini/settings.json').write_text('{"skills":{"disabled":["skill-creator","antigravity-support"]}}')
+            self.assertEqual((await inventory()).commands, [])

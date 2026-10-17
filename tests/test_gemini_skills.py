@@ -24,8 +24,9 @@ class GeminiSkillTests(unittest.TestCase):
         (self.home / '.gemini/oauth_creds.json').write_text('{"access_token":"do-not-copy"}')
         (self.home / '.gemini/trustedFolders.json').write_text('{}')
 
-    def listing(self, name='test', enabled='Enabled', description='Test skill'):
-        return f'Discovered Agent Skills:\n\n{name} [{enabled}]\n  Description: {description}\n  Location:    {self.skill}\n\n'
+    def listing(self, name='test', enabled='Enabled', description='Test skill', builtin=False):
+        marker = ' [Built-in]' if builtin else ''
+        return f'Discovered Agent Skills:\n\n{name} [{enabled}]{marker}\n  Description: {description}\n  Location:    {self.skill}\n\n'
 
     def inventory(self, raw=None, binding='chat'):
         return gemini_provider_skill_inventory(raw or self.listing(), cwd=str(self.root), selector_secret='test-secret', binding_context=binding)
@@ -50,6 +51,25 @@ class GeminiSkillTests(unittest.TestCase):
         self.assertTrue(self.inventory(self.listing(description='Line one\n  second line')).commands)
         self.assertEqual(self.inventory(self.listing(name='unsafe/name')).commands, [])
 
+    def test_builtin_marker_is_metadata_not_part_of_invocation(self):
+        local = self.listing(name='local')
+        builtin = self.listing(name='skill-creator', builtin=True)
+        inv = self.inventory(local + builtin.split('\n\n', 1)[1])
+        self.assertEqual([c['name'] for c in inv.commands], ['local', 'skill-creator'])
+        self.assertEqual(inv.commands[0]['scope'], 'native')
+        self.assertEqual(inv.commands[1]['scope'], 'built-in')
+        self.assertEqual(inv.commands[1]['invocation'], '/skill-creator')
+        self.assertNotIn(str(self.home), json.dumps(inv.commands))
+        before = self.inventory(builtin).revision
+        self.skill.write_text('changed builtin content')
+        self.assertNotEqual(before, self.inventory(builtin).revision)
+
+    def test_disabled_builtin_and_unknown_markers_are_not_offered(self):
+        self.assertEqual(self.inventory(self.listing(builtin=True, enabled='Disabled')).commands, [])
+        for marker in ['[Built-in] [Built-in]', '[Unknown]', '[Built-in] extra']:
+            with self.subTest(marker=marker), self.assertRaises(ProviderCommandDiscoveryError):
+                self.inventory(self.listing(builtin=True).replace('[Built-in]', marker))
+
     def test_api_links_assets_and_preserves_disables_trust_policies_not_auth(self):
         before = self.settings.read_bytes()
         profile = self.root / 'api'
@@ -71,7 +91,7 @@ class GeminiSkillTests(unittest.TestCase):
 
     def test_discovery_is_bounded_and_uses_exact_native_subcommand(self):
         executable = self.root / 'gemini'
-        executable.write_text(f'#!{sys.executable}\nimport sys\nassert sys.argv[1:]==["skills", "list"]\nprint("No skills discovered.")\n')
+        executable.write_text(f'#!{sys.executable}\nimport sys\nassert sys.argv[1:]==["skills", "list", "--all"]\nprint("No skills discovered.")\n')
         executable.chmod(0o700)
         self.assertEqual(list_native_skills(str(executable), dict(os.environ), str(self.root)).strip(), 'No skills discovered.')
         for code in ['import time; time.sleep(10)', 'print("x"*1100000)']:

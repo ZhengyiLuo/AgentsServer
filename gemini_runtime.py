@@ -254,10 +254,12 @@ def inherit_skill_configuration(original: Path, profile: Path, settings: dict) -
 def list_native_skills(executable: str, env: dict[str, str], cwd: str, timeout: float = 15) -> str:
     """Pinned native discovery, including enabled extension skills and trust.
 
-    This is the CLI's local `skills list`, not an ACP model prompt/authenticate.
+    Include built-ins with the native --all flag; it does not enable disabled
+    skills or override workspace trust. This is local discovery, not an ACP
+    model prompt/authenticate.
     Kill the owned group on timeout/output overflow; never publish stderr.
     """
-    process = subprocess.Popen([executable, "skills", "list"], cwd=cwd,
+    process = subprocess.Popen([executable, "skills", "list", "--all"], cwd=cwd,
         env={**env, "NO_COLOR": "1", "FORCE_COLOR": "0"}, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)
     data = bytearray()

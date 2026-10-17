@@ -1008,10 +1008,10 @@ def gemini_provider_skill_inventory(raw: str, *, cwd: str, selector_secret: str,
     seen = set()
     total = 0
     for block in blocks:
-        match = re.fullmatch(r"([^\n]+) \[(Enabled|Disabled)\]\n  Description: ([\s\S]*?)\n  Location:    ([^\n]+)", block)
+        match = re.fullmatch(r"([^\n]+) \[(Enabled|Disabled)\]( \[Built-in\])?\n  Description: ([\s\S]*?)\n  Location:    ([^\n]+)", block)
         if not match:
             raise ProviderCommandDiscoveryError("Gemini skill inventory format is unsupported")
-        name, enabled, description, location = match.groups()
+        name, enabled, builtin, description, location = match.groups()
         if enabled == "Disabled":
             continue
         # Native names can be more permissive than our slash-token grammar.
@@ -1047,7 +1047,7 @@ def gemini_provider_skill_inventory(raw: str, *, cwd: str, selector_secret: str,
         records.append(ProviderCommandRecord(public={
             "id": command_id, "name": name, "label": name,
             "description": sanitize_provider_command_text(description, MAX_PROVIDER_COMMAND_DESCRIPTION_CHARS),
-            "scope": "native", "source": "gemini", "kind": "skill", "invocation": f"/{name}",
+            "scope": "built-in" if builtin else "native", "source": "gemini", "kind": "skill", "invocation": f"/{name}",
         }, native={"name": name, "path": str(path), "content_sha256": digest}))
     return _inventory(selector_secret, binding_context, "gemini", cwd, records, truncated=False)
 

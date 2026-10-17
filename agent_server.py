@@ -61248,7 +61248,7 @@ async def discover_session_provider_commands(
             inventory = await asyncio.to_thread(discover_gemini)
         except (GeminiConfigurationError, ProviderCommandDiscoveryError, HTTPException, OSError, ValueError):
             return provider_command_snapshot(empty, provider_command_support(False, "unavailable",
-                "Gemini skills could not be read. Check gemini skills list in this workspace and refresh.")), empty
+                "Gemini skills could not be read. Check gemini skills list --all in this workspace and refresh.")), empty
         return provider_command_snapshot(inventory, provider_command_support(True, "native_activation_request")), inventory
     if backend == BACKEND_OPENCODE:
         try:

@@ -87,8 +87,11 @@ require an explicit model check. Manual model selection remains available.
 - Gemini sparkle mark and separate native/API choices in the desktop picker.
   Slim session polling retains custom model lists instead of replacing them
   with a model-less summary. Gemini errors are not labeled as Codex errors.
-- Skills are discovered by the pinned native `gemini skills list`, including
-  its trust, precedence and disabled-skill decisions. The slash picker uses
+- Skills are discovered by the pinned native `gemini skills list --all`, including
+  built-ins (marked `built-in`), extensions, user and trusted workspace skills.
+  The plain command hides built-ins. Native trust, precedence and disabled-skill
+  decisions still apply; unrelated provider-private skill folders are not scanned.
+  The slash picker uses
   opaque chat-bound IDs and revalidates the file fingerprint at admission and
   launch. Selection is a **native activation request**, not a native slash
   command: Gemini must call `activate_skill`; ordinary approvals still apply.

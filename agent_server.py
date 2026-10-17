@@ -1305,6 +1305,7 @@ MAX_LOCAL_SESSION_SCAN_FILES = 10_000
 # Retained text/metadata budget. Opaque native media/tool bytes are streamed.
 # Private timeline/index readers still use this as their raw record bound.
 MAX_LOCAL_TRANSCRIPT_LINE_BYTES = 32 * 1024 * 1024
+HISTORY_SYNC_BATCH_BYTES = 16 * 1024 * 1024
 MAX_LOCAL_TRANSCRIPT_SCAN_LINES = 250_000
 MAX_CODEX_SESSION_INDEX_BYTES = 16 * 1024 * 1024
 MAX_CODEX_SESSION_INDEX_LINES = 100_000
@@ -6752,6 +6753,7 @@ class ProviderCommandSelectionUnavailable(HTTPException):
 
 class TurnRequest(BaseModel):
     prompt: str
+    client_request_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{8,128}$")
     # Server-derived attribution only; the guest router accepts neither field
     # from its JSON body and never accepts arbitrary TurnRequest controls.
     shared_chat_id: str | None = Field(default=None, pattern=r"^interactive_[a-f0-9]{32}$")
@@ -14183,6 +14185,8 @@ RUN_NOW_TURNS: dict[str, dict[str, Any]] = {}
 # that the scan has not discovered yet. A completed failed task intentionally
 # remains installed and keeps admission fail-closed.
 QUEUE_RECOVERY_TASK: asyncio.Task[tuple[int, int]] | None = None
+QUEUE_RECOVERY_READY: set[str] = set()
+QUEUE_CHECKPOINT_DIRTY: set[str] = set()
 QUEUE_RECOVERY_ADMISSION_WAIT_SECONDS = 2.0
 STEERING_SESSIONS: set[str] = set()
 # A non-native Force Send keeps the steering fence while the interrupted
@@ -17445,6 +17449,7 @@ def should_bump_session_updated_at(event_type: str, event: dict[str, Any]) -> bo
 
 
 async def update_session_event_metadata(session_id: str, event: dict[str, Any]) -> None:
+    QUEUE_CHECKPOINT_DIRTY.add(session_id)
     sess = STORE.sessions.get(session_id)
     if not sess:
         return
@@ -17587,8 +17592,17 @@ def queue_recovery_readiness() -> dict[str, Any]:
     }
 
 
-async def wait_for_queue_recovery_admission() -> None:
-    """Wait for startup replay without cancelling it or masking its failure."""
+async def wait_for_queue_recovery_admission(session_id: str | None = None) -> None:
+    """Wait briefly for the one startup queue scan, then fail retryably.
+
+    The shared recovery task is shielded because disconnecting one request
+    must never cancel the only owner of the durable queue rebuild. A failed
+    scan remains authoritative until process restart rather than opening an
+    ordering hole with only a partial in-memory queue.
+    """
+
+    if session_id is not None and session_id in QUEUE_RECOVERY_READY:
+        return
     recovery = QUEUE_RECOVERY_TASK
     if recovery is None or recovery is asyncio.current_task():
         return
@@ -17627,7 +17641,7 @@ async def enqueue_turn(
     secure_peer_route_snapshots: list[dict[str, Any]] | None = None,
     reciprocal_route_grant: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    await wait_for_queue_recovery_admission()
+    await wait_for_queue_recovery_admission(session_id)
     if not routed_references_match_visible_prompt(
         req.prompt,
         req.display_prompt,
@@ -17899,6 +17913,7 @@ async def enqueue_turn(
                 ),
                 "prompt": display_prompt,
                 "request_prompt": req.prompt,
+                "client_request_id": getattr(req, "client_request_id", None),
                 "display_prompt": req.display_prompt,
                 "file_ids": list(req.file_ids),
                 "position": position,
@@ -18164,7 +18179,7 @@ async def enqueue_turn(
 
 
 async def unqueue_turn(session_id: str, queued_id: str) -> dict[str, Any]:
-    await wait_for_queue_recovery_admission()
+    await wait_for_queue_recovery_admission(session_id)
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
 
@@ -22701,7 +22716,7 @@ def public_queued_turn(
 
 
 async def queued_turns_snapshot(session_id: str) -> list[dict[str, Any]]:
-    await wait_for_queue_recovery_admission()
+    await wait_for_queue_recovery_admission(session_id)
     async with QUEUE_LOCK:
         queue = list(QUEUED_TURNS.get(session_id) or [])
         run_now = RUN_NOW_TURNS.get(session_id)
@@ -22761,7 +22776,7 @@ def reject_promoted_queue_mutation(session_id: str, queued_id: str) -> None:
 
 
 async def update_queued_turn(session_id: str, queued_id: str, req: UpdateQueuedTurnRequest) -> dict[str, Any]:
-    await wait_for_queue_recovery_admission()
+    await wait_for_queue_recovery_admission(session_id)
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
     async_result = await update_async_queued_message(session_id, queued_id, req)
@@ -23208,7 +23223,7 @@ async def update_queued_turn(session_id: str, queued_id: str, req: UpdateQueuedT
 
 
 async def move_queued_turn(session_id: str, queued_id: str, req: MoveQueuedTurnRequest) -> dict[str, Any]:
-    await wait_for_queue_recovery_admission()
+    await wait_for_queue_recovery_admission(session_id)
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
     direction = req.direction.strip().lower()
@@ -23723,7 +23738,7 @@ async def reconcile_idle_queued_turns(*, reason: str) -> int:
 
 async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]:
     """Coalesce duplicate Force Send requests without replaying a steer."""
-    await wait_for_queue_recovery_admission()
+    await wait_for_queue_recovery_admission(session_id)
     ensure_session_not_deleting(session_id)
     await reconcile_idle_queue_session(
         session_id,
@@ -25368,7 +25383,7 @@ def schedule_steered_turn_slot_waiter(
 
 
 async def start_next_queued_turn(session_id: str) -> None:
-    await wait_for_queue_recovery_admission()
+    await wait_for_queue_recovery_admission(session_id)
     await reconcile_idle_queue_session(
         session_id,
         schedule=False,
@@ -26010,12 +26025,76 @@ def queued_turn_from_event(event: dict[str, Any], sess: dict[str, Any], position
     }
 
 
-def queued_event_lines(path: Path, *, include_envelopes: bool = False) -> Iterator[bytes]:
+def queued_event_lines(path: Path, *, include_envelopes: bool = False,
+                       scan: dict[str, Any] | None = None) -> Iterator[bytes]:
     with path.open("rb") as source:
-        for raw_line in source:
+        if scan is not None:
+            source.seek(scan["offset"])
+        while True:
+            remaining = scan["end"] - source.tell() if scan is not None else -1
+            if remaining == 0:
+                break
+            raw_line = source.readline(remaining)
+            if not raw_line:
+                break
+            if scan is not None:
+                if not raw_line.endswith(b"\n"):
+                    break
+                scan["offset"] = source.tell()
             if (b'"queued_id"' in raw_line or b'"turn_queue_paused"' in raw_line
                     or (include_envelopes and b'"cross_chat_envelope_id"' in raw_line)):
                 yield raw_line
+
+
+def queue_checkpoint_anchor(path: Path, offset: int) -> str:
+    with path.open("rb") as stream:
+        stream.seek(max(0, offset - 4096))
+        return hashlib.sha256(stream.read(min(offset, 4096))).hexdigest()
+
+
+def queue_checkpoint_seed(path: Path, stamp, *, enabled: bool) -> tuple[dict, list]:
+    if enabled:
+        try:
+            checkpoint_path = path.with_name("queue-recovery.json")
+            if checkpoint_path.stat().st_size > 16 * 1024 * 1024:
+                raise ValueError("oversized queue checkpoint")
+            value = json.loads(checkpoint_path.read_text())
+            offset = value["offset"]
+            rows = value["pending"]
+            if (value["version"] == 1 and value["dev"] == stamp.st_dev
+                    and value["ino"] == stamp.st_ino and isinstance(offset, int)
+                    and 0 <= offset <= stamp.st_size
+                    and (offset != stamp.st_size or value["mtime_ns"] == stamp.st_mtime_ns)
+                    and value["anchor"] == queue_checkpoint_anchor(path, offset)
+                    and isinstance(rows, list)
+                    and all(isinstance(row, dict) and isinstance(row.get("queued_id"), str) for row in rows)):
+                return {"offset": offset, "end": stamp.st_size}, rows
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    return {"offset": 0, "end": stamp.st_size}, []
+
+
+def save_queue_checkpoint(path: Path, stamp, offset: int, rows: list) -> None:
+    # These logs are server-owned append-only journals. Replacement/truncation
+    # invalidates the checkpoint; a bounded boundary anchor detects regrowth.
+    current = path.stat()
+    if (current.st_dev, current.st_ino) != (stamp.st_dev, stamp.st_ino) or current.st_size < offset:
+        return
+    if current.st_size == stamp.st_size and current.st_mtime_ns != stamp.st_mtime_ns:
+        return
+    value = {"version": 1, "dev": stamp.st_dev, "ino": stamp.st_ino,
+             "mtime_ns": stamp.st_mtime_ns, "offset": offset,
+             "anchor": queue_checkpoint_anchor(path, offset), "pending": rows}
+    target = path.with_name("queue-recovery.json")
+    temporary = target.with_suffix(f".{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("x") as stream:
+            json.dump(value, stream, separators=(",", ":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def record_mailbox_migration_evidence(evidence: dict[str, dict[str, Any]], event: dict[str, Any]) -> None:
@@ -26051,11 +26130,13 @@ def scan_queued_turns_from_events(
             value["complete"] = False
         if not path.exists():
             continue
-        proof_stamp = path.stat() if evidence else None
+        scan_stamp = path.stat()
+        proof_stamp = scan_stamp if evidence else None
         proof_complete = True
-        pending: dict[str, dict[str, Any]] = {}
-        order: list[str] = []
-        for raw_line in (queued_event_lines(path, include_envelopes=True) if evidence else queued_event_lines(path)):
+        scan, prior_rows = queue_checkpoint_seed(path, scan_stamp, enabled=not evidence)
+        pending: dict[str, dict[str, Any]] = {row["queued_id"]: row for row in prior_rows}
+        order: list[str] = [row["queued_id"] for row in prior_rows]
+        for raw_line in queued_event_lines(path, include_envelopes=bool(evidence), scan=scan):
             try:
                 event = json.loads(raw_line.decode("utf-8", "replace"))
             except Exception:
@@ -26215,7 +26296,9 @@ def scan_queued_turns_from_events(
             unchanged = ((proof_stamp.st_dev, proof_stamp.st_ino, proof_stamp.st_size, proof_stamp.st_mtime_ns)
                          == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns))
             for value in evidence.values():
-                value["complete"] = proof_complete and unchanged
+                # A snapshot ending in a partial record was not fully scanned.
+                # It may hide a terminal/admission event, so never migrate it.
+                value["complete"] = proof_complete and unchanged and scan["offset"] == scan["end"]
         items = [
             pending[qid]
             for qid in order
@@ -26226,6 +26309,9 @@ def scan_queued_turns_from_events(
         ]
         if items:
             recovered[session_id] = items
+        if proof_complete:
+            with suppress(OSError):
+                save_queue_checkpoint(path, scan_stamp, scan["offset"], [pending[qid] for qid in order if qid in pending])
     return recovered
 
 
@@ -26389,13 +26475,48 @@ async def migrate_unstarted_chat_mailbox_backlog(
     return migrated
 
 
+async def queue_checkpoint_loop() -> None:
+    while True:
+        await asyncio.sleep(60)
+        if QUEUE_RECOVERY_TASK is not None:
+            continue
+        for session_id in tuple(QUEUE_CHECKPOINT_DIRTY):
+            sess = STORE.sessions.get(session_id)
+            QUEUE_CHECKPOINT_DIRTY.discard(session_id)
+            if not sess or session_id in DELETING_SESSIONS:
+                continue
+            try:
+                await asyncio.to_thread(scan_queued_turns_from_events, [(session_id, dict(sess))])
+            except Exception as exc:
+                QUEUE_CHECKPOINT_DIRTY.add(session_id)
+                logger.warning("queue checkpoint deferred session=%s error=%s", session_id, type(exc).__name__)
+
+
 async def recover_queued_turns_after_start() -> tuple[int, int]:
+    QUEUE_RECOVERY_READY.clear()
+    candidates = await CROSS_CHAT.pending_mailbox_migration_candidates()
+    sessions = [(sid, dict(sess)) for sid, sess in STORE.sessions.items()]
+    # Recover small/checkpointed chats first. A legacy giant only fences itself.
+    def recovery_cost(item):
+        path = events_path(item[0])
+        try:
+            checkpoint = json.loads(path.with_name("queue-recovery.json").read_text())
+            return max(0, path.stat().st_size - int(checkpoint.get("offset", 0)))
+        except (OSError, ValueError, TypeError):
+            return path.stat().st_size if path.exists() else 0
+    sessions = await asyncio.to_thread(lambda: sorted(sessions, key=recovery_cost))
+    rebuilt = scheduled = 0
+    for sid, sess in sessions:
+        relevant = [row for row in candidates if row.get("target_session_id") == sid]
+        count, started = await _recover_queued_turns_for_sessions([(sid, sess)], relevant)
+        rebuilt += count
+        scheduled += started
+        QUEUE_RECOVERY_READY.add(sid)
+    return rebuilt, scheduled
+
+
+async def _recover_queued_turns_for_sessions(session_items, migration_candidates) -> tuple[int, int]:
     started = time.monotonic()
-    session_items = [
-        (session_id, dict(sess))
-        for session_id, sess in STORE.sessions.items()
-    ]
-    migration_candidates = await CROSS_CHAT.pending_mailbox_migration_candidates()
     mailbox_evidence = {str(record["id"]): {"target_session_id": record["target_session_id"]}
                        for record in migration_candidates if is_async_route_message(record)}
     recovered = await asyncio.to_thread(scan_queued_turns_from_events, session_items,
@@ -32604,14 +32725,14 @@ CODEX_GOAL_HISTORY_REPAIR_CACHE = CodexGoalHistoryRepairCache()
 CODEX_NATIVE_HISTORY_REPAIR_CACHE = CodexNativeHistoryRepairCache()
 
 
-def prepare_provider_history_metadata_repair(session_id: str) -> None:
-    """Prepare bounded source proofs only at explicit history-read boundaries."""
+def prepare_provider_history_metadata_repair(session_id: str) -> bool | None:
+    """Prepare bounded source proofs in background history maintenance."""
     prepare_claude_history_metadata_repair(session_id)
     prepare_codex_goal_history_repair(session_id)
-    prepare_codex_native_history_repair(session_id)
+    return prepare_codex_native_history_repair(session_id)
 
 
-def prepare_codex_native_history_repair(session_id: str) -> None:
+def prepare_codex_native_history_repair(session_id: str) -> bool | None:
     session = STORE.sessions.get(session_id)
     provider_id = provider_session_identifier(session_provider_id(session)) if isinstance(session, dict) else None
     if not provider_id or session.get("backend") != BACKEND_CODEX or session.get("_deleting") is True:
@@ -32626,11 +32747,13 @@ def prepare_codex_native_history_repair(session_id: str) -> None:
             session_id, provider_id, events_path(session_id), source, CODEX_SESSIONS_ROOT,
             lambda event: codex_history_event_item(event, expected_session_id=session_id),
         )
-    except CodexNativeHistoryProofUnavailable:
+    except CodexNativeHistoryProofUnavailable as exc:
+        if getattr(exc, "deterministic", False):
+            raise
         # Incomplete evidence is retryable at a later explicit read boundary,
         # not a successful empty proof and not a reason to break chat opening.
         logger.debug("native history repair deferred session=%s", session_id)
-        return
+        return False
     if changed:
         HISTORY_SEARCH_REPAIR_DIRTY.add(session_id)
         HISTORY_SEARCH_DIRTY.add(session_id)
@@ -33193,7 +33316,6 @@ def build_timeline_index(session_id: str) -> dict[str, Any]:
 
 
 def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
-    prepare_provider_history_metadata_repair(session_id)
     claude_metadata_signature = CLAUDE_METADATA_REPAIR_CACHE.signature(session_id)
     codex_goal_history_signature = (
         CODEX_GOAL_HISTORY_REPAIR_CACHE.signature(session_id),
@@ -33281,6 +33403,15 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
         if can_append
         else []
     )
+    # Keep provisional turn lookup linear in the journal size. Scheduled-job
+    # streams can have hundreds of thousands of events with no ordinary turn;
+    # scanning every preceding landmark for each one makes cold opens quadratic.
+    turn_record_keys_by_run: dict[str, list[str]] = {}
+    for existing in records:
+        existing_key = str(existing.get("key") or "")
+        if existing_key.startswith("turn:"):
+            existing_run = existing_key[5:].split(":start-", 1)[0]
+            turn_record_keys_by_run.setdefault(existing_run, []).append(existing_key)
     dirty_record_keys: set[str] = set()
     active_turn_key: str | None = cached.get("active_turn_key") if can_append else None
     current_turn_by_run: dict[str, str] = (
@@ -33601,6 +33732,8 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
             }
             by_key[key] = record
             records.append(record)
+            if key.startswith("turn:"):
+                turn_record_keys_by_run.setdefault(key[5:].split(":start-", 1)[0], []).append(key)
             if advance_timeline:
                 latest_timeline_landmark_key = key
         record["start_seq"] = min(int(record["start_seq"]), seq)
@@ -34067,16 +34200,10 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                     job_by_run[run_id] = job_id
                 prior_key = current_turn_by_run.pop(run_id, None) if run_id else None
                 if not prior_key and run_id:
-                    base_turn_key = f"turn:{run_id}"
-                    prior_key = next(
-                        (
-                            str(candidate.get("key") or "")
-                            for candidate in reversed(records)
-                            if str(candidate.get("key") or "") == base_turn_key
-                            or str(candidate.get("key") or "").startswith(f"{base_turn_key}:start-")
-                        ),
-                        None,
-                    )
+                    prior_keys = turn_record_keys_by_run.get(run_id, [])
+                    while prior_keys and prior_keys[-1] not in by_key:
+                        prior_keys.pop()
+                    prior_key = prior_keys[-1] if prior_keys else None
                 prior = by_key.get(prior_key or "")
                 group_key, group_created = assign_job_timeline_group(
                     event,
@@ -46385,7 +46512,7 @@ def bounded_jsonl_events(path: Path, *, preserve_invalid: bool = False) -> Itera
 
 def bounded_jsonl_records_range(
     path: Path, start: int, end: int, *, expected_stat: dict[str, int],
-    require_newline: bool = True,
+    require_newline: bool = True, allow_partial: bool = False,
 ) -> Iterator[tuple[dict[str, Any] | None, int]]:
     """Read every record and ending offset in one immutable JSONL range."""
     if start < 0 or end < start or end > expected_stat["st_size"]:
@@ -46395,10 +46522,12 @@ def bounded_jsonl_records_range(
         if any(int(getattr(before, field)) != int(expected_stat[field]) for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns")):
             raise ValueError("transcript changed before cursor parsing")
         stream.seek(start)
-        for event, offset, _raw in jsonl_records(stream, end=end,
+        for count, (event, offset, _raw) in enumerate(jsonl_records(stream, end=end,
                 require_newline=require_newline, max_records=MAX_LOCAL_TRANSCRIPT_SCAN_LINES,
-                max_retained_bytes=MAX_LOCAL_TRANSCRIPT_LINE_BYTES):
+                max_retained_bytes=MAX_LOCAL_TRANSCRIPT_LINE_BYTES), 1):
             yield event, offset
+            if allow_partial and count >= MAX_LOCAL_TRANSCRIPT_SCAN_LINES:
+                break
         after = os.fstat(stream.fileno())
         if any(int(getattr(after, field)) != int(expected_stat[field]) for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns")):
             raise ValueError("transcript changed during cursor parsing")
@@ -46692,20 +46821,7 @@ def find_codex_history(provider_id: str) -> Path | None:
     clean_provider_id = provider_session_identifier(provider_id)
     if clean_provider_id is None:
         return None
-    if not CODEX_SESSIONS_ROOT.exists():
-        return None
-    selected: Path | None = None
-    selected_mtime = -1.0
-    for path in bounded_jsonl_paths(CODEX_SESSIONS_ROOT):
-        transcript_id, _cwd = codex_transcript_meta(path)
-        if transcript_id != clean_provider_id:
-            continue
-        with suppress(OSError):
-            mtime = path.stat().st_mtime
-            if mtime > selected_mtime:
-                selected = path
-                selected_mtime = mtime
-    return selected
+    return codex_rollout_path(clean_provider_id)
 
 
 def codex_compaction_count(sess: dict[str, Any]) -> int:
@@ -46747,7 +46863,7 @@ def codex_rollout_path(thread_id: str) -> Path | None:
     """Locate ``rollout-*-<thread_id>.jsonl`` under CODEX_SESSIONS_ROOT.
 
     Blocking filesystem work; call from a worker thread. Hits are cached per
-    thread id and re-validated with one stat. Misses are cached briefly so a
+    thread id and re-validated with a bounded metadata read. Misses are cached briefly so a
     thread whose rollout has not been flushed yet does not trigger a directory
     walk on every runtime snapshot.
     """
@@ -46757,7 +46873,7 @@ def codex_rollout_path(thread_id: str) -> Path | None:
         return None
     cached = CODEX_ROLLOUT_PATH_CACHE.get(clean_id)
     if cached is not None:
-        if cached.is_file():
+        if contained_jsonl_path(cached, CODEX_SESSIONS_ROOT) is not None and codex_transcript_meta(cached)[0] == clean_id:
             return cached
         CODEX_ROLLOUT_PATH_CACHE.pop(clean_id, None)
     missed_at = CODEX_ROLLOUT_PATH_MISSES.get(clean_id)
@@ -46770,17 +46886,29 @@ def codex_rollout_path(thread_id: str) -> Path | None:
     suffix = f"-{clean_id}.jsonl"
     selected: Path | None = None
     selected_mtime = -1.0
+    legacy_paths: list[Path] = []
     for path in bounded_jsonl_paths(CODEX_SESSIONS_ROOT):
         name = path.name
         if not (name.startswith("rollout-") and name.endswith(suffix)):
+            legacy_paths.append(path)
             continue
-        if not codex_rollout_head_matches(path, clean_id):
+        if codex_transcript_meta(path)[0] != clean_id:
             continue
         with suppress(OSError):
             mtime = path.stat().st_mtime
             if mtime > selected_mtime:
                 selected = path
                 selected_mtime = mtime
+    if selected is None:
+        # Preserve discovery of renamed/legacy transcripts without reading
+        # unrelated headers on the ordinary filename lookup path.
+        for path in legacy_paths:
+            if codex_transcript_meta(path)[0] != clean_id:
+                continue
+            with suppress(OSError):
+                mtime = path.stat().st_mtime
+                if mtime > selected_mtime:
+                    selected, selected_mtime = path, mtime
     if selected is None:
         CODEX_ROLLOUT_PATH_MISSES[clean_id] = now
         if len(CODEX_ROLLOUT_PATH_MISSES) > 1024:
@@ -48444,7 +48572,7 @@ def codex_transcript_meta(
 ) -> tuple[str | None, str | None]:
     """Return (session_id, cwd) from a Codex transcript's session_meta record."""
     with suppress(OSError, ValueError):
-        for index, event in enumerate(bounded_jsonl_events(path)):
+        for index, event in enumerate(codex_transcript_metadata_records(path)):
             if index >= CODEX_TRANSCRIPT_SCAN_LINES:
                 break
             if event.get("type") != "session_meta":
@@ -48458,6 +48586,23 @@ def codex_transcript_meta(
             cwd = normalized_local_session_cwd(payload.get("cwd"))
             return session_id, cwd
     return None, None
+
+
+def codex_transcript_metadata_records(path: Path) -> Iterator[dict[str, Any]]:
+    """Discovery reads a bounded header, independent of total rollout size."""
+    remaining = 1024 * 1024
+    with path.open("rb") as stream:
+        for _ in range(CODEX_TRANSCRIPT_SCAN_LINES):
+            line = stream.readline(min(remaining, MAX_LOCAL_TRANSCRIPT_LINE_BYTES) + 1)
+            if not line or len(line) > remaining or not line.endswith(b"\n"):
+                return
+            remaining -= len(line)
+            try:
+                record = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if isinstance(record, dict):
+                yield record
 
 
 def codex_transcript_preview(path: Path) -> str | None:
@@ -48814,6 +48959,12 @@ def provider_history_path(sess: dict[str, Any]) -> Path | None:
     if backend == BACKEND_CLAUDE:
         return find_claude_history(provider_id)
     if backend == BACKEND_CODEX:
+        cursor = normalized_history_sync_cursor(sess)
+        if cursor and cursor.get("provider_session_id") == provider_id:
+            path = contained_jsonl_path(Path(cursor["source_path"]), CODEX_SESSIONS_ROOT)
+            if path is not None and codex_transcript_meta(path)[0] == provider_id:
+                CODEX_ROLLOUT_PATH_CACHE[provider_id] = path
+                return path
         return find_codex_history(provider_id)
     return None
 
@@ -48936,6 +49087,8 @@ def normalized_history_sync_cursor(
             raw.get("timeline_pending_through_seq") or 0
         ),
         "timeline_pending_active": timeline_pending_active,
+        **({"bootstrap_timeline_seq": raw["bootstrap_timeline_seq"]}
+           if type(raw.get("bootstrap_timeline_seq")) is int and raw["bootstrap_timeline_seq"] >= 0 else {}),
         "checkpoint_seq": int(raw.get("checkpoint_seq", raw["timeline_seq"])),
     }
     # Distinguish a pre-feature cursor from an initialized conservative empty
@@ -49117,7 +49270,12 @@ def provider_history_source_snapshot(
             int(opened.st_mtime_ns),
         ) != expected_identity:
             raise ValueError("transcript changed before cursor snapshot")
-        remaining = int(initial.st_size)
+        # Verify the existing prefix, then prepare at most one bounded suffix.
+        # Total file size is not an import limit. Prefix verification remains
+        # necessary: provider transcripts can be replaced or rewritten.
+        snapshot_limit = min(int(initial.st_size), (verify_offset or 0) + HISTORY_SYNC_BATCH_BYTES)
+        remaining = snapshot_limit
+        consumed = 0
         while remaining > 0:
             chunk = stream.read(min(1024 * 1024, remaining))
             if not chunk:
@@ -49132,10 +49290,15 @@ def provider_history_source_snapshot(
             if newline >= 0:
                 running_digest.update(chunk[:newline + 1])
                 complete_digest = running_digest.copy()
-                complete_size = int(initial.st_size) - remaining - len(chunk) + newline + 1
+                complete_size = consumed + newline + 1
                 running_digest.update(chunk[newline + 1:])
             else:
                 running_digest.update(chunk)
+            consumed += len(chunk)
+            # A single streamed record may exceed a batch. Extend only until
+            # at least one new complete record exists, under the scan deadline.
+            if remaining == 0 and complete_size <= (verify_offset or 0) and consumed < int(initial.st_size):
+                remaining = min(1024 * 1024, int(initial.st_size) - consumed)
         finished = os.fstat(stream.fileno())
         if (
             int(finished.st_dev),
@@ -49288,6 +49451,7 @@ def parse_provider_history_delta(
         start,
         end,
         expected_stat=expected_stat,
+        allow_partial=True,
     ):
         if blocked_on_unseen_message:
             # Exhaust the fixed range so its final fstat validation still
@@ -49418,51 +49582,27 @@ def load_provider_history_with_cursor(
             if "claude_interruption_context" in previous
             else seed_claude_interruption_context(path, start, expected_stat=snapshot["expected_stat"], provider_session_id=provider_id)
         )
-    if continued and previous:
-        (
-            items,
-            cursor_offset,
-            last_item_digest,
-            delta_overflow,
-        ) = parse_provider_history_delta(
-            path,
-            backend,
-            start,
-            end,
-            limit=limit,
-            expected_stat=snapshot["expected_stat"],
-            previous_last_item_digest=str(
-                previous.get("last_item_digest") or ""
-            ),
-            expected_session_id=str(sess.get("id") or "") or None,
-            interruption_context=interruption_context,
-            codex_phase_context=codex_phase_context,
-            source_text_context=source_text_context,
-        )
-        caught_up = not delta_overflow and cursor_offset == end
-    else:
-        events = bounded_jsonl_events_range(
-            path,
-            0,
-            end,
-            expected_stat=snapshot["expected_stat"],
-            preserve_invalid=backend == BACKEND_CLAUDE,
-        )
-        if backend == BACKEND_CLAUDE:
-            items = parse_claude_history_events(events, limit, expected_session_id=str(sess.get("id") or "") or None, interruption_context=interruption_context)
-        elif backend == BACKEND_CODEX:
-            items = parse_codex_history_events(events, limit, expected_session_id=str(sess.get("id") or "") or None)
-        else:
-            return None, [], None, False
-        cursor_offset = end
-        last_item_digest = (
-            history_item_cursor_digest(items[-1]) if items else ""
-        )
-        if items and items[-1].get("source_text_sha256"):
-            source_text_context["sha256"] = items[-1]["source_text_sha256"]
-        if backend == BACKEND_CODEX and items and items[-1].get("phase") in ("commentary", "final_answer"):
-            codex_phase_context["phase"] = items[-1]["phase"]
-        caught_up = True
+    (
+        items,
+        cursor_offset,
+        last_item_digest,
+        delta_overflow,
+    ) = parse_provider_history_delta(
+        path,
+        backend,
+        start,
+        end,
+        limit=limit,
+        expected_stat=snapshot["expected_stat"],
+        previous_last_item_digest=str(
+            (previous or {}).get("last_item_digest") or ""
+        ),
+        expected_session_id=str(sess.get("id") or "") or None,
+        interruption_context=interruption_context,
+        codex_phase_context=codex_phase_context,
+        source_text_context=source_text_context,
+    )
+    caught_up = not delta_overflow and cursor_offset == end and end == int(snapshot["source_size"])
     source_digest = (
         str(snapshot["source_digest"])
         if cursor_offset == end
@@ -49825,6 +49965,7 @@ def reconcile_cursor_history_items(
     *,
     timeline_after_seq: int,
     timeline_through_seq: int,
+    bootstrap: bool = False,
 ) -> tuple[list[dict[str, str]], int]:
     """Subtract timeline-owned occurrences from one exact provider delta.
 
@@ -49848,14 +49989,15 @@ def reconcile_cursor_history_items(
         timeline_after_seq=after_seq,
         timeline_through_seq=through_seq,
         tail=False,
-        include_imported=False,
+        include_imported=bootstrap,
         message_details=message_details,
     )
 
     fresh: list[dict[str, str]] = []
     timeline_index = 0
     consumed_seq = after_seq
-    for item in items:
+    last_match_index = -1
+    for item_index, item in enumerate(items):
         item_details = history_message_match_details(item.get("kind", ""), item.get("text", ""), item, provider_item=True)
         if (
             timeline_index < len(timeline_messages)
@@ -49865,6 +50007,7 @@ def reconcile_cursor_history_items(
         ):
             consumed_seq = timeline_messages[timeline_index][0]
             timeline_index += 1
+            last_match_index = item_index
         else:
             fresh.append(item)
 
@@ -49879,6 +50022,11 @@ def reconcile_cursor_history_items(
             if timeline_window_truncated and timeline_messages
             else through_seq
         )
+    if bootstrap:
+        # Initial backfill uses the same conservative tail semantics as a
+        # single full import. Old imported rows are credits too; keep only
+        # source items after the entire captured preexisting timeline.
+        fresh = items[last_match_index + 1:] if consumed_seq == through_seq and not timeline_window_truncated else []
     return fresh, consumed_seq
 
 
@@ -50000,10 +50148,48 @@ def unsynced_history_items(
     return items[last_matched + 1:]
 
 
+class HistoryPreparationStale(RuntimeError):
+    """The read-only plan lost its ownership or immutable input generation."""
+
+
+def history_file_stamp(path: Path) -> tuple[int, int, int, int] | None:
+    try:
+        value = path.stat()
+        return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns
+    except FileNotFoundError:
+        return None
+
+
+@asynccontextmanager
+async def history_commit_guard(sess, cursor, timeline_stamp, source_stamp, enabled):
+    if not enabled:
+        yield
+        return
+    session_id = str(sess["id"])
+    async with session_lifecycle_lock(session_id):
+        current = STORE.sessions.get(session_id)
+        if (not current or session_id in DELETING_SESSIONS
+                or session_id in DELETED_SESSION_TOMBSTONES
+                or session_id in BUSY_SESSIONS or ACTIVE.get(session_id) is not None
+                or session_id in SERVER_MAINTENANCE_SESSIONS
+                or any(not task.done() for task in SESSION_TURN_TASKS.get(session_id, ()))
+                or current.get("backend") != sess.get("backend")
+                or session_provider_id(current) != session_provider_id(sess)
+                or normalized_history_sync_cursor(current) != cursor
+                or history_file_stamp(events_path(session_id)) != timeline_stamp):
+            raise HistoryPreparationStale("chat changed during history preparation")
+        if source_stamp is not None:
+            path, size, mtime, dev, ino = source_stamp
+            if history_file_stamp(Path(path)) != (dev, ino, size, mtime):
+                raise HistoryPreparationStale("provider transcript changed during history preparation")
+        yield
+
+
 async def sync_provider_history(
     sess: dict[str, Any],
     *,
     limit: int | None = None,
+    background: bool = False,
 ) -> dict[str, Any]:
     """Append provider messages added outside this chat since the last sync.
 
@@ -50024,6 +50210,7 @@ async def sync_provider_history(
         }
     live_session = STORE.sessions.get(session_id) or {}
     previous_cursor = normalized_history_sync_cursor(live_session)
+    timeline_stamp = history_file_stamp(events_path(session_id))
     # A durable cursor makes the unchanged fast path survive process restart;
     # all five stat/identity fields must still describe the fully-consumed
     # source before parsing can be skipped.
@@ -50046,6 +50233,10 @@ async def sync_provider_history(
             "source_path": None,
             "message": "No provider transcript found.",
         }
+    if (previous_cursor is not None and next_cursor is not None
+            and next_cursor["source_offset"] == previous_cursor["source_offset"]
+            and not next_cursor.get("source_caught_up", True)):
+        return {"imported": 0, "deferred": True, "reason": "incomplete_source_record"}
     if next_cursor is not None and previous_cursor is not None:
         recovered = await asyncio.to_thread(
             committed_history_sync_checkpoint,
@@ -50054,11 +50245,11 @@ async def sync_provider_history(
         )
         if recovered is not None:
             recovered_cursor, _terminal_seq = recovered
-            await persist_history_sync_cursor(
-                sess,
-                recovered_cursor,
-                timeline_seq=int(recovered_cursor.get("timeline_seq") or 0),
-            )
+            async with history_commit_guard(sess, previous_cursor, timeline_stamp, stamp, background):
+                await persist_history_sync_cursor(
+                    sess, recovered_cursor,
+                    timeline_seq=int(recovered_cursor.get("timeline_seq") or 0),
+                )
             return {
                 "imported": 0,
                 "source_path": str(source_path),
@@ -50068,14 +50259,18 @@ async def sync_provider_history(
         last_event_seq_from_file,
         events_path(session_id),
     )
-    if continued and previous_cursor is not None:
-        timeline_scan_through_seq = timeline_latest_seq
+    bootstrap_boundary = (previous_cursor or {}).get("bootstrap_timeline_seq") if continued else None
+    if not continued and next_cursor is not None and not next_cursor.get("source_caught_up", True):
+        bootstrap_boundary = timeline_latest_seq
+    if (continued and previous_cursor is not None) or (next_cursor is not None and not next_cursor.get("source_caught_up", True)):
+        timeline_scan_through_seq = timeline_latest_seq if bootstrap_boundary is None else bootstrap_boundary
         fresh, consumed_timeline_seq = await asyncio.to_thread(
             reconcile_cursor_history_items,
             session_id,
             items,
-            timeline_after_seq=int(previous_cursor.get("timeline_seq") or 0),
+            timeline_after_seq=int((previous_cursor or {}).get("timeline_seq") or 0) if continued else 0,
             timeline_through_seq=timeline_scan_through_seq,
+            **({"bootstrap": True} if bootstrap_boundary is not None else {}),
         )
     else:
         # First sync or invalidated/rotated source: retain the conservative
@@ -50096,11 +50291,11 @@ async def sync_provider_history(
         )
         if recovered is not None:
             recovered_cursor, _terminal_seq = recovered
-            await persist_history_sync_cursor(
-                sess,
-                recovered_cursor,
-                timeline_seq=int(recovered_cursor.get("timeline_seq") or 0),
-            )
+            async with history_commit_guard(sess, previous_cursor, timeline_stamp, stamp, background):
+                await persist_history_sync_cursor(
+                    sess, recovered_cursor,
+                    timeline_seq=int(recovered_cursor.get("timeline_seq") or 0),
+                )
             return {
                 "imported": 0,
                 "source_path": str(source_path),
@@ -50111,6 +50306,8 @@ async def sync_provider_history(
     timeline_seq = timeline_latest_seq
     if next_cursor is not None:
         caught_up = bool(next_cursor.pop("source_caught_up", True))
+        if bootstrap_boundary is not None and not caught_up:
+            next_cursor["bootstrap_timeline_seq"] = bootstrap_boundary
         next_cursor["timeline_pending_through_seq"] = 0
         next_cursor["timeline_pending_active"] = False
         if not caught_up:
@@ -50126,50 +50323,59 @@ async def sync_provider_history(
             caught_up=caught_up,
         )
 
-    result: dict[str, Any]
-    if not fresh:
-        result = {
-            "imported": 0,
-            "source_path": str(source_path),
-            "message": "Already up to date with the provider transcript.",
-        }
-    else:
-        # The imported batch is fsynced atomically together with its exact next
-        # cursor. A cursor moves only after that authoritative commit; if the
-        # registry save then fails, retry recovers the embedded checkpoint
-        # without relying on ambiguous content alignment.
+    if background and fresh:
         try:
-            result = await append_imported_history(
-                sess,
-                source_path,
-                fresh,
-                sync_checkpoint=checkpoint,
-            )
+            fresh = await prepare_imported_history_items(sess, source_path, fresh, checkpoint)
         except CodexNativeHistoryProofUnavailable:
-            # Do not persist next_cursor: these source bytes have not yet been
-            # proven against native history. A later explicit sync can retry.
-            return {
-                "imported": 0, "source_path": str(source_path), "deferred": True,
-                "reason": "native_history_proof_unavailable",
-                "message": "History reconciliation deferred; no messages were imported.",
+            return {"imported": 0, "deferred": True, "reason": "native_history_proof_unavailable"}
+    async with history_commit_guard(sess, previous_cursor, timeline_stamp, stamp, background):
+        result: dict[str, Any]
+        if not fresh:
+            result = {
+                "imported": 0,
+                "source_path": str(source_path),
+                "message": "Already up to date with the provider transcript.",
             }
-    if next_cursor is not None:
-        if caught_up:
-            timeline_seq = max(
+        else:
+            # The imported batch is fsynced atomically together with its exact next
+            # cursor. A cursor moves only after that authoritative commit; if the
+            # registry save then fails, retry recovers the embedded checkpoint
+            # without relying on ambiguous content alignment.
+            try:
+                result = await append_imported_history(
+                    sess,
+                    source_path,
+                    fresh,
+                    sync_checkpoint=checkpoint,
+                    _prepared=background,
+                    _expected_timeline_stamp=timeline_stamp,
+                )
+            except CodexNativeHistoryProofUnavailable:
+                # Do not persist next_cursor: these source bytes have not yet been
+                # proven against native history. A later explicit sync can retry.
+                return {
+                    "imported": 0, "source_path": str(source_path), "deferred": True,
+                    "reason": "native_history_proof_unavailable",
+                    "message": "History reconciliation deferred; no messages were imported.",
+                }
+        if next_cursor is not None:
+            if caught_up:
+                timeline_seq = max(
+                    timeline_latest_seq,
+                    int(result.get("timeline_seq") or 0),
+                )
+            next_cursor["checkpoint_seq"] = max(
+                int(next_cursor.get("checkpoint_seq") or 0),
                 timeline_latest_seq,
                 int(result.get("timeline_seq") or 0),
             )
-        next_cursor["checkpoint_seq"] = max(
-            int(next_cursor.get("checkpoint_seq") or 0),
-            timeline_latest_seq,
-            int(result.get("timeline_seq") or 0),
-        )
-        await persist_history_sync_cursor(
-            sess,
-            next_cursor,
-            timeline_seq=timeline_seq,
-        )
-    return result
+            await persist_history_sync_cursor(
+                sess,
+                next_cursor,
+                timeline_seq=timeline_seq,
+            )
+        result["pending"] = not caught_up
+        return result
 
 
 def provider_history_source_stamp(sess: dict[str, Any]) -> list[Any] | None:
@@ -50251,73 +50457,115 @@ async def persist_history_sync_cursor(
     return True
 
 
-async def run_provider_history_sync(session_id: str) -> None:
-    """Sync one chat in the background; never surface failure to the opener."""
+HISTORY_MAINTENANCE_SLOTS = asyncio.Semaphore(2)
+HISTORY_MAINTENANCE_STATE: dict[str, dict[str, Any]] = {}
+HISTORY_MAINTENANCE_TASKS: dict[str, asyncio.Task] = {}
+HISTORY_PROJECTION_REVISIONS: dict[str, int] = {}
 
+
+def history_projection_notice(session_id: str) -> dict[str, Any]:
+    return {"type": "history_projection_changed", "session_id": session_id,
+            "revision": f"{SERVER_INSTANCE_ID}:{HISTORY_PROJECTION_REVISIONS.get(session_id, 0)}"}
+
+
+def history_maintenance_key(sess: dict[str, Any]) -> list[Any]:
+    provider_id = session_provider_id(sess)
+    cursor = normalized_history_sync_cursor(sess)
+    source = (Path(cursor["source_path"]) if cursor else CODEX_ROLLOUT_PATH_CACHE.get(provider_id))
+    return [2, sess.get("backend"), provider_id,
+            list(history_file_stamp(events_path(str(sess["id"]))) or ()),
+            str(source) if source else None,
+            list(history_file_stamp(source) or ()) if source else None]
+
+
+def history_maintenance_state(session_id: str) -> dict[str, Any]:
+    if session_id not in HISTORY_MAINTENANCE_STATE:
+        try:
+            raw = json.loads((events_path(session_id).parent / "history-maintenance.json").read_text())
+            HISTORY_MAINTENANCE_STATE[session_id] = raw if isinstance(raw, dict) else {}
+        except (OSError, ValueError):
+            HISTORY_MAINTENANCE_STATE[session_id] = {}
+    return HISTORY_MAINTENANCE_STATE[session_id]
+
+
+def save_history_maintenance_state(session_id: str, value: dict[str, Any]) -> None:
+    path = events_path(session_id).parent / "history-maintenance.json"
+    if not path.parent.is_dir():
+        return
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value, separators=(",", ":")))
+    temporary.replace(path)
+
+
+async def run_provider_history_sync(session_id: str) -> None:
+    """Prepare in the background; hold admission only for validated commit."""
+    state = history_maintenance_state(session_id)
+    key = None
+    pending = False
     try:
-        # Turn admission, deletion, backend changes, and provider-native
-        # controls use this same lifecycle lock. Revalidate after acquiring it
-        # so a sync scheduled while idle cannot import a transcript that a new
-        # live turn is concurrently extending.
-        async with session_lifecycle_lock(session_id):
+        async with HISTORY_MAINTENANCE_SLOTS:
             sess = STORE.sessions.get(session_id)
-            if (
-                not sess
-                or session_id in DELETING_SESSIONS
-                or session_id in DELETED_SESSION_TOMBSTONES
-            ):
+            if (not sess or session_id in DELETING_SESSIONS
+                    or session_id in DELETED_SESSION_TOMBSTONES
+                    or session_id in BUSY_SESSIONS or ACTIVE.get(session_id) is not None
+                    or session_id in SERVER_MAINTENANCE_SESSIONS):
                 return
-            async with ACTIVE_LOCK:
-                if (
-                    session_id in BUSY_SESSIONS
-                    or ACTIVE.get(session_id) is not None
-                    or session_id in SERVER_MAINTENANCE_SESSIONS
-                    or any(
-                        task is not asyncio.current_task() and not task.done()
-                        for task in tuple(SESSION_TURN_TASKS.get(session_id) or ())
-                    )
-                ):
-                    return
+            key = history_maintenance_key(sess)
+            state.update(status="running", reason=None)
             await refresh_native_session_title(session_id)
-            result = await sync_provider_history(dict(sess))
-        if result.get("imported"):
-            logger.info(
-                "synced %d provider message(s) added outside session=%s",
-                result["imported"],
-                session_id,
-            )
+            repair_caches = (CLAUDE_METADATA_REPAIR_CACHE, CODEX_GOAL_HISTORY_REPAIR_CACHE,
+                             CODEX_NATIVE_HISTORY_REPAIR_CACHE)
+            before_repair = tuple(cache.signature(session_id) for cache in repair_caches)
+            result = await sync_provider_history(dict(sess), background=True)
+            pending = bool(result.get("pending")) and not result.get("deferred")
+            # Forward imports have already proved their own batch. Repair of
+            # older displayed rows must not starve the remaining source suffix.
+            repaired = None if pending else await asyncio.to_thread(prepare_provider_history_metadata_repair, session_id)
+            if before_repair != tuple(cache.signature(session_id) for cache in repair_caches):
+                HISTORY_PROJECTION_REVISIONS[session_id] = HISTORY_PROJECTION_REVISIONS.get(session_id, 0) + 1
+                await HUB.broadcast(session_id, history_projection_notice(session_id))
+            deferred = result.get("deferred") or repaired is False
+            state.update(status="deferred" if deferred else "pending" if pending else "idle", deterministic=False,
+                         reason=result.get("reason") or ("native_history_proof_unavailable" if repaired is False else None))
+            if result.get("imported"):
+                logger.info("synced %d provider message(s) added outside session=%s", result["imported"], session_id)
     except asyncio.CancelledError:
+        state.update(status="deferred", reason="cancelled")
         raise
     except Exception as exc:
-        # A read-only catch-up must never break opening a chat.
-        logger.warning(
-            "provider history sync failed session=%s error=%s",
-            session_id,
-            type(exc).__name__,
-        )
+        state.update(status="deferred", reason=type(exc).__name__, deterministic=isinstance(exc, ValueError))
+        logger.warning("provider history sync deferred session=%s error=%s", session_id, type(exc).__name__)
     finally:
+        if key is not None:
+            # A changing input retries on its next open; unchanged failures
+            # survive reconnects and process restarts without a scan storm.
+            current = STORE.sessions.get(session_id)
+            state.update(key=history_maintenance_key(current) if current else key,
+                         retry_at=time.time() + (60 if state.get("status") == "deferred" else 1 if pending else 15))
+            with suppress(OSError):
+                await asyncio.to_thread(save_history_maintenance_state, session_id, dict(state))
         HISTORY_SYNC_SCHEDULED.discard(session_id)
+        HISTORY_MAINTENANCE_TASKS.pop(session_id, None)
+        if pending and state.get("status") == "pending" and not SERVER_SHUTTING_DOWN:
+            def continue_history():
+                current = STORE.sessions.get(session_id)
+                if current is not None:
+                    schedule_provider_history_sync(current)
+            asyncio.get_running_loop().call_later(1.1, continue_history)
 
 
 def schedule_provider_history_sync(sess: dict[str, Any]) -> None:
-    """Catch one chat's transcript up when opened, without blocking the open.
-
-    Opening a chat must stay fast, and the client is already subscribed to
-    the event stream, so recovered messages arrive live instead of delaying
-    the response.
-    """
-
     session_id = str(sess.get("id") or "")
-    if not session_id or session_id in HISTORY_SYNC_SCHEDULED:
+    if not session_id or session_id in HISTORY_SYNC_SCHEDULED or not session_provider_id(sess):
         return
-    if not session_provider_id(sess):
-        return
-    # A turn in flight is already streaming the provider's own output and its
-    # transcript writes are still landing.
     if session_id in BUSY_SESSIONS or ACTIVE.get(session_id) is not None:
         return
+    state = history_maintenance_state(session_id)
+    if state.get("key") == history_maintenance_key(sess) and (
+            state.get("deterministic") or time.time() < state.get("retry_at", 0)):
+        return
     HISTORY_SYNC_SCHEDULED.add(session_id)
-    asyncio.create_task(run_provider_history_sync(session_id))
+    HISTORY_MAINTENANCE_TASKS[session_id] = asyncio.create_task(run_provider_history_sync(session_id))
 
 
 async def filter_codex_history_for_import(
@@ -50345,13 +50593,10 @@ async def filter_codex_history_for_import(
         raise
 
 
-async def append_imported_history(
-    sess: dict[str, Any],
-    source_path: Path,
-    items: list[dict[str, Any]],
-    *,
-    sync_checkpoint: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+async def prepare_imported_history_items(
+    sess: dict[str, Any], source_path: Path, items: list[dict[str, Any]],
+    sync_checkpoint: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
     session_id = str(sess["id"])
     provider_id = str(session_provider_id(sess) or "")
     backend = str(sess.get("backend") or DEFAULT_BACKEND).lower()
@@ -50378,6 +50623,23 @@ async def append_imported_history(
             normalize_user=normalize_wake_user, normalize_full_user=normalize_full_wake_user,
             normalize_assistant=clean_assistant_text,
         )
+    return items
+
+
+async def append_imported_history(
+    sess: dict[str, Any],
+    source_path: Path,
+    items: list[dict[str, Any]],
+    *,
+    sync_checkpoint: dict[str, Any] | None = None,
+    _prepared: bool = False,
+    _expected_timeline_stamp: tuple | None = None,
+) -> dict[str, Any]:
+    session_id = str(sess["id"])
+    provider_id = str(session_provider_id(sess) or "")
+    backend = str(sess.get("backend") or DEFAULT_BACKEND).lower()
+    if not _prepared:
+        items = await prepare_imported_history_items(sess, source_path, items, sync_checkpoint)
     metadata_only = bool(items) and all(item.get("kind") == "interruption" or (
         item.get("provider_history_repair") in {"source_proven_import", "source_proven_native_replay", "source_proven_assistant_replay"}
         and item.get("text") == ""
@@ -50467,7 +50729,13 @@ async def append_imported_history(
     imported_events.append(imported_history_terminal_event(
         run_id, backend, metadata_only=metadata_only, source_timestamp=last_source_timestamp,
     ))
-    committed = await append_durable_event_batch(session_id, imported_events)
+    if _prepared:
+        async with event_delivery_lock(session_id):
+            if history_file_stamp(events_path(session_id)) != _expected_timeline_stamp:
+                raise HistoryPreparationStale("timeline changed before history publication")
+            committed = await append_durable_event_batch_locked(session_id, imported_events)
+    else:
+        committed = await append_durable_event_batch(session_id, imported_events)
     if len(committed) != len(imported_events):
         raise RuntimeError("history event batch was not fully persisted")
     if backend == BACKEND_CODEX:
@@ -51670,6 +51938,11 @@ def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, 
             "last_read_agent_event_seq", "last_read_agent_event_at", "manual_unread",
         )
     }
+    maintenance = HISTORY_MAINTENANCE_STATE.get(str(sess.get("id") or ""), {})
+    # Never-started maintenance adds no useful information to high-volume lists.
+    # Once observed, retain idle/cleared fields so caches can retire old errors.
+    if not summary or maintenance:
+        public["history_maintenance"] = {key: maintenance.get(key) for key in ("status", "reason", "retry_at")}
     # Omit only never-configured defaults from high-volume lists. A stored null
     # is a clear tombstone and must survive summary/cache merges.
     if not summary or "subagent_limit" in sess:
@@ -72953,7 +73226,7 @@ async def start_turn(
     scheduled_job_revision: str | None = None,
     scheduled_job_manual_run: bool = False,
 ) -> dict[str, Any]:
-    await wait_for_queue_recovery_admission()
+    await wait_for_queue_recovery_admission(session_id)
     if queue_if_busy and provider_context_mode == "chat":
         await reconcile_idle_queue_session(
             session_id,
@@ -73026,7 +73299,7 @@ async def _start_turn_locked(
     # Internal delivery paths can enter with the lifecycle lock already held
     # and intentionally bypass ``start_turn``. They still must not start or
     # queue ahead of an undiscovered durable startup row.
-    await wait_for_queue_recovery_admission()
+    await wait_for_queue_recovery_admission(session_id)
     if (
         req.purpose == SECURE_PEER_DELIVERY_PURPOSE
         and not SECURE_PEER_AGENT_RELAY_ENABLED
@@ -74142,6 +74415,8 @@ async def _start_turn_locked(
         else:
             started_payload["model"] = sess.get("model")
             started_payload["effort"] = sess.get("effort")
+        if getattr(req, "client_request_id", None):
+            started_payload["client_request_id"] = req.client_request_id
         if queued_id:
             started_payload["queued_id"] = queued_id
         run_metadata = {
@@ -74221,6 +74496,7 @@ async def _start_turn_locked(
                     or mailbox_wake_claim is not None
                     or getattr(req, "shared_chat_id", None) is not None
                     or queued_id is not None
+                    or getattr(req, "client_request_id", None) is not None
                 )
                 else append_event(session_id, "turn_started", started_payload)
             )
@@ -78699,6 +78975,7 @@ async def lifespan(app: FastAPI):
         cleanup_abandoned_fork_provider_threads(startup_abandoned_fork_threads)
     )
     host_monitor_task = asyncio.create_task(host_monitor_loop())
+    queue_checkpoint_task = asyncio.create_task(queue_checkpoint_loop())
     history_search_task = asyncio.create_task(history_search_index_loop())
     runtime_probe_task = asyncio.create_task(asyncio.to_thread(refresh_runtime_diagnostics, force=True))
     if CONFIG_ENV_APPLIED:
@@ -78776,6 +79053,10 @@ async def lifespan(app: FastAPI):
         cross_chat_expiry_task.cancel()
         digest_recovery_task.cancel()
         queue_recovery_task.cancel()
+        queue_checkpoint_task.cancel()
+        history_tasks = (*HISTORY_MAINTENANCE_TASKS.values(), *(item[1] for item in TURN_RECEIPT_TASKS.values()))
+        for task in history_tasks:
+            task.cancel()
         server_update_pending_waiter_task.cancel()
         await bounded_shutdown_phase(
             "startup-reconciliation",
@@ -78784,6 +79065,8 @@ async def lifespan(app: FastAPI):
                 cross_chat_expiry_task,
                 digest_recovery_task,
                 queue_recovery_task,
+                queue_checkpoint_task,
+                *history_tasks,
                 server_update_pending_waiter_task,
                 *(
                     (health_queue_reconcile_task,)
@@ -87457,8 +87740,6 @@ async def get_session(
     normalized_page_mode = str(page_mode or "").strip().lower()
     if normalized_page_mode not in {"", "semantic"}:
         raise HTTPException(status_code=400, detail="page_mode must be semantic")
-    if normalized_page_mode != "semantic":
-        await asyncio.to_thread(prepare_provider_history_metadata_repair, session_id)
     page_tail = tail and after <= 0
     semantic_page: dict[str, Any] | None = None
     if normalized_page_mode == "semantic":
@@ -87522,6 +87803,23 @@ async def get_session(
             "next_semantic_before": semantic_page["next_semantic_before"],
         })
     return response
+
+
+@app.post("/api/sessions/{session_id}/history/maintenance", status_code=202)
+async def retry_history_maintenance(session_id: str) -> dict[str, Any]:
+    """Explicit retry clears backoff, never provenance or lifecycle guards."""
+    ensure_session_not_initializing(session_id)
+    ensure_session_not_deleting(session_id)
+    sess = STORE.sessions.get(session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="session not found")
+    if session_id in BUSY_SESSIONS or ACTIVE.get(session_id) is not None:
+        raise HTTPException(status_code=409, detail="history maintenance waits for this chat to become idle")
+    if session_id not in HISTORY_SYNC_SCHEDULED:
+        history_maintenance_state(session_id).clear()
+        schedule_provider_history_sync(sess)
+    return {"scheduled": session_id in HISTORY_SYNC_SCHEDULED,
+            "history_maintenance": dict(history_maintenance_state(session_id))}
 
 
 @app.post("/api/sessions/{session_id}/import-history")
@@ -89728,7 +90026,7 @@ async def _put_codex_goal_locked(
     if req.status == "active":
         if (STORE.sessions.get(session_id) or {}).get("archived"):
             raise HTTPException(status_code=409, detail="archived chats cannot resume goals")
-        await wait_for_queue_recovery_admission()
+        await wait_for_queue_recovery_admission(session_id)
     manager, thread_id, control_session = await acquire_codex_control_thread(
         session_id,
         reserve_session=req.status == "active",
@@ -91729,8 +92027,123 @@ async def _fork_session_locked(
     return {"session": public_session(child), "sessions": [public_session(sess) for sess in ordered_sessions]}
 
 
+TURN_RECEIPT_TASKS: dict[tuple[str, str], tuple[str, asyncio.Task]] = {}
+
+
+def turn_receipt_path(session_id: str, request_id: str) -> Path:
+    return events_path(session_id).parent / "turn-receipts" / f"{request_id}.json"
+
+
+def write_turn_receipt(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = path.with_suffix(".tmp")
+    with temporary.open("w") as stream:
+        json.dump(value, stream, separators=(",", ":"))
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(path)
+    descriptor = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def recover_turn_receipt(session_id: str, value: dict) -> dict | None:
+    path = events_path(session_id)
+    stamp = history_file_stamp(path)
+    before = value.get("journal")
+    offset = before[2] if before else 0
+    if stamp is None:
+        if before is not None:
+            raise ValueError("send receipt journal disappeared")
+        return None
+    if before and (stamp[:2] != tuple(before[:2]) or stamp[2] < offset):
+        raise ValueError("send receipt journal was replaced")
+    # An ambiguous old receipt must not cause an unbounded scan or a resend.
+    if stamp[2] - offset > 32 * 1024 * 1024:
+        raise ValueError("send receipt recovery requires a larger journal scan")
+    with path.open("rb") as stream:
+        stream.seek(offset)
+        while stream.tell() < stamp[2]:
+            line = stream.readline(stamp[2] - stream.tell())
+            if not line.endswith(b"\n"):
+                raise ValueError("send receipt journal has an incomplete record")
+            if b'"client_request_id"' not in line:
+                continue
+            event = json.loads(line)
+            if event.get("client_request_id") != value["request_id"]:
+                continue
+            if event.get("type") == "turn_started":
+                return {"run_id": event["run_id"], "queued": False}
+            if event.get("type") == "turn_queued":
+                return {"queued_id": event["queued_id"], "queued": True,
+                        "position": event.get("position", 1)}
+    return None
+
+
+async def execute_receipted_turn(session_id: str, req: TurnRequest, fingerprint: str) -> dict:
+    path = turn_receipt_path(session_id, req.client_request_id)
+    try:
+        value = await asyncio.to_thread(lambda: json.loads(path.read_text()))
+    except FileNotFoundError:
+        value = {"request_id": req.client_request_id, "fingerprint": fingerprint,
+                 "journal": history_file_stamp(events_path(session_id)), "status": "pending"}
+        await asyncio.to_thread(write_turn_receipt, path, value)
+    else:
+        if value.get("fingerprint") != fingerprint:
+            raise HTTPException(status_code=409, detail="request ID was already used for a different message")
+        if value.get("status") == "accepted":
+            return {**value["response"], "session": public_session(STORE.sessions[session_id])}
+        try:
+            recovered = await asyncio.to_thread(recover_turn_receipt, session_id, value)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=409, detail="message acceptance is uncertain; retain this request ID") from exc
+        if recovered is not None:
+            recovered["session"] = public_session(STORE.sessions[session_id])
+            value.update(status="accepted", response=recovered)
+            await asyncio.to_thread(write_turn_receipt, path, value)
+            return recovered
+    response = await post_turn_without_receipt(session_id, req)
+    value.update(status="accepted", response=response)
+    await asyncio.to_thread(write_turn_receipt, path, value)
+    return response
+
+
+async def post_turn_with_receipt(session_id: str, req: TurnRequest) -> Any:
+    if session_id not in STORE.sessions or session_id in DELETED_SESSION_TOMBSTONES:
+        raise HTTPException(status_code=404, detail="session not found")
+    fingerprint = hashlib.sha256(json.dumps(req.model_dump(mode="json"), sort_keys=True,
+                                           separators=(",", ":")).encode()).hexdigest()
+    key = (session_id, req.client_request_id)
+    existing = TURN_RECEIPT_TASKS.get(key)
+    if existing is not None and existing[0] != fingerprint:
+        raise HTTPException(status_code=409, detail="request ID was already used for a different message")
+    if existing is None:
+        task = asyncio.create_task(execute_receipted_turn(session_id, req, fingerprint))
+        TURN_RECEIPT_TASKS[key] = (fingerprint, task)
+        def completed(done):
+            TURN_RECEIPT_TASKS.pop(key, None)
+            if not done.cancelled():
+                done.exception()
+        task.add_done_callback(completed)
+    else:
+        task = existing[1]
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=10)
+    except asyncio.TimeoutError:
+        return JSONResponse(status_code=202, content={"request_id": req.client_request_id,
+                            "acceptance": "pending", "retry_same_request": True})
+
+
 @app.post("/api/sessions/{session_id}/turns")
-async def post_turn(session_id: str, req: TurnRequest) -> dict[str, Any]:
+async def post_turn(session_id: str, req: TurnRequest) -> Any:
+    if req.client_request_id is not None:
+        return await post_turn_with_receipt(session_id, req)
+    return await post_turn_without_receipt(session_id, req)
+
+
+async def post_turn_without_receipt(session_id: str, req: TurnRequest) -> dict[str, Any]:
     while True:
         try:
             return await start_turn(session_id, req)
@@ -97122,6 +97535,7 @@ async def session_events(
     reasoning_stream: bool = False,
     reasoning_text: bool = False,
     liveness: bool = False,
+    history_projection: bool = False,
 ) -> None:
     selected_subprotocol = websocket_endpoint_subprotocol(
         ws,
@@ -97136,6 +97550,7 @@ async def session_events(
         await ws.close(code=4404)
         return
     await ws.accept(subprotocol=selected_subprotocol)
+    schedule_provider_history_sync(STORE.sessions[session_id])
     try:
         if not await HUB.reserve(session_id, ws):
             await close_event_websocket_over_capacity(ws)
@@ -97151,7 +97566,6 @@ async def session_events(
         # is ready. Reading its fsynced rows earlier can replay raw scheduled
         # inputs before this socket is registered for the repaired broadcast.
         async with event_delivery_lock(session_id):
-            await asyncio.to_thread(prepare_provider_history_metadata_repair, session_id)
             boundary = await asyncio.to_thread(
                 last_event_seq_from_file,
                 events_path(session_id),
@@ -97204,6 +97618,10 @@ async def session_events(
                     await asyncio.wait_for(ws.send_json(reasoning_snapshot), timeout=WEBSOCKET_SEND_TIMEOUT_SECONDS)
                 if liveness:
                     await send_event_stream_status(ws, session_id, "ready")
+                if history_projection:
+                    # A proof may finish between the HTTP page and subscription.
+                    # The revision closes that gap without replaying old rows.
+                    await asyncio.wait_for(ws.send_json(history_projection_notice(session_id)), timeout=WEBSOCKET_SEND_TIMEOUT_SECONDS)
                 break
             boundary = gap_boundary
         while True:

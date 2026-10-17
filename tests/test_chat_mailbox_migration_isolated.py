@@ -6,10 +6,12 @@ import asyncio
 from collections import deque
 from copy import deepcopy
 import json
+import os
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+import uuid
 from unittest.mock import AsyncMock, Mock
 
 from tests.test_chat_mailbox_runtime_isolated import isolated_source, TREE, PAIR, ROUTE, NOW
@@ -18,7 +20,9 @@ from tests.test_chat_mailbox_runtime_isolated import isolated_source, TREE, PAIR
 def migration_source():
     ns = isolated_source()
     names = {"queued_event_lines", "record_mailbox_migration_evidence", "scan_queued_turns_from_events",
-             "migrate_unstarted_chat_mailbox_backlog", "recover_queued_turns_after_start", "is_async_route_message"}
+             "queue_checkpoint_anchor", "queue_checkpoint_seed", "save_queue_checkpoint",
+             "migrate_unstarted_chat_mailbox_backlog", "recover_queued_turns_after_start",
+             "_recover_queued_turns_for_sessions", "is_async_route_message"}
     ledger = next(node for node in TREE.body if isinstance(node, ast.ClassDef) and node.name == "CrossChatStore")
     methods = {"pending_mailbox_migration_candidates", "migrate_pending_mailbox_message"}
     nodes = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
@@ -26,7 +30,7 @@ def migration_source():
               if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
     nodes += [deepcopy(node) for node in ledger.body
               if isinstance(node, ast.AsyncFunctionDef) and node.name in methods]
-    ns.update(json=json, deque=deque)
+    ns.update(json=json, deque=deque, os=os, uuid=uuid, QUEUE_RECOVERY_READY=set())
     exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])),
                  "<isolated-mailbox-migration>", "exec"), ns)
     for name in methods:
@@ -182,6 +186,25 @@ class ChatMailboxMigrationTests(unittest.IsolatedAsyncioTestCase):
         proof = {record["id"]: {"target_session_id": "recipient"}}
         recovered = self.ns["scan_queued_turns_from_events"]([("recipient", {})], mailbox_evidence=proof)
         self.assertFalse(proof[record["id"]]["complete"])
+        self.assertEqual(await self.ns["migrate_unstarted_chat_mailbox_backlog"]([record], proof, recovered), 0)
+
+    async def test_partial_terminal_after_complete_queue_cannot_authorize_migration(self):
+        record = await self.envelope()
+        self.events([self.queue_event(record)])
+        path = self.root / "recipient.jsonl"
+        with path.open("a") as stream:
+            stream.write(json.dumps({"type": "turn_started", "cross_chat_envelope_id": record["id"]}))
+        proof = {record["id"]: {"target_session_id": "recipient"}}
+        recovered = self.ns["scan_queued_turns_from_events"]([("recipient", {})], mailbox_evidence=proof)
+        self.assertEqual(len(recovered["recipient"]), 1)
+        self.assertFalse(proof[record["id"]]["complete"])
+        self.assertEqual(await self.ns["migrate_unstarted_chat_mailbox_backlog"]([record], proof, recovered), 0)
+        with path.open("a") as stream:
+            stream.write("\n")
+        proof = {record["id"]: {"target_session_id": "recipient"}}
+        recovered = self.ns["scan_queued_turns_from_events"]([("recipient", {})], mailbox_evidence=proof)
+        self.assertTrue(proof[record["id"]]["complete"])
+        self.assertTrue(proof[record["id"]]["started_or_terminal"])
         self.assertEqual(await self.ns["migrate_unstarted_chat_mailbox_backlog"]([record], proof, recovered), 0)
 
 

@@ -37,7 +37,7 @@ FUNCTIONS = {
     "history_message_match_details", "history_messages_match", "history_message_match_tokens",
     "clean_assistant_text",
     "append_imported_history", "append_staged_imported_history", "imported_history_terminal_event",
-    "filter_codex_history_for_import",
+    "filter_codex_history_for_import", "prepare_imported_history_items",
     "seed_claude_interruption_context", "normalized_history_sync_cursor", "load_provider_history_with_cursor",
     "should_bump_session_updated_at", "is_agent_visible_event",
     "bounded_jsonl_events", "bounded_jsonl_events_range",
@@ -407,7 +407,7 @@ class ClaudeHistoryProvenanceTests(unittest.TestCase):
         chain = interruption_chain()
         context = {"version": 1, "session_id": SESSION_ID, "prompt_id": PROMPT_ID, "anchor_event_id": EVENT_ID, "last_event_id": PARENT_ID}
         self.projection["provider_history_path"] = Mock(return_value=Path("unused.jsonl"))
-        snapshot = {"source_dev": 1, "source_ino": 2, "source_mtime_ns": 4, "source_offset": 30, "source_digest": "a" * 64, "expected_stat": {}}
+        snapshot = {"source_dev": 1, "source_ino": 2, "source_mtime_ns": 4, "source_size": 30, "source_offset": 30, "source_digest": "a" * 64, "expected_stat": {}}
         self.projection["provider_history_source_snapshot"] = Mock(return_value=(snapshot, True))
         self.projection["seed_claude_interruption_context"] = Mock(return_value=dict(context))
         self.projection["bounded_jsonl_records_range"] = Mock(return_value=iter([(chain[2], 30)]))
@@ -429,7 +429,7 @@ class ClaudeHistoryProvenanceTests(unittest.TestCase):
         self.projection["seed_claude_interruption_context"].assert_called_once()
         enrich.assert_called_once()
         self.projection["provider_history_source_snapshot"].return_value = (snapshot, False)
-        self.projection["bounded_jsonl_events_range"] = Mock(return_value=iter([chain[0]]))
+        self.projection["bounded_jsonl_records_range"] = Mock(return_value=iter([(chain[0], 30)]))
         self.projection["load_provider_history_with_cursor"](session, 1, None)
         self.projection["strip_agentsdock_generated_user_text"].assert_called_with("Real conversation", expected_session_id="app-chat", provider_history=True)
         enrich.assert_called_once()

@@ -279,10 +279,49 @@ class Lifecycle(unittest.TestCase):
         self.assertTrue(self.finished(sender)[-1]["is_error"])
         errors = [e["message"] for e in self.events(sender) if e["type"] == "error"]
         self.assertTrue(any("folder trust and MCP settings" in message for message in errors), errors)
-        self.assertTrue(any("No cross-chat message was sent." in message for message in errors), errors)
+        self.assertTrue(any("No cross-chat message was sent by this turn." in message for message in errors), errors)
+        self.assertTrue(any("not a sign-in error" in message and str(self.project) in message for message in errors), errors)
         self.assertFalse((self.root / ".gemini/trustedFolders.json").exists())
         self.assertEqual(len(self.fixture_type.bodies), before, "A blocked explicit handoff must not start model work")
         self.assertFalse(any(e["type"] == "turn_started" for e in self.events(receiver)))
+
+    def test_unavailable_mcp_does_not_block_later_ordinary_chat(self):
+        self.client.get("/api/runtime/catalog").raise_for_status()
+        sender, receiver = self.new(), self.new()
+        before = len(self.fixture_type.bodies)
+        self.send(sender, prompt="@Receiver send a greeting", client_capabilities=["gemini_acp_v1", "chat_conversation_async_route_v1", "agent_cross_chat_routes_v2", "cross_chat_handoffs_v2"],
+                  chat_references=[{"session_id": receiver, "display_title_snapshot": "Receiver", "source_text_start": 0,
+                                    "source_text_end": 9, "action": "route", "grant_intent": True}])
+        self.assertTrue(self.finished(sender)[-1]["is_error"])
+        self.assertEqual(len(self.fixture_type.bodies), before)
+        # Durable permission is not a request to communicate on every later turn.
+        self.send(sender, prompt="Just answer this question locally. Do not contact another chat.")
+        self.assertFalse(self.finished(sender, 2)[-1]["is_error"])
+        self.assertGreater(len(self.fixture_type.bodies), before)
+        self.assertFalse(any(e["type"] == "turn_started" for e in self.events(receiver)))
+        self.assertFalse((self.root / ".gemini/trustedFolders.json").exists())
+
+    def test_untrusted_mailbox_wake_still_fails_without_processing_incoming_mail(self):
+        self.trust_fixture()
+        self.client.get("/api/runtime/catalog").raise_for_status()
+        sender = self.new()
+        other = self.root / "untrusted receiver"; other.mkdir()
+        response = self.client.post("/api/sessions", json={"backend": "gemini", "provider_connection": "custom", "cwd": str(other)})
+        response.raise_for_status(); receiver = response.json()["session"]["id"]
+        self.fixture_type.mode = "mail"; self.send_route_fixture(sender, receiver)
+        handled = set()
+        def receiver_failed():
+            for item in self.client.get(f"/api/sessions/{sender}/gemini/runtime").json()["pending_interactions"]:
+                if item["id"] not in handled:
+                    handled.add(item["id"])
+                    self.client.post(f"/api/sessions/{sender}/gemini/interactions/{item['id']}/resolve", json={"response": {"decision": "accept"}}).raise_for_status()
+            return any(e["type"] == "turn_finished" and e.get("is_error") for e in self.events(receiver))
+        self.wait(receiver_failed)
+        events = self.events(receiver)
+        self.assertTrue(any(e.get("purpose") == "chat_mailbox_wake" for e in events))
+        self.assertTrue(any(e["type"] == "error" and "not a sign-in error" in e.get("message", "") for e in events))
+        self.assertFalse(any(e["type"] in {"assistant_text", "tool_started"} for e in events))
+        self.assertEqual(json.loads((self.root / ".gemini/trustedFolders.json").read_text()), {str(self.project): "TRUST_FOLDER"})
 
     def test_mixed_attachments_reach_native_api_and_can_resume(self):
         import base64

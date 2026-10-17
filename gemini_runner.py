@@ -18,6 +18,17 @@ PERMISSIONS: dict[str, dict] = {}
 MODEL_CATALOG: dict[str, dict] = {}
 
 
+def communication_unavailable_message(cwd: str) -> str:
+    # Point at the actual project, not the terminal's default HOME or the
+    # credential-isolated API profile. Never change native trust on retry.
+    return ("No cross-chat message was sent by this turn. Gemini did not load the AgentsDock communication tool. "
+            "This is not a sign-in error. "
+            f"Workspace: {json.dumps(cwd, ensure_ascii=False)}. "
+            "On the server, open Gemini in that directory and review folder trust and MCP settings (/permissions and /mcp). "
+            "Trust only projects you recognize, then retry in AgentsDock. "
+            "AgentsDock does not grant folder trust automatically.")
+
+
 async def clear_cleanup_fence(api, session_id: str, run_id: str):
     session = api.STORE.sessions.get(session_id) or {}
     if session.get("gemini_cleanup_pending_run_id") != run_id:
@@ -125,7 +136,8 @@ def router(api) -> APIRouter:
 
 
 async def run(api, session_id: str, run_id: str, prompt: str, sess: dict,
-              manifest_path: Path, *, standalone_provider_context=False, **_kwargs):
+              manifest_path: Path, *, standalone_provider_context=False,
+              communication_required=False, **_kwargs):
     """A new owned process per turn, resuming the same durable native UUID."""
     from cursor_provider_mcp import CursorToolBroker
 
@@ -296,7 +308,6 @@ async def run(api, session_id: str, run_id: str, prompt: str, sess: dict,
             capabilities = [c for c in api.CROSS_CHAT_CAPABILITIES.values()
                             if c.get("source_session_id") == session_id and c.get("source_run_id") == run_id]
             has_authority = bool(capabilities)
-            needs_chat_tool = any(c.get("provider_route_grants") for c in capabilities)
         if has_authority:
             async def execute(value, key):
                 try:
@@ -354,8 +365,12 @@ async def run(api, session_id: str, run_id: str, prompt: str, sess: dict,
         if broker and not broker.definition_requested.is_set():
             # Native Gemini refuses MCP discovery in an untrusted workspace.
             # Never grant folder trust or weaken an existing MCP policy here.
-            if needs_chat_tool:
-                raise GeminiConfigurationError("No cross-chat message was sent. Gemini did not load the AgentsDock communication tool. Open Gemini CLI in this chat's workspace and review its folder trust and MCP settings, then retry. AgentsDock does not grant folder trust automatically.")
+            # A durable route permits communication; it does not require every
+            # later ordinary question to use it. Admission supplies this bit
+            # from this turn's validated references/internal delivery purpose.
+            # The broker's authorization and native tool policies are unchanged.
+            if communication_required:
+                raise GeminiConfigurationError(communication_unavailable_message(cwd))
             prompt += "\nThe native AgentsDock MCP tool was not loaded. Do not use shell helpers as a substitute; report unavailable helper operations instead."
         if snapshot is not None:
             verify_resume_snapshot(snapshot, await asyncio.to_thread(native_snapshot, env, cwd, provider_id))

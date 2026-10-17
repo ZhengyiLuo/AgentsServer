@@ -74320,6 +74320,13 @@ async def _start_turn_locked(
             task = run_gemini(sys.modules[__name__], session_id, run_id, provider_prompt,
                              dict(sess), manifest_path,
                              file_ids=prompt_file_ids,
+                             communication_required=bool(
+                                 any(reference.action in {"route", "direct_message", "instruction", "request_reply"}
+                                     for reference in req.chat_references)
+                                 or req.team_references or team_mail_command
+                                 or mailbox_wake_claim is not None
+                                 or req.purpose in {"cross_chat_handoff_delivery", "secure_peer_handoff_delivery"}
+                             ),
                              provider_command=resolved_provider_command,
                              provider_runtime_env=provider_turn_payload.runtime_env,
                              standalone_provider_context=provider_context_mode == "standalone")

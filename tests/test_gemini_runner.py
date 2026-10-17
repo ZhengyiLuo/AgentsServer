@@ -2,6 +2,7 @@
 import asyncio
 from pathlib import Path
 import tempfile
+import json
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
@@ -13,6 +14,16 @@ ID = "12345678-1234-1234-1234-123456789abc"
 
 
 class Runner(unittest.IsolatedAsyncioTestCase):
+    def test_mcp_error_points_to_exact_workspace_without_auth_or_trust_mutation(self):
+        for cwd in ("/project", "/project with 中文", "/project's $(not-a-command)", "/project\nwith-newline"):
+            message = gemini_runner.communication_unavailable_message(cwd)
+            self.assertIn("Workspace: " + json.dumps(cwd, ensure_ascii=False), message)
+            self.assertNotIn("\n", message)
+            self.assertIn("not a sign-in error", message)
+            self.assertIn("/permissions", message)
+            self.assertIn("does not grant folder trust automatically", message)
+            self.assertNotIn("--skip-trust", message)
+
     async def test_cleanup_fence_only_clears_exact_owner_after_durable_save(self):
         row = {"gemini_cleanup_pending_run_id": "owned-run"}
         store = SimpleNamespace(sessions={"s": row}, save=AsyncMock(side_effect=OSError("disk full")))

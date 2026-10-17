@@ -81,6 +81,10 @@ require an explicit model check. Manual model selection remains available.
   an untrusted workspace. An explicit handoff fails with a folder-trust/MCP
   instruction if the tool was not loaded; AgentsDock never grants folder trust
   or substitutes shell helpers. Review trust in the native CLI yourself.
+  This is separate from account authentication: signing in in a different
+  directory does not trust the chat's workspace. An existing route alone does
+  not make the MCP tool mandatory for an unrelated ordinary question; explicit
+  turn references and internal mailbox/delivery turns still require it.
   Additional real-CLI fixtures reject an unissued recipient and a route revoked
   between list/send, deduplicate retried delivery, and leave a busy recipient's
   existing turn uninterrupted. Authority-file paths are not put in the prompt.

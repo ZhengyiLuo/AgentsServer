@@ -50,6 +50,7 @@ def make_namespace(root: Path):
     locks = {}
     registry = local_session_ownership.Registry(root)
     ns = {"Any": Any, "Literal": Literal, "BaseModel": BaseModel, "Field": Field,
+        "HISTORY_MAINTENANCE_STATE": {},
         "cancel_generated_session_title": Mock(),
         "local_session_ownership": local_session_ownership,
         "local_history_import_guard": lambda: local_session_ownership.history_import_lock(registry=registry),

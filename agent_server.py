@@ -26253,7 +26253,9 @@ def scan_queued_turns_from_events(
             unchanged = ((proof_stamp.st_dev, proof_stamp.st_ino, proof_stamp.st_size, proof_stamp.st_mtime_ns)
                          == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns))
             for value in evidence.values():
-                value["complete"] = proof_complete and unchanged
+                # A snapshot ending in a partial record was not fully scanned.
+                # It may hide a terminal/admission event, so never migrate it.
+                value["complete"] = proof_complete and unchanged and scan["offset"] == scan["end"]
         items = [
             pending[qid]
             for qid in order
@@ -50406,6 +50408,7 @@ async def run_provider_history_sync(session_id: str) -> None:
                 return
             key = history_maintenance_key(sess)
             state.update(status="running", reason=None)
+            await refresh_native_session_title(session_id)
             repair_caches = (CLAUDE_METADATA_REPAIR_CACHE, CODEX_GOAL_HISTORY_REPAIR_CACHE,
                              CODEX_NATIVE_HISTORY_REPAIR_CACHE)
             before_repair = tuple(cache.signature(session_id) for cache in repair_caches)
@@ -51825,7 +51828,10 @@ def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, 
         )
     }
     maintenance = HISTORY_MAINTENANCE_STATE.get(str(sess.get("id") or ""), {})
-    public["history_maintenance"] = {key: maintenance.get(key) for key in ("status", "reason", "retry_at")}
+    # Never-started maintenance adds no useful information to high-volume lists.
+    # Once observed, retain idle/cleared fields so caches can retire old errors.
+    if not summary or maintenance:
+        public["history_maintenance"] = {key: maintenance.get(key) for key in ("status", "reason", "retry_at")}
     # Omit only never-configured defaults from high-volume lists. A stored null
     # is a clear tombstone and must survive summary/cache merges.
     if not summary or "subagent_limit" in sess:

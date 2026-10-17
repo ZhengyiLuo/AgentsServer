@@ -168,8 +168,12 @@ class Lifecycle(unittest.TestCase):
         sid = self.new(); self.fixture_type.mode = "error"; self.send(sid)
         self.assertTrue(self.finished(sid)[-1]["is_error"])
         self.assertFalse(json.loads((self.state / "sessions.json").read_text())[sid].get("gemini_session_id"))
+        self.assertIsNone(self.client.get(f"/api/sessions/{sid}").json()["session"]["gemini_session_id"])
         self.fixture_type.mode = "normal"; self.send(sid)
         self.assertFalse(self.finished(sid, 2)[-1]["is_error"])
+        public = self.client.get(f"/api/sessions/{sid}").json()["session"]
+        self.assertTrue(public["gemini_session_id"])
+        self.assertEqual(public["gemini_session_id"], public["session_id"])
         neighbor = sid; before = self.events(neighbor)
         sid = self.new(); self.fixture_type.mode = "tool"; self.send(sid)
         route = f"/api/sessions/{sid}"
@@ -275,6 +279,7 @@ class Lifecycle(unittest.TestCase):
         self.assertTrue(self.finished(sender)[-1]["is_error"])
         errors = [e["message"] for e in self.events(sender) if e["type"] == "error"]
         self.assertTrue(any("folder trust and MCP settings" in message for message in errors), errors)
+        self.assertTrue(any("No cross-chat message was sent." in message for message in errors), errors)
         self.assertFalse((self.root / ".gemini/trustedFolders.json").exists())
         self.assertEqual(len(self.fixture_type.bodies), before, "A blocked explicit handoff must not start model work")
         self.assertFalse(any(e["type"] == "turn_started" for e in self.events(receiver)))
@@ -523,6 +528,42 @@ class Lifecycle(unittest.TestCase):
         self.approve_next(sender, handled); self.finished(sender)
         self.assertTrue(any(e["type"] == "tool_finished" and e["tool"].get("is_error") for e in self.events(sender)))
         self.assertFalse(any(e.get("source_session_id") == sender for e in self.events(receiver)))
+
+    def test_busy_sender_queue_grants_access_but_sends_nothing_until_execution(self):
+        self.trust_fixture(); sender, receiver = self.new(), self.new()
+        self.fixture_type.mode = "stream"; self.send(sender)
+        self.assertTrue(self.fixture_type.entered.wait(20))
+        self.send_route_fixture(sender, receiver)
+        first = next(e["queued_id"] for e in self.events(sender) if e["type"] == "turn_queued")
+        self.assertTrue(any(e["type"] == "agent_handoff_route_created" for e in self.events(sender)))
+        self.assertFalse(any(e.get("message_id") or e["type"] == "turn_started" for e in self.events(receiver)))
+        self.assertEqual(self.client.delete(f"/api/sessions/{sender}/queue/{first}").status_code, 200)
+        self.send_route_fixture(sender, receiver)
+        self.assertEqual(sum(e["type"] == "turn_started" for e in self.events(sender)), 1)
+        self.assertFalse(any(e.get("message_id") for e in self.events(receiver)))
+        self.fixture_type.mode = "mail"; self.fixture_type.release.set()
+        handled = set()
+        def replied():
+            for sid in (sender, receiver):
+                for item in self.client.get(f"/api/sessions/{sid}/gemini/runtime").json()["pending_interactions"]:
+                    if item["id"] in handled: continue
+                    handled.add(item["id"])
+                    self.assertEqual(self.client.post(f"/api/sessions/{sid}/gemini/interactions/{item['id']}/resolve",
+                        json={"response": {"decision": "accept"}}).status_code, 200)
+            return any(e.get("handoff_preview") == "MAIL_ACK" and e.get("source_session_id") == receiver for e in self.events(sender))
+        self.wait(replied, timeout=45)
+        self.assertFalse(any(e["type"] == "turn_started" and e.get("queued_id") == first for e in self.events(sender)))
+        incoming = [e for e in self.events(receiver) if e.get("source_session_id") == sender and e.get("message_id")]
+        self.assertEqual(len({e["message_id"] for e in incoming}), 1)
+
+    def test_declining_native_mcp_approval_does_not_send_a_message(self):
+        self.trust_fixture(); sender, receiver = self.new(), self.new()
+        self.fixture_type.mode = "mail"; self.send_route_fixture(sender, receiver)
+        pending = self.wait(lambda: self.client.get(f"/api/sessions/{sender}/gemini/runtime").json()["pending_interactions"])
+        self.assertEqual(self.client.post(f"/api/sessions/{sender}/gemini/interactions/{pending[0]['id']}/resolve",
+            json={"response": {"decision": "decline"}}).status_code, 200)
+        self.finished(sender)
+        self.assertFalse(any(e.get("message_id") or e["type"] == "turn_started" for e in self.events(receiver)))
 
     def test_busy_recipient_not_interrupted_and_retry_does_not_duplicate_mail(self):
         self.trust_fixture(); sender, receiver = self.new(), self.new()

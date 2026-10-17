@@ -2,10 +2,18 @@ import unittest
 
 from fastapi.responses import JSONResponse
 
-from agent_server import public_session
+from agent_server import public_session, session_provider_id
 
 
 class SessionSummaryTests(unittest.TestCase):
+    def test_gemini_identity_is_available_in_detail_not_summary(self):
+        native_id = "11111111-1111-4111-8111-111111111111"
+        session = {"id": "chat-gemini", "backend": "gemini", "gemini_session_id": native_id}
+        self.assertEqual(public_session(session).get("gemini_session_id"), native_id)
+        self.assertEqual(session_provider_id(session), native_id)
+        self.assertNotIn("gemini_session_id", public_session(session, summary=True))
+        self.assertIsNone(public_session({"id": "failed-first-turn", "backend": "gemini"}).get("gemini_session_id"))
+
     def test_summary_omits_provider_and_prompt_payloads(self):
         session = {
             "id": "chat-1",

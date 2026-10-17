@@ -95,6 +95,12 @@ require an explicit model check. Manual model selection remains available.
   opaque chat-bound IDs and revalidates the file fingerprint at admission and
   launch. Selection is a **native activation request**, not a native slash
   command: Gemini must call `activate_skill`; ordinary approvals still apply.
+- A route-access receipt is permission, not proof of message delivery. Queued
+  user turns do not send mail before execution. Gemini must load its run-bound
+  MCP tool in a natively trusted workspace and receive any required tool
+  approval. A blocked MCP startup sends no cross-chat message; AgentsDock does
+  not automatically trust a workspace. Failed first turns without saved native
+  history have no resumable Gemini ID; the desktop explains this pending state.
   Its current text-only inventory is bounded and parsed strictly. Ambiguous
   output fails closed; names outside the safe slash grammar are not listed.
 - Private API profiles reference the existing user skill/extension directories,

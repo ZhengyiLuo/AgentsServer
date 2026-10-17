@@ -47959,6 +47959,8 @@ def session_provider_id(sess: dict[str, Any]) -> str | None:
         return sess.get("cursor_session_id") or sess.get("session_id")
     if backend == BACKEND_OPENCODE:
         return sess.get("opencode_session_id") or sess.get("session_id")
+    if backend == BACKEND_GEMINI:
+        return sess.get("gemini_session_id") or sess.get("session_id")
     return sess.get("session_id")
 
 
@@ -51606,7 +51608,7 @@ def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, 
     detail_fields = () if summary else (
         "auto_title_enabled",
         "system_prompt", "session_id", "claude_session_id", "codex_thread_id",
-        "cursor_session_id", "opencode_session_id",
+        "cursor_session_id", "opencode_session_id", "gemini_session_id",
         "claude_permission_mode", "cursor_permission_mode",
         "opencode_permission_mode",
         "codex_approval_policy", "codex_sandbox_mode",

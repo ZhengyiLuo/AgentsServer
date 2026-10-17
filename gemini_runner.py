@@ -355,7 +355,7 @@ async def run(api, session_id: str, run_id: str, prompt: str, sess: dict,
             # Native Gemini refuses MCP discovery in an untrusted workspace.
             # Never grant folder trust or weaken an existing MCP policy here.
             if needs_chat_tool:
-                raise GeminiConfigurationError("Gemini did not load the AgentsDock communication tool. Open Gemini CLI in this chat's workspace and review its folder trust and MCP settings, then retry. AgentsDock does not grant folder trust automatically.")
+                raise GeminiConfigurationError("No cross-chat message was sent. Gemini did not load the AgentsDock communication tool. Open Gemini CLI in this chat's workspace and review its folder trust and MCP settings, then retry. AgentsDock does not grant folder trust automatically.")
             prompt += "\nThe native AgentsDock MCP tool was not loaded. Do not use shell helpers as a substitute; report unavailable helper operations instead."
         if snapshot is not None:
             verify_resume_snapshot(snapshot, await asyncio.to_thread(native_snapshot, env, cwd, provider_id))

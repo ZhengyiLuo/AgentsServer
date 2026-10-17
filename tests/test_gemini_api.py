@@ -30,6 +30,11 @@ class GeminiAPITests(unittest.IsolatedAsyncioTestCase):
             "PROVIDER_CONNECTION_STORE": store, "provider_connections": provider_connections}
         exec(compile(ast.Module(body=[function], type_ignores=[]), "agent_server.py", "exec"), namespace)
         with patch("gemini_runtime.probe", return_value={"status": "ready"}):
+            with self.assertRaises(HTTPException) as rejected:
+                await namespace["ensure_runtime_available"]("gemini", session={"backend": "gemini"})
+            self.assertEqual(rejected.exception.status_code, 409)
+            self.assertIn("API connections only", rejected.exception.detail)
+            store.for_session.assert_not_called()
             session = {"backend": "gemini", "provider_connection": "custom"}
             store.for_session.return_value = selected()
             self.assertEqual(await namespace["ensure_runtime_available"]("gemini", session=session), {"status": "ready"})

@@ -214,6 +214,24 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(terminal["output_tokens"], 4)
         self.assertEqual([e["text"] for e in self.events(sid) if e["type"] == "assistant_text"], ["VISIBLE_FIRST_CHUNK VISIBLE_LAST_CHUNK"])
 
+    def test_api_only_catalog_and_legacy_native_chat_admission(self):
+        legacy = self.client.post('/api/sessions', json={"backend": "gemini", "cwd": str(self.project)}).json()['session']
+        catalog = self.client.get('/api/runtime/catalog?refresh=true').json()['backends']['gemini']
+        self.assertFalse(catalog['native_credentials_present'])
+        self.assertFalse(catalog['available'])
+        self.assertTrue(catalog['custom_provider']['available'])
+        self.assertEqual(catalog['models'], [])
+        before = len(self.fixture_type.bodies)
+        rejected = self.client.post(f"/api/sessions/{legacy['id']}/turns", json={
+            "prompt": "Do not run", "client_capabilities": ["gemini_acp_v1"]})
+        self.assertEqual(rejected.status_code, 409, rejected.text)
+        self.assertIn('API connections only', rejected.json()['detail'])
+        self.assertEqual(len(self.fixture_type.bodies), before)
+        self.assertEqual(self.client.get(f"/api/sessions/{legacy['id']}").status_code, 200)
+        # The configured API remains usable and receives a genuine native-CLI turn.
+        sid = self.new(); self.send(sid)
+        self.assertFalse(self.finished(sid)[-1]['is_error'])
+
     def test_initial_native_import_titles_exclusion_and_idempotency(self):
         native_id = str(uuid4()); chats = self.root / ".gemini/tmp/native/chats"; chats.mkdir(parents=True)
         (chats.parent / ".project_root").write_text(str(self.project))

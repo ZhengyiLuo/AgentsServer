@@ -19,6 +19,8 @@ import tempfile
 import time
 
 VERSION = "0.64.0"
+API_ONLY_MESSAGE = ("Gemini in AgentsDock supports API connections only. Configure a Gemini API key "
+                    "in My Agents and create a Gemini API chat. Existing Google-login chat history is preserved.")
 AUTH_ENV = (
     "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS",
     "GOOGLE_CLOUD_ACCESS_TOKEN", "GOOGLE_GENAI_USE_GCA", "GOOGLE_GENAI_USE_VERTEXAI",
@@ -79,7 +81,7 @@ def probe(env: dict[str, str], *, timeout: float = 8) -> dict:
             "installed": bool(executable), "version": None, "_executable": executable}
     if not executable:
         return {**base, "status": "missing", "message": "Gemini CLI is not installed.",
-                "action": "Install @google/gemini-cli on the server, then run gemini to sign in."}
+                "action": "Install @google/gemini-cli on the server, then configure a Gemini API key in My Agents."}
     try:
         version = version_output(executable, env, timeout).strip()
     except (OSError, subprocess.SubprocessError):
@@ -132,10 +134,12 @@ def build_environment(base: dict[str, str], *, cwd: str, api_home: Path | None =
     API home is server-owned and durable for this connection's native history.
     Never point it at an ordinary user's home or reset/delete it on Forget.
     """
+    if api_home is None:
+        raise GeminiConfigurationError(API_ONLY_MESSAGE)
     env = {key: value for key, value in base.items() if key not in AUTH_ENV}
     env.update({"GEMINI_CLI_NO_RELAUNCH": "1", "NO_BROWSER": "true",
                 "GEMINI_TELEMETRY_ENABLED": "false"})
-    expected_auth = "gemini-api-key" if api_home is not None else "oauth-personal"
+    expected_auth = "gemini-api-key"
     system_path = Path(env.get("GEMINI_CLI_SYSTEM_SETTINGS_PATH") or (
         "/Library/Application Support/GeminiCli/settings.json" if sys.platform == "darwin" else "/etc/gemini-cli/settings.json"))
     # System-selected auth outranks our private profile. Do not bypass an
@@ -154,12 +158,6 @@ def build_environment(base: dict[str, str], *, cwd: str, api_home: Path | None =
             raise GeminiConfigurationError("The workspace enforces a different Gemini authentication method.")
     except AttributeError as exc:
         raise GeminiConfigurationError("Invalid project Gemini authentication settings.") from exc
-    if api_home is None:
-        if project_auth not in {None, "oauth-personal"}:
-            raise GeminiConfigurationError("This workspace selects a different Gemini authentication method. Use a matching connection.")
-        if not native_credentials_present(env):
-            raise GeminiConfigurationError("Sign in with Google by running gemini on the server, or configure a Gemini API connection.")
-        return env
     if not api_key or not base_url:
         raise GeminiConfigurationError("Configure the Gemini API connection before sending a message.")
     if project_auth not in {None, "gemini-api-key"}:

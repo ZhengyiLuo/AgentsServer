@@ -59103,7 +59103,9 @@ def record_runtime_success(backend: str) -> None:
 
 async def ensure_runtime_available(backend: str, *, session: dict[str, Any] | None = None) -> dict[str, Any]:
     if backend == BACKEND_GEMINI:
-        from gemini_runtime import probe
+        from gemini_runtime import probe, API_ONLY_MESSAGE
+        if (session or {}).get("provider_connection") != "custom":
+            raise HTTPException(409, API_ONLY_MESSAGE)
         diagnostic = await asyncio.to_thread(probe, runner_env())
         store_runtime_diagnostic(diagnostic)
         if diagnostic.get("status") != "ready":
@@ -59890,13 +59892,11 @@ def discover_runtime_backend_catalog(backend: str, *, force_runtime_probe: bool 
     ready = diagnostic.get("status") == "ready"
     executable = str(diagnostic.get("_executable") or "") or None
     if backend == BACKEND_GEMINI:
-        from gemini_runner import MODEL_CATALOG
-        from gemini_runtime import native_credentials_present
-        return {**MODEL_CATALOG.get("default", {"models": [runtime_option("", "Gemini default")], "default_model": ""}),
+        return {"models": [], "default_model": None,
                 "efforts": [], "default_effort": None, "effort_source": "none",
-                "model_source": "Gemini ACP session catalog" if MODEL_CATALOG else "Gemini native default (until first session)",
-                "available": ready, "diagnostic": public_runtime_diagnostic(diagnostic),
-                "native_credentials_present": native_credentials_present(runner_env()),
+                "model_source": "Configure a Gemini API connection in My Agents",
+                "available": False, "diagnostic": public_runtime_diagnostic(diagnostic),
+                "native_credentials_present": False,
                 "custom_provider": PROVIDER_CONNECTION_STORE.catalog(backend, installed=ready)}
     if backend == BACKEND_CLAUDE:
         catalog = parse_claude_help_catalog()
@@ -70003,6 +70003,35 @@ async def retain_codex_goal_run_owner(
             return True
 
 
+def codex_native_archive_rejection(exc: BaseException, thread_id: str) -> bool:
+    """Only the owning native resume RPC can report this state, not chat text."""
+    return bool(
+        thread_id and isinstance(exc, CodexAppServerRequestError)
+        and exc.method == "thread/resume" and isinstance(exc.error, dict)
+        and exc.error.get("message") == (
+            f"session {thread_id} is archived. Run `codex unarchive {thread_id}` to unarchive it first."
+        )
+    )
+
+
+async def archive_rejected_codex_session(session_id: str, thread_id: str, run_id: str) -> None:
+    """Mirror a confirmed native archive through the normal local archive path.
+
+    This never archives/unarchives/deletes the native thread. It retires local
+    routes and jobs exactly like the user's Archive action, preserving history.
+    Identity is stable while this run owns the chat; ignore stale/deleted runs.
+    """
+    current = STORE.sessions.get(session_id)
+    active = ACTIVE.get(session_id) or {}
+    if (not current or current.get("archived") or session_id in DELETING_SESSIONS
+            or current.get("backend") != BACKEND_CODEX
+            or str(session_provider_id(current) or "") != thread_id
+            or active.get("run_id") != run_id):
+        return
+    await _update_session(session_id, UpdateSessionRequest(archived=True),
+                          native_archive_owner=(thread_id, run_id))
+
+
 async def run_codex_app_server(
     session_id: str,
     run_id: str,
@@ -72426,6 +72455,7 @@ async def run_codex_app_server(
             thread_pinned = False
         can_fallback = (
             allow_exec_fallback
+            and not codex_native_archive_rejection(exc, str(session_provider_id(sess) or ""))
             and codex_provider.session_choice(sess.get("codex_provider")) == "default"
             and provider_command is None
             and not stop_requested
@@ -72490,6 +72520,15 @@ async def run_codex_app_server(
                 **current_metadata(),
             })
             error_emitted = True
+            if codex_native_archive_rejection(exc, str(session_provider_id(sess) or "")):
+                try:
+                    await archive_rejected_codex_session(
+                        session_id, str(session_provider_id(sess)), current_run_id,
+                    )
+                except Exception:
+                    # Preserve the actual provider error if local retirement
+                    # fails. Never pretend the native thread was unarchived.
+                    logger.exception("Could not mirror native Codex archive session=%s", session_id)
     finally:
         async def settle_transport_finalizer() -> None:
             """Retire every owner before cancellation can escape the runner."""
@@ -87745,6 +87784,17 @@ async def ensure_backend_update_allowed(
 
 @app.patch("/api/sessions/{session_id}")
 async def update_session(session_id: str, req: UpdateSessionRequest) -> dict[str, Any]:
+    return await _update_session(session_id, req)
+
+
+async def _update_session(
+    session_id: str, req: UpdateSessionRequest, *,
+    native_archive_owner: tuple[str, str] | None = None,
+) -> dict[str, Any]:
+    # Internal provenance is not an HTTP parameter. Recheck after acquiring
+    # the same lock as Stop, replacement and new-turn admission.
+    if native_archive_owner is not None and req.archived is not True:
+        raise ValueError("native archive ownership only applies to archive")
     ensure_session_not_initializing(session_id)
     patch = req.model_dump(exclude_unset=True)
     if SESSION_LIFECYCLE_UPDATE_FIELDS.intersection(patch):
@@ -87752,6 +87802,12 @@ async def update_session(session_id: str, req: UpdateSessionRequest) -> dict[str
             current = STORE.sessions.get(session_id)
             if not current:
                 raise HTTPException(status_code=404, detail="session not found")
+            if native_archive_owner is not None:
+                thread_id, run_id = native_archive_owner
+                if (session_id in DELETING_SESSIONS or current.get("backend") != BACKEND_CODEX
+                        or str(session_provider_id(current) or "") != thread_id
+                        or (ACTIVE.get(session_id) or {}).get("run_id") != run_id):
+                    return {"session": public_session(current)}
             if req.archived is False and current.get("archived"):
                 try:
                     # An earlier archive may have failed to save jobs.json

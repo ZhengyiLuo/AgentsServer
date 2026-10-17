@@ -6,16 +6,18 @@ Do not enable it in a public build until the acceptance gaps below are closed.
 
 ## Authentication is separate from ACP
 
-- **Google login:** run `gemini` on the AgentsServer machine and choose Google's
-  interactive sign-in. The server reads the CLI's cached OAuth configuration;
-  credential presence is not proof that the next remote request will succeed.
+- **API-only in AgentsDock:** Google/CLI login is not an available connection.
+  Existing Google-login chats keep their history, but sends are rejected with
+  instructions to configure API and create an API chat. No account logout,
+  credential deletion or automatic rebinding occurs. Native-history imports
+  remain readable; they cannot resume using a different account implicitly.
 - **Gemini Developer API:** configure a Gemini API key in My Agents. The official
   endpoint is `https://generativelanguage.googleapis.com`; compatible endpoints
   must speak the native Gemini API with `x-goog-api-key`. OpenAI Responses,
   Chat Completions and Anthropic protocols are not interchangeable with it.
 - **ACP** is the JSON-RPC transport between AgentsServer and Gemini CLI. It is
-  neither an account nor a third login method. Both connections still execute
-  tasks through the CLI; their credentials and quotas remain separate.
+  neither an account nor a login method. API connections still execute tasks
+  through the installed CLI; its runtime remains required.
 
 API chats use private server-owned Gemini profiles. They do not modify the
 ordinary Google login, silently fall back to it, or write keys into Gemini
@@ -37,7 +39,7 @@ this is not a claim that every routed model is covered by the key's quota.
 Existing empty-model chats work without reconnecting or rewriting credentials.
 An explicit chat model wins over its saved connection default, and both reach
 the CLI. Third-party URLs still require an explicit model; their support for
-Google's Auto model family is unknown. Native Google-login behavior is unchanged.
+Google's Auto model family is unknown. Native Google login is not offered in AgentsDock.
 
 References: [Gemini authentication](https://geminicli.com/docs/get-started/authentication/),
 [ACP mode](https://geminicli.com/docs/cli/acp-mode/),
@@ -56,8 +58,8 @@ The health capability is `gemini_backend`, with required client capability
 `gemini_acp_v1` on turns. Without the preview flag the ordinary four-provider
 behavior remains. Old clients cannot send Gemini turns accidentally.
 
-My Agents gains a fifth, expandable Gemini CLI row with separate CLI and API
-cards. Initial API setup does not require guessing a model ID. It discovers
+My Agents gains a fifth, expandable Gemini row with an API card only.
+Initial API setup does not require guessing a model ID. It discovers
 models from the configured endpoint, then uses the existing default-model
 control. A public catalog alone is not proof of authentication: such endpoints
 require an explicit model check. Manual model selection remains available.
@@ -197,7 +199,7 @@ exercise Google inference nor certify low-memory or sustained production load.
 ### Native permission modes
 
 The desktop composer offers Gemini's own **Default**, **Auto Edit**, **YOLO**
-and **Plan**, for both Google-login and API connections. These are not Codex
+and **Plan**, for API connections. These are not Codex
 sandbox/access profiles. New chats inherit the last selected Gemini chat's
 mode; absent a saved preference, they use Default. YOLO selection requires an
 explicit risk confirmation. A change applies at the next turn's start and
@@ -284,11 +286,12 @@ signal or equivalent before broad compatibility can be promised.
 - Initial Google OAuth and Developer API attempts encountered upstream
   eligibility and billing errors. Subsequent actual desktop Developer API
   acceptance succeeds, including Default/Plan, skills and cross-chat flows
-  recorded above. Google OAuth-account acceptance remains pending; cached
-  login presence is not proof that inference works. Known eligibility, credits
+  recorded above. Google OAuth is no longer exposed as an AgentsDock connection;
+  cached login presence is not proof that inference works. Known eligibility, credits
   and model-removal errors have actionable, secret-safe messages.
 - The visible development desktop was restarted against the Gemini-enabled
-  server: New Chat shows both native and API Gemini choices with the sparkle
+  server: New Chat originally showed native and API Gemini choices; the API-only
+  policy now exposes just the API choice with the sparkle
   mark, the slash picker lists installed skills, and an explicit model refresh
   retains the returned model list through subsequent compact session polling.
   First-generation failure recovery is now separately covered with a real CLI

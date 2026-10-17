@@ -44,7 +44,7 @@ def safe_rpc_error(error: dict) -> str:
         return "This Gemini permission mode is not enabled in the workspace. Choose an available native mode; no prompt was sent."
     if "no longer supported" in message and "code assist for individuals" in message:
         return ("Google no longer supports this Gemini CLI connection for Code Assist for individuals. "
-                "Use a Gemini Developer API key in My Agents, or an eligible organization account. "
+                "Use a Gemini Developer API key in My Agents. "
                 "Signing in to the same personal account again will not resolve this restriction.")
     if error.get("code") == 402 or "prepayment credits are depleted" in message:
         return "Gemini API project credits are depleted. Add credits or check billing in Google AI Studio, then retry."
@@ -53,7 +53,7 @@ def safe_rpc_error(error: dict) -> str:
     if "quota" in message or "resource_exhausted" in message or "rate limit" in message:
         return "Gemini's selected account or API project has reached its quota. Check its billing/quota or retry later."
     if error.get("code") == -32000 and ("auth" in message or "api key" in message):
-        return "Gemini authentication is required. Sign in on the server or configure its API connection."
+        return "Gemini API authentication is required. Configure its API key in My Agents, then retry."
     return "Gemini rejected the request. Check the selected account, model and workspace."
 
 

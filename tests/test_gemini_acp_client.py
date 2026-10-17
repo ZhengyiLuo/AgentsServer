@@ -263,12 +263,13 @@ class GeminiIsolationTests(unittest.TestCase):
         (self.gemini / "oauth_creds.json").write_text("{}")
         self.env = {"HOME":str(self.home), "GEMINI_API_KEY":"unrelated-key", "GOOGLE_GENAI_USE_VERTEXAI":"true"}
 
-    def test_native_mode_does_not_inherit_api_key(self):
-        result = build_environment(self.env, cwd=str(self.project))
-        self.assertNotIn("GEMINI_API_KEY", result)
-        self.assertNotIn("GOOGLE_GENAI_USE_VERTEXAI", result)
-        self.assertTrue(native_credentials_present(result))
-        self.assertNotIn("GEMINI_CLI_HOME", result)
+    def test_native_login_is_not_an_agentsdock_connection_even_with_credentials(self):
+        before = (self.gemini / "settings.json").read_bytes()
+        self.assertTrue(native_credentials_present(self.env))
+        with self.assertRaisesRegex(GeminiConfigurationError, "API connections only"):
+            build_environment(self.env, cwd=str(self.project))
+        self.assertEqual((self.gemini / "settings.json").read_bytes(), before)
+        self.assertTrue((self.gemini / "oauth_creds.json").exists())
 
     def test_api_mode_has_separate_home_and_never_overwrites_native_settings(self):
         before = (self.gemini / "settings.json").read_bytes()

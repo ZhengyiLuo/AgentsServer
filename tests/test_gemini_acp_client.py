@@ -286,6 +286,29 @@ class GeminiIsolationTests(unittest.TestCase):
         with self.assertRaises(GeminiConfigurationError):
             build_environment(self.env, cwd=str(self.project), api_home=self.root / "api", api_key=None)
 
+    def test_native_import_selects_explicit_api_only_in_process_without_mutating_login(self):
+        before = (self.gemini / "settings.json").read_bytes()
+        result = build_environment(self.env, cwd=str(self.project), api_home=self.root / "unused",
+            api_key="selected-api-key", base_url="https://example.invalid/v1beta", native_history=True)
+        self.assertEqual(result["GEMINI_CLI_HOME"],str(self.home))
+        self.assertEqual(result["GEMINI_CLI_AUTH_OVERRIDE"],"gemini-api-key")
+        self.assertEqual(result["GEMINI_API_KEY"],"selected-api-key")
+        self.assertNotIn("GOOGLE_GENAI_USE_VERTEXAI",result)
+        self.assertEqual((self.gemini / "settings.json").read_bytes(),before)
+        self.assertEqual((self.gemini / "oauth_creds.json").read_text(),"{}")
+        self.assertFalse((self.root / "unused").exists())
+
+    def test_native_import_cannot_bypass_enforced_or_malformed_auth(self):
+        for settings in ({"security":{"auth":{"enforcedType":"oauth-personal"}}}, {"security":None}):
+            (self.gemini / "settings.json").write_text(json.dumps(settings))
+            with self.assertRaises(GeminiConfigurationError):
+                build_environment(self.env,cwd=str(self.project),api_home=self.root / "unused",
+                    api_key="selected",base_url="https://example.invalid",native_history=True)
+
+    def test_native_import_missing_key_never_falls_back_to_cached_google_auth(self):
+        with self.assertRaises(GeminiConfigurationError):
+            build_environment(self.env,cwd=str(self.project),api_home=self.root / "unused",native_history=True)
+
     def test_native_home_cannot_be_reused_as_api_home(self):
         with self.assertRaises(GeminiConfigurationError):
             build_environment(self.env, cwd=str(self.project), api_home=self.home,

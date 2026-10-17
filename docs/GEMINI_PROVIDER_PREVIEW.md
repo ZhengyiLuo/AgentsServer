@@ -7,10 +7,10 @@ Do not enable it in a public build until the acceptance gaps below are closed.
 ## Authentication is separate from ACP
 
 - **API-only in AgentsDock:** Google/CLI login is not an available connection.
-  Existing Google-login chats keep their history, but sends are rejected with
-  instructions to configure API and create an API chat. No account logout,
-  credential deletion or automatic rebinding occurs. Native-history imports
-  remain readable; they cannot resume using a different account implicitly.
+  Native-history imports remain readable without an API. To continue, explicitly
+  choose the saved Gemini API during import, or click **Connect Gemini API** in
+  an already-imported chat. No account logout, credential deletion or automatic
+  rebinding occurs. The API destination is disclosed before connection.
 - **Gemini Developer API:** configure a Gemini API key in My Agents. The official
   endpoint is `https://generativelanguage.googleapis.com`; compatible endpoints
   must speak the native Gemini API with `x-goog-api-key`. OpenAI Responses,
@@ -19,7 +19,7 @@ Do not enable it in a public build until the acceptance gaps below are closed.
   neither an account nor a login method. API connections still execute tasks
   through the installed CLI; its runtime remains required.
 
-API chats use private server-owned Gemini profiles. They do not modify the
+New API chats use private server-owned Gemini profiles. They do not modify the
 ordinary Google login, silently fall back to it, or write keys into Gemini
 settings. Forget revokes the API binding; it does not erase native history.
 Conflicting project/system auth settings fail closed rather than bypassing
@@ -28,6 +28,30 @@ email/plan display are deferred.
 
 No background discovery calls ACP `authenticate`. In the pinned CLI that method
 can clear cached credentials and persist a different selected auth type.
+
+### Continue an imported native conversation with API
+
+History storage and authentication are independent. Explicitly connected imports
+keep their original native profile, workspace, transcript and UUID. The pinned
+CLI's in-memory `GEMINI_CLI_AUTH_OVERRIDE=gemini-api-key` selects the saved API for
+that child process; no transcript copy, new native chat, persistent login change
+or ACP `authenticate` call is used. Existing native tool context is loaded by the
+CLI even though the initial AgentsDock projection remains a text snapshot.
+Managed/workspace authentication policy still wins; conflicts fail closed.
+
+Health advertises `gemini_backend.features.native_import_api`. Gemini bulk-import
+items may explicitly include `provider_connection: "custom"`. To connect an
+existing history-only import, native clients may PATCH the session with only
+`{"gemini_connect_api": true}`. This is not general account switching: other
+providers, missing native history, archived/deleting/busy/queued chats and
+revoked existing bindings are rejected. Persistence must succeed before success
+is returned. Shared-chat viewers cannot change a connection.
+
+Forget still blocks sends; reconnecting the same saved credential identity can
+restore them. Binding does not silently select a different saved API for a
+previously API-bound chat. Later native transcript edits are not automatically
+reconciled into the AgentsDock timeline; avoid concurrent writers to one native
+session. Delete removes AgentsDock data, not the original provider history.
 
 ### API model defaults
 
@@ -359,7 +383,7 @@ signal or equivalent before broad compatibility can be promised.
 | Reasoning/trace/usage | Exposed native ACP events retained; fixture ordering/reconnect pass. Full real-model parity still unverified. |
 | Titles | Native-summary priority and tool-free API fallback implemented. Actual offscreen App + Google Developer API verifies first-turn short English and long Chinese/log naming, Auto resolution, no hidden user turn, repeated-turn identity and reopen. Native fixtures cover missing summary/manual-name protection; failure/revocation/race cases have focused regressions. |
 | Agent-to-agent | Server-provided, run-bound MCP; allowed/denied/revoked/busy/retry cases tested without blanket approvals. Actual offscreen App + Google API verifies queue/cancel, one message each way, purple cards, native IDs and reopen; automatic mailbox wakes do not create user bubbles. |
-| Import/sync | Native discovery and initial text snapshot implemented; exact identity, workspace and ownership checked. Later native edits are not reconciled. |
+| Import/sync | Native discovery and initial text snapshot implemented; exact identity, workspace and ownership checked. Explicit API connection preserves the original native history/UUID and terminal login settings. Later native edits are not reconciled. |
 | Existing skills | Native inventory/activation, trust, precedence, stale selection and approval tested; extension/hook parity not claimed. |
 | Jobs/shares/media | Server-provided jobs and interactive shares tested. Text/image/WAV transport tested; media understanding not accepted. |
 | Permission modes | Native Default/Auto Edit/YOLO/Plan wired through desktop and ACP, with explicit startup checks, native denial, next-turn semantics and same-session resume tested. Real Google API Default/Plan passed; broader organization/platform policy coverage remains unverified. |

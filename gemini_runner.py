@@ -294,7 +294,8 @@ async def run(api, session_id: str, run_id: str, prompt: str, sess: dict,
         profile = api.PROVIDER_CONNECTION_STORE.root / ("gemini-runtime-" + connection["credential_id"]) if connection else None
         env = build_environment(api.runner_env(), cwd=cwd, api_home=profile,
             api_key=connection.get("api_key") if connection else None,
-            base_url=connection.get("base_url") if connection else None)
+            base_url=connection.get("base_url") if connection else None,
+            native_history=bool(sess.get("gemini_native_history")) and not standalone_provider_context)
         selected_skill = _kwargs.get("provider_command")
         if selected_skill is not None:
             # Recheck immediately before launching, including after queueing.

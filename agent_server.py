@@ -6343,6 +6343,7 @@ class BulkImportSessionItem(BaseModel):
     backend: Literal["claude", "codex", "cursor", "gemini"]
     cwd: str | None = Field(default=None, max_length=MAX_WORKSPACE_PATH_CHARS)
     title: str | None = Field(default=None, max_length=MAX_LOCAL_SESSION_LABEL_CHARS)
+    provider_connection: Literal["custom"] | None = None
 
     @field_validator("provider_session_id")
     @classmethod
@@ -6366,6 +6367,7 @@ class BulkImportSessionsRequest(BaseModel):
 
 
 class UpdateSessionRequest(BaseModel):
+    gemini_connect_api: bool | None = Field(default=None, strict=True)
     title: str | None = None
     auto_title_enabled: bool | None = None
     folder: str | None = None
@@ -10591,7 +10593,7 @@ class SessionStore:
         if initializing_fork and parent_id and req.provider_connection == "custom":
             parent = self.sessions.get(parent_id) or {}
             runtime_source.update({name: parent.get(name) for name in ("provider_connection", "provider_connection_revision")})
-        if req.provider_connection == "custom" and not initializing_fork and any((req.provider_session_id, req.session_id, req.claude_session_id, req.opencode_session_id)):
+        if backend != BACKEND_GEMINI and req.provider_connection == "custom" and not initializing_fork and any((req.provider_session_id, req.session_id, req.claude_session_id, req.opencode_session_id)):
             raise HTTPException(409, "Import native conversations with their native login. Create a new chat for a custom API.")
         runtime = preview_session_runtime_update(runtime_source, {
             "codex_provider": req.codex_provider, "provider_connection": req.provider_connection, "model": req.model, "effort": req.effort,
@@ -10602,8 +10604,6 @@ class SessionStore:
             if req.provider_session_id or req.session_id or req.import_history:
                 from gemini_import import initial_history
                 from gemini_acp_client import GeminiProtocolError
-                if runtime.get("provider_connection") == "custom":
-                    raise HTTPException(400, "Gemini external imports use the original CLI connection, not a custom API profile.")
                 try:
                     await asyncio.to_thread(initial_history, sys.modules[__name__], runner_env(),
                         req.provider_session_id or req.session_id or "", str(Path(session_cwd).expanduser().resolve()))
@@ -10716,6 +10716,7 @@ class SessionStore:
             "codex_thread_id": codex_thread_id,
             "cursor_session_id": cursor_session_id,
             "gemini_session_id": provider_id if backend == BACKEND_GEMINI else None,
+            "gemini_native_history": bool(backend == BACKEND_GEMINI and provider_id),
             "gemini_session_cwd": session_cwd if backend == BACKEND_GEMINI and provider_id else None,
             "opencode_session_id": opencode_session_id,
             "opencode_session_cwd": (
@@ -48113,10 +48114,8 @@ def read_native_session_title(sess: dict[str, Any]) -> str | None:
         return cursor_native_session_title(provider_id, sess.get("cwd"))
     if backend == BACKEND_GEMINI:
         from gemini_history import native_snapshot
-        env = runner_env()
-        if sess.get("provider_connection") == "custom":
-            connection = PROVIDER_CONNECTION_STORE.for_session(sess)
-            env["GEMINI_CLI_HOME"] = str(PROVIDER_CONNECTION_STORE.root / ("gemini-runtime-" + connection["credential_id"]))
+        from gemini_runtime import history_environment
+        env = history_environment(runner_env(), sess, PROVIDER_CONNECTION_STORE.for_session(sess), PROVIDER_CONNECTION_STORE.root)
         record = native_snapshot(env, str(sess.get("cwd") or ""), provider_id)
         return native_session_title(record.get("summary"))
     if backend == "opencode":
@@ -48266,8 +48265,8 @@ async def generate_session_title(session_id: str, snapshot: dict, reply: str) ->
             connection = PROVIDER_CONNECTION_STORE.for_session(snapshot)
             model = default_model(connection)
             if model == "auto":
-                env = runner_env()
-                env["GEMINI_CLI_HOME"] = str(PROVIDER_CONNECTION_STORE.root / ("gemini-runtime-" + connection["credential_id"]))
+                from gemini_runtime import history_environment
+                env = history_environment(runner_env(), snapshot, connection, PROVIDER_CONNECTION_STORE.root)
                 native = await asyncio.wait_for(asyncio.to_thread(native_snapshot, env,
                     str(snapshot.get("cwd") or ""), session_provider_id(snapshot)), timeout=1.0)
                 model = next((row.get("model") for row in reversed(native["messages"])
@@ -61280,7 +61279,8 @@ async def discover_session_provider_commands(
             profile = PROVIDER_CONNECTION_STORE.root / ("gemini-runtime-" + connection["credential_id"]) if connection else None
             env = build_environment(runner_env(), cwd=cwd, api_home=profile,
                 api_key=connection.get("api_key") if connection else None,
-                base_url=connection.get("base_url") if connection else None)
+                base_url=connection.get("base_url") if connection else None,
+                native_history=bool(session.get("gemini_native_history")))
             executable = resolve_executable(env)
             if not executable:
                 raise GeminiConfigurationError("Install Gemini CLI to discover its skills.")
@@ -82324,6 +82324,7 @@ async def health() -> dict[str, Any]:
                 "client_capability": GEMINI_CLIENT_CAPABILITY,
                 "history_mode": "initial_text_snapshot",
                 "features": {"resume": True, "external_import": True, "fork": False,
+                             "native_import_api": True,
                              "history_reconciliation": False,
                              "approvals": True, "skills_picker": True, "custom_api": True,
                              "attachments": True, "live_text": True, "token_usage": True,
@@ -87112,6 +87113,10 @@ async def bulk_import_sessions_guarded(
         results: list[dict[str, Any]] = []
         for item in req.items:
             key = (item.backend, item.provider_session_id)
+            if item.provider_connection and item.backend != BACKEND_GEMINI:
+                results.append(bulk_import_result(item, ok=False, code="invalid_connection",
+                    error="API binding on import is only supported for Gemini."))
+                continue
             if key in requested_keys:
                 results.append(bulk_import_result(
                     item,
@@ -87198,6 +87203,7 @@ async def bulk_import_sessions_guarded(
                 staged_session = await STORE.create(
                     CreateSessionRequest(
                         backend=item.backend,
+                        provider_connection=item.provider_connection,
                         provider_session_id=item.provider_session_id,
                         cwd=candidate_cwd or DEFAULT_CWD,
                         title=(item.title or str(candidate.get("label") or "")).strip()
@@ -87813,7 +87819,58 @@ async def ensure_backend_update_allowed(
 
 @app.patch("/api/sessions/{session_id}")
 async def update_session(session_id: str, req: UpdateSessionRequest) -> dict[str, Any]:
+    if req.gemini_connect_api:
+        if set(req.model_dump(exclude_unset=True)) != {"gemini_connect_api"}:
+            raise HTTPException(400, "Connect the Gemini API separately from other chat edits.")
+        return await connect_gemini_import_api(session_id)
     return await _update_session(session_id, req)
+
+
+async def connect_gemini_import_api(session_id: str) -> dict[str, Any]:
+    """Explicit one-way binding of a native import, not general account switching."""
+    from gemini_import import initial_history
+    from gemini_history import native_snapshot, snapshot_replay
+    from gemini_acp_client import GeminiProtocolError
+    ensure_session_not_initializing(session_id)
+    async with session_lifecycle_lock(session_id):
+        current = STORE.sessions.get(session_id)
+        if not current:
+            raise HTTPException(404, "session not found")
+        if current.get("backend") != BACKEND_GEMINI or not session_provider_id(current):
+            raise HTTPException(400, "Only an imported Gemini conversation can use this action.")
+        if current.get("archived") or session_id in DELETING_SESSIONS:
+            raise HTTPException(409, "Unarchive this chat before connecting its API.")
+        if (session_id in BUSY_SESSIONS or session_id in ACTIVE or QUEUED_TURNS.get(session_id)
+                or current.get("gemini_cleanup_pending_run_id")
+                or any(not task.done() for task in SESSION_TURN_TASKS.get(session_id, ()))):
+            raise HTTPException(409, "Stop active work and clear queued messages before connecting this API.")
+        if current.get("provider_connection") == "custom":
+            PROVIDER_CONNECTION_STORE.for_session(current)  # No silent rebind on Forget.
+            return {"session": public_session(current)}
+        provider_id, cwd = session_provider_id(current), str(current.get("cwd") or "")
+        def validate():
+            initial_history(sys.modules[__name__], runner_env(), provider_id, cwd)
+            snapshot_replay(native_snapshot(runner_env(), cwd, provider_id))
+        try:
+            await asyncio.to_thread(validate)
+        except (GeminiProtocolError, OSError, ValueError):
+            raise HTTPException(409, "The original Gemini history is unavailable or changed; refresh Import Chat.") from None
+        async with STORE._lock:
+            if (STORE.sessions.get(session_id) is not current or session_id in DELETING_SESSIONS
+                    or current.get("archived") or session_id in BUSY_SESSIONS or session_id in ACTIVE
+                    or QUEUED_TURNS.get(session_id) or current.get("gemini_cleanup_pending_run_id")
+                    or any(not task.done() for task in SESSION_TURN_TASKS.get(session_id, ()))):
+                raise HTTPException(409, "This chat changed while connecting; wait for active work to finish and retry.")
+            previous = dict(current)
+            selected = PROVIDER_CONNECTION_STORE.bind({"backend": BACKEND_GEMINI, "provider_connection": "custom"})
+            current.update(provider_connection="custom", provider_connection_revision=selected["credential_id"],
+                gemini_native_history=True, gemini_session_cwd=cwd, model=selected.get("model"), updated_at=now_iso())
+            try:
+                await STORE.save(durable=True)
+            except BaseException:
+                current.clear(); current.update(previous)
+                raise
+        return {"session": public_session(current)}
 
 
 async def _update_session(

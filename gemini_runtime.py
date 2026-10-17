@@ -1,7 +1,8 @@
 """Gemini runtime resolution and explicit per-process credential isolation.
 
 No login, settings mutation or model request takes place during discovery.
-Custom API profiles never reuse the native Google credential directory.
+New API chats use private profiles. Explicitly connected native imports keep
+their original history root, selecting API auth only in the child process.
 """
 from __future__ import annotations
 
@@ -20,7 +21,7 @@ import time
 
 VERSION = "0.64.0"
 API_ONLY_MESSAGE = ("Gemini in AgentsDock supports API connections only. Configure a Gemini API key "
-                    "in My Agents and create a Gemini API chat. Existing Google-login chat history is preserved.")
+                    "in My Agents, then connect this imported chat to that API or create a Gemini API chat. Existing history is preserved.")
 AUTH_ENV = (
     "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS",
     "GOOGLE_CLOUD_ACCESS_TOKEN", "GOOGLE_GENAI_USE_GCA", "GOOGLE_GENAI_USE_VERTEXAI",
@@ -128,7 +129,8 @@ def version_output(executable: str, env: dict[str, str], timeout: float) -> str:
 
 
 def build_environment(base: dict[str, str], *, cwd: str, api_home: Path | None = None,
-                      api_key: str | None = None, base_url: str | None = None) -> dict[str, str]:
+                      api_key: str | None = None, base_url: str | None = None,
+                      native_history: bool = False) -> dict[str, str]:
     """Explicit auth selection; no fallback between API and Google accounts.
 
     API home is server-owned and durable for this connection's native history.
@@ -162,6 +164,19 @@ def build_environment(base: dict[str, str], *, cwd: str, api_home: Path | None =
         raise GeminiConfigurationError("Configure the Gemini API connection before sending a message.")
     if project_auth not in {None, "gemini-api-key"}:
         raise GeminiConfigurationError("The workspace overrides Gemini API authentication. Its settings must match this connection.")
+    if native_history:
+        # Pinned 0.64's in-memory user auth override preserves normal settings
+        # precedence, unlike ACP authenticate (which writes settings/credentials).
+        # Keep the ORIGINAL history root: no transcript copy, symlink or new ID.
+        original = native_home(base)
+        try:
+            auth = read_settings(original / ".gemini/settings.json").get("security", {}).get("auth", {})
+            if auth.get("enforcedType") not in {None, expected_auth}:
+                raise GeminiConfigurationError("Native Gemini settings enforce a different authentication method.")
+        except AttributeError as exc:
+            raise GeminiConfigurationError("Invalid native Gemini authentication settings.") from exc
+        env.update({"GEMINI_CLI_HOME": str(original), "GEMINI_CLI_AUTH_OVERRIDE": expected_auth})
+        return api_environment(env, api_key, base_url)
     api_home = api_home.absolute()
     original = native_home(base).resolve()
     if api_home.resolve() == original or api_home.is_symlink():
@@ -192,14 +207,26 @@ def build_environment(base: dict[str, str], *, cwd: str, api_home: Path | None =
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+    env["GEMINI_CLI_HOME"] = str(api_home)
+    return api_environment(env, api_key, base_url)
+
+
+def api_environment(env: dict[str, str], api_key: str, base_url: str) -> dict[str, str]:
     normalized_base = base_url.rstrip("/")
     for version in ("v1beta", "v1"):
         if normalized_base.endswith("/" + version):
             normalized_base = normalized_base[:-(len(version) + 1)]
             env["GOOGLE_GENAI_API_VERSION"] = version
             break
-    env.update({"GEMINI_CLI_HOME": str(api_home), "GEMINI_API_KEY": api_key,
+    env.update({"GEMINI_API_KEY": api_key,
                 "GOOGLE_GEMINI_BASE_URL": normalized_base})
+    return env
+
+
+def history_environment(base: dict, session: dict, connection: dict, root: Path) -> dict:
+    env = dict(base)
+    if connection and not session.get("gemini_native_history"):
+        env["GEMINI_CLI_HOME"] = str(root / ("gemini-runtime-" + connection["credential_id"]))
     return env
 
 

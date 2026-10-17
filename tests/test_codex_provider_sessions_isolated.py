@@ -95,6 +95,7 @@ def make_namespace(root: Path):
         "codex_user_config_defaults": lambda: ("normal-model", "high", "fast"),
         "CODEX_DEFAULT_MODEL": "normal-model", "CODEX_DEFAULT_EFFORT": "high",
         "clamp_codex_runtime_effort": lambda model, effort: effort,
+        "codex_available_model": lambda model: model,
         "codex_default_service_tier": lambda model: "fast",
         "CODEX_SETTINGS_FILE": root / "codex-settings.json", "CODEX_NONINTERACTIVE_APPROVAL_POLICY": "never",
         "CODEX_PROVIDER_MCP_NAME": "fixture", "codex_provider_mcp_config": lambda: {},

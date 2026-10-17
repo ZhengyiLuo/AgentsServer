@@ -27,14 +27,14 @@ class Runner(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("gemini_cleanup_pending_run_id", row)
         store.save.assert_awaited_once_with(durable=True)
 
-    async def scenario(self, *, updates=(), history=None, failure=False, history_error=None):
+    async def scenario(self, *, updates=(), history=None, failure=False, history_error=None, connection=None, model=None):
         with tempfile.TemporaryDirectory() as directory:
             api = SimpleNamespace(
                 STORE=SimpleNamespace(sessions={"s": {"backend": "gemini"}}),
                 ACTIVE={"s": {"run_id": "r", "backend": "gemini", "provider_tools_ready": asyncio.Event()}},
                 DELETING_SESSIONS=set(), STOPPED_RUNS=set(), DEFAULT_CWD=directory,
                 CROSS_CHAT_CAPABILITY_LOCK=asyncio.Lock(), CROSS_CHAT_CAPABILITIES={}, ACTIVE_LOCK=asyncio.Lock(),
-                PROVIDER_CONNECTION_STORE=SimpleNamespace(for_session=lambda _: None, root=Path(directory)),
+                PROVIDER_CONNECTION_STORE=SimpleNamespace(for_session=lambda sess: ({**connection, "model": sess.get("model") or connection.get("model")} if connection else None), root=Path(directory)),
                 validate_provider_runtime_env=lambda _: {}, opencode_helper_output_redactor=lambda *_: lambda x: x,
                 runner_env=lambda: {"HOME": directory}, run_event_metadata=lambda _: {},
                 turn_slot_is_owned=AsyncMock(return_value=True),
@@ -48,7 +48,7 @@ class Runner(unittest.IsolatedAsyncioTestCase):
             class Client:
                 session_id = ID
                 def __init__(self, *, on_update, **_): self.update = on_update
-                async def start(self, *_, **__): pass
+                async def start(self, command, **__): api.started_command = command
                 async def open_session(self, **_): return {}
                 async def prompt(self, *_):
                     for update in updates: await self.update(update)
@@ -60,10 +60,24 @@ class Runner(unittest.IsolatedAsyncioTestCase):
             ) as environment, patch("gemini_history.native_snapshot", return_value=history, side_effect=history_error), patch(
                 "gemini_content.attachments", return_value=[]
             ):
-                await gemini_runner.run(api, "s", "r", "test", {"cwd": directory, "_gemini_executable": "fixture"}, Path(directory))
-                self.assertIsNone(environment.call_args.kwargs["api_key"], "CLI mode must not require an API connection")
-                self.assertIsNone(environment.call_args.kwargs["api_home"])
+                await gemini_runner.run(api, "s", "r", "test", {"cwd": directory, "_gemini_executable": "fixture", "model": model}, Path(directory))
+                if not connection:
+                    self.assertIsNone(environment.call_args.kwargs["api_key"], "CLI mode must not require an API connection")
+                    self.assertIsNone(environment.call_args.kwargs["api_home"])
+                else:
+                    self.assertEqual(environment.call_args.kwargs["api_key"], connection["api_key"])
+                    self.assertIsNotNone(environment.call_args.kwargs["api_home"])
             return api
+
+    async def test_api_model_defaults_reach_cli_and_explicit_chat_model_wins(self):
+        connection = {"base_url": "https://generativelanguage.googleapis.com", "api_key": "fixture-key", "credential_id": "a" * 32}
+        for default, model, expected in ((None, None, "auto"), ("gemini-saved", None, "gemini-saved"),
+                                         ("gemini-saved", "gemini-chosen", "gemini-chosen")):
+            api = await self.scenario(connection={**connection, "model": default}, model=model)
+            self.assertEqual(api.started_command, ["fixture", "--acp", "--model", expected])
+            self.assertNotIn(connection["api_key"], str(api.started_command))
+        native = await self.scenario()
+        self.assertEqual(native.started_command, ["fixture", "--acp"])
 
     async def test_native_connection_runs_without_custom_api_object(self):
         api = await self.scenario(updates=[{"type": "text", "text": "answer"}], history={"messages": [{"type": "gemini"}]})

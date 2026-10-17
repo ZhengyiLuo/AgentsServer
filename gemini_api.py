@@ -5,11 +5,36 @@ import asyncio
 import json
 import re
 import time
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 
 MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}\Z")
+
+
+def supports_auto(selected: dict) -> bool:
+    """Only Google's API is known to support the models chosen by CLI Auto.
+
+    Auto is a CLI routing alias, not a model returned by the REST inventory.
+    Do not assume a Gemini-compatible gateway implements that model family.
+    """
+    url = urlsplit(selected.get("base_url") or "")
+    return (url.scheme == "https" and url.netloc.lower() in {
+        "generativelanguage.googleapis.com", "generativelanguage.googleapis.com:443"
+    } and url.path.rstrip("/") in {"", "/v1", "/v1beta"}
+        and not url.query and not url.fragment)
+
+
+def default_model(selected: dict) -> str | None:
+    # Preserve an explicit chat model or its immutable connection default.
+    return selected.get("model") or ("auto" if supports_auto(selected) else None)
+
+
+def model_options(selected: dict, models: list[dict]) -> list[dict]:
+    if supports_auto(selected):
+        return [{"value": "auto", "label": "Auto (Gemini CLI)"},
+                *[item for item in models if item["value"] != "auto"]]
+    return models
 
 
 def api_base(selected):

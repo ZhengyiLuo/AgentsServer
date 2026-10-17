@@ -209,11 +209,15 @@ class ConnectionStore:
         try:
             value = self.for_session(session) if session else self.read(backend)
             configured = value.get("configured") is True and value.get("last_result") == "verified"
+            model = value.get("model")
+            if configured and backend == "gemini":
+                from gemini_api import default_model
+                model = default_model(value)
             if summary:
                 # Large endpoint inventories belong to detail/settings reads,
                 # not repeated once for every row of a session-list response.
                 return {"configured": configured, "available": configured and installed,
-                        "model": value.get("model"), "base_url": value.get("base_url")}
+                        "model": model, "base_url": value.get("base_url")}
             models = []
             if configured:
                 cache_key = (backend, value["revision"])
@@ -227,12 +231,14 @@ class ConnectionStore:
                         self.catalog_cache.pop(next(iter(self.catalog_cache)))
                 if backend == "cursor" and not models:
                     models = [{"value": "auto", "label": "Auto"}]
-                model = value.get("model")
+                if backend == "gemini":
+                    from gemini_api import model_options
+                    models = model_options(value, models)
                 if model and not any(item["value"] == model for item in models):
                     models = [{"value": model, "label": model}, *models]
             return {"configured": configured, "available": configured and installed,
-                    "models": models, "efforts": [], "default_model": value.get("model"),
-                    "model": value.get("model"), "default_effort": None, "base_url": value.get("base_url")}
+                    "models": models, "efforts": [], "default_model": model,
+                    "model": model, "default_effort": None, "base_url": value.get("base_url")}
         except HTTPException:
             return {"configured": False, "available": False, "models": [], "efforts": [], "model": None, "base_url": None}
 
@@ -579,8 +585,9 @@ def create_router(*, authorize, store: ConnectionStore, check=probe, account=nat
             if cursor_catalog is None: raise HTTPException(501, "Cursor API keys are unavailable.")
             result = await cursor_catalog(selected)
         elif backend == "gemini":
-            from gemini_api import catalog
+            from gemini_api import catalog, model_options
             result = await asyncio.to_thread(catalog, selected)
+            result["models"] = model_options(selected, result["models"])
         else:
             result = await asyncio.to_thread(endpoint_model_catalog, selected, protocol=selected.get("protocol", "responses"))
         # Fence a settings read that raced replacement/forget. Session bindings
@@ -595,8 +602,12 @@ def create_router(*, authorize, store: ConnectionStore, check=probe, account=nat
             with store.lock:
                 store.catalog_cache[(backend, selected["revision"])] = (time.monotonic(), result["models"])
                 if len(store.catalog_cache) > 32: store.catalog_cache.pop(next(iter(store.catalog_cache)))
+        model = selected.get("model")
+        if backend == "gemini":
+            from gemini_api import default_model
+            model = default_model(selected)
         return reply({"backend": backend, "revision": selected.get("credential_id") if backend == "codex" else selected["revision"],
-                      "models": result["models"], "default_model": selected.get("model"), "discovery_status": result["discovery_status"]})
+                      "models": result["models"], "default_model": model, "discovery_status": result["discovery_status"]})
 
     @router.put("/api/admin/provider-models/{backend}")
     async def default_model(backend: str, request: Request):
@@ -625,7 +636,11 @@ def create_router(*, authorize, store: ConnectionStore, check=probe, account=nat
                     saved = store.write(backend, current["revision"], {**value, "model": model, "expected_revision": current["revision"]}, current["last_result"], checked_at=current["checked_at"])
                     cached = store.catalog_cache.get((backend, current["revision"]))
                     if cached: store.catalog_cache[(backend, saved["revision"])] = cached
-                    return {"backend": backend, "revision": saved["revision"], "default_model": saved["model"]}
+                    effective_model = saved["model"]
+                    if backend == "gemini":
+                        from gemini_api import default_model as gemini_default_model
+                        effective_model = gemini_default_model(saved)
+                    return {"backend": backend, "revision": saved["revision"], "default_model": effective_model}
             return reply(await asyncio.to_thread(save_model))
 
     @router.get("/api/admin/provider-accounts/{backend}")

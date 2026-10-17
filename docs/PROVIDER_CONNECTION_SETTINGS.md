@@ -134,6 +134,11 @@ the chat selector still allow an exact ID. Friendly names are
 shown alongside exact IDs; confirmed non-chat/non-tool models are filtered out.
 Inventory presence is not proof of permission, billing or agent-tool compatibility.
 
+Gemini's experimental integration is an exception to the empty-default rule:
+the official Google Developer API uses the native CLI **Auto** selector when
+no model is chosen. Explicit models still take precedence. Compatible third-party
+Gemini endpoints need their own model selection; we do not guess their defaults.
+
 Connected Custom API cards offer **⋯ → Forget endpoint**, with confirmation.
 This revokes this instance's existing custom-chat bindings as well as its saved
 selection for new chats. History remains readable; new/queued runs, forks and

@@ -59096,7 +59096,9 @@ async def ensure_runtime_available(backend: str, *, session: dict[str, Any] | No
         if diagnostic.get("status") != "ready":
             raise HTTPException(503, diagnostic.get("message"))
         if (session or {}).get("provider_connection") == "custom":
-            provider_connections.require_model(PROVIDER_CONNECTION_STORE.for_session(session))
+            from gemini_api import default_model
+            selected = PROVIDER_CONNECTION_STORE.for_session(session)
+            provider_connections.require_model({**selected, "model": default_model(selected)})
         return diagnostic
     diagnostic = await asyncio.to_thread(runtime_diagnostic, backend)
     if (session or {}).get("provider_connection") == "custom":

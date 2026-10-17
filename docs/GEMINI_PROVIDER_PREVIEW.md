@@ -27,6 +27,18 @@ email/plan display are deferred.
 No background discovery calls ACP `authenticate`. In the pinned CLI that method
 can clear cached credentials and persist a different selected auth type.
 
+### API model defaults
+
+For Google's official Developer API endpoint, an unset model now uses Gemini
+CLI's native `auto` routing alias. The server passes `--model auto`, not a
+hard-coded model version or an arbitrary first catalog entry. My Agents and
+chat catalogs expose **Auto (Gemini CLI)** independently of REST discovery;
+this is not a claim that every routed model is covered by the key's quota.
+Existing empty-model chats work without reconnecting or rewriting credentials.
+An explicit chat model wins over its saved connection default, and both reach
+the CLI. Third-party URLs still require an explicit model; their support for
+Google's Auto model family is unknown. Native Google-login behavior is unchanged.
+
 References: [Gemini authentication](https://geminicli.com/docs/get-started/authentication/),
 [ACP mode](https://geminicli.com/docs/cli/acp-mode/),
 [Developer API models](https://ai.google.dev/api/models).

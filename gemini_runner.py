@@ -324,8 +324,15 @@ async def run(api, session_id: str, run_id: str, prompt: str, sess: dict,
                 + f"\nUse the run-bound AgentsDock MCP tool from {name} for authorized helper operations. "
                 "There is no shell-helper fallback for this integration."
                 "\n[End AgentsDock provider authority]")
-        if sess.get("model"):
-            command += ["--model", str(sess["model"])]
+        model = sess.get("model")
+        if connection:
+            from gemini_api import default_model
+            from provider_connections import require_model
+            # Re-resolve the immutable binding at execution, including queued
+            # runs. Never ignore its default or inherit a native-account model.
+            model = require_model({**connection, "model": default_model(connection)})
+        if model:
+            command += ["--model", str(model)]
 
         async def started(proc):
             bound, stop = await api.bind_active_turn(session_id, run_id, {

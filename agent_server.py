@@ -11133,7 +11133,8 @@ class SessionStore:
             }
             sess.update(title=title, _title_source=source, _title_auto_value=title)
             if source == "prompt" and isinstance(prompt_seed, str):
-                sess["_title_seed"] = prompt_seed[:1600]
+                sess["_title_seed"] = (title_generation.gemini_title_seed(prompt_seed)
+                    if sess.get("backend") == BACKEND_GEMINI else prompt_seed[:1600])
             elif source in {"provider", "generated"}:
                 sess.pop("_title_seed", None)
             sess["updated_at"] = now_iso()
@@ -48202,7 +48203,8 @@ def generated_title_eligible(sess: dict[str, Any], *, allow_attempted: bool = Fa
     return bool(
         os.environ.get("AGENTSDOCK_AUTO_TITLES", "1").strip().lower() not in {"0", "false", "off"}
         and not SERVER_SHUTTING_DOWN
-        and sess.get("backend") in {BACKEND_CODEX, BACKEND_CURSOR}
+        and (sess.get("backend") in {BACKEND_CODEX, BACKEND_CURSOR}
+             or (sess.get("backend") == BACKEND_GEMINI and sess.get("provider_connection") == "custom"))
         and sess.get("auto_title_enabled", True) is not False
         and not sess.get("archived") and not sess.get("parent_id") and not sess.get("fork_from")
         and sess.get("id") not in DELETING_SESSIONS
@@ -48229,6 +48231,9 @@ async def close_generated_session_titles() -> None:
 
 async def generate_session_title(session_id: str, snapshot: dict, reply: str) -> None:
     async with GENERATED_TITLE_SLOTS:
+        if snapshot["backend"] == BACKEND_GEMINI:
+            # A native summary may arrive while this optional task waits.
+            await refresh_native_session_title(session_id)
         # Persist the claim before spending any provider usage. A restart does
         # not retry an ambiguous request. This is one optional attempt per chat.
         async with STORE._lock:
@@ -48255,6 +48260,27 @@ async def generate_session_title(session_id: str, snapshot: dict, reply: str) ->
             options["model"] = codex_runtime_settings(snapshot)[0]
             options["executable"] = CODEX_BIN
             options["provider_selection"] = CODEX_PROVIDER_STORE.for_session(snapshot, include_key=True)
+        elif snapshot["backend"] == BACKEND_GEMINI:
+            from gemini_api import default_model
+            from gemini_history import native_snapshot
+            connection = PROVIDER_CONNECTION_STORE.for_session(snapshot)
+            model = default_model(connection)
+            if model == "auto":
+                env = runner_env()
+                env["GEMINI_CLI_HOME"] = str(PROVIDER_CONNECTION_STORE.root / ("gemini-runtime-" + connection["credential_id"]))
+                native = await asyncio.wait_for(asyncio.to_thread(native_snapshot, env,
+                    str(snapshot.get("cwd") or ""), session_provider_id(snapshot)), timeout=1.0)
+                model = next((row.get("model") for row in reversed(native["messages"])
+                    if row.get("type") == "gemini" and row.get("model") and row.get("model") != "auto"), None)
+            # Recheck revocation after the awaited metadata read and before
+            # sending anything. Never take credentials from the current default.
+            connection = PROVIDER_CONNECTION_STORE.for_session(snapshot)
+            current = STORE.sessions.get(session_id)
+            if (not current or not generated_title_eligible(current, allow_attempted=True)
+                    or title_runtime_key(current) != title_runtime_key(snapshot)
+                    or current.get("title") != snapshot.get("title")):
+                return
+            options = {"model": model, "provider_selection": connection}
         else:
             options["executable"] = resolve_cursor_executable()
             if not options["executable"]:
@@ -48266,6 +48292,9 @@ async def generate_session_title(session_id: str, snapshot: dict, reply: str) ->
             snapshot["backend"], snapshot["_title_seed"], reply, **options,
         )
         if result:
+            if snapshot["backend"] == BACKEND_GEMINI:
+                await refresh_native_session_title(session_id)
+                PROVIDER_CONNECTION_STORE.for_session(snapshot)  # Forget also fences a pending result.
             changed = await STORE.adopt_auto_title(
                 session_id, result, source="generated", backend=snapshot["backend"],
                 provider_id=session_provider_id(snapshot), expected_title=snapshot.get("title"),

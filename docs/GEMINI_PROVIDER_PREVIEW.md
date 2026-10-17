@@ -124,13 +124,14 @@ require an explicit model check. Manual model selection remains available.
   acceptance. Arbitrary
   file URLs, PDF/video and larger attachments are not advertised as supported.
 - Adopt the native transcript `summary` as an automatic title when it exists;
-  manual names win. **First-turn summarized naming is not implemented when
-  native metadata is absent.** The current fallback generator only handles
-  Codex and Cursor, not Gemini. A successful real API first turn can therefore
-  retain the first prompt line, including an irrelevant pasted-log heading.
-  The existing title test injects a native summary and checks adoption/manual
-  name protection; it does not verify generation. No separate title-model
-  request or hidden user prompt is added.
+  manual names win. After the first successful ordinary user turn, a missing
+  native title triggers one bounded, tool-free background API request using
+  this chat's saved endpoint/key/model. CLI Auto resolves from the exact native
+  transcript's model, not an arbitrary model default. Long pasted prompts keep
+  both beginning and end within the excerpt budget. No message or native
+  session is created; naming failure keeps the first-line fallback without
+  retries. Forget, manual rename, identity changes and opt-out fence pending
+  results. See [automatic titles](NATIVE_SESSION_TITLES.md) for limits and usage.
 - Opt-in native discovery and initial **text-only** history import, preserving
   exact UUID/workspace and title (first actual human message when absent).
   Child, archived, deleted, unavailable, ambiguous and already-owned identities
@@ -356,7 +357,7 @@ signal or equivalent before broad compatibility can be promised.
 | Runtime/auth/models | CLI runtime + isolated API profiles; local fixtures and bounded actual desktop Developer API requests pass. Google/CLI login is intentionally unsupported, not a pending acceptance item. |
 | New/resume/Stop/Delete | Native UUID, queue, crash recovery, retained history and truthful cleanup tested. Early startup Stop/Delete race fixed and exercised through the actual desktop; old persisted cleanup fences are not automatically cleared. No native Fork. |
 | Reasoning/trace/usage | Exposed native ACP events retained; fixture ordering/reconnect pass. Full real-model parity still unverified. |
-| Titles | Native summary adoption/manual-name protection tested. Real first-turn naming fails when native summary is absent; Gemini fallback generation is missing. This required behavior is not accepted. |
+| Titles | Native-summary priority and tool-free API fallback implemented. Actual offscreen App + Google Developer API verifies first-turn short English and long Chinese/log naming, Auto resolution, no hidden user turn, repeated-turn identity and reopen. Native fixtures cover missing summary/manual-name protection; failure/revocation/race cases have focused regressions. |
 | Agent-to-agent | Server-provided, run-bound MCP; allowed/denied/revoked/busy/retry cases tested without blanket approvals. Actual offscreen App + Google API verifies queue/cancel, one message each way, purple cards, native IDs and reopen; automatic mailbox wakes do not create user bubbles. |
 | Import/sync | Native discovery and initial text snapshot implemented; exact identity, workspace and ownership checked. Later native edits are not reconciled. |
 | Existing skills | Native inventory/activation, trust, precedence, stale selection and approval tested; extension/hook parity not claimed. |
@@ -379,10 +380,9 @@ just the successful text fixture. In particular:
    fixture or bounded protocol-output tests as a memory sizing recommendation.
 4. External-history reconciliation is unsupported. Native Fork is unsupported:
    the pinned ACP implementation does not implement `session/fork`; a copied
-   transcript is not a substitute. First-successful-turn summarized titles need
-   an implementation and actual App/real-model acceptance, including long
-   pasted inputs, absent native metadata, manual rename and reopen. Merely
-   reading an injected summary does not meet that requirement.
+   transcript is not a substitute. First-successful-turn summarized titles have
+   separate actual App/real-model acceptance; this does not establish external
+   history reconciliation or native Fork support.
 5. Extension/hook customization parity remains unverified. Native permission
    modes have isolated native CLI and actual desktop boundary tests, not full
    organization/platform policy coverage. Managed subagents, native goals, explicit compaction control and

@@ -109,6 +109,9 @@ class Lifecycle(unittest.TestCase):
         with socket.socket() as sock: sock.bind(("127.0.0.1", 0)); self.port = sock.getsockname()[1]
         self.token = secrets.token_hex(32)
         self.env = {"PATH": os.environ["PATH"], "HOME": str(self.root), "LANG": "en_US.UTF-8",
+            # Title inference has its own opt-in native contract. Other lifecycle
+            # fixtures count model calls and must not race optional metadata work.
+            "AGENTSDOCK_AUTO_TITLES": "1" if getattr(self, "auto_titles", False) else "0",
             "AGENTSDOCK_STATE_DIR": str(self.state), "AGENTSDOCK_AGENT_TOKEN": self.token, "AGENTSDOCK_AGENT_PORT": str(self.port),
             "AGENTSDOCK_AGENT_CWD": str(self.project), "AGENTSDOCK_GEMINI_PREVIEW": "1",
             "AGENTSDOCK_GEMINI_BIN": os.environ["AGENTSDOCK_TEST_GEMINI_BIN"], "AGENTSDOCK_CODEX_TRANSPORT": "exec", "AGENTSDOCK_CLAUDE_TRANSPORT": "print"}

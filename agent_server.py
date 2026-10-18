@@ -755,6 +755,7 @@ EVENTS_WEBSOCKET_PROTOCOL = "agentsdock-events-v1"
 TERMINAL_WEBSOCKET_PROTOCOL = "agentsdock-terminal-v1"
 EMERGENCY_AUTHORITY_DENIED_PURPOSES = {
     "chat_mailbox_wake",
+    "server_update_continuation",
     "cross_chat_handoff_delivery",
     "secure_peer_handoff_delivery",
     "handoff_digest",
@@ -1636,6 +1637,7 @@ CROSS_CHAT_DELIVERY_PURPOSES = {
 }
 FORK_INTERNAL_PURPOSES = {
     "chat_mailbox_wake",
+    "server_update_continuation",
     "handoff_digest",
     "handoff_digest_delivery",
     *CROSS_CHAT_DELIVERY_PURPOSES,
@@ -9079,6 +9081,7 @@ class ServerRestartRequest(BaseModel):
         max_length=32,
         pattern=r"^[0-9a-f]{32}$",
     )
+    resume_interrupted_turns: Literal[True] | None = None
 
     @field_validator("confirmed", mode="before")
     @classmethod
@@ -9087,7 +9090,7 @@ class ServerRestartRequest(BaseModel):
             raise ValueError("confirmed must be the JSON boolean true")
         return value
 
-    @field_validator("force", "force_confirmed", mode="before")
+    @field_validator("force", "force_confirmed", "resume_interrupted_turns", mode="before")
     @classmethod
     def require_optional_literal_boolean_true(cls, value: Any) -> Any:
         if value is not None and value is not True:
@@ -9115,6 +9118,8 @@ class ServerRestartRequest(BaseModel):
             raise ValueError(
                 "expected_update_schedule_id requires a forced restart"
             )
+        if self.resume_interrupted_turns and not self.expected_update_schedule_id:
+            raise ValueError("resume_interrupted_turns requires an exact scheduled force update")
         return self
 
 
@@ -21339,6 +21344,8 @@ def provider_turn_may_manage_jobs(
     """
 
     normalized_purpose = str(purpose or "").strip()
+    if normalized_purpose == SERVER_UPDATE_CONTINUATION_PURPOSE:
+        return False
     if normalized_purpose == "secure_peer_handoff_delivery":
         return False
     if normalized_purpose == "cross_chat_handoff_delivery":
@@ -22628,6 +22635,10 @@ def public_queued_turn(
         # provider wrapper, peer identity, body, and attachment identifiers
         # remain private to the secure-peer lifecycle surface.
         public_prompt = "Incoming secure-peer delivery"
+        public_display_prompt = public_prompt
+        public_file_ids = []
+    elif purpose == SERVER_UPDATE_CONTINUATION_PURPOSE:
+        public_prompt = "Continuing after server update"
         public_display_prompt = public_prompt
         public_file_ids = []
     else:
@@ -26606,6 +26617,88 @@ RESTART_ORPHAN_TERMINAL_TYPES = {
     "turn_stopped",
 }
 
+SERVER_UPDATE_CONTINUATION_PURPOSE = "server_update_continuation"
+SERVER_UPDATE_CONTINUATION_PROMPT = (
+    "Continue the unfinished task from before the AgentsDock server update. "
+    "First inspect the conversation and current workspace state, then continue "
+    "from the last completed step. Do not repeat completed file changes, "
+    "commands, messages, or other side effects. The previous provider turn "
+    "was interrupted, so verify its outcome before acting."
+)
+
+
+def server_update_continuation_id(request_id: str, session_id: str, run_id: str) -> str:
+    digest = hashlib.sha256(f"{request_id}:{session_id}:{run_id}".encode()).hexdigest()
+    return f"queued_{digest[:16]}"
+
+
+def unsupported_coordinated_update_turns() -> list[str]:
+    """Only established ordinary chat runs can use generic continuation."""
+
+    return [session_id for session_id in BUSY_SESSIONS
+        if not (owner := CURRENT_TURNS.get(session_id))
+        or not owner.get("run_id")
+        or owner.get("purpose") is not None
+        or owner.get("provider_context_mode") != "chat"
+        or owner.get("backend") not in {BACKEND_CODEX, BACKEND_CLAUDE, BACKEND_CURSOR}]
+
+
+def has_server_update_continuation(session_id: str, queued_id: str) -> bool:
+    """Avoid creating a second continuation after a crash during recovery."""
+
+    return any(
+        item.get("type") == "turn_queued" and item.get("queued_id") == queued_id
+        for item in tail_jsonl_file(events_path(session_id), limit=200, max_bytes=8 * 1024 * 1024)
+    )
+
+
+async def queue_interrupted_server_update_turn(
+    session_id: str,
+    abandoned: dict[str, Any],
+    request_id: str,
+) -> str | None:
+    """Durably queue a new continuation, never replay the accepted prompt.
+
+    Only ordinary interactive turns have a safe generic continuation path.
+    Jobs, deliveries, standalone contexts and goals have their own ownership
+    ledgers and must not be promoted as a second user instruction here.
+    """
+
+    if (
+        abandoned.get("purpose") is not None
+        or str(abandoned.get("provider_context_mode") or "chat") != "chat"
+        or str(abandoned.get("backend") or "") not in {
+            BACKEND_CODEX, BACKEND_CLAUDE, BACKEND_CURSOR,
+        }
+        or (STORE.sessions.get(session_id) or {}).get("archived")
+    ):
+        return None
+    run_id = str(abandoned.get("run_id") or "").strip()
+    if not run_id:
+        return None
+    queued_id = server_update_continuation_id(request_id, session_id, run_id)
+    if has_server_update_continuation(session_id, queued_id):
+        return queued_id
+    await append_durable_event(session_id, "turn_queued", {
+        "queued_id": queued_id,
+        "backend": abandoned.get("backend"),
+        "prompt": "Continuing after server update",
+        "request_prompt": SERVER_UPDATE_CONTINUATION_PROMPT,
+        "display_prompt": "",
+        "file_ids": [],
+        "position": 1,
+        "purpose": SERVER_UPDATE_CONTINUATION_PURPOSE,
+        "provider_generated": True,
+        "provider_user_authored": False,
+        "server_update_interrupted_run_id": run_id,
+        "server_update_restart_request_id": request_id,
+    })
+    # Recover the interrupted turn before messages queued while it was active.
+    await append_durable_event(session_id, "turn_queue_reordered", {
+        "positions": [{"queued_id": queued_id, "position": 1}],
+    })
+    return queued_id
+
 
 def abandoned_turn_after_restart(
     session_id: str,
@@ -26686,7 +26779,7 @@ async def recover_abandoned_turns_after_start(
     *,
     forced_restart_request_id: str | None = None,
 ) -> int:
-    """Close runs orphaned by a crash without replaying accepted user input."""
+    """Close orphaned runs; resume ordinary chats after a confirmed force update."""
 
     try:
         await asyncio.to_thread(
@@ -26726,6 +26819,17 @@ async def recover_abandoned_turns_after_start(
         run_id = str(abandoned.get("run_id") or "").strip()
         if not run_id:
             continue
+        continuation_id: str | None = None
+        if forced_restart_request_id:
+            try:
+                continuation_id = await queue_interrupted_server_update_turn(
+                    session_id, abandoned, forced_restart_request_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "could not queue server-update continuation session=%s run=%s error=%s",
+                    session_id, run_id, concise_error_message(exc),
+                )
         payload: dict[str, Any] = {
             "run_id": run_id,
             "backend": abandoned.get("backend")
@@ -26742,10 +26846,13 @@ async def recover_abandoned_turns_after_start(
                 "forced_restart": True,
                 "restart_request_id": forced_restart_request_id,
                 "message": (
-                    "This agent turn was forcibly interrupted when AgentsServer "
-                    "restarted. Its accepted user message was not replayed."
+                    "This agent turn was forcibly interrupted by the server update. "
+                    + ("A continuation was queued after restart."
+                       if continuation_id else "Its accepted user message was not replayed.")
                 ),
             })
+            if continuation_id:
+                payload["server_update_continuation_id"] = continuation_id
         for key in (
             "purpose",
             "provider_context_mode",
@@ -73221,6 +73328,15 @@ async def _start_turn_locked(
         raise HTTPException(status_code=404, detail="session not found")
     if sess.get("archived"):
         raise HTTPException(status_code=409, detail="archived chats cannot start turns")
+    if req.purpose == SERVER_UPDATE_CONTINUATION_PURPOSE and (
+        req.prompt != SERVER_UPDATE_CONTINUATION_PROMPT
+        or req.display_prompt != ""
+        or provider_context_mode != "chat"
+        or req.file_ids or req.chat_references or req.team_references
+        or req.cross_chat_envelope_id or req.secure_peer_envelope_id
+        or queued_id is None
+    ):
+        raise HTTPException(status_code=400, detail="invalid server update continuation")
     if req.purpose == "chat_mailbox_wake" or mailbox_wake_claim is not None:
         if (req.purpose != "chat_mailbox_wake" or mailbox_wake_claim is None
                 or mailbox_wake_claim.get("target_session_id") != session_id
@@ -74279,6 +74395,8 @@ async def _start_turn_locked(
                if is_async_route_message(delivery_record or {}) else {}),
             "backend": backend,
             "prompt": display_prompt,
+            **({"provider_generated": True, "provider_user_authored": False}
+               if req.purpose == SERVER_UPDATE_CONTINUATION_PURPOSE else {}),
             "file_ids": display_file_ids if display_file_ids is not None else req.file_ids,
             "chat_references": chat_reference_dicts(req.chat_references),
             "team_references": team_reference_dicts(req.team_references),
@@ -74317,6 +74435,13 @@ async def _start_turn_locked(
             started_payload["client_request_id"] = req.client_request_id
         if queued_id:
             started_payload["queued_id"] = queued_id
+        if req.purpose == SERVER_UPDATE_CONTINUATION_PURPOSE:
+            # The provider records this as a user input in its native transcript.
+            # Retain exact server-generated provenance so history repair can
+            # suppress that input without hiding an identically worded human turn.
+            started_payload["provider_input_sha256"] = hashlib.sha256(
+                req.prompt.encode("utf-8")
+            ).hexdigest()
         run_metadata = {
             "purpose": req.purpose,
             **(getattr(req, "shared_chat_metadata", None) or {}),
@@ -75966,6 +76091,7 @@ def server_restart_request_fingerprint(body: ServerRestartRequest) -> str:
             "forced": body.force is True and body.force_confirmed is True,
             "expected_blocker_revision": body.expected_blocker_revision,
             "expected_update_schedule_id": body.expected_update_schedule_id,
+            "resume_interrupted_turns": body.resume_interrupted_turns is True,
         },
         ensure_ascii=True,
         separators=(",", ":"),
@@ -78698,6 +78824,7 @@ async def lifespan(app: FastAPI):
         )
         else ""
     )
+    resume_interrupted_turns = startup_restart_status.get("_resume_interrupted_turns") is True
     reconcile_server_restart_status_after_startup()
     clear_imported_active_runs()
     startup_update_status = await reconcile_server_update_status_after_startup()
@@ -78707,7 +78834,12 @@ async def lifespan(app: FastAPI):
         )
     )
     abandoned_turn_count = await recover_abandoned_turns_after_start(
-        forced_restart_request_id=(forced_restart_request_id or None),
+        forced_restart_request_id=(
+            forced_restart_request_id
+            if forced_restart_request_id and resume_interrupted_turns
+            and managed_server_force_update_is_pending(startup_update_status)
+            else None
+        ),
     )
     if managed_server_force_update_is_pending(startup_update_status):
         # Give an explicitly confirmed force update first admission after its
@@ -82530,11 +82662,19 @@ async def health() -> dict[str, Any]:
                 "required": False,
                 "message": "Signed Stable and Beta AgentsServer channels are available.",
                 "action": None,
+                # v12 adds a durable continuation for ordinary chat turns
+                # interrupted by an exact schedule-bound force update.
                 # v11 adds an exact schedule-bound force-update restart. v10
                 # keeps human work passive while ordinary pending updates
                 # defer autonomous scheduled-job admission.
-                "version": 11,
+                "version": 12,
                 "tracks": ["stable", "beta"],
+            },
+            "server_update_continuation_v1": {
+                "available": True,
+                "version": 1,
+                "supported_backends": [BACKEND_CODEX, BACKEND_CLAUDE, BACKEND_CURSOR],
+                "scope": "ordinary_chat_turns_only",
             },
             "server_update_ensure_v1": {
                 "available": (
@@ -84715,6 +84855,21 @@ def arm_schedule_bound_force_update(
         )
 
 
+def unarm_failed_coordinated_update_restart(request_id: str) -> None:
+    """Release only our pending fence if the required restart receipt failed."""
+
+    with server_update_status_lock(SERVER_UPDATE_STATUS_FILE):
+        current = read_server_update_status()
+        if (managed_server_force_update_is_pending(current)
+                and current.get("_force_restart_request_id") == request_id):
+            _write_server_update_status_unlocked(
+                cancelable=True,
+                _force_restart_request_id=None,
+                _force_restart_requested_at=None,
+                message="Coordinated restart was not accepted; update remains scheduled for idle activation.",
+            )
+
+
 def signal_forced_server_restart(request_id: str) -> None:
     """Signal an emergency restart without depending on the restart journal.
 
@@ -84998,6 +85153,26 @@ async def accept_forced_server_restart(
 
         now = update_utc_now()
         if expected_schedule_id is not None:
+            if body.resume_interrupted_turns is True:
+                if (snapshot.get("snapshot_degraded") is True
+                        or snapshot.get("has_safety_blockers") is True
+                        or int(snapshot.get("provider_background_count") or 0) > 0
+                        or snapshot.get("tmux_server_in_service_cgroup") is True
+                        or snapshot.get("tmux_server_cgroup_unknown") is True):
+                    raise HTTPException(status_code=409, detail=server_restart_error_detail(
+                        "server_update_continuation_unsafe",
+                        "The server cannot safely save all active work for automatic continuation.",
+                        action="Finish maintenance work and retry the coordinated update.",
+                        retryable=True,
+                    ))
+                unsupported = unsupported_coordinated_update_turns()
+                if unsupported:
+                    raise HTTPException(status_code=409, detail=server_restart_error_detail(
+                        "server_update_continuation_unsupported",
+                        "Some active work cannot be resumed automatically after interruption.",
+                        action="Let those turns finish, then retry the coordinated update.",
+                        retryable=True,
+                    ))
             # No await may separate this durable arm from restart acceptance.
             # If the restart journal write fails, the emergency signal still
             # proceeds and the replacement process owns the exact reservation.
@@ -85011,6 +85186,7 @@ async def accept_forced_server_restart(
             _source_instance_id=SERVER_INSTANCE_ID,
             _request_fingerprint=request_fingerprint,
             _forced=True,
+            _resume_interrupted_turns=(body.resume_interrupted_turns is True),
             _update_schedule_id=expected_schedule_id,
             _forced_work_snapshot=public_server_restart_work_counts(snapshot),
             _forced_audit=audit,
@@ -85033,6 +85209,17 @@ async def accept_forced_server_restart(
         try:
             restart_status = write_server_restart_status(**journal_changes)
         except Exception as exc:
+            if body.resume_interrupted_turns is True:
+                try:
+                    unarm_failed_coordinated_update_restart(request_id)
+                except Exception:
+                    logger.exception("could not release failed coordinated restart fence")
+                raise HTTPException(status_code=503, detail=server_restart_error_detail(
+                    "server_update_continuation_receipt_failed",
+                    "The server could not save its restart receipt; running chats were not interrupted.",
+                    action="Check server storage and retry the coordinated update.",
+                    retryable=True,
+                )) from exc
             logger.error(
                 "forced restart journal could not be written; restarting anyway "
                 "request_id=%s error_type=%s",
@@ -91873,6 +92060,8 @@ async def post_turn_with_receipt(session_id: str, req: TurnRequest) -> Any:
 
 @app.post("/api/sessions/{session_id}/turns")
 async def post_turn(session_id: str, req: TurnRequest) -> Any:
+    if req.purpose == SERVER_UPDATE_CONTINUATION_PURPOSE:
+        raise HTTPException(status_code=403, detail="server update continuation is internal")
     if req.client_request_id is not None:
         return await post_turn_with_receipt(session_id, req)
     return await post_turn_without_receipt(session_id, req)

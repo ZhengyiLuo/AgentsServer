@@ -16,6 +16,32 @@ def write_events(path: Path, events: list[dict]) -> None:
 
 
 class AbandonedTurnDetectionTests(unittest.TestCase):
+    def test_continuation_is_restored_ahead_of_waiting_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "events.jsonl"
+            write_events(path, [
+                {"seq": 1, "type": "turn_queued", "queued_id": "queued_user", "request_prompt": "Next task", "prompt": "Next task"},
+                {"seq": 2, "type": "turn_queued", "queued_id": "queued_resume", "request_prompt": agent_server.SERVER_UPDATE_CONTINUATION_PROMPT,
+                 "prompt": "Continuing after server update", "display_prompt": "", "purpose": agent_server.SERVER_UPDATE_CONTINUATION_PURPOSE},
+                {"seq": 3, "type": "turn_queue_reordered", "positions": [{"queued_id": "queued_resume", "position": 1}]},
+            ])
+            with patch.object(agent_server, "events_path", return_value=path):
+                recovered = agent_server.scan_queued_turns_from_events([("chat-1", {"id": "chat-1", "backend": "codex"})])
+        self.assertEqual([row["queued_id"] for row in recovered["chat-1"]], ["queued_resume", "queued_user"])
+        self.assertEqual(recovered["chat-1"][0]["purpose"], agent_server.SERVER_UPDATE_CONTINUATION_PURPOSE)
+        self.assertEqual(recovered["chat-1"][0]["prompt"], agent_server.SERVER_UPDATE_CONTINUATION_PROMPT)
+        self.assertEqual(recovered["chat-1"][0]["display_prompt"], "")
+
+    def test_coordinated_force_refuses_unowned_or_special_work(self) -> None:
+        with patch.object(agent_server, "BUSY_SESSIONS", {"chat-a", "chat-b", "chat-c"}), patch.object(
+            agent_server, "CURRENT_TURNS", {
+                "chat-a": {"run_id": "run-a", "backend": "codex", "purpose": None, "provider_context_mode": "chat"},
+                "chat-b": {"run_id": None, "backend": "claude", "purpose": None, "provider_context_mode": "chat"},
+                "chat-c": {"run_id": "run-c", "backend": "codex", "purpose": "codex_goal_resume", "provider_context_mode": "chat"},
+            },
+        ):
+            self.assertEqual(set(agent_server.unsupported_coordinated_update_turns()), {"chat-b", "chat-c"})
+
     def test_detects_latest_unfinished_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "events.jsonl"
@@ -164,6 +190,44 @@ class AbandonedTurnDetectionTests(unittest.TestCase):
 
 
 class AbandonedTurnRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_forced_update_queues_one_internal_continuation_before_closing_turn(self) -> None:
+        queued = AsyncMock(return_value={})
+        stopped = AsyncMock(return_value={})
+        with patch.object(agent_server.STORE, "sessions", {
+            "chat-1": {"id": "chat-1", "backend": "codex", "latest_event_type": "tool_started"},
+        }), patch.object(agent_server, "abandoned_turn_after_restart", return_value={
+            "run_id": "run-open", "backend": "codex", "provider_context_mode": "chat",
+        }), patch.object(agent_server, "has_server_update_continuation", return_value=False), patch.object(
+            agent_server, "append_durable_event", queued,
+        ), patch.object(agent_server, "append_event", stopped), patch.object(
+            agent_server, "cleanup_opencode_turn_instruction_files", return_value=0,
+        ):
+            self.assertEqual(await agent_server.recover_abandoned_turns_after_start(
+                forced_restart_request_id="restart-1",
+            ), 1)
+
+        self.assertEqual([call.args[1] for call in queued.await_args_list],
+                         ["turn_queued", "turn_queue_reordered"])
+        continuation = queued.await_args_list[0].args[2]
+        self.assertEqual(continuation["purpose"], agent_server.SERVER_UPDATE_CONTINUATION_PURPOSE)
+        self.assertEqual(continuation["display_prompt"], "")
+        self.assertFalse(continuation["provider_user_authored"])
+        self.assertEqual(stopped.await_args.args[2]["server_update_continuation_id"],
+                         continuation["queued_id"])
+
+    async def test_forced_update_does_not_replay_scheduled_jobs_or_duplicate_continuations(self) -> None:
+        queued = AsyncMock(return_value={})
+        with patch.object(agent_server.STORE, "sessions", {"chat-1": {"id": "chat-1"}}), patch.object(
+            agent_server, "has_server_update_continuation", return_value=True,
+        ), patch.object(agent_server, "append_durable_event", queued):
+            self.assertIsNone(await agent_server.queue_interrupted_server_update_turn(
+                "chat-1", {"run_id": "run-job", "backend": "codex", "purpose": "scheduled_job"}, "restart-1",
+            ))
+            self.assertEqual(await agent_server.queue_interrupted_server_update_turn(
+                "chat-1", {"run_id": "run-chat", "backend": "claude"}, "restart-1",
+            ), agent_server.server_update_continuation_id("restart-1", "chat-1", "run-chat"))
+        queued.assert_not_awaited()
+
     async def test_session_metadata_persists_active_run_until_terminal(self) -> None:
         sessions = {"chat-1": {"id": "chat-1", "backend": "codex"}}
         save = AsyncMock()
@@ -252,6 +316,8 @@ class AbandonedTurnRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "abandoned_turn_after_restart",
             return_value={"run_id": "run-orphan", "backend": "codex"},
         ), patch.object(agent_server, "append_event", append_event), patch.object(
+            agent_server, "append_durable_event", AsyncMock(return_value={}),
+        ), patch.object(agent_server, "has_server_update_continuation", return_value=False), patch.object(
             agent_server, "cleanup_opencode_turn_instruction_files", return_value=0
         ):
             recovered = await agent_server.recover_abandoned_turns_after_start(

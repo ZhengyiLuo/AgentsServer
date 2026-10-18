@@ -583,6 +583,32 @@ class CodexNativeHistoryRepairTests(unittest.TestCase):
         self.assertTrue(filtered[0]["metadata_only"])
         self.assertEqual(before, (self.events.read_bytes(), self.source.read_bytes()))
 
+    def test_update_continuation_exact_native_input_is_silent(self):
+        self.wake_fixture()
+        self.native[0].update(purpose="server_update_continuation",
+            queued_id="queued_" + "a" * 16)
+        self.native[0].pop("mailbox_wake_id")
+        self.native[0].pop("mailbox_wake_through_seq")
+        self.fixture()
+        self.prepare()
+        projected = self.cache.project_event("chat", self.imports[0])
+        self.assertEqual(projected["prompt"], "")
+        item = self.parse(self.raw[0])
+        filtered = filter_native_codex_history_items("chat", PROVIDER, self.events, [item])
+        self.assertTrue(filtered[0]["metadata_only"])
+        self.assertEqual(filtered[0]["text"], "")
+
+    def test_update_continuation_without_internal_claim_is_not_hidden(self):
+        self.wake_fixture()
+        self.native[0].update(purpose="server_update_continuation")
+        self.native[0].pop("mailbox_wake_id")
+        self.native[0].pop("mailbox_wake_through_seq")
+        self.fixture()
+        self.prepare()
+        self.assertIsNone(self.cache.project_event("chat", self.imports[0]))
+        item = self.parse(self.raw[0])
+        self.assertEqual(filter_native_codex_history_items("chat", PROVIDER, self.events, [item]), [item])
+
     def test_mailbox_wake_before_native_continuation_keeps_original_turn_owner(self):
         self.wake_fixture()
         self.native[1]["item_id"] = self.raw[1]["payload"]["id"]

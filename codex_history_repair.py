@@ -624,12 +624,19 @@ def _native_mailbox_wake_hash(event: dict) -> str | None:
     """A server-authored hidden input, not a text-based provider classification."""
     digest = event.get("provider_input_sha256")
     wake_id = event.get("mailbox_wake_id")
-    if (event.get("type") == "turn_started" and event.get("imported") is not True
-        and event.get("purpose") == "chat_mailbox_wake" and event.get("prompt") == ""
-        and event.get("provider_generated") is True and not _runtime_human_provenance(event)
+    if (event.get("type") != "turn_started" or event.get("imported") is True
+        or event.get("prompt") != "" or event.get("provider_generated") is not True
+        or _runtime_human_provenance(event) or not isinstance(digest, str)
+        or not _DIGEST.fullmatch(digest)):
+        return None
+    if (event.get("purpose") == "chat_mailbox_wake"
         and isinstance(wake_id, str) and re.fullmatch(r"mailwake_[a-f0-9]{32}", wake_id)
-        and type(event.get("mailbox_wake_through_seq")) is int and 0 < event["mailbox_wake_through_seq"] < 2**63
-        and isinstance(digest, str) and _DIGEST.fullmatch(digest)):
+        and type(event.get("mailbox_wake_through_seq")) is int
+        and 0 < event["mailbox_wake_through_seq"] < 2**63):
+        return digest
+    queued_id = event.get("queued_id")
+    if (event.get("purpose") == "server_update_continuation"
+        and isinstance(queued_id, str) and re.fullmatch(r"queued_[a-f0-9]{16}", queued_id)):
         return digest
     return None
 

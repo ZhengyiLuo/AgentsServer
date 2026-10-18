@@ -140,8 +140,19 @@ def _async_delivery_identity(event: dict) -> tuple | None:
 
 
 def _mailbox_wake_identity(event: dict) -> tuple | None:
+    # Both forms are internal inputs. The exact native source, run ownership,
+    # and checkpoint still have to match before either one can be hidden.
     claim, cutoff, digest = (event.get(key) for key in (
         "mailbox_wake_id", "mailbox_wake_through_seq", "provider_input_sha256"))
+    if (event.get("purpose") == "server_update_continuation"
+            and event.get("provider_generated") is True and event.get("prompt") == ""
+            and event.get("provider_user_authored") is not True
+            and not any(event.get(key) for key in (
+                "clientUserMessageId", "clientId", "client_user_message_id", "client_id"))
+            and isinstance(event.get("queued_id"), str)
+            and re.fullmatch(r"queued_[a-f0-9]{16}", event["queued_id"])
+            and isinstance(digest, str) and _DIGEST.fullmatch(digest)):
+        return event["queued_id"], 0, digest
     if (event.get("purpose") != "chat_mailbox_wake" or event.get("provider_generated") is not True
             or event.get("prompt") != ""
             or event.get("provider_user_authored") is True

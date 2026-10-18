@@ -1446,6 +1446,65 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("_force_restart_requested_at", public_pending)
         forced_signal.assert_called_once_with(str(request_id))
 
+    async def test_coordinated_force_refuses_turns_without_a_continuation_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            schedule_id = "a" * 32
+            with restart_environment(root) as forced_signal, patch.object(
+                agent_server, "SERVER_VERSION", "1.0.0",
+            ), patch.object(agent_server, "BUSY_SESSIONS", {"chat-1"}), patch.object(
+                agent_server, "CURRENT_TURNS", {"chat-1": {
+                    "run_id": "run-1", "backend": "opencode", "purpose": None,
+                    "provider_context_mode": "chat",
+                }},
+            ):
+                agent_server.write_fresh_server_update_status(
+                    phase="pending", schedule_id=schedule_id,
+                    target_version="1.1.0", latest_version="1.1.0",
+                    track="stable", update_available=True,
+                    when_idle=True, cancelable=True,
+                )
+                body = restart_body(force=True, update_schedule_id=schedule_id).model_copy(
+                    update={"resume_interrupted_turns": True},
+                )
+                with self.assertRaises(HTTPException) as rejected:
+                    await agent_server.restart_server_endpoint(
+                        body, http_request(method="POST"), BackgroundTasks(),
+                    )
+                pending = agent_server.read_server_update_status()
+        self.assertEqual(rejected.exception.detail["code"], "server_update_continuation_unsupported")
+        self.assertTrue(pending["cancelable"])
+        forced_signal.assert_not_called()
+
+    async def test_coordinated_force_preserves_untracked_background_work(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            schedule_id = "c" * 32
+            snapshot = {"revision": "0" * 64, "snapshot_degraded": False,
+                        "has_safety_blockers": False, "provider_background_count": 1,
+                        "tmux_server_in_service_cgroup": False, "tmux_server_cgroup_unknown": False}
+            with restart_environment(root) as forced_signal, patch.object(
+                agent_server, "SERVER_VERSION", "1.0.0",
+            ), patch.object(agent_server, "current_server_restart_blocker_snapshot",
+                            AsyncMock(return_value=snapshot)):
+                agent_server.write_fresh_server_update_status(
+                    phase="pending", schedule_id=schedule_id,
+                    target_version="1.1.0", latest_version="1.1.0",
+                    track="stable", update_available=True,
+                    when_idle=True, cancelable=True,
+                )
+                body = restart_body(force=True, update_schedule_id=schedule_id).model_copy(
+                    update={"resume_interrupted_turns": True},
+                )
+                with self.assertRaises(HTTPException) as rejected:
+                    await agent_server.restart_server_endpoint(
+                        body, http_request(method="POST"), BackgroundTasks(),
+                    )
+                pending = agent_server.read_server_update_status()
+        self.assertEqual(rejected.exception.detail["code"], "server_update_continuation_unsafe")
+        self.assertTrue(pending["cancelable"])
+        forced_signal.assert_not_called()
+
     async def test_force_update_replay_is_idempotent_and_schedule_is_fingerprinted(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2153,6 +2212,33 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(status["phase"], "accepted")
         self.assertTrue(status["forced"])
+
+    async def test_coordinated_force_keeps_chats_running_if_restart_receipt_cannot_be_saved(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            schedule_id = "b" * 32
+            with restart_environment(root) as forced_signal, patch.object(
+                agent_server, "SERVER_VERSION", "1.0.0",
+            ):
+                agent_server.write_fresh_server_update_status(
+                    phase="pending", schedule_id=schedule_id,
+                    target_version="1.1.0", latest_version="1.1.0",
+                    track="stable", update_available=True,
+                    when_idle=True, cancelable=True,
+                )
+                body = restart_body(force=True, update_schedule_id=schedule_id).model_copy(
+                    update={"resume_interrupted_turns": True},
+                )
+                with patch.object(agent_server, "write_server_restart_status", side_effect=OSError("disk full")):
+                    with self.assertRaises(HTTPException) as rejected:
+                        await agent_server.restart_server_endpoint(
+                            body, http_request(method="POST"), BackgroundTasks(),
+                        )
+                pending = agent_server.read_server_update_status()
+        self.assertEqual(rejected.exception.detail["code"], "server_update_continuation_receipt_failed")
+        self.assertTrue(pending["cancelable"])
+        self.assertIsNone(pending.get("_force_restart_request_id"))
+        forced_signal.assert_not_called()
 
     async def test_force_restart_proceeds_when_team_hub_snapshot_fails(self):
         with tempfile.TemporaryDirectory() as temporary:

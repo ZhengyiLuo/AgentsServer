@@ -181,7 +181,7 @@ git pull --ff-only
 - [Setup and connection help](https://agentsdock.net/setup.html)
 - [AgentsDock features](https://agentsdock.net/features.html)
 - [Server releases](https://github.com/ZhengyiLuo/AgentsServer/releases)
-- [Report a server issue](https://github.com/ZhengyiLuo/AgentsServer/issues)
+- [Report a server issue](https://github.com/ZhengyiLuo/AgentsDock/issues)
 - [Contributing and tests](CONTRIBUTING.md)
 
 Features in this checkout may not yet be in a published release. The maintained server source is this repository's `server/` directory. The

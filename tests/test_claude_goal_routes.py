@@ -20,7 +20,7 @@ from claude_sdk_client import ClaudeSDKSupervisorError
 
 
 def load_routes():
-    names = {"refresh_claude_goal", "require_claude_goal_session",
+    names = {"refresh_claude_goal", "require_claude_goal_session", "queued_claude_goal",
              "start_claude_goal_command", "put_claude_goal", "delete_claude_goal"}
     source = (Path(__file__).resolve().parents[1] / "agent_server.py")
     tree = ast.parse(source.read_text(), filename=str(source))
@@ -44,6 +44,11 @@ def load_routes():
         "append_event": AsyncMock(),
         "CLAUDE_GOAL_PROJECTIONS": {}, "CLAUDE_GOAL_PATHS": {}, "CLAUDE_GOAL_LOCKS": {},
         "CLAUDE_GOAL_PENDING": {}, "ACTIVE": {}, "ACTIVE_LOCK": asyncio.Lock(),
+        "CLAUDE_GOAL_CLEAR_ARGUMENTS": frozenset({"clear", "stop", "off", "reset", "none", "cancel"}),
+        "QUEUED_TURNS": {}, "RUN_NOW_TURNS": {}, "QUEUE_LOCK": asyncio.Lock(),
+        "wait_for_queue_recovery_admission": AsyncMock(),
+        "provider_command_prompt_matches": lambda prompt, invocation: prompt == invocation or (
+            prompt.startswith(invocation) and prompt[len(invocation):len(invocation) + 1] in " \t\r\n"),
         "ensure_session_not_deleting": lambda session_id: None,
         "start_turn": AsyncMock(return_value={"run_id": "new-run"}),
     }
@@ -67,7 +72,7 @@ class ClaudeGoalRouteTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.client.aclose()
 
-    async def test_set_dispatches_only_validated_native_goal_and_does_not_queue(self):
+    async def test_set_dispatches_validated_native_goal_through_noninterrupting_queue(self):
         response = await self.client.put("/api/sessions/chat/claude/goal", json={"condition": "  Reply DONE  "})
         self.assertEqual(response.status_code, 200, response.text)
         call = self.ns["start_turn"].await_args
@@ -75,7 +80,66 @@ class ClaudeGoalRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call.args[1].prompt, "/goal Reply DONE")
         self.assertEqual(call.args[1].skill_selection.id, "opaque-native-goal")
         self.assertEqual(call.args[1].skill_selection.revision, "inventory-revision")
-        self.assertFalse(call.kwargs["queue_if_busy"])
+        self.assertTrue(call.kwargs["queue_if_busy"])
+
+    async def test_queued_set_preserves_active_run_and_native_pending_state(self):
+        active = {"run_id": "existing-run", "transport": "agent-sdk"}
+        pending = {"run_id": "existing-run", "previous_set_at": "earlier"}
+        self.ns["ACTIVE"]["chat"] = active
+        self.ns["CLAUDE_GOAL_PENDING"]["chat"] = pending
+        self.ns["start_turn"].return_value = {"queued": True, "queued_id": "saved-goal"}
+        response = await self.client.put("/api/sessions/chat/claude/goal", json={"condition": "Reply DONE"})
+        self.assertEqual(response.status_code, 200)
+        self.assertIs(self.ns["ACTIVE"]["chat"], active)
+        self.assertIs(self.ns["CLAUDE_GOAL_PENDING"]["chat"], pending)
+        self.ns["claude_sdk_manager"].assert_not_awaited()
+
+    async def test_finished_admission_cannot_leave_a_phantom_starting_goal(self):
+        self.ns["start_turn"].return_value = {"run_id": "already-finished"}
+        response = await self.client.put("/api/sessions/chat/claude/goal", json={"condition": "Reply DONE"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.ns["CLAUDE_GOAL_PENDING"], {})
+
+    async def test_native_clear_aliases_cannot_be_admitted_as_goal_conditions(self):
+        for condition in ("clear", " STOP ", "off", "reset", "none", "cancel"):
+            response = await self.client.put("/api/sessions/chat/claude/goal", json={"condition": condition})
+            self.assertEqual(response.status_code, 400, condition)
+        self.ns["start_turn"].assert_not_awaited()
+
+    async def test_queued_goal_projection_tracks_saved_order_edits_and_removal(self):
+        selection = {"id": "opaque-native-goal", "revision": "inventory-revision"}
+        first = {"queued_id": "first", "prompt": "/goal First condition", "skill_selection": selection}
+        second = {"queued_id": "second", "prompt": "/goal Second condition", "skill_selection": selection,
+                  "_paused_after_stop": True}
+        self.ns["QUEUED_TURNS"]["chat"] = [
+            {"queued_id": "ordinary", "prompt": "/goal Just unselected text"}, first, second]
+        snapshot = await self.ns["queued_claude_goal"]("chat")
+        self.assertEqual(snapshot, {"queued_id": "first", "condition": "First condition", "position": 2,
+                                    "paused": False, "pause_reason": None, "queued_count": 2})
+        first["prompt"] = "/goal Edited condition"
+        self.assertEqual((await self.ns["queued_claude_goal"]("chat"))["condition"], "Edited condition")
+        self.ns["QUEUED_TURNS"]["chat"].remove(first)
+        snapshot = await self.ns["queued_claude_goal"]("chat")
+        self.assertEqual(snapshot["queued_id"], "second")
+        self.assertEqual(snapshot["queued_count"], 1)
+        self.assertTrue(snapshot["paused"])
+        self.assertEqual(snapshot["pause_reason"], "stopped")
+        self.ns["QUEUED_TURNS"]["chat"].remove(second)
+        self.assertIsNone(await self.ns["queued_claude_goal"]("chat"))
+
+    async def test_queued_goal_projection_excludes_plain_text_uncommitted_and_clear_commands(self):
+        selected = {"queued_id": "candidate", "prompt": "/goal Condition",
+                    "skill_selection": {"id": "native", "revision": "revision"}}
+        for changes in ({"skill_selection": None}, {"_durable": False}, {"backend": "codex"},
+                        {"purpose": "internal"}, {"prompt": "/goalx Condition"},
+                        {"prompt": "/goal clear"}, {"prompt": "/goal stop"},
+                        {"prompt": "/goal " + "x" * 4001}, {"prompt": "/goal"}):
+            with self.subTest(changes=changes):
+                self.ns["QUEUED_TURNS"]["chat"] = [{**selected, **changes}]
+                self.assertIsNone(await self.ns["queued_claude_goal"]("chat"))
+        self.ns["QUEUED_TURNS"]["chat"] = []
+        self.ns["RUN_NOW_TURNS"]["chat"] = selected
+        self.assertEqual((await self.ns["queued_claude_goal"]("chat"))["queued_id"], "candidate")
 
     async def test_unavailable_goal_command_and_busy_start_leave_no_pending_goal(self):
         self.ns["discover_session_provider_commands"].return_value = (
@@ -132,6 +196,7 @@ class ClaudeGoalRouteTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.delete("/api/sessions/chat/claude/goal")
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(self.ns["start_turn"].await_args.args[1].prompt, "/goal clear")
+        self.assertFalse(self.ns["start_turn"].await_args.kwargs["queue_if_busy"])
         self.ns["start_turn"].reset_mock()
         self.ns["STORE"].sessions["chat"]["backend"] = "codex"
         response = await self.client.delete("/api/sessions/chat/claude/goal")

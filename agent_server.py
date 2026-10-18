@@ -49889,6 +49889,14 @@ def history_timeline_message_keys(
                 if len(provider_runs) > maximum:
                     provider_runs.pop(next(iter(provider_runs)))
             before_window = raw_seq <= after_seq
+            if (event_type == "turn_started" and event.get("backend") == BACKEND_CODEX
+                    and event.get("purpose") == "codex_goal_resume"
+                    and event.get("prompt") is None and not event.get("file_ids")):
+                # Goal Resume publishes a lifecycle boundary, not a user
+                # message. Its native runtime input is filtered from history;
+                # an empty credit here would block every later real message,
+                # including accepted steering and the provider's final reply.
+                continue
             if event_type == "turn_started" or is_native_goal_steer_event(event):
                 key = history_dedup_key("user", event.get("prompt"), source_text_sha256=event.get("source_text_sha256"))
             elif event_type == "assistant_text":

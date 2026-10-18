@@ -39,7 +39,7 @@ class CodexProviderReadinessTests(unittest.IsolatedAsyncioTestCase):
             "provider_connections": SimpleNamespace(native_credentials_present=lambda *args: False),
             "PROVIDER_CONNECTION_STORE": SimpleNamespace(catalog=lambda *args, **kwargs: {}),
             "BACKEND_CODEX": "codex", "BACKEND_CLAUDE": "claude", "BACKEND_CURSOR": "cursor",
-            "BACKEND_OPENCODE": "opencode", "VALID_BACKENDS": {"claude", "codex", "cursor", "opencode"},
+            "BACKEND_OPENCODE": "opencode", "BACKEND_GEMINI": "gemini", "VALID_BACKENDS": {"claude", "codex", "cursor", "opencode"},
             "ThreadPoolExecutor": ThreadPoolExecutor, "copy_context": copy_context,
             "RUNTIME_CATALOG_DEADLINE": ContextVar("test_catalog_deadline", default=None),
             "RUNTIME_CATALOG_BUDGET_SECONDS": 25.0,

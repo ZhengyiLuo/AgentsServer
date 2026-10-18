@@ -4,10 +4,44 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import Mock, patch
 from pathlib import Path
+
+import cursor_process_guard as guard_module
 
 
 class CursorProcessGuardTests(unittest.TestCase):
+    def test_spawn_failure_is_verified_without_changing_legacy_cursor_exit(self):
+        with patch.object(guard_module.signal, "signal"), \
+             patch.object(guard_module.subprocess, "Popen", side_effect=FileNotFoundError):
+            args = ["--parent-pid", str(os.getppid()), "--", "missing-fixture"]
+            self.assertEqual(guard_module.main(args), 127)
+            self.assertEqual(guard_module.main(["--verify-cleanup", *args]), 71)
+
+    def test_required_process_inspection_never_treats_failure_as_empty(self):
+        with patch.object(guard_module.os.path, "isfile", return_value=False):
+            self.assertEqual(guard_module._process_snapshot(), {})
+            with self.assertRaises(RuntimeError):
+                guard_module._process_snapshot(required=True)
+        with patch.object(guard_module.subprocess, "run", side_effect=subprocess.TimeoutExpired("ps", .2)):
+            with self.assertRaises(RuntimeError):
+                guard_module._process_snapshot(required=True)
+
+    def test_verified_exit_contract_distinguishes_native_failure_and_inspection_failure(self):
+        for native_exit, expected in ((0, 0), (1, 71), (70, 71)):
+            child = Mock(pid=999_999, returncode=native_exit)
+            child.poll.return_value = native_exit
+            with self.subTest(native_exit=native_exit), patch.object(guard_module.signal, "signal"), \
+                 patch.object(guard_module.subprocess, "Popen", return_value=child), \
+                 patch.object(guard_module, "_process_snapshot", return_value={}), \
+                 patch.object(guard_module, "_terminate_child_group"):
+                self.assertEqual(guard_module.main(["--verify-cleanup", "--parent-pid", str(os.getppid()), "--", "fixture"]), expected)
+        with patch.object(guard_module.signal, "signal"), \
+             patch.object(guard_module.subprocess, "Popen", return_value=child), \
+             patch.object(guard_module, "_process_snapshot", side_effect=RuntimeError("no inspection")), \
+             patch.object(guard_module, "_terminate_child_group"):
+            self.assertEqual(guard_module.main(["--verify-cleanup", "--parent-pid", str(os.getppid()), "--", "fixture"]), 70)
+
     def test_guard_terminates_cursor_group_when_signalled(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -1,9 +1,11 @@
-"""Small parent-death guard for a Cursor CLI subprocess.
+"""Small parent-death guard for an owned provider CLI subprocess.
 
 AgentsServer launches this helper in its own process group. The helper launches
 Cursor in a child group, forwards inherited stdio unchanged, and terminates the
 entire Cursor tree when its leader exits or AgentsServer disappears abruptly.
 This prevents a detached agent from continuing workspace edits after the turn.
+Gemini opts into verified-cleanup exit codes; existing Cursor callers retain
+their original exit contract. Process sampling is not an OS security sandbox.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ TERMINATE_GRACE_SECONDS = 0.5
 PROCESS_SNAPSHOT_TIMEOUT_SECONDS = 0.2
 MAX_PROCESS_SNAPSHOT_ROWS = 32_768
 MAX_CAPTURED_DESCENDANTS = 4_096
+READY_NOTICE = b"AGENTSDOCK_PROCESS_GUARD_READY\n"
 
 
 class _ProcessIdentity(NamedTuple):
@@ -34,7 +37,7 @@ class _ProcessIdentity(NamedTuple):
     started_at: str
 
 
-def _process_snapshot() -> dict[int, _ProcessIdentity]:
+def _process_snapshot(*, required: bool = False) -> dict[int, _ProcessIdentity]:
     """Return one bounded POSIX process snapshot with stable-enough identities.
 
     ``lstart`` is intentionally retained as a PID-reuse fence. Before sending
@@ -48,6 +51,8 @@ def _process_snapshot() -> dict[int, _ProcessIdentity]:
         None,
     )
     if ps_path is None:
+        if required:
+            raise RuntimeError("Process inspection unavailable")
         return {}
     env = dict(os.environ)
     env["LC_ALL"] = "C"
@@ -61,13 +66,19 @@ def _process_snapshot() -> dict[int, _ProcessIdentity]:
             env=env,
         )
     except (OSError, subprocess.SubprocessError):
+        if required:
+            raise RuntimeError("Process inspection failed") from None
         return {}
     if result.returncode != 0:
+        if required:
+            raise RuntimeError("Process inspection failed")
         return {}
 
     snapshot: dict[int, _ProcessIdentity] = {}
     for index, raw_line in enumerate(result.stdout.splitlines()):
         if index >= MAX_PROCESS_SNAPSHOT_ROWS:
+            if required:
+                raise RuntimeError("Process inspection exceeded its limit")
             break
         parts = raw_line.strip().split(None, 3)
         if len(parts) != 4:
@@ -278,6 +289,14 @@ def _terminate_child_group(
 
 
 def main(argv: list[str]) -> int:
+    # Opt-in strict contract for Gemini; existing Cursor callers keep their
+    # established return-code behavior. 70 means cleanup was not confirmed.
+    verify_cleanup = bool(argv and argv[0] == "--verify-cleanup")
+    if verify_cleanup:
+        argv = argv[1:]
+    ready_notice = bool(verify_cleanup and argv and argv[0] == "--ready-notice")
+    if ready_notice:
+        argv = argv[1:]
     if len(argv) < 4 or argv[0] != "--parent-pid" or argv[2] != "--":
         return 64
     try:
@@ -299,6 +318,12 @@ def main(argv: list[str]) -> int:
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGHUP, request_stop)
 
+    if ready_notice:
+        # Only the opt-in Gemini owner consumes this first stderr record.
+        # Publish it before launching native code, after TERM becomes a request
+        # for verified cleanup rather than an unhandled process-killing signal.
+        os.write(2, READY_NOTICE)
+
     # The server can disappear after spawning this wrapper but before Python
     # reaches Popen. Do not briefly launch an editing agent in that window.
     if stop.is_set() or os.getppid() != expected_parent:
@@ -307,9 +332,13 @@ def main(argv: list[str]) -> int:
     try:
         child = subprocess.Popen(command, start_new_session=True)
     except OSError:
-        return 127
+        # Popen did not return a child; it reaps a failed exec itself. Preserve
+        # the legacy Cursor code, but do not fence Gemini as though an editing
+        # process survived when no provider was launched.
+        return 71 if verify_cleanup else 127
 
     interrupted = False
+    inspection_failed = False
     child_group = child.pid
     tracked_descendants: dict[int, _ProcessIdentity] = {}
     next_descendant_snapshot = 0.0
@@ -317,7 +346,22 @@ def main(argv: list[str]) -> int:
         now = time.monotonic()
         child_alive = child.poll() is None
         if now >= next_descendant_snapshot:
-            snapshot = _process_snapshot()
+            try:
+                snapshot = _process_snapshot(required=verify_cleanup)
+            except RuntimeError:
+                # A caller may signal the wrapper's group while its short ps
+                # probe is in flight. Retry outside that signal before declaring
+                # inspection unavailable; never equate an interrupted ps with
+                # an empty process table.
+                if stop.is_set():
+                    try:
+                        snapshot = _process_snapshot(required=verify_cleanup)
+                    except RuntimeError:
+                        inspection_failed = True
+                        break
+                else:
+                    inspection_failed = True
+                    break
             child_alive = child.poll() is None
             _track_child_processes(
                 child.pid,
@@ -340,6 +384,25 @@ def main(argv: list[str]) -> int:
         child_group,
         tuple(tracked_descendants.values()),
     )
+    if verify_cleanup:
+        deadline = time.monotonic() + 1.5
+        while True:
+            try:
+                snapshot = _process_snapshot(required=True)
+            except RuntimeError:
+                return 70
+            survivors = _matching_survivors(tuple(tracked_descendants.values()), snapshot)
+            group_alive = any(row.process_group == child_group for row in snapshot.values())
+            if child.poll() is not None and not survivors and not group_alive:
+                break
+            if time.monotonic() >= deadline:
+                return 70
+            time.sleep(POLL_SECONDS)
+        if inspection_failed:
+            return 70
+        # A distinct verified exit contract prevents an unexpected wrapper
+        # crash (e.g. Python exit 1) from masquerading as successful cleanup.
+        return 143 if interrupted else (0 if child.returncode == 0 else 71)
     return 143 if interrupted else int(child.returncode or 0)
 
 

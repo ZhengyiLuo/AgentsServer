@@ -41,6 +41,7 @@ class CursorToolBroker:
         self.server = None
         self.tasks: set[asyncio.Task] = set()
         self.closed = False
+        self.definition_requested = asyncio.Event()
 
     async def start(self) -> dict[str, str]:
         self.server = await asyncio.start_server(
@@ -78,6 +79,7 @@ class CursorToolBroker:
                     or not hmac.compare_digest(request["secret"], self.secret)):
                 raise ValueError("provider IPC is forbidden")
             if request.get("method") == "definition":
+                self.definition_requested.set()
                 result = self.definition
             elif request.get("method") == "call":
                 key = request.get("key")

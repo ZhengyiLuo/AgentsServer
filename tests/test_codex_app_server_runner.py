@@ -542,6 +542,21 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
                 self.fail("native provider turn never became ready")
             await asyncio.sleep(0)
 
+    async def test_confirmed_native_archive_is_not_replayed_through_exec(self):
+        manager = FakeManager(FakeTurn())
+        rejection = CodexAppServerRequestError("thread/resume", {"code": -32600, "message":
+            "session thread-native is archived. Run `codex unarchive thread-native` to unarchive it first."})
+        stack, events, finished, fallback = self.runner_patches(manager)
+        with stack, patch.object(agent_server, "ensure_codex_app_server_thread", AsyncMock(side_effect=rejection)), \
+                patch.object(agent_server, "archive_rejected_codex_session", new_callable=AsyncMock) as archive:
+            await agent_server.run_codex_app_server(
+                "chat-native", "run-original", "Original request", dict(self.session), Path("/tmp/manifest"),
+                allow_exec_fallback=True,
+            )
+        archive.assert_awaited_once_with("chat-native", "thread-native", "run-original")
+        fallback.assert_not_awaited()
+        self.assertTrue(any(call.args[1] == "error" and 'codex unarchive' in call.args[2]['message'] for call in events.await_args_list))
+
     async def test_superseded_login_result_does_not_overwrite_current_readiness(self):
         for status in ("completed", "failed"):
             with self.subTest(status=status):

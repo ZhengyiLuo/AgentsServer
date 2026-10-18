@@ -42,6 +42,39 @@ class SettingsTests(unittest.IsolatedAsyncioTestCase):
         self.client = TestClient(self.app)
         self.addCleanup(self.client.close)
 
+    def test_switching_api_backend_before_first_turn_gets_new_binding_not_old_provider_credentials(self):
+        from tests.test_codex_provider_sessions_isolated import make_namespace
+        from tests.test_gemini_api import selected
+        self.store.write("claude", 0, INPUT, "verified")
+        self.store.write("gemini", 0, selected(), "verified")
+        ns = make_namespace(Path(self.temp.name))
+        ns["VALID_BACKENDS"].add("gemini")
+        ns["PROVIDER_CONNECTION_STORE"] = self.store
+        preview = ns["preview_session_runtime_update"]
+        original = preview({"backend": "claude"}, {"provider_connection": "custom"})
+        switched = preview(original, {"backend": "gemini", "provider_connection": "custom", "model": None, "effort": None})
+        self.assertNotEqual(switched["provider_connection_revision"], original["provider_connection_revision"])
+        self.assertEqual(self.store.for_session(switched)["api_key"], selected()["api_key"])
+        self.assertEqual(self.store.for_session(original)["api_key"], KEY)
+        with self.assertRaises(HTTPException):
+            preview({**original, "backend_locked": True}, {"backend": "gemini", "provider_connection": "custom"})
+
+    def test_gemini_default_auto_is_exposed_without_saving_or_checking_a_model(self):
+        from tests.test_gemini_api import selected
+        self.store.write("gemini", 0, selected(), "verified")
+        path = "/api/admin/provider-models/gemini"
+        with patch("gemini_api.catalog", return_value={"models": [], "discovery_status": "unavailable"}):
+            result = self.client.get(path, headers=NATIVE).json()
+        self.assertEqual(result["default_model"], "auto")
+        self.assertEqual(result["models"], [{"value": "auto", "label": "Auto (Gemini CLI)"}])
+        self.assertEqual(result["discovery_status"], "unavailable", "Auto must not imply API discovery succeeded")
+        self.assertIsNone(self.store.public("gemini")["model"])
+        for revision, model, expected in ((1, "gemini-explicit", "gemini-explicit"), (2, None, "auto")):
+            result = self.client.put(path, headers=NATIVE, json={"model": model, "expected_revision": revision})
+            self.assertEqual(result.status_code, 200, result.text)
+            self.assertEqual(result.json()["default_model"], expected)
+        self.check.assert_not_awaited()
+
     def test_success_persists_private_key_and_returns_only_metadata(self):
         self.assertFalse(self.client.get(PATH, headers=NATIVE).json()["configured"])
         response = self.client.put(PATH, headers=NATIVE, json=INPUT)

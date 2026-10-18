@@ -987,6 +987,71 @@ def claude_provider_command_inventory(
     )
 
 
+def gemini_provider_skill_inventory(raw: str, *, cwd: str, selector_secret: str,
+                                    binding_context: str) -> ProviderCommandInventory:
+    """Project the pinned CLI's own resolved inventory, not a guessed scanner.
+
+    CLI 0.64 has no JSON skills command. Parse its exact bounded list format and
+    fail closed on ambiguous output. Paths/content stay server-side; invocation
+    asks Gemini's native activate_skill tool and never grants a tool permission.
+    """
+    records = []
+    text = raw.replace("\r\n", "\n")
+    if text.strip() == "No skills discovered.":
+        return _inventory(selector_secret, binding_context, "gemini", cwd, [], truncated=False)
+    header = "Discovered Agent Skills:\n\n"
+    if not text.startswith(header) or len(text.encode()) > 1024 * 1024:
+        raise ProviderCommandDiscoveryError("Gemini skill inventory format is unsupported")
+    blocks = text[len(header):].rstrip("\n").split("\n\n")
+    if len(blocks) > MAX_PROVIDER_COMMANDS:
+        raise ProviderCommandDiscoveryError("Gemini skill inventory exceeded its limit")
+    seen = set()
+    total = 0
+    for block in blocks:
+        match = re.fullmatch(r"([^\n]+) \[(Enabled|Disabled)\]( \[Built-in\])?\n  Description: ([\s\S]*?)\n  Location:    ([^\n]+)", block)
+        if not match:
+            raise ProviderCommandDiscoveryError("Gemini skill inventory format is unsupported")
+        name, enabled, builtin, description, location = match.groups()
+        if enabled == "Disabled":
+            continue
+        # Native names can be more permissive than our slash-token grammar.
+        # Such skills remain usable by the agent but are not offered as tokens.
+        if canonical_provider_command_name(name) is None:
+            continue
+        if name.casefold() in seen:
+            raise ProviderCommandDiscoveryError("Gemini skill names are ambiguous")
+        seen.add(name.casefold())
+        path = Path(location)
+        if not path.is_absolute() or path.name != "SKILL.md" or len(location) > MAX_PROVIDER_COMMAND_PATH_CHARS:
+            raise ProviderCommandDiscoveryError("Gemini returned an invalid skill location")
+        # Resolve native installed links, then open only a regular, bounded file.
+        # Discovery/revalidation is read-only; never use this path as a command.
+        path = path.resolve(strict=True)
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 1024 * 1024:
+                raise ProviderCommandDiscoveryError("Gemini skill file is unsupported")
+            data = os.read(descriptor, 1024 * 1024 + 1)
+            after = os.fstat(descriptor)
+            if len(data) > 1024 * 1024 or (info.st_size, info.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                raise ProviderCommandDiscoveryError("Gemini skill changed during discovery")
+        finally:
+            os.close(descriptor)
+        total += len(data)
+        if total > 16 * 1024 * 1024:
+            raise ProviderCommandDiscoveryError("Gemini skills exceeded the aggregate limit")
+        digest = hashlib.sha256(data).hexdigest()
+        command_id = _opaque_command_id(selector_secret, binding_context, "gemini", cwd,
+            name, json.dumps([str(path), digest]))
+        records.append(ProviderCommandRecord(public={
+            "id": command_id, "name": name, "label": name,
+            "description": sanitize_provider_command_text(description, MAX_PROVIDER_COMMAND_DESCRIPTION_CHARS),
+            "scope": "built-in" if builtin else "native", "source": "gemini", "kind": "skill", "invocation": f"/{name}",
+        }, native={"name": name, "path": str(path), "content_sha256": digest}))
+    return _inventory(selector_secret, binding_context, "gemini", cwd, records, truncated=False)
+
+
 def empty_provider_command_inventory(
     backend: str,
     *,

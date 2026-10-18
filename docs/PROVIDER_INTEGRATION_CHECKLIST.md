@@ -4,6 +4,9 @@ Use this when adding a provider or upgrading its CLI/SDK. A successful text repl
 is not enough: verify the server contract and the behavior exposed by that
 provider's native runtime/client. This is a review template, not a support claim.
 
+Provider-specific implementation and validation records:
+[Gemini](GEMINI_PROVIDER_PREVIEW.md) (built in; API-only, with documented limits).
+
 Record: **provider · transport · CLI/SDK versions · model/endpoint · server commit
 · OS/client versions · reviewer/date**.
 
@@ -53,11 +56,23 @@ Describe differences and extra provider usage for server-provided equivalents.
 
 - [ ] Identify a real native title source, or explicitly implement a separate
   generation step. Having a rename API does not imply automatic summarization.
+- [ ] Verify the generation trigger in the actual integration transport, not
+  just the native terminal UI. Reading an existing `title`/`summary` field or
+  injecting one into a test fixture does not prove a fresh chat gets named.
+- [ ] In the actual App, create an unnamed chat and complete its first ordinary
+  turn with a real supported model. Cover a short request, a long pasted log
+  whose first line is not its topic, and supported languages. Observe a useful
+  summarized title, its persistence after reopen, and the same native session ID.
+  If the native transport supplies no title, record the fallback generator as
+  implemented and tested, or explicitly mark automatic summarization missing.
 - [ ] Keep a usable fallback. Manual names win; check imports, forks, children,
   opt-out, stale results and rename/delete/archive races.
 - [ ] Extra generation is isolated from the main conversation and its tools,
   permissions and transcript. Bound input, attempts, time and concurrency;
   keep the fallback on failure and disclose additional provider usage.
+  Use the chat's authorized provider/connection; never fall back to another
+  account. Test failed first turns followed by success, unavailable title models,
+  and repeated turns without duplicate title requests or hidden chat messages.
 - [ ] Verify the saved title actually refreshes in supported clients.
 
 ## 5. Agent-to-agent chat and authorization
@@ -130,6 +145,10 @@ Describe differences and extra provider usage for server-provided equivalents.
 - [ ] Preserve discovery of the user's existing project, user and plugin skills
   under the provider's native scope/precedence rules. Use the correct working
   directory and configuration; do not copy, overwrite or reinstall their skills.
+- [ ] Include native built-in skills when available; check whether the provider's
+  default listing hides them behind an explicit flag. Test built-in markers,
+  same-name overrides and disabled entries. Do not advertise another provider's
+  private skills unless this runtime actually discovers and can activate them.
 - [ ] Verify runtime availability separately from AgentsDock's skill/command
   picker. Test explicit selection and automatic invocation where natively
   supported; do not assume every provider has the same syntax or discovery API.
@@ -175,13 +194,13 @@ Run this minimum smoke flow with disposable chats/workspaces:
 
 ## Repository starting points
 
-- [Native-parity rules](../AGENTS.md); [runtime diagnostics tests](../test_runtime_diagnostics.py).
-- [Cursor CLI import contract](CURSOR_LOCAL_IMPORT.md); [Cursor import tests](../test_cursor_local_import.py), [cross-instance import tests](../test_cross_instance_import.py).
-- [Titles](NATIVE_SESSION_TITLES.md); [title lifecycle tests](../test_generated_title_lifecycle.py).
-- [Chat authorization](ASYNC_CHAT_ROUTES.md), [mailbox](CHAT_MAILBOX.md); [authority tests](../test_provider_authority_lifecycle.py).
-- [Reasoning tests](../test_reasoning_stream_isolated.py), [WebSocket catch-up tests](../test_event_websocket_catchup.py), [history reconciliation tests](../test_provider_history_sync.py).
+- [Native-parity rules](../AGENTS.md); [runtime diagnostics tests](../tests/test_runtime_diagnostics.py).
+- [Cursor CLI import contract](CURSOR_LOCAL_IMPORT.md); [Cursor import tests](../tests/test_cursor_local_import.py), [cross-instance import tests](../tests/test_cross_instance_import.py).
+- [Titles](NATIVE_SESSION_TITLES.md); [title lifecycle tests](../tests/test_generated_title_lifecycle.py).
+- [Chat authorization](ASYNC_CHAT_ROUTES.md), [mailbox](CHAT_MAILBOX.md); [authority tests](../tests/test_provider_authority_lifecycle.py).
+- [Reasoning tests](../tests/test_reasoning_stream_isolated.py), [WebSocket catch-up tests](../tests/test_event_websocket_catchup.py), [history reconciliation tests](../tests/test_provider_history_sync.py).
 - [Side questions](NATIVE_SIDE_CHAT.md), [subagents](SUBAGENT_IDENTITY.md), [custom endpoints](CODEX_PROVIDER.md).
-- [Skill/command projection](../provider_commands.py), [discovery and selection tests](../test_provider_command_api.py).
+- [Skill/command projection](../provider_commands.py), [discovery and selection tests](../tests/test_provider_command_api.py).
 - [CI](../.github/workflows/server-ci.yml), [packaging](../scripts/package_release.py).
 
 Research baseline: `release/1.0` at `929bd47`, 2026-09-20. Also checked the

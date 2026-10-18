@@ -1664,7 +1664,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response["managed_updates"])
         self.assertEqual(
             response["capabilities"]["server_updates"]["version"],
-            11,
+            12,
         )
         self.assertEqual(response["update_service_cgroup"], {
             "safe": True,

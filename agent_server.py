@@ -26661,10 +26661,13 @@ SERVER_UPDATE_CONTINUATION_PURPOSE = "server_update_continuation"
 MAX_SERVER_UPDATE_CONTINUATION_RUNS = 256
 SERVER_UPDATE_CONTINUATION_PROMPT = (
     "Continue the unfinished task from before the AgentsDock server update. "
-    "First inspect the conversation and current workspace state, then continue "
-    "from the last completed step. Do not repeat completed file changes, "
-    "commands, messages, or other side effects. The previous provider turn "
-    "was interrupted, so verify its outcome before acting."
+    "First inspect the conversation and current workspace state to find what "
+    "finished and what remains. Then complete the remaining work; do not stop "
+    "at merely reporting that the previous turn was interrupted. If a command "
+    "or tool operation was cut off, verify its effects and resume its unfinished "
+    "steps. Rerun the interrupted operation if necessary, even if some effects "
+    "might repeat. Avoid repeating confirmed completed steps when possible, "
+    "and tell the user about any uncertain effects."
 )
 
 

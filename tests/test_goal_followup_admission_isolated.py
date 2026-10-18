@@ -34,7 +34,7 @@ FUNCTIONS = {
 }
 
 
-def saved_route_snapshots():
+def saved_route_snapshots(count=3):
     """Real durable route DTO shape: automatic metadata, no route_kind."""
     return [{
         "route_id": f"route_{index + 1:032x}", "revision": f"rev_{index + 11:032x}",
@@ -42,7 +42,7 @@ def saved_route_snapshots():
         "target_session_id": f"sess_synthetic_{index}", "alias": f"synthetic_{index}",
         "actions": ["instruction", "request_reply"],
         "created_at": "2026-09-09T10:00:00Z", "updated_at": "2026-09-10T10:00:00Z",
-    } for index in range(3)]
+    } for index in range(count)]
 
 
 class AdmissionHTTPException(Exception):
@@ -482,6 +482,38 @@ class GoalFollowupAdmissionTests(unittest.IsolatedAsyncioTestCase):
                 self.selected["provider_cross_chat_route_snapshot"] = saved_route_snapshots()
                 self.selected[field] = value
                 await self.assert_rejected()
+
+    async def test_ordinary_local_mention_with_saved_routes_steers_existing_goal(self):
+        for ordinary in (False, True):
+            for mentioned in (False, True):
+                with self.subTest(ordinary=ordinary, mentioned=mentioned):
+                    self.setUp()
+                    references = [{
+                        "session_id": "sess_synthetic_0",
+                        "display_title_snapshot": "Example",
+                        "source_text_start": 0, "source_text_end": 8,
+                        "action": "route", "grant_intent": True,
+                    }] if mentioned else []
+                    self.selected.update(
+                        prompt=("@Example " if mentioned else "") + "Consider the additional context.",
+                        skill_selection=None, purpose=None,
+                        chat_references=references, team_references=[],
+                        secure_peer_route_snapshots=[],
+                        cross_chat_obligation_ids=[], cross_chat_exchange_ids=[],
+                        cross_chat_envelope_id=None, cross_chat_exchange_id=None,
+                        cross_chat_exchange_leg_id=None,
+                        provider_cross_chat_route_snapshot=saved_route_snapshots(5),
+                    )
+                    lane = self.active["native_steer_queue"]
+                    if ordinary:
+                        self.active.pop("codex_native_operation_kind")
+                        self.current.pop("purpose")
+                        self.active["native_steer_queue"] = None
+                        lane = self.active["codex_goal_steer_queue"] = asyncio.Queue()
+                    await self.assert_admitted_to_goal_lane(lane)
+                    self.assertEqual(self.selected["chat_references"], references)
+                    self.assertIsNone(self.selected["skill_selection"])
+                    self.assertEqual(self.selected["provider_cross_chat_route_snapshot"], saved_route_snapshots(5))
 
     async def test_saved_routes_still_require_ordinary_non_goal_authority_replacement(self):
         self.session.pop("codex_goal")

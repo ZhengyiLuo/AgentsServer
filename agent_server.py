@@ -24045,6 +24045,7 @@ def native_steer_requeue_event_payload(
         ),
         "model": selected.get("model"),
         "effort": selected.get("effort"),
+        "skill_selection": selected.get("skill_selection"),
         "prompt": display_prompt,
         "request_prompt": str(selected.get("prompt") or ""),
         "display_prompt": selected.get("display_prompt"),
@@ -24346,22 +24347,26 @@ def codex_goal_followup_requires_native(
     )
 
 
-def codex_goal_steer_selection_is_plain(selected: dict[str, Any]) -> bool:
-    """User text/attachments may steer without changing runtime authority."""
+def codex_goal_steer_selection_is_supported(selected: dict[str, Any]) -> bool:
+    """User follow-ups keep the current run owner and explicitly selected input."""
     routes = selected.get("provider_cross_chat_route_snapshot")
+    references = selected.get("chat_references") or []
     return (
         str(selected.get("prompt") or "").strip().split(maxsplit=1)[:1] != ["/mail"]
-        and selected.get("skill_selection") is None
-        # Saved/ambient snapshots are automatic queue metadata and are never
-        # applied by the owner-preserving goal lane. Explicit new @ grants
-        # still require separate work, even without their structured refs.
+        and isinstance(references, list)
+        and all(isinstance(reference, dict) and reference.get("target_kind") is None
+                and reference.get("action") == "route"
+                and reference.get("grant_intent") is True
+                and reference.get("route_action") is None for reference in references)
+        # Only exact current user selections extend chat access. Historical
+        # unattended-job route snapshots are not user-selected references.
         and not any(
             isinstance(route, dict)
             and route.get("route_kind") == PROVIDER_CROSS_CHAT_ROUTE_KIND_REFERENCE
             for route in (routes if isinstance(routes, list) else [])
         )
         and not any(selected.get(field) for field in (
-        "purpose", "chat_references", "team_references",
+        "purpose", "team_references",
         "secure_peer_route_snapshots", "cross_chat_obligation_ids",
         "cross_chat_exchange_ids", "cross_chat_envelope_id",
         "cross_chat_exchange_id", "cross_chat_exchange_leg_id",
@@ -24548,14 +24553,14 @@ async def _run_queued_turn_now_once(
                             isinstance(STORE.sessions[session_id].get("codex_goal"), dict)
                             and STORE.sessions[session_id]["codex_goal"].get("status") == "active"
                             and not STORE.sessions[session_id].get("codex_goal_time_budget_exhausted")
-                            and codex_goal_steer_selection_is_plain(selected)
+                            and codex_goal_steer_selection_is_supported(selected)
                         )
                     )
-                    and not selected.get("chat_references")
+                    and (goal_followup or not selected.get("chat_references"))
                     and not selected.get("team_references")
                     and not selected.get("cross_chat_obligation_ids")
                     and not selected.get("cross_chat_exchange_ids")
-                    and selected.get("skill_selection") is None
+                    and (goal_followup or selected.get("skill_selection") is None)
                     # Only ordinary logical-run replacement issues fresh
                     # authority. A goal steer keeps its exact owner and does
                     # not replace the original turn's references or command.
@@ -24606,19 +24611,19 @@ async def _run_queued_turn_now_once(
                     )
                 )
                 if goal_followup and not native_steer:
-                    unsupported_input = not codex_goal_steer_selection_is_plain(selected)
+                    unsupported_input = not codex_goal_steer_selection_is_supported(selected)
                     raise HTTPException(
                         status_code=409,
                         detail=force_send_conflict_detail(
                             session_id, queued_id,
                             guard="active_goal_requires_native_steer",
                             message=(
-                                "This queued action adds chat access or invokes a provider command, which cannot be applied inside the running Codex turn."
+                                "This queued action contains a Team, remote-chat or legacy delivery that needs a separate turn."
                                 if unsupported_input else
                                 "Codex does not have a running goal turn ready to receive this message."
                             ),
                             action=(
-                                "It remains queued for a new turn. Text and file follow-ups can be sent now."
+                                "It remains queued. Text, files, local skills and local @chat mentions can be sent now."
                                 if unsupported_input else
                                 "Your message remains queued. Retry Send now when Codex is running."
                             ),
@@ -44705,10 +44710,15 @@ async def reserve_async_provider_route_message(
     if not available or target_session_id == source_session_id:
         raise HTTPException(status_code=409, detail="permanent chat pair is unavailable")
     cross_chat_delivery_client_capabilities(STORE.sessions.get(target_session_id) or {})
-    delegation_action = next((action for action in ("instruction", "request_reply", "route")
-        if (target_session_id, action) in (capability.get("user_delegation_grants") or set())), "")
+    route_instruction = (capability.get("provider_route_source_instructions") or {}).get(route_id)
+    delegation_action = "route" if route_instruction is not None else next((
+        action for action in ("instruction", "request_reply", "route")
+        if (target_session_id, action) in (capability.get("user_delegation_grants") or set())
+    ), "")
     source_user_instruction = (
-        validated_cross_chat_source_user_instruction(capability.get("source_user_instruction"))
+        validated_cross_chat_source_user_instruction(
+            route_instruction if route_instruction is not None else capability.get("source_user_instruction")
+        )
         if delegation_action else ""
     )
     if delegation_action and not source_user_instruction.strip():
@@ -44718,6 +44728,23 @@ async def reserve_async_provider_route_message(
     envelope_id = "handoff_" + hashlib.sha256(
         f"async_route_v1\0{source_run_id}\0{idempotency_key}".encode("utf-8")
     ).hexdigest()[:32]
+    if route_instruction is not None:
+        prior = await CROSS_CHAT.get(envelope_id)
+        if prior is not None:
+            if (prior.get("kind") != "instruction" or prior.get("delivery_mode") != "mailbox"
+                    or prior.get("source_session_id") != source_session_id
+                    or prior.get("source_run_id") != source_run_id
+                    or prior.get("target_session_id") != target_session_id
+                    or prior.get("idempotency_key") != idempotency_key
+                    or prior.get("authorization_kind") != "configured_route"
+                    or prior.get("authorization_route_id") != route_id
+                    or prior.get("authorization_pair_id") != live["pair_id"]
+                    or prior.get("body") != body):
+                raise HTTPException(status_code=409, detail="idempotency key was already used for a different handoff")
+            # A later explicit @ selection updates future messages only. An
+            # exact retry keeps the instruction recorded with its first send.
+            source_user_instruction = validated_cross_chat_source_user_instruction(prior.get("source_user_instruction"))
+            delegation_action = str(prior.get("source_user_delegation_action") or "")
     return {
         "envelope_id": envelope_id,
         "route_id": route_id,
@@ -56965,6 +56992,7 @@ async def acquire_codex_control_thread(
                     "provider_turn_id": None,
                     "provider_turn_ready": False,
                     "interactive_app_server": True,
+                    "cwd": cwd,
                     "codex_approval_policy": effective_codex_approval_policy(session),
                     "codex_native_operation": True,
                     "codex_native_operation_kind": None,
@@ -57313,6 +57341,175 @@ async def cancel_codex_native_actions(session_id: str | None = None) -> None:
         )
 
 
+async def prepare_codex_goal_route_steer(
+    session_id: str, run_id: str, selected: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Validate an exact local @ selection without changing live authority."""
+    raw_references = selected.get("chat_references")
+    if not raw_references:
+        return None
+    prompt = str(selected.get("prompt") or "")
+    try:
+        references = [ChatReference.model_validate(value) for value in raw_references]
+        if selected.get("purpose") is not None or any(
+            reference.target_kind is not None or reference.action != "route"
+            or reference.grant_intent is not True or reference.route_action is not None
+            for reference in references
+        ):
+            raise ValueError("Only explicit local @Chat access can be added to a running goal")
+        references = validate_chat_references(
+            session_id, prompt, references, selected.get("client_capabilities") or [],
+        )
+    except (HTTPException, ValueError, TypeError) as exc:
+        raise NativeSteerHandoffError(
+            str(exc.detail) if isinstance(exc, HTTPException) else str(exc),
+            safe_to_requeue=True,
+        ) from exc
+    targets = {reference.session_id for reference in references}
+    # Queued snapshots may also contain unmentioned permanent pairs. Only
+    # the exact visible selection can extend this already-running owner.
+    routes = [route for route in provider_cross_chat_route_snapshot_for_authority(
+        selected.get("provider_cross_chat_route_snapshot"), references,
+        source_session_id=session_id,
+    ) if route.get("target_session_id") in targets and route.get("pair_id")
+        and live_provider_cross_chat_route(session_id, route) is not None]
+    if {route.get("target_session_id") for route in routes} != targets:
+        raise NativeSteerHandoffError(
+            "Selected chat access was revoked or changed; the follow-up remains queued",
+            safe_to_requeue=True,
+        )
+    async with CROSS_CHAT_CAPABILITY_LOCK:
+        matches = [(key, value) for key, value in CROSS_CHAT_CAPABILITIES.items()
+                   if value.get("source_session_id") == session_id
+                   and value.get("source_run_id") == run_id
+                   and not value.get("native_transition_nonce")]
+        active = ACTIVE.get(session_id) or {}
+        current = CURRENT_TURNS.get(session_id) or {}
+        resumed_owner_without_authority = bool(
+            not matches and re.fullmatch(r"run_[A-Za-z0-9_-]+", run_id)
+            and active.get("run_id") == current.get("run_id") == run_id
+            and active.get("codex_native_operation_kind") == "goal_resume"
+            and active.get("codex_control_reservation_id")
+            == current.get("codex_control_reservation_id")
+            and active.get("codex_control_reservation_id")
+        )
+        if (not provider_capability_is_attached_to_live_run(session_id, run_id)
+                or not resumed_owner_without_authority and (
+                    len(matches) != 1 or matches[0][1].get("server_identity") != server_identity()
+                    or matches[0][1].get("async_route_v1") is not True
+                    or float(matches[0][1].get("expires_at") or 0) <= time.time()
+                )):
+            raise NativeSteerHandoffError(
+                "This running goal has no compatible chat-access authority; the follow-up remains queued",
+                safe_to_requeue=True,
+            )
+        token_hash, capability = matches[0] if matches else (None, None)
+        # Capture the registry object as well as its key: a replacement run or
+        # capability cannot inherit this admission after native acknowledgement.
+        return {
+            "token_hash": token_hash, "capability": capability,
+            "routes": tuple(copy.deepcopy(route) for route in routes),
+            "source_user_instruction": prompt,
+        }
+
+
+async def commit_codex_goal_route_steer(
+    session_id: str, run_id: str, prepared: dict[str, Any] | None,
+) -> bool:
+    """Extend only the accepted owner's live routes; never revive revoked access."""
+    if prepared is None:
+        return True
+    async with CROSS_CHAT_CAPABILITY_LOCK:
+        capability = CROSS_CHAT_CAPABILITIES.get(prepared["token_hash"])
+        if (capability is None or capability is not prepared["capability"]
+                or capability.get("source_session_id") != session_id
+                or capability.get("source_run_id") != run_id
+                or capability.get("server_identity") != server_identity()
+                or capability.get("native_transition_nonce")
+                or float(capability.get("expires_at") or 0) <= time.time()
+                or not provider_capability_is_attached_to_live_run(session_id, run_id)):
+            return False
+        routes = [live_provider_cross_chat_route(session_id, route) for route in prepared["routes"]]
+        if any(route is None for route in routes):
+            return False
+        # Keep handles, reply bindings, action ceilings and consumed effects
+        # from the original run. The static tool reads this environment afresh.
+        actions = set(capability.get("actions") or set()) | {"agent_cross_chat_routes"}
+        runtime_env = validate_provider_runtime_env({
+            **(capability.get("provider_runtime_env") or {}),
+            "AGENTSDOCK_PROVIDER_AUTHORITY_ACTIONS": ",".join(sorted(actions)),
+            "AGENTSDOCK_CROSS_CHAT_MODE": "async_route_v1",
+        })
+        grants = dict(capability.get("provider_route_grants") or {})
+        instructions = dict(capability.get("provider_route_source_instructions") or {})
+        for route in routes:
+            assert route is not None
+            previous = grants.get(route["route_id"])
+            if previous is None or any(previous.get(key) != route.get(key) for key in (
+                "revision", "alias", "target_session_id", "pair_id", "paired_route_id",
+            )):
+                grants[route["route_id"]] = copy.deepcopy(route)
+            instructions[route["route_id"]] = prepared["source_user_instruction"]
+        capability.update({
+            "provider_route_grants": grants,
+            "provider_route_source_instructions": instructions,
+            "actions": actions, "provider_runtime_env": runtime_env,
+        })
+        return True
+
+
+async def issue_codex_goal_route_steer_authority(
+    session_id: str, run_id: str, prepared: dict[str, Any],
+) -> bool:
+    """Bind accepted user references to a resumed goal without replacing it."""
+    active = ACTIVE.get(session_id) or {}
+    if (active.get("codex_native_operation_kind") != "goal_resume"
+            or not provider_capability_is_attached_to_live_run(session_id, run_id)
+            or any(live_provider_cross_chat_route(session_id, route) is None
+                   for route in prepared["routes"])):
+        return False
+    async with CROSS_CHAT_CAPABILITY_LOCK:
+        if any(value.get("source_run_id") == run_id
+               for value in CROSS_CHAT_CAPABILITIES.values()):
+            return False
+    authority_path = None
+    try:
+        authority_path = await issue_cross_chat_capability(
+            session_id, run_id, [],
+            source_user_instruction=prepared["source_user_instruction"],
+            actions={"agent_cross_chat_routes"},
+            provider_route_snapshot=list(prepared["routes"]),
+            async_route_v1=True,
+        )
+        if authority_path is None:
+            return False
+        await provider_authority_runtime_env(run_id, authority_path, session_id, [])
+        async with CROSS_CHAT_CAPABILITY_LOCK:
+            matches = [(key, value) for key, value in CROSS_CHAT_CAPABILITIES.items()
+                       if value.get("source_run_id") == run_id
+                       and value.get("authority_path") == str(authority_path)]
+            if (len(matches) == 1
+                    and provider_capability_is_attached_to_live_run(session_id, run_id)):
+                prepared["token_hash"], prepared["capability"] = matches[0]
+                return True
+    except Exception as exc:
+        # Input is already accepted. Never return it to the queue after a
+        # local authority failure, or deliver it twice on the next goal turn.
+        logger.warning("could not bind accepted goal chat access session=%s: %s",
+                       session_id, concise_error_message(exc))
+    finally:
+        if authority_path is not None and prepared["capability"] is None:
+            # Remove exactly our new record; never revoke the original owner
+            # or a capability installed by later work in the same chat.
+            async with CROSS_CHAT_CAPABILITY_LOCK:
+                for key, value in list(CROSS_CHAT_CAPABILITIES.items()):
+                    if value.get("source_run_id") == run_id and value.get("authority_path") == str(authority_path):
+                        CROSS_CHAT_CAPABILITIES.pop(key, None)
+            with suppress(OSError):
+                authority_path.unlink()
+    return False
+
+
 async def send_codex_goal_steer(
     session_id: str, operation_id: str, manager: CodexAppServerManager,
     thread_id: str, reservation_id: str, subscription: Any,
@@ -57320,6 +57517,11 @@ async def send_codex_goal_steer(
 ) -> dict[str, Any]:
     """Steer one exact native goal turn without replacing its authority/owner."""
     selected = request["selected"]
+    selected_command = selected.get("skill_selection")
+    command_selection = dict(selected_command) if isinstance(selected_command, dict) else selected_command
+    user_prompt = str(selected.get("prompt") or "")
+    reference_selection = copy.deepcopy(selected.get("chat_references"))
+    route_steer = None
     expected_turn_id = str(request.get("expected_provider_turn_id") or "")
     generation = manager.generation
 
@@ -57375,10 +57577,20 @@ async def send_codex_goal_steer(
             and str(current.get("run_id") or "") == operation_id
             and str(active.get("codex_control_reservation_id") or "") == reservation_id
             and str(current.get("codex_control_reservation_id") or "") == reservation_id
-            and codex_goal_steer_selection_is_plain(selected)
-            # Only text/files are sent. The current turn's command, references,
-            # runtime and authority stay intact, regardless of picker changes
-            # or capability metadata on an older queued message.
+            and codex_goal_steer_selection_is_supported(selected)
+            and selected.get("skill_selection") == command_selection
+            and str(selected.get("prompt") or "") == user_prompt
+            and selected.get("chat_references") == reference_selection
+            and (route_steer is None or route_steer["capability"] is None or (
+                CROSS_CHAT_CAPABILITIES.get(route_steer["token_hash"]) is route_steer["capability"]
+                and float(route_steer["capability"].get("expires_at") or 0) > time.time()
+            ))
+            and (route_steer is None or all(
+                live_provider_cross_chat_route(session_id, route) is not None
+                for route in route_steer["routes"]
+            ))
+            # Runtime and the original command remain pinned. Only accepted,
+            # explicitly selected references add to the same owner's routes.
         )
 
     async def validate_delivery_owner() -> None:
@@ -57392,9 +57604,22 @@ async def send_codex_goal_steer(
 
     try:
         await validate_delivery_owner()
+        command = None
+        if command_selection is not None:
+            owner_session = {**(STORE.sessions.get(session_id) or {}),
+                             "cwd": (ACTIVE.get(session_id) or {}).get("cwd")
+                                    or (STORE.sessions.get(session_id) or {}).get("cwd")}
+            command = await resolve_provider_command_selection(
+                session_id, owner_session, SkillSelection.model_validate(command_selection),
+                prompt=user_prompt, purpose=None, provider_context_mode="chat",
+                client_capabilities=list(selected.get("client_capabilities") or []),
+                refresh_native=True, codex_manager=manager,
+            )
         prompt = build_user_provider_prompt(
-            session_id, str(selected.get("prompt") or ""), list(selected.get("file_ids") or []),
+            session_id, user_prompt, list(selected.get("file_ids") or []),
         )
+        input_items = codex_provider_command_turn_input(prompt, command)
+        route_steer = await prepare_codex_goal_route_steer(session_id, operation_id, selected)
         await fence_native_steer_delivery(session_id, selected, backend=BACKEND_CODEX)
         # Stop/Pause, budget/goal changes, and native turn rollover can win
         # during the durable fence. Check again at the RPC boundary.
@@ -57402,7 +57627,7 @@ async def send_codex_goal_steer(
         request["_goal_steer_rpc_started"] = True
         acknowledged_turn_id, watermark = await manager.steer_turn_with_notification_watermark(
             thread_id, expected_turn_id,
-            [{"type": "text", "text": prompt, "text_elements": []}],
+            input_items,
             client_user_message_id=str(selected.get("queued_id") or ""),
             notification_subscription=subscription,
             before_send=delivery_owner_valid,
@@ -57412,7 +57637,11 @@ async def send_codex_goal_steer(
                 "Codex goal steer returned an invalid acknowledgement boundary",
                 request_sent=True, safe_to_retry=False,
             )
-        return {"request": request, "watermark": watermark, "provider_turn_id": expected_turn_id}
+        return {"request": request, "watermark": watermark, "provider_turn_id": expected_turn_id,
+                "route_steer": route_steer,
+                **({"skill_selection": command_selection,
+                    "source_text_sha256": history_dedup_key("user", codex_provider_command_turn_input(user_prompt, command)[0]["text"])[1]}
+                   if command is not None else {})}
     except NativeSteerHandoffError:
         raise
     except BaseException as exc:
@@ -57458,11 +57687,14 @@ async def commit_codex_goal_steer(
         if selected.get("display_file_ids") is not None
         else selected.get("file_ids") or []
     )
+    reference_fields = ({"chat_references": selected["chat_references"]}
+                        if selected.get("chat_references") else {})
     await append_durable_event_batch(session_id, [
         ("turn_queue_run_now", {
             "queued_id": selected.get("queued_id"), "run_id": operation_id,
             "backend": BACKEND_CODEX, "prompt": display_prompt,
             "file_ids": display_file_ids,
+            **reference_fields,
             "native_steer": True, "native_goal_steer": True,
             "interrupted": False, "replays_interrupted_message": False,
             "remaining": request.get("remaining", 0), "superseded_queued_ids": [],
@@ -57474,12 +57706,26 @@ async def commit_codex_goal_steer(
             "queued_id": selected.get("queued_id"), "prompt": display_prompt,
             "file_ids": display_file_ids, "native_steer": True, "native_goal_steer": True,
             "provider_user_authored": True,
+            **reference_fields,
+            **({"skill_selection": pending["skill_selection"],
+                "source_text_sha256": pending["source_text_sha256"]}
+               if pending.get("skill_selection") is not None else {}),
         }),
     ])
+    route_steer = pending.get("route_steer")
+    access_applied = True
+    if route_steer is not None:
+        if route_steer["capability"] is None:
+            access_applied = await issue_codex_goal_route_steer_authority(session_id, operation_id, route_steer)
+        if access_applied:
+            access_applied = await commit_codex_goal_route_steer(session_id, operation_id, route_steer)
     return {
         "ok": True, "queued_id": selected.get("queued_id"), "run_id": operation_id,
         "interrupted": False, "native_steer": True, "native_goal_steer": True,
         "replays_interrupted_message": False, "superseded_queued_ids": [],
+        **({"chat_access_applied": access_applied} if route_steer is not None else {}),
+        **({"message": "Message sent, but the selected chat access was revoked or became unavailable. The message will not be resent."}
+           if not access_applied else {}),
     }
 
 
@@ -58141,6 +58387,13 @@ async def consume_codex_native_turn(
                         },
                     )
             finally:
+                if goal_resume:
+                    authority_cleanup = asyncio.create_task(revoke_cross_chat_capability(operation_id))
+                    try:
+                        await asyncio.shield(authority_cleanup)
+                    except BaseException:
+                        with suppress(BaseException):
+                            await join_task_despite_caller_cancellation(authority_cleanup)
                 STOPPED_RUNS.discard(operation_id)
                 if terminal_claimed:
                     # The slot is already exactly released. Remove the admission
@@ -61489,6 +61742,7 @@ async def discover_session_provider_commands(
     session: dict[str, Any],
     *,
     refresh: bool = False,
+    codex_manager: CodexAppServerManager | None = None,
 ) -> tuple[dict[str, Any], ProviderCommandInventory]:
     """Read one backend's native inventory without exposing provider metadata."""
 
@@ -61576,7 +61830,7 @@ async def discover_session_provider_commands(
 
     if backend == BACKEND_CODEX:
         try:
-            manager = await codex_app_server_manager(session)
+            manager = codex_manager if codex_manager is not None else await codex_app_server_manager(session)
             raw = await manager.request(
                 "skills/list",
                 {"cwds": [cwd], "forceReload": bool(refresh)},
@@ -61721,6 +61975,7 @@ async def resolve_provider_command_selection(
     provider_context_mode: str,
     client_capabilities: list[str],
     refresh_native: bool = False,
+    codex_manager: CodexAppServerManager | None = None,
 ) -> ProviderCommandRecord | None:
     """Revalidate an opaque provider command at every actual admission."""
 
@@ -61759,6 +62014,7 @@ async def resolve_provider_command_selection(
         # Revalidate against the exact current provider generation. Do not
         # evict it here: Claude command inventories can vary across connects.
         refresh=bool(refresh_native and backend == BACKEND_CODEX),
+        **({"codex_manager": codex_manager} if codex_manager is not None else {}),
     )
     if snapshot["support"].get("available") is not True:
         deterministic_transport_mismatch = (
@@ -82386,14 +82642,23 @@ async def codex_provider_mcp(request: Request) -> Response:
         client_meta = turn_meta
     run_id = str(client_meta.get("agentsdock_run_id") or "")
     proof = str(client_meta.get("agentsdock_run_proof") or "")
+    native_goal_metadata = (
+        all(key not in metadata for metadata in (
+                turn_meta, turn_meta.get("responsesapi_client_metadata"),
+                turn_meta.get("responsesapiClientMetadata"),
+            ) if isinstance(metadata, dict)
+            for key in ("agentsdock_run_id", "agentsdock_run_proof"))
+    )
     core_call_id = str(meta.get("callId") or "")
     if (
         not thread_id
         or len(thread_id) > 256
         or not turn_id
         or len(turn_id) > 256
-        or re.fullmatch(r"run_[A-Za-z0-9_-]{1,128}", run_id) is None
-        or re.fullmatch(r"[0-9a-f]{64}", proof) is None
+        or not native_goal_metadata and (
+            re.fullmatch(r"run_[A-Za-z0-9_-]{1,128}", run_id) is None
+            or re.fullmatch(r"[0-9a-f]{64}", proof) is None
+        )
         or not core_call_id
     ):
         return codex_provider_mcp_jsonrpc_error(request_id, -32602, "Incomplete turn metadata")
@@ -82401,6 +82666,26 @@ async def codex_provider_mcp(request: Request) -> Response:
         return codex_provider_mcp_jsonrpc_error(request_id, -32602, "Invalid call identity")
     standalone_active_owner = False
     async with ACTIVE_LOCK:
+        if native_goal_metadata:
+            # thread/goal/set cannot carry responsesapiClientMetadata. The
+            # authenticated static MCP still supplies provider-owned thread
+            # and turn IDs; bind those only to one exact live goal reservation.
+            # Supplied partial, invalid or stale proofs never use this lane.
+            native_owners = []
+            for candidate, active in ACTIVE.items():
+                candidate_run = str(active.get("run_id") or "")
+                manager = existing_codex_app_server_manager(STORE.sessions.get(candidate))
+                matches, _ready = provider_tool_active_matches(
+                    candidate, candidate_run, backend=BACKEND_CODEX,
+                    provider_thread_id=thread_id, provider_turn_id=turn_id,
+                )
+                if (re.fullmatch(r"run_[A-Za-z0-9_-]{1,128}", candidate_run)
+                        and manager is not None and manager.ready and matches
+                        and codex_native_mailbox_owner_matches(candidate, candidate_run, thread_id, turn_id)):
+                    native_owners.append(candidate_run)
+            if len(native_owners) != 1:
+                return codex_provider_mcp_jsonrpc_error(request_id, -32602, "Incomplete turn metadata")
+            run_id = native_owners[0]
         owners = [
             session_id
             for session_id, active in ACTIVE.items()
@@ -82435,7 +82720,7 @@ async def codex_provider_mcp(request: Request) -> Response:
     ):
         return codex_provider_mcp_jsonrpc_error(request_id, -32602, "Ambiguous thread owner")
     expected_proof = codex_provider_mcp_run_proof(session_id, thread_id, run_id)
-    if not hmac.compare_digest(proof, expected_proof):
+    if not native_goal_metadata and not hmac.compare_digest(proof, expected_proof):
         return codex_provider_mcp_jsonrpc_error(request_id, -32602, "Invalid turn proof")
     try:
         text, is_error = await execute_provider_tool_once(
@@ -90174,7 +90459,7 @@ async def _put_codex_goal_locked(
             blocker = await turn_start_blocker(ignore_session_id=session_id)
             if blocker:
                 raise HTTPException(status_code=503, detail=f"agent launch deferred: {blocker}")
-            operation_id = f"codexgoal_{uuid.uuid4().hex[:16]}"
+            operation_id = f"run_codexgoal_{uuid.uuid4().hex[:16]}"
             subscription = manager.subscribe_thread(thread_id)
             provider_model, provider_effort, provider_service_tier = codex_runtime_settings(stored_session)
             async with ACTIVE_LOCK:

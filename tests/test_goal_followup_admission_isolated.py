@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, Mock
 SOURCE = (Path(__file__).resolve().parents[1] / "agent_server.py")
 FUNCTIONS = {
     "codex_goal_followup_requires_native",
-    "codex_goal_steer_selection_is_plain",
+    "codex_goal_steer_selection_is_supported",
     "_run_queued_turn_now_once",
     "async_route_queue_fields",
     "active_snapshot_input",
@@ -297,6 +297,19 @@ class GoalFollowupAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assert_untouched(before)
         self.ns["queued_codex_runtime_matches_active"].assert_called_once()
 
+    async def test_selected_native_skill_uses_goal_lane_without_replacing_owner(self):
+        for ordinary in (False, True):
+            with self.subTest(ordinary=ordinary):
+                self.setUp()
+                self.selected.update(prompt="/review Verify the result", skill_selection={
+                    "id": "pcmd_" + "a" * 32, "revision": "pcmdrev_" + "b" * 32})
+                lane = self.active["native_steer_queue"]
+                if ordinary:
+                    self.active.pop("codex_native_operation_kind")
+                    self.active["native_steer_queue"] = None
+                    lane = self.active["codex_goal_steer_queue"] = asyncio.Queue()
+                await self.assert_admitted_to_goal_lane(lane)
+
     async def test_authority_bearing_followups_stay_queued_without_stop(self):
         for field in (
             "chat_references", "team_references", "cross_chat_obligation_ids",
@@ -455,11 +468,10 @@ class GoalFollowupAdmissionTests(unittest.IsolatedAsyncioTestCase):
                         self.assertIs(self.active["provider_authority"], authority)
                         self.assertEqual(self.selected["provider_cross_chat_route_snapshot"], routes)
 
-    async def test_saved_routes_do_not_relax_explicit_reference_or_command_rejections(self):
+    async def test_saved_routes_do_not_relax_explicit_reference_rejections(self):
         for field, value in (
             ("chat_references", [{"session_id": "new-target"}]),
             ("team_references", [{"id": "new-team"}]),
-            ("skill_selection", {"name": "provider-command"}),
             ("prompt", "/mail server remote New message"),
             ("provider_cross_chat_route_snapshot", [
                 *saved_route_snapshots(), {**saved_route_snapshots()[0], "route_kind": "prompt_reference"},

@@ -26658,6 +26658,7 @@ RESTART_ORPHAN_TERMINAL_TYPES = {
 }
 
 SERVER_UPDATE_CONTINUATION_PURPOSE = "server_update_continuation"
+MAX_SERVER_UPDATE_CONTINUATION_RUNS = 256
 SERVER_UPDATE_CONTINUATION_PROMPT = (
     "Continue the unfinished task from before the AgentsDock server update. "
     "First inspect the conversation and current workspace state, then continue "
@@ -26681,6 +26682,79 @@ def unsupported_coordinated_update_turns() -> list[str]:
         or owner.get("purpose") is not None
         or owner.get("provider_context_mode") != "chat"
         or owner.get("backend") not in {BACKEND_CODEX, BACKEND_CLAUDE, BACKEND_CURSOR}]
+
+
+def active_coordinated_update_turns() -> list[dict[str, str]]:
+    """Snapshot run ownership before a graceful restart can close the turn."""
+
+    return [
+        {
+            "session_id": session_id,
+            "run_id": str(CURRENT_TURNS[session_id]["run_id"]),
+            "backend": str(CURRENT_TURNS[session_id]["backend"]),
+            "provider_context_mode": "chat",
+        }
+        for session_id in sorted(BUSY_SESSIONS)
+    ]
+
+
+def coordinated_update_run_was_interrupted(session_id: str, run_id: str) -> bool:
+    """A completed turn needs no continuation, even if it was busy at acceptance."""
+
+    for event in reversed(tail_jsonl_file(
+        events_path(session_id), limit=200, max_bytes=8 * 1024 * 1024,
+    )):
+        if str(event.get("run_id") or "") != run_id:
+            continue
+        if event.get("type") in RESTART_ORPHAN_TERMINAL_TYPES:
+            return event.get("stopped") is True or event.get("type") == "turn_stopped"
+    return True
+
+
+async def queue_saved_coordinated_update_turns(
+    restart_status: dict[str, Any],
+    update_status: dict[str, Any],
+) -> int:
+    """Recover runs that shutdown closed normally before orphan scanning began."""
+
+    if restart_status.get("_continuation_recovered_at"):
+        return 0
+    if restart_status.get("_resume_interrupted_turns") is not True:
+        return 0
+    request_id = str(restart_status.get("request_id") or "")
+    schedule_id = str(restart_status.get("_update_schedule_id") or "")
+    if (
+        restart_status.get("_forced") is not True
+        or not request_id
+        or not re.fullmatch(r"[0-9a-f]{32}", schedule_id)
+        or str(restart_status.get("_source_instance_id") or "") in {"", SERVER_INSTANCE_ID}
+        or str(update_status.get("schedule_id") or "") != schedule_id
+        or not (
+            managed_server_force_update_is_pending(update_status)
+            or (
+                update_status.get("phase") == "complete"
+                and update_status.get("target_version") == SERVER_VERSION
+            )
+        )
+    ):
+        return 0
+    saved = restart_status.get("_continuation_runs")
+    if not isinstance(saved, list):
+        return 0
+    queued = 0
+    for row in saved:
+        if not isinstance(row, dict):
+            continue
+        session_id = str(row.get("session_id") or "")
+        run_id = str(row.get("run_id") or "")
+        if not session_id or not run_id or session_id not in STORE.sessions:
+            continue
+        if not coordinated_update_run_was_interrupted(session_id, run_id):
+            continue
+        if await queue_interrupted_server_update_turn(session_id, row, request_id):
+            queued += 1
+    write_server_restart_status(_continuation_recovered_at=update_utc_now())
+    return queued
 
 
 def has_server_update_continuation(session_id: str, queued_id: str) -> bool:
@@ -79063,6 +79137,16 @@ async def lifespan(app: FastAPI):
             else None
         ),
     )
+    try:
+        await queue_saved_coordinated_update_turns(
+            startup_restart_status, startup_update_status,
+        )
+    except Exception as exc:
+        # Leave the receipt unacknowledged so the next startup can retry.
+        logger.error(
+            "could not restore saved server-update turns error_type=%s",
+            type(exc).__name__,
+        )
     if managed_server_force_update_is_pending(startup_update_status):
         # Give an explicitly confirmed force update first admission after its
         # cleanup restart. Durable queued turns are reconstructed later, and
@@ -85413,6 +85497,7 @@ async def accept_forced_server_restart(
                 audit["team_hub_snapshot_skipped"] = True
 
         now = update_utc_now()
+        continuation_runs: list[dict[str, str]] = []
         if expected_schedule_id is not None:
             if body.resume_interrupted_turns is True:
                 if (snapshot.get("snapshot_degraded") is True
@@ -85434,6 +85519,14 @@ async def accept_forced_server_restart(
                         action="Let those turns finish, then retry the coordinated update.",
                         retryable=True,
                     ))
+                if len(BUSY_SESSIONS) > MAX_SERVER_UPDATE_CONTINUATION_RUNS:
+                    raise HTTPException(status_code=409, detail=server_restart_error_detail(
+                        "server_update_continuation_capacity",
+                        "Too many active chats to save for this coordinated update.",
+                        action="Let some chats finish, then retry the coordinated update.",
+                        retryable=True,
+                    ))
+                continuation_runs = active_coordinated_update_turns()
             # No await may separate this durable arm from restart acceptance.
             # If the restart journal write fails, the emergency signal still
             # proceeds and the replacement process owns the exact reservation.
@@ -85448,6 +85541,8 @@ async def accept_forced_server_restart(
             _request_fingerprint=request_fingerprint,
             _forced=True,
             _resume_interrupted_turns=(body.resume_interrupted_turns is True),
+            _continuation_runs=continuation_runs,
+            _continuation_recovered_at=None,
             _update_schedule_id=expected_schedule_id,
             _forced_work_snapshot=public_server_restart_work_counts(snapshot),
             _forced_audit=audit,

@@ -190,6 +190,57 @@ class AbandonedTurnDetectionTests(unittest.TestCase):
 
 
 class AbandonedTurnRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_gracefully_stopped_force_update_turn_is_saved_and_recovered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stopped_events = root / "stopped.jsonl"
+            finished_events = root / "finished.jsonl"
+            write_events(stopped_events, [
+                {"type": "turn_started", "run_id": "run-stopped", "backend": "codex"},
+                {"type": "turn_finished", "run_id": "run-stopped", "stopped": True},
+            ])
+            write_events(finished_events, [
+                {"type": "turn_started", "run_id": "run-finished", "backend": "claude"},
+                {"type": "turn_finished", "run_id": "run-finished", "stopped": False},
+            ])
+            request_id = "restart-1"
+            restart_status = {
+                "phase": "complete", "request_id": request_id,
+                "_forced": True, "_resume_interrupted_turns": True,
+                "_source_instance_id": "previous-process",
+                "_update_schedule_id": "a" * 32,
+                "_continuation_runs": [
+                    {"session_id": "stopped", "run_id": "run-stopped", "backend": "codex", "provider_context_mode": "chat"},
+                    {"session_id": "finished", "run_id": "run-finished", "backend": "claude", "provider_context_mode": "chat"},
+                ],
+            }
+            update_status = {
+                "phase": "complete", "schedule_id": "a" * 32,
+                "target_version": "1.0.11-beta.7",
+            }
+            queued = AsyncMock(return_value={})
+            with patch.object(agent_server, "SERVER_RESTART_STATUS_FILE", root / "restart.json"), patch.object(
+                agent_server, "SERVER_VERSION", "1.0.11-beta.7",
+            ), patch.object(agent_server, "SERVER_INSTANCE_ID", "new-process"), patch.object(
+                agent_server.STORE, "sessions", {"stopped": {}, "finished": {}},
+            ), patch.object(agent_server, "events_path", side_effect=lambda session_id: {
+                "stopped": stopped_events, "finished": finished_events,
+            }[session_id]), patch.object(
+                agent_server, "append_durable_event", queued,
+            ):
+                agent_server.write_server_restart_status(**restart_status)
+                self.assertEqual(await agent_server.queue_saved_coordinated_update_turns(
+                    agent_server.read_server_restart_status(), update_status,
+                ), 1)
+                self.assertEqual(await agent_server.queue_saved_coordinated_update_turns(
+                    agent_server.read_server_restart_status(), update_status,
+                ), 0)
+
+            self.assertEqual([call.args[1] for call in queued.await_args_list],
+                             ["turn_queued", "turn_queue_reordered"])
+            self.assertEqual(queued.await_args_list[0].args[0], "stopped")
+            self.assertFalse(queued.await_args_list[0].args[2]["provider_user_authored"])
+
     async def test_forced_update_queues_one_internal_continuation_before_closing_turn(self) -> None:
         queued = AsyncMock(return_value={})
         stopped = AsyncMock(return_value={})

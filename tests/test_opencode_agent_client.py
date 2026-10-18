@@ -110,6 +110,15 @@ class NormalizeStreamEventTests(unittest.TestCase):
             normalize_opencode_stream_event(line)["message"], "ProviderAuthError"
         )
 
+    def test_api_error_preserves_http_status_without_dumping_response_or_headers(self) -> None:
+        for status in (401, 403, 429, 500):
+            with self.subTest(status=status):
+                line = json.dumps({"type": "error", "sessionID": SESSION_ID, "error": {
+                    "name": "APIError", "data": {"statusCode": status,
+                    "responseHeaders": {"secret": "private"}, "responseBody": "<html>private</html>"}}})
+                message = normalize_opencode_stream_event(line)["message"]
+                self.assertEqual(message, f"APIError (HTTP {status})")
+
     def test_withheld_tool_is_rejected_despite_completed_status(self) -> None:
         # The status field says "completed", so keying only off status would
         # report a blocked action as one that successfully ran.

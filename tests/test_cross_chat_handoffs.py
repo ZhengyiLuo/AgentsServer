@@ -9129,11 +9129,14 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
                     request,
                 )
             )
-            await asyncio.wait_for(delivered.wait(), timeout=1)
+            # This rendezvous selects the cancellation point, not a response
+            # latency contract. Full-suite CI can pause the loop for several
+            # seconds while the real SQLite worker is pending.
+            await asyncio.wait_for(delivered.wait(), timeout=15)
             task.cancel()
             release.set()
             with self.assertRaises(asyncio.CancelledError):
-                await asyncio.wait_for(task, timeout=1)
+                await asyncio.wait_for(task, timeout=15)
 
         self.assertEqual(len(next_waiters), 1)
         next_waiter = next_waiters[0]

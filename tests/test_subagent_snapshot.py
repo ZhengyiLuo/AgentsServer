@@ -445,6 +445,19 @@ class ClaudeSubagentSnapshotTests(unittest.IsolatedAsyncioTestCase):
             "Review complete",
         )
 
+    async def test_codex_snapshot_can_inspect_owner_during_login_handoff(self) -> None:
+        session = {"id": self.session_id, "backend": "codex", "codex_thread_id": "parent"}
+        owner = object()
+        select = AsyncMock(return_value=owner)
+        reconcile = AsyncMock()
+        with patch.dict(agent_server.STORE.sessions, {self.session_id: session}, clear=True), \
+             patch.object(agent_server, "codex_app_server_manager", select), \
+             patch.object(agent_server, "reconcile_codex_subagents", reconcile), \
+             patch.object(agent_server, "build_subagent_snapshot", return_value={"subagents": []}):
+            await agent_server.get_session_subagents(self.session_id, limit=12)
+        select.assert_awaited_once_with(session, allow_retired_login=True)
+        reconcile.assert_awaited_once_with(self.session_id, owner)
+
     async def test_endpoint_offloads_snapshot_and_rejects_unknown_sessions(self) -> None:
         self.write_events([])
         original_to_thread = asyncio.to_thread

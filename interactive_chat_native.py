@@ -11,7 +11,7 @@ PRIVATE_FIELDS = frozenset({
     "token", "access_token", "refresh_token", "api_key", "password", "secret",
     "authority", "authority_file", "authority_path", "request_prompt", "provider_cross_chat_route_snapshot",
     "secure_peer_route_snapshots", "chat_references", "team_references",
-    "claude_session_id", "codex_thread_id", "cursor_session_id",
+    "claude_session_id", "codex_thread_id", "cursor_session_id", "gemini_session_id", "gemini_session_cwd",
 })
 SESSION_FIELDS = frozenset({
     "id", "title", "backend", "model", "effort", "system_prompt", "backend_locked",

@@ -96,6 +96,55 @@ class CatalogTests(unittest.TestCase):
 
 class ModelSettingsTests(unittest.IsolatedAsyncioTestCase):
     setUp = fixtures.SettingsTests.setUp
+    def test_public_catalog_setup_saves_no_default_and_cannot_run_until_explicit_check(self):
+        self.check.return_value = "model_required"
+        saved = self.client.put(PATH, headers=NATIVE, json={**INPUT, "model": None})
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertFalse(saved.json()["ok"])
+        self.assertTrue(saved.json()["configuration"]["configured"])
+        self.assertIsNone(saved.json()["configuration"]["model"])
+        self.assertNotIn(KEY, saved.text)
+        self.assertFalse(self.store.catalog("claude")["available"])
+        with self.assertRaises(HTTPException):
+            self.store.bind({"backend": "claude", "provider_connection": "custom"})
+        route = "/api/admin/provider-models/claude"
+        self.check.reset_mock()
+        with patch.object(connections, "endpoint_model_catalog", return_value={"models": [{"value": "fixture/model", "label": "Fixture"}], "discovery_status": "ready"}):
+            response = self.client.get(route, headers=NATIVE)
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.json()["default_model"])
+        chosen = self.client.put(route, headers=NATIVE, json={"model": "fixture/model", "expected_revision": 1})
+        self.assertEqual(chosen.status_code, 200, chosen.text)
+        self.check.assert_not_awaited()
+        self.assertEqual(self.store.public("claude")["last_result"], "model_required")
+        with self.assertRaises(HTTPException):
+            self.store.bind({"backend": "claude", "provider_connection": "custom"})
+        self.check.return_value = "verified"
+        checked = self.client.post(PATH + "/check", headers=NATIVE, json={"expected_revision": 2})
+        self.assertTrue(checked.json()["ok"])
+        self.assertEqual(self.check.await_count, 1)
+        self.assertEqual(self.store.bind({"backend": "claude", "provider_connection": "custom"})["model"], "fixture/model")
+
+    def test_failed_model_check_and_forget_never_enable_pending_connection(self):
+        self.check.return_value = "model_required"
+        self.client.put(PATH, headers=NATIVE, json={**INPUT, "model": None})
+        route = "/api/admin/provider-models/claude"
+        self.client.put(route, headers=NATIVE, json={"model": "fixture/model", "expected_revision": 1})
+        self.check.return_value = "authentication_failed"
+        checked = self.client.post(PATH + "/check", headers=NATIVE, json={"expected_revision": 2})
+        self.assertFalse(checked.json()["ok"])
+        self.assertFalse(self.store.catalog("claude")["available"])
+        self.assertNotIn(KEY, checked.text)
+        # Retry selection after a failed check remains unverified and read-only.
+        self.check.reset_mock()
+        self.assertEqual(self.client.put(route, headers=NATIVE, json={"model": "other/model", "expected_revision": 3}).status_code, 200)
+        self.check.assert_not_awaited()
+        self.client.request("DELETE", PATH, headers=NATIVE, json={"expected_revision": 4})
+        self.assertFalse(self.store.public("claude")["configured"])
+        self.assertEqual(self.client.post(PATH + "/check", headers=NATIVE, json={"expected_revision": 4}).status_code, 409)
+        self.assertEqual(self.client.get(route, headers=NATIVE).status_code, 409)
+        self.check.assert_not_awaited()
+
     def test_model_read_is_separate_and_default_save_preserves_key_history_and_check_time(self):
         self.client.put(PATH, headers=NATIVE, json=INPUT)
         before = self.store.read("claude")

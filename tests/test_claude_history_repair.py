@@ -132,6 +132,17 @@ class ClaudeHistoryRepairTests(unittest.TestCase):
         self.prepare()
         self.assertFalse(self.cache.is_hidden("chat-1", self.wrapper))
 
+    def test_large_source_media_does_not_disable_metadata_proof(self):
+        self.fixture([
+            {"type": "user", "message": {"content": [{"type": "image", "source": {"data": "x" * (40 * 1024 * 1024)}}]}},
+            user_event("Generated wrapper", isMeta=True), user_event("Real question"),
+        ])
+        before = self.source.read_bytes(), self.events.read_bytes()
+        self.assertTrue(self.prepare())
+        self.assertTrue(self.cache.is_hidden("chat-1", self.wrapper))
+        self.assertFalse(self.cache.is_hidden("chat-1", self.rows[3]))
+        self.assertEqual(before, (self.source.read_bytes(), self.events.read_bytes()))
+
     def test_any_normalized_human_match_preserves_the_user_quote(self):
         for flag in ({}, {"isMeta": False}, {"isMeta": "true"}, {"isMeta": 1}):
             with self.subTest(flag=flag):

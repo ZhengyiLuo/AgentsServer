@@ -91,3 +91,49 @@ class DiscardEmptySessionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await server.discard_empty_session("empty", "v1"), {"deleted": True})
             recovery.assert_awaited_once()
             delete.assert_awaited_once_with("empty", discard_updated_at="v1")
+
+    async def test_recoverable_dismissal_adopts_legacy_blank_and_is_desktop_scoped(self):
+        import json
+        with patch.object(server, "wait_for_queue_recovery_admission", new_callable=AsyncMock), \
+             patch.object(server.STORE, "save", new_callable=AsyncMock) as save, \
+             patch.object(server.STORE, "delete", new_callable=AsyncMock) as delete, \
+             patch.object(server.STORE, "ensure_sort_orders", new_callable=AsyncMock):
+            self.assertEqual(await server.dismiss_empty_session("empty", "v1", "desktop-client-one"),
+                             {"ok": True, "dismissed": True})
+            delete.assert_not_awaited()
+            save.assert_awaited_once()
+            self.assertIn("empty", server.STORE.sessions)
+            self.assertNotIn("empty", server.DELETING_SESSIONS)
+            self.assertEqual((await server.list_sessions(placeholder_client_id="desktop-client-one"))["sessions"], [])
+            self.assertEqual(len((await server.list_sessions(placeholder_client_id="desktop-client-two"))["sessions"]), 1)
+            restored = json.loads(json.dumps(self.session))
+            self.assertTrue(server.empty_chat_dismissed_for(restored, "desktop-client-one"))
+            self.assertFalse(server.empty_chat_dismissed_for(restored, ""))
+            restored.update(sort_order=42, last_read_agent_event_seq=0,
+                            codex_thread_status={"type": "notLoaded"},
+                            claude_permission_mode="default")
+            self.assertTrue(server.empty_chat_dismissed_for(restored, "desktop-client-one"))
+            for key, value in (("model", "another-model"), ("backend_locked", True), ("latest_event_seq", 2)):
+                with patch.dict(restored, {key: value}):
+                    self.assertFalse(server.empty_chat_dismissed_for(restored, "desktop-client-one"))
+
+    async def test_recoverable_dismissal_preserves_resources_and_rolls_back_save_failure(self):
+        with patch.object(server, "wait_for_queue_recovery_admission", new_callable=AsyncMock), \
+             patch.object(server.STORE, "save", new_callable=AsyncMock, side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                await server.dismiss_empty_session("empty", "v1", "desktop-client-one")
+            self.assertNotIn("_empty_chat_cleanup", self.session)
+            self.assertNotIn("empty", server.DELETING_SESSIONS)
+            self.files.return_value = [{"id": "uploaded"}]
+            with self.assertRaises(HTTPException):
+                await server.dismiss_empty_session("empty", "v1", "desktop-client-one")
+            self.assertNotIn("empty", server.DELETING_SESSIONS)
+
+    async def test_recoverable_dismissal_rejects_invalid_identity_and_stale_revision(self):
+        with self.assertRaises(HTTPException) as raised:
+            await server.dismiss_empty_session("empty", "v1", "")
+        self.assertEqual(raised.exception.status_code, 400)
+        with patch.object(server, "wait_for_queue_recovery_admission", new_callable=AsyncMock):
+            with self.assertRaises(HTTPException):
+                await server.dismiss_empty_session("empty", "old", "desktop-client-one")
+        self.assertNotIn("_empty_chat_cleanup", self.session)

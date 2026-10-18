@@ -21,20 +21,21 @@ class CrossChatConnectionTests(unittest.TestCase):
                    "claude_sdk_dependency_available": lambda: True,
                    "BACKEND_CODEX": "codex", "BACKEND_CLAUDE": "claude",
                    "BACKEND_CURSOR": "cursor", "BACKEND_OPENCODE": "opencode",
+                   "BACKEND_GEMINI": "gemini",
                    "RUNTIME_DIAGNOSTICS": {}, "RUNTIME_DIAGNOSTICS_LOCK": threading.RLock(),
                    "PROVIDER_CONNECTION_STORE": self.store, "HTTPException": HTTPException}
         exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), self.ns)
 
     def test_verified_api_supports_cross_chat_without_native_login(self):
         self.store.public.return_value = {"configured": True, "last_result": "verified"}
-        for backend in ("cursor", "opencode"):
+        for backend in ("cursor", "opencode", "gemini"):
             with self.subTest(backend=backend):
                 self.ns["RUNTIME_DIAGNOSTICS"] = {backend: {"status": "unauthenticated", "installed": True}}
                 self.assertIn(backend, self.ns["cross_chat_supported_target_backends"]())
                 self.assertEqual(self.ns["RUNTIME_DIAGNOSTICS"][backend]["status"], "unauthenticated")
 
     def test_missing_cli_forgotten_or_unverified_api_cannot_enable_transport(self):
-        for backend in ("cursor", "opencode"):
+        for backend in ("cursor", "opencode", "gemini"):
             for installed, configured, result in ((False, True, "verified"),
                     (True, False, None), (True, True, "authentication_failed"), (True, True, None)):
                 with self.subTest(backend=backend, installed=installed, configured=configured, result=result):
@@ -158,6 +159,26 @@ class RuntimeBindingTests(unittest.TestCase):
         chat = self.chat()
         with self.assertRaisesRegex(HTTPException, "Choose a model"):
             self.store.claude_overrides(chat)
+
+    def test_opencode_openai_adapters_do_not_gain_an_anthropic_prefix(self):
+        for protocol, adapter in (("responses", "@ai-sdk/openai"), ("chat_completions", "@ai-sdk/openai-compatible")):
+            with self.subTest(protocol=protocol), tempfile.TemporaryDirectory() as directory:
+                store = connections.ConnectionStore(Path(directory) / "private")
+                store.write("opencode", 0, {**self.input, "protocol": protocol}, "verified")
+                chat = {"backend": "opencode", "provider_connection": "custom"}
+                chat["provider_connection_revision"] = store.bind(chat)["credential_id"]
+                env = store.opencode_overrides(chat, {})
+                provider = json.loads(env["OPENCODE_CONFIG_CONTENT"])["provider"]["agentsdock_custom"]
+                self.assertEqual(provider["options"]["baseURL"], self.input["base_url"])
+                self.assertEqual(provider["npm"], adapter)
+
+    def test_claude_still_receives_root_while_opencode_receives_api_prefix(self):
+        self.input["base_url"] += "/v1"
+        claude = self.chat("claude")
+        opencode = self.chat("opencode")
+        self.assertEqual(self.store.claude_overrides(claude)[0]["ANTHROPIC_BASE_URL"], "https://gateway.invalid/api")
+        env = self.store.opencode_overrides(opencode, {})
+        self.assertEqual(json.loads(env["OPENCODE_CONFIG_CONTENT"])["provider"]["agentsdock_custom"]["options"]["baseURL"], self.input["base_url"])
 
     def test_public_catalog_has_no_keys_and_session_projection_never_networks(self):
         chat = self.chat()

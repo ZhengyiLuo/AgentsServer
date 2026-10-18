@@ -66,7 +66,8 @@ function ensureFreshInstall(context) {
   if (context.uid === 0) throw new Error('Run as the user who will own the server, without sudo.')
   if (!['darwin', 'linux'].includes(context.platform)) throw new Error('Server installation requires Linux or Apple silicon macOS.')
   for (const name of ROOT_SELECTORS) if (context.env[name]) throw new Error(`Custom installation selector ${name} is unsupported by the fresh-install CLI. Use the existing server's managed updater.`)
-  const existingInstall = () => new Error('An existing server installation or state was found. Use AgentsDock or agentsdock-server update; no installer was started.')
+  const existingInstall = (message = 'An existing server installation or state was found. Use AgentsDock or agentsdock-server update; no installer was started.') =>
+    Object.assign(new Error(message), { code: 'AGENTSDOCK_EXISTING_INSTALLATION' })
   const safeDirectory = info => info.isDirectory() && !info.isSymbolicLink() && info.uid === context.uid && (info.mode & 0o022) === 0 && (info.mode & 0o500) === 0o500
   const allowEmptyScaffold = (relative, child) => {
     const root = path.join(context.home, relative)
@@ -100,11 +101,14 @@ function ensureFreshInstall(context) {
   }
   if (context.platform === 'darwin') {
     const check = context.spawn('/bin/launchctl', ['print', `gui/${context.uid}/com.agentsdock.server`], { encoding: 'utf8', timeout: 10000 })
-    if (check.status === 0) throw new Error('An AgentsServer service already exists. Use its managed updater.')
+    if (check.status === 0) throw existingInstall('An AgentsServer service already exists. Use its managed updater.')
     if (check.error || !/could not find service|service.*not found/i.test(`${check.stdout || ''} ${check.stderr || ''}`)) throw new Error('Could not verify the user service is absent. No installer was started.')
   } else {
     for (const unit of ['agents-server.service', 'zenithbot-agent.service']) {
       const check = context.spawn('systemctl', ['--user', 'show', unit, '--property=LoadState', '--value'], { encoding: 'utf8', timeout: 10000 })
+      if (!check.error && check.status === 0 && String(check.stdout).trim() && String(check.stdout).trim() !== 'not-found') {
+        throw existingInstall('An existing user service was found. Use its managed updater.')
+      }
       if (check.error || String(check.stdout).trim() !== 'not-found') throw new Error('An existing user service was found or its absence could not be verified. Use its managed updater.')
     }
   }

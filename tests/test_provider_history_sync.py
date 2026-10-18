@@ -2327,6 +2327,8 @@ class DurableHistoryCursorTests(unittest.IsolatedAsyncioTestCase):
 
 class ScheduleProviderHistorySyncTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
+        self.enterContext(patch.object(agent_server, "HISTORY_MAINTENANCE_STATE", {}))
+        self.enterContext(patch.object(agent_server, "HISTORY_MAINTENANCE_TASKS", {}))
         self.previous_scheduled = set(agent_server.HISTORY_SYNC_SCHEDULED)
         self.previous_busy = agent_server.BUSY_SESSIONS
         self.previous_active = agent_server.ACTIVE

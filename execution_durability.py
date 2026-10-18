@@ -7,6 +7,7 @@ No bytes, modes, links, configuration or service state are changed here.
 from __future__ import annotations
 
 import fcntl
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import re
@@ -41,7 +42,56 @@ def _full_barrier(path: Path) -> None:
         os.close(descriptor)
 
 
-def flush_tree(root: Path, *, dependency_prefix: bool = False) -> dict[str, int]:
+@dataclass(frozen=True)
+class _VenvDependency:
+    link: Path
+    target: Path
+    link_text: str
+    link_identity: tuple
+    target_identity: tuple
+    release_identity: dict
+    release_directory_identity: tuple
+
+    def check(self) -> None:
+        if (_identity(self.link.lstat()) != self.link_identity
+                or os.readlink(self.link) != self.link_text
+                or self.link.resolve(strict=True) != self.target
+                or _identity(self.target.lstat()) != self.target_identity
+                or _identity(self.target.parent.lstat()) != self.release_directory_identity
+                or not activation._release_matches(self.target.parent, self.release_identity)):
+            raise RuntimeError("durability venv dependency binding changed")
+
+
+def _venv_dependency(root: Path, release: Path) -> _VenvDependency | None:
+    link = release / ".venv"
+    if not link.is_symlink():
+        return None
+    info = link.lstat()
+    text = os.readlink(link)
+    target = Path(os.path.abspath(link.parent / text))
+    if release in link.resolve(strict=True).parents:
+        # Existing internal directory aliases are covered by the ordinary walk.
+        return None
+    # Pin only this direct runtime dependency of a journal-owned release. The
+    # dependency itself is newly observed, not inferred to be journal authority.
+    if (release.parent != root / "releases" or info.st_uid != os.getuid()
+            or target.name != ".venv" or target.parent.parent != root / "releases"
+            or target.parent == release or target.parent.name.startswith(".")
+            or target.resolve(strict=True) != target):
+        raise ValueError("durability venv dependency must be a direct sibling release directory")
+    target_info = target.lstat()
+    if (not stat.S_ISDIR(target_info.st_mode) or target_info.st_uid != os.getuid()
+            or target_info.st_dev != info.st_dev):
+        raise PermissionError("durability venv dependency ownership or device changed")
+    binding = _VenvDependency(link, target, text, _identity(info), _identity(target_info),
+                              activation._release_identity(target.parent, target.parent),
+                              _identity(target.parent.lstat()))
+    binding.check()
+    return binding
+
+
+def flush_tree(root: Path, *, dependency_prefix: bool = False,
+               _venv_binding: _VenvDependency | None = None) -> dict[str, int]:
     """Flush one owned tree without following directory links or special files."""
     root = Path(root)
     if not root.is_absolute() or root.resolve(strict=True) != root:
@@ -98,11 +148,18 @@ def flush_tree(root: Path, *, dependency_prefix: bool = False) -> dict[str, int]
                     resolved = child.resolve(strict=True)
                     if root not in resolved.parents:
                         relative = child.relative_to(root).parts
-                        if (dependency_prefix or len(relative) != 3 or relative[:2] != (".venv", "bin")
+                        if (_venv_binding is not None and not dependency_prefix
+                                and child == root / ".venv" == _venv_binding.link
+                                and resolved == _venv_binding.target):
+                            # flush_activation has already flushed the exact real
+                            # sibling tree, with no directory-link grant of its own.
+                            _venv_binding.check()
+                        elif (dependency_prefix or len(relative) != 3 or relative[:2] != (".venv", "bin")
                                 or not re.fullmatch(r"python(?:[0-9]+(?:\.[0-9]+)*)?", relative[2])
                                 or not re.fullmatch(r"python(?:[0-9]+(?:\.[0-9]+)*)?", resolved.name)):
                             raise ValueError("external durability link is not a Python interpreter")
-                        external.add(resolved)
+                        else:
+                            external.add(resolved)
                     if target != os.readlink(name, dir_fd=descriptor):
                         raise RuntimeError("durability link changed while flushing")
                 else:
@@ -151,6 +208,8 @@ def flush_tree(root: Path, *, dependency_prefix: bool = False) -> dict[str, int]
             raise RuntimeError("durability tree changed after flush")
     if _identity(root.lstat()) != _identity(root_info):
         raise RuntimeError("durability root changed after flush")
+    if _venv_binding is not None:
+        _venv_binding.check()
     return total
 
 
@@ -163,16 +222,16 @@ def flush_activation(root: Path, value: dict) -> None:
         raise RuntimeError("runtime durability must precede native quiescing")
     releases = [value["candidate_release"], value["old_release"], value["execution"]["old_worker_release"]]
     seen: set[Path] = set()
-    for release in releases:
-        if not release:
-            continue
-        path = activation._locate_release(release)
-        if path is None:
-            raise RuntimeError("durability runtime is not retained by the journal")
+    bindings: list[_VenvDependency] = []
+
+    def flush_release(path: Path, release: dict, binding=None) -> None:
         if path in seen:
-            continue
+            return
         seen.add(path)
-        flush_tree(path)
+        if binding is None:
+            flush_tree(path)
+        else:
+            flush_tree(path, _venv_binding=binding)
         descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             os.fsync(descriptor)
@@ -181,6 +240,23 @@ def flush_activation(root: Path, value: dict) -> None:
         _full_barrier(path / "VERSION")
         if not activation._release_matches(path, release):
             raise RuntimeError("durability runtime identity changed")
+
+    for release in releases:
+        if not release:
+            continue
+        path = activation._locate_release(release)
+        if path is None:
+            raise RuntimeError("durability runtime is not retained by the journal")
+        if path in seen:
+            continue
+        binding = _venv_dependency(root, path)
+        if binding is not None:
+            bindings.append(binding)
+            flush_release(binding.target.parent, binding.release_identity)
+            binding.check()
+        flush_release(path, release, binding)
+    for binding in bindings:
+        binding.check()
     descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         os.fsync(descriptor)

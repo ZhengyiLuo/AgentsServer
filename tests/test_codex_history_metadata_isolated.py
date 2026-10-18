@@ -134,18 +134,18 @@ class CodexHistoryMetadataTests(unittest.IsolatedAsyncioTestCase):
 
     def test_loader_cursor_reopen_keeps_phase_without_changing_digest(self):
         session = {"id": "chat", "backend": "codex", "codex_thread_id": "thread"}
-        snapshot = {"source_offset": 10, "source_digest": "a" * 64, "source_dev": 1,
+        snapshot = {"source_size": 10, "source_offset": 10, "source_digest": "a" * 64, "source_dev": 1,
                     "source_ino": 2, "source_mtime_ns": 3, "expected_stat": {}}
         self.ns["provider_history_path"] = Mock(return_value=Path("/exact/transcript.jsonl"))
         self.ns["provider_history_source_snapshot"] = Mock(return_value=(snapshot, False))
-        self.ns["bounded_jsonl_events_range"] = Mock(return_value=iter([assistant(phase="commentary", timestamp=STAMP)]))
+        self.ns["bounded_jsonl_records_range"] = Mock(return_value=iter([(assistant(phase="commentary", timestamp=STAMP), 10)]))
         _, items, cursor, _ = self.ns["load_provider_history_with_cursor"](session, 400, None)
         self.assertEqual(cursor["codex_last_item_phase"], "commentary")
         session["_history_sync_cursor"] = cursor
         reopened = self.ns["normalized_history_sync_cursor"](session)
         self.assertEqual(reopened["codex_last_item_phase"], "commentary")
         self.assertEqual(reopened["last_item_digest"], self.ns["history_item_cursor_digest"](items[0]))
-        snapshot = {**snapshot, "source_offset": 20}
+        snapshot = {**snapshot, "source_size": 20, "source_offset": 20}
         self.ns["provider_history_source_snapshot"].return_value = (snapshot, True)
         self.ns["bounded_jsonl_records_range"] = Mock(return_value=iter([(assistant(phase="final_answer", timestamp=STAMP), 20)]))
         _, items, cursor, continued = self.ns["load_provider_history_with_cursor"](session, 400, reopened)

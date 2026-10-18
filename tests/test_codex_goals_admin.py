@@ -224,47 +224,51 @@ class CodexGoalsAdminTests(unittest.IsolatedAsyncioTestCase):
 
                     self.assertEqual(response.status_code, 200)
 
-    def test_setting_defaults_enabled_and_reads_persisted_choice(self) -> None:
+    def test_goals_ignore_retired_environment_and_persisted_switch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "codex-settings.json"
-            self.assertEqual(
-                agent_server.read_codex_goals_enabled(path),
-                agent_server.CODEX_GOALS_DEFAULT_ENABLED,
-            )
-            path.write_text(json.dumps({"goals_enabled": False}))
-            self.assertFalse(agent_server.read_codex_goals_enabled(path))
+            with patch.dict("os.environ", {"CODEX_GOALS_ENABLED": "false"}):
+                self.assertTrue(agent_server.CODEX_GOALS_DEFAULT_ENABLED)
+                self.assertTrue(agent_server.read_codex_goals_enabled(path))
+                self.assertFalse(path.exists())
+                for content in ('{"goals_enabled":false,"other":"preserved"}', '{'):
+                    path.write_text(content)
+                    self.assertTrue(agent_server.read_codex_goals_enabled(path))
+                    self.assertEqual(path.read_text(), content)
 
-    async def test_disabling_pauses_goals_restarts_manager_and_persists(self) -> None:
-        async def pause_goal(_session_id: str) -> dict[str, bool]:
-            agent_server.STORE.sessions["chat"]["codex_goal"]["status"] = "paused"
-            return {"goal_paused": True}
-
+    async def test_legacy_goal_switch_cannot_change_settings_or_chat_goals(self) -> None:
+        agent_server.STORE.sessions["paused"] = {
+            "id": "paused", "backend": agent_server.BACKEND_CODEX,
+            "codex_goal": {"objective": "Wait for explicit resume", "status": "paused"},
+        }
+        before_sessions = json.dumps(agent_server.STORE.sessions, sort_keys=True)
         with tempfile.TemporaryDirectory() as temporary:
-            settings_file = Path(temporary) / "admin" / "codex-settings.json"
+            settings_file = Path(temporary) / "codex-settings.json"
+            contents = '{"goals_enabled":false,"thread_config":{"agents":{"max_threads":4}}}'
+            settings_file.write_text(contents)
             with (
                 patch.object(agent_server, "CODEX_SETTINGS_FILE", settings_file),
-                patch.object(
-                    agent_server,
-                    "settle_idle_codex_goal_for_stop",
-                    AsyncMock(side_effect=pause_goal),
-                ) as settle,
-                patch.object(
-                    agent_server,
-                    "close_codex_app_server_manager",
-                    AsyncMock(),
-                ) as close_manager,
+                patch.object(agent_server, "settle_idle_codex_goal_for_stop", AsyncMock()) as settle,
+                patch.object(agent_server, "close_codex_app_server_manager", AsyncMock()) as close_manager,
+                patch.object(agent_server, "AGENT_TOKEN", "test-secret"),
             ):
-                result = await agent_server.put_codex_goals_admin(
-                    agent_server.CodexGoalsAdminRequest(enabled=False)
-                )
-
-            self.assertFalse(result["enabled"])
-            self.assertTrue(result["configurable"])
-            self.assertFalse(result["reconfiguring"])
-            self.assertEqual(result["paused_goal_count"], 1)
-            self.assertFalse(json.loads(settings_file.read_text())["goals_enabled"])
-            settle.assert_awaited_once_with("chat")
-            close_manager.assert_awaited_once()
+                client = TestClient(agent_server.app)
+                headers = {"X-AgentsDock-Token": "test-secret"}
+                read = client.get("/api/admin/codex/goals", headers=headers)
+                self.assertEqual(read.status_code, 200)
+                self.assertTrue(read.json()["enabled"])
+                self.assertFalse(read.json()["configurable"])
+                enabled = client.put("/api/admin/codex/goals", headers=headers, json={"enabled": True})
+                self.assertEqual(enabled.status_code, 200)
+                self.assertEqual(enabled.json(), read.json())
+                disabled = client.put("/api/admin/codex/goals", headers=headers, json={"enabled": False})
+                self.assertEqual(disabled.status_code, 409)
+                self.assertIn("cannot be disabled server-wide", disabled.json()["detail"])
+                settle.assert_not_awaited()
+                close_manager.assert_not_awaited()
+            self.assertEqual(settings_file.read_text(), contents)
+        self.assertTrue(agent_server.CODEX_GOALS_ENABLED)
+        self.assertEqual(json.dumps(agent_server.STORE.sessions, sort_keys=True), before_sessions)
 
     async def test_disabling_does_not_load_ordinary_codex_threads(self) -> None:
         for index in range(500):
@@ -321,9 +325,7 @@ class CodexGoalsAdminTests(unittest.IsolatedAsyncioTestCase):
         }
 
         with self.assertRaises(HTTPException) as raised:
-            await agent_server.put_codex_goals_admin(
-                agent_server.CodexGoalsAdminRequest(enabled=False)
-            )
+            await agent_server.reserve_codex_goals_reconfiguration()
 
         self.assertEqual(raised.exception.status_code, 409)
         self.assertIn("active or queued", str(raised.exception.detail))
@@ -339,9 +341,7 @@ class CodexGoalsAdminTests(unittest.IsolatedAsyncioTestCase):
         ])
 
         with self.assertRaises(HTTPException) as raised:
-            await agent_server.put_codex_goals_admin(
-                agent_server.CodexGoalsAdminRequest(enabled=False)
-            )
+            await agent_server.reserve_codex_goals_reconfiguration()
 
         self.assertEqual(raised.exception.status_code, 409)
         self.assertIn("queued Codex turn", str(raised.exception.detail))
@@ -498,61 +498,35 @@ class CodexGoalsAdminTests(unittest.IsolatedAsyncioTestCase):
             (agent_server.CODEX_BIN, "exec", "--disable", "goals"),
         )
 
-    async def test_manager_creation_waits_for_goal_reconfiguration(self) -> None:
-        entered_close = asyncio.Event()
-        release_close = asyncio.Event()
+    async def test_manager_creation_waits_for_provider_reconfiguration(self) -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
 
-        async def delayed_close() -> None:
-            entered_close.set()
-            await release_close.wait()
+        async def reconfigure_provider() -> None:
+            async with agent_server.CODEX_GOALS_CONFIG_LOCK:
+                entered.set()
+                await release.wait()
 
         manager = Mock()
         manager.add_notification_handler = Mock()
-        with tempfile.TemporaryDirectory() as temporary:
-            with (
-                patch.object(
-                    agent_server,
-                    "CODEX_SETTINGS_FILE",
-                    Path(temporary) / "codex-settings.json",
-                ),
-                patch.object(
-                    agent_server,
-                    "pause_idle_codex_goals_before_disable",
-                    AsyncMock(return_value={
-                        "paused_goal_count": 0,
-                        "fenced_goal_count": 0,
-                    }),
-                ),
-                patch.object(
-                    agent_server,
-                    "close_codex_app_server_manager",
-                    AsyncMock(side_effect=delayed_close),
-                ),
-                patch.object(
-                    agent_server,
-                    "CodexAppServerManager",
-                    return_value=manager,
-                ) as manager_type,
-            ):
-                reconfigure = asyncio.create_task(
-                    agent_server.put_codex_goals_admin(
-                        agent_server.CodexGoalsAdminRequest(enabled=False)
-                    )
-                )
-                await entered_close.wait()
-                create_manager = asyncio.create_task(
-                    agent_server.codex_app_server_manager()
-                )
+        with patch.object(agent_server, "CodexAppServerManager", return_value=manager) as manager_type:
+            reconfigure = asyncio.create_task(reconfigure_provider())
+            create_manager = None
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=2)
+                create_manager = asyncio.create_task(agent_server.codex_app_server_manager())
                 await asyncio.sleep(0)
                 self.assertFalse(create_manager.done())
-                release_close.set()
-                await reconfigure
-                self.assertIs(await create_manager, manager)
-
-        self.assertEqual(
-            manager_type.call_args.kwargs["app_server_args"],
-            ("--disable", "goals"),
-        )
+                release.set()
+                await asyncio.wait_for(reconfigure, timeout=2)
+                self.assertIs(await asyncio.wait_for(create_manager, timeout=2), manager)
+            finally:
+                release.set()
+                await asyncio.gather(reconfigure, return_exceptions=True)
+                if create_manager is not None and not create_manager.done():
+                    create_manager.cancel()
+                    await asyncio.gather(create_manager, return_exceptions=True)
+        self.assertEqual(manager_type.call_args.kwargs["app_server_args"], ())
 
     async def test_compaction_metadata_closes_and_rejects_late_duplicate_start(
         self,

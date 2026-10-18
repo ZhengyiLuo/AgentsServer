@@ -22,12 +22,61 @@ MAX_API_KEY_CHARS = 4096
 AUTH_TIMEOUT_SECONDS = 30.0
 BUSY_MESSAGE = "Wait for Codex chats, goals, queued turns and Side chat requests to finish before changing authentication."
 HANDOFF_MESSAGE = (
-    "Refreshing Codex sign-in. Wait for this chat's running work, approvals, "
-    "goals and background terminals to finish, then retry. Your message has "
-    "not been sent to Codex."
+    "Codex sign-in changed or was explicitly reloaded. This chat is waiting for "
+    "its running work, approvals, goals or background terminals before switching. "
+    "Your running work has not been stopped and this message has not been sent. "
+    "Retry after that work finishes."
 )
 _REVISION_KEY = secrets.token_bytes(32)
 _MAX_AUTH_BYTES = 128 * 1024
+
+# Native ChatGPT sign-in only. API-key and custom-provider availability is
+# provider-owned. Keep old IDs in saved conversations; this is picker/admission
+# policy, not transcript cleanup. Source: https://learn.chatgpt.com/docs/models
+CHATGPT_RETIRED_MODELS = frozenset({
+    "gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.3-codex-spark",
+    "gpt-5.4", "gpt-5.4-mini", "gpt-5.5",
+})
+
+
+def native_model_auth_mode(env: dict[str, str], *, cwd: str, observed_mode: str = "") -> str:
+    """Read only the auth kind for model policy, never authenticate or refresh.
+
+    An opaque store may use the existing native login-status probe. A file
+    store is checked directly so a switch to an API key cannot inherit a cached
+    ChatGPT restriction. Unknown/managed providers are never globally banned.
+    """
+    try:
+        root, config = _native_login_config(env, cwd)
+        profile = config.get("profile")
+        profiles = config.get("profiles")
+        selected_profile = profiles.get(profile, {}) if isinstance(profiles, dict) and isinstance(profile, str) else {}
+        if not isinstance(selected_profile, dict):
+            return "unknown"
+        provider = selected_profile.get("model_provider", config.get("model_provider", "openai"))
+        if provider != "openai":
+            return "custom"
+        providers = config.get("model_providers") or {}
+        override = providers.get("openai") if isinstance(providers, dict) else None
+        if env.get("OPENAI_BASE_URL") or isinstance(override, dict) and override.get("base_url"):
+            return "custom"
+        if any(env.get(key) for key in ("CODEX_API_KEY", "OPENAI_API_KEY", "OPENAI_IDENTITY_TOKEN_FILE")):
+            return "apiKey"
+        if env.get("CODEX_ACCESS_TOKEN"):
+            return "unknown"
+        store = config.get("cli_auth_credentials_store", "file")
+        if store != "file":
+            return observed_mode if store in {"keyring", "auto"} and observed_mode in {"chatgpt", "apiKey"} else "unknown"
+        data = json.loads(_bounded_file(root / "auth.json"))
+        if not isinstance(data, dict):
+            return "unknown"
+        if isinstance(data.get("OPENAI_API_KEY"), str) and data["OPENAI_API_KEY"]:
+            return "apiKey"
+        if data.get("auth_mode") in (None, "chatgpt") and isinstance(data.get("tokens"), dict):
+            return "chatgpt"
+    except (OSError, ValueError, TypeError, RecursionError):
+        pass
+    return "unknown"
 
 
 @dataclass(frozen=True)
@@ -84,8 +133,9 @@ def native_login_revision(env: dict[str, str], *, cwd: str) -> LoginRevision | N
 
     Ignore rotating access/refresh tokens and last_refresh. OIDC auth_time is
     stable across refresh but changes on an interactive authentication. Without
-    it we can detect an account switch, not prove a same-account re-login;
-    Recheck CLIs provides an explicit handoff for that case and keyring stores.
+    it we can detect an account switch, not prove a same-account re-login.
+    Explicit native-admin reload can hand off opaque/keyring logins; an
+    unchanged known revision remains observational even on explicit reload.
     Missing/malformed files are not evidence of a new login. No secret survives
     this bounded read except a process-keyed comparison digest.
     """
@@ -178,7 +228,7 @@ async def read_account(manager) -> dict:
     return account_summary(result)
 
 
-def create_router(*, authorize, operation, available) -> APIRouter:
+def create_router(*, authorize, operation, available, reload_login=None) -> APIRouter:
     router = APIRouter()
 
     @router.get("/api/admin/codex/auth")
@@ -196,7 +246,26 @@ def create_router(*, authorize, operation, available) -> APIRouter:
             raise
         except Exception:
             raise HTTPException(503, "Codex authentication status is unavailable.") from None
-        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+        return JSONResponse({**result, "login_reload_available": reload_login is not None},
+                            headers={"Cache-Control": "no-store"})
+
+    @router.post("/api/admin/codex/auth/reload")
+    async def reload(request: Request):
+        authorize(request)
+        if not available() or reload_login is None:
+            raise HTTPException(501, "Native Codex sign-in reload is unavailable.")
+        # No credential input; no handoff from GET, mounting a page or polling.
+        try:
+            body = await request.json()
+        except ValueError:
+            raise HTTPException(400, "Send an empty JSON object to reload Codex sign-in.") from None
+        if body != {}:
+            raise HTTPException(400, "Send an empty JSON object to reload Codex sign-in.")
+        pending = await reload_login()
+        response = await status(request)
+        result = json.loads(response.body)
+        return JSONResponse({**result, "login_reload_pending": pending},
+                            headers={"Cache-Control": "no-store"})
 
     @router.post("/api/admin/codex/auth/api-key")
     async def login(request: Request):

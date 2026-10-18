@@ -87,6 +87,7 @@ class ServerUpdateEnsureTests(unittest.IsolatedAsyncioTestCase):
             "prepare_provider_background_work_snapshot": AsyncMock(return_value={}),
             "server_update_active_session_ids_locked": lambda: ["busy-chat"],
             "update_blocking_queued_turn_count_locked": lambda: 0,
+            "QUEUED_TURNS": {}, "RUN_NOW_TURNS": {},
             "unsafe_http_mutation_count_locked": lambda: 0,
             "BUSY_SESSIONS": {"busy-chat"}, "SERVER_MAINTENANCE_SESSIONS": set(),
             "provider_background_work_labels_from_snapshot": lambda snapshot: [],

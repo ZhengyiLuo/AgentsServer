@@ -181,6 +181,111 @@ execution_stop_services() { kill "$PROVIDER_PID"; }
             child.terminate()
             child.wait(timeout=5)
 
+    def linked_venv_activation(self):
+        releases = self.base / "releases"
+        releases.mkdir()
+        source, dependency = releases / "hotfix", releases / "base"
+        source.mkdir(mode=0o700)
+        (dependency / ".venv/lib").mkdir(parents=True)
+        (source / "VERSION").write_text("hotfix\n")
+        (dependency / "VERSION").write_text("base\n")
+        payload = dependency / ".venv/lib/package.py"
+        payload.write_text("retained dependency\n")
+        (source / ".venv").symlink_to(dependency / ".venv", target_is_directory=True)
+        identity = durability.activation._release_identity
+        retained = identity(source, source)
+        value = {"phase": "prepared", "candidate_release": identity(self.runtime, self.runtime),
+                 "old_release": retained, "execution": {"old_worker_release": retained}}
+        return source, dependency, payload, value
+
+    def test_activation_flushes_exact_sibling_venv_dependency_without_rewriting_it(self):
+        source, dependency, payload, value = self.linked_venv_activation()
+        prefix = self.base / "cpython-3.13.12-macos-aarch64-none"
+        (prefix / "bin").mkdir(parents=True)
+        (prefix / "lib/python3.13").mkdir(parents=True)
+        (prefix / "BUILD").write_text("20260921")
+        stdlib = prefix / "lib/python3.13/stdlib.py"
+        stdlib.write_text("retained Python runtime\n")
+        executable = prefix / "bin/python3.13"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+        (dependency / ".venv/bin").mkdir()
+        (dependency / ".venv/bin/python").symlink_to(executable)
+        before = {p: durability._identity(p.lstat()) for p in
+                  (source, source / ".venv", dependency, dependency / ".venv", payload)}
+        with self.assertRaisesRegex(ValueError, "external durability link"):
+            durability.flush_tree(source)
+        seen = []
+        actual = durability._file_barrier
+        def record(fd):
+            seen.append(os.fstat(fd).st_ino)
+            actual(fd)
+        with patch.object(durability, "_file_barrier", side_effect=record):
+            durability.flush_activation(self.base, value)
+        self.assertEqual(seen.count(payload.stat().st_ino), 1)
+        self.assertEqual(seen.count(stdlib.stat().st_ino), 1)
+        self.assertEqual(before, {p: durability._identity(p.lstat()) for p in before})
+
+    def test_activation_rejects_non_sibling_or_chained_venv_dependency(self):
+        source, dependency, payload, value = self.linked_venv_activation()
+        link = source / ".venv"
+        outside = self.base / "outside"
+        (outside / ".venv").mkdir(parents=True)
+        (outside / "VERSION").write_text("outside")
+        alias = self.base / "releases/alias"
+        alias.symlink_to(dependency, target_is_directory=True)
+        for target in (outside / ".venv", dependency / ".venv/lib", alias / ".venv"):
+            with self.subTest(target=target):
+                link.unlink()
+                link.symlink_to(target, target_is_directory=True)
+                with self.assertRaises((ValueError, PermissionError)):
+                    durability.flush_activation(self.base, value)
+        link.unlink()
+        link.symlink_to(dependency / ".venv", target_is_directory=True)
+        (dependency / ".venv").rename(dependency / "actual-venv")
+        (dependency / ".venv").symlink_to("actual-venv", target_is_directory=True)
+        with self.assertRaises((ValueError, PermissionError)):
+            durability.flush_activation(self.base, value)
+
+    def test_activation_rechecks_dependency_binding_after_other_runtime_flush(self):
+        source, dependency, payload, value = self.linked_venv_activation()
+        # Flush the linked old release before the candidate; mutate its dependency later.
+        value["candidate_release"], value["old_release"] = value["old_release"], value["candidate_release"]
+        actual = durability._file_barrier
+        def mutate(fd):
+            actual(fd)
+            if os.fstat(fd).st_ino == (self.runtime / "VERSION").stat().st_ino:
+                (dependency / "VERSION").write_text("changed generation\n")
+        with patch.object(durability, "_file_barrier", side_effect=mutate):
+            with self.assertRaisesRegex(RuntimeError, "dependency.*changed"):
+                durability.flush_activation(self.base, value)
+
+    def test_activation_rechecks_link_and_dependency_inode_during_flush(self):
+        source, dependency, payload, value = self.linked_venv_activation()
+        actual = durability._file_barrier
+        def replace_link(fd):
+            actual(fd)
+            if os.fstat(fd).st_ino == payload.stat().st_ino:
+                (source / ".venv").unlink()
+                (source / ".venv").symlink_to(dependency / ".venv", target_is_directory=True)
+        with patch.object(durability, "_file_barrier", side_effect=replace_link):
+            with self.assertRaisesRegex(RuntimeError, "dependency.*changed"):
+                durability.flush_activation(self.base, value)
+        original = (source / ".venv").readlink(), payload.read_bytes()
+        with patch.object(durability, "_file_barrier", side_effect=OSError("disk failure")):
+            with self.assertRaisesRegex(OSError, "disk failure"):
+                durability.flush_activation(self.base, value)
+        self.assertEqual(((source / ".venv").readlink(), payload.read_bytes()), original)
+
+    def test_activation_keeps_internal_venv_alias_support(self):
+        (self.runtime / "environment").mkdir()
+        (self.runtime / "environment/package.py").write_text("same tree")
+        (self.runtime / ".venv").symlink_to("environment", target_is_directory=True)
+        identity = durability.activation._release_identity(self.runtime, self.runtime)
+        value = {"phase": "prepared", "candidate_release": identity,
+                 "old_release": identity, "execution": {"old_worker_release": identity}}
+        durability.flush_activation(self.base, value)
+
 
 if __name__ == "__main__":
     unittest.main()

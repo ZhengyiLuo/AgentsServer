@@ -335,7 +335,7 @@ class ExplicitStopDeadlineTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PendingUpdateSelectiveDrainTests(unittest.IsolatedAsyncioTestCase):
-    async def test_pending_reservation_defers_only_automatic_jobs(self):
+    async def test_pending_reservation_allows_automatic_and_manual_jobs(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             with patch.object(
@@ -361,9 +361,8 @@ class PendingUpdateSelectiveDrainTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(agent_server.managed_server_update_is_pending())
                 self.assertIsNone(agent_server.managed_server_update_admission_blocker())
                 self.assertIsNone(await agent_server.turn_start_blocker())
-                self.assertEqual(
+                self.assertIsNone(
                     await agent_server.scheduled_job_blocker("other-chat"),
-                    agent_server.MANAGED_SERVER_UPDATE_PENDING_DETAIL,
                 )
                 self.assertIsNone(
                     await agent_server.scheduled_job_blocker(

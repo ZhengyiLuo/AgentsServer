@@ -1121,6 +1121,51 @@ print("{not-json", flush=True)
         self.assertTrue(errors)
         self.assertIn("without finishing its turn", errors[-1]["message"])
 
+    async def test_unknown_finish_is_not_success_and_stops_retrying_cli(self) -> None:
+        # HTML-200 gateways produce this shape in OpenCode 1.18.29 and the
+        # CLI starts another request instead of exiting. Do not wait for it.
+        script = _event_script([_step_start(), _step_finish("unknown", input_tokens=0, output_tokens=0)])
+        script = script.replace("sys.exit(0)", "import time; time.sleep(60)")
+        with patch.object(agent_server, "OPENCODE_POST_TERMINAL_EXIT_SECONDS", 0.05):
+            events = await self._run(script)
+        error = [event for event in events if event["type"] == "error"][-1]
+        self.assertIn("valid completion", error["message"])
+        self.assertIn("endpoint", error["message"])
+        self.assertNotIn("finished its turn", error["message"])
+        self.assertTrue([event for event in events if event["type"] == "turn_finished"][-1]["is_error"])
+        self.assertNotIn(self.session_id, agent_server.ACTIVE)
+        self.assertNotIn(self.session_id, agent_server.BUSY_SESSIONS)
+
+    async def test_unknown_finish_keeps_partial_text_but_is_not_completed(self) -> None:
+        events = await self._run(_event_script([_text_event("Partial answer"), _step_finish("unknown")]))
+        terminal = [event for event in events if event["type"] == "turn_finished"][-1]
+        self.assertTrue(terminal["is_error"])
+        self.assertEqual(terminal["result_text"], "")
+        self.assertIn("Partial answer", [event["text"] for event in events if event["type"] == "assistant_text"])
+
+    async def test_explicit_completion_reasons_still_complete(self) -> None:
+        for reason in ("stop", "length", "content-filter"):
+            with self.subTest(reason=reason):
+                events = await self._run(_event_script([_text_event(), _step_finish(reason)]), run_id="run-" + reason)
+                self.assertFalse([event for event in events if event["type"] == "turn_finished"][-1]["is_error"])
+
+    async def test_error_or_unrecognized_finish_cannot_claim_success(self) -> None:
+        for index, reason in enumerate(("error", "", "future-reason")):
+            with self.subTest(reason=reason):
+                events = await self._run(_event_script([_step_finish(reason)]), run_id=f"run-invalid-{index}")
+                self.assertTrue([event for event in events if event["type"] == "turn_finished"][-1]["is_error"])
+
+    async def test_provider_http_status_survives_a_hanging_error_exit(self) -> None:
+        script = _event_script([{"type": "error", "sessionID": SESSION,
+            "error": {"name": "APIError", "data": {"statusCode": 429, "message": "Rate limited"}}}])
+        script = script.replace("sys.exit(0)", "import time; time.sleep(60)")
+        with patch.object(agent_server, "OPENCODE_POST_TERMINAL_EXIT_SECONDS", 0.05):
+            events = await self._run(script)
+        error = [event for event in events if event["type"] == "error"][-1]
+        self.assertIn("HTTP 429", error["message"])
+        self.assertIn("Rate limited", error["message"])
+        self.assertNotIn("did not exit cleanly", error["message"])
+
     async def test_resume_flag_carries_the_stored_session_id(self) -> None:
         await self._run(
             _event_script([_text_event(), _step_finish("stop")]),

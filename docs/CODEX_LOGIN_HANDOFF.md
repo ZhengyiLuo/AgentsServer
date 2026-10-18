@@ -16,12 +16,22 @@ into another authentication mode, or replay a previously submitted turn.
   issue/expiry times are excluded. A rewrite or ordinary token renewal should
   not cause process churn. Missing, malformed, oversized or unsupported data
   is inconclusive, not proof of logout or a new login.
-- **Recheck CLIs** (`GET /api/runtime/catalog?refresh=true`) explicitly requests
-  a safe normal-Codex handoff even when no revision change can be established.
-  Use this when a login is not automatically detected, including same-account
-  SSO sessions whose `auth_time` is absent or unchanged, or an OS keychain/keyring.
-  It changes future process selection, not authentication.
-  Repeated explicit rechecks can retire successive normal process generations.
+- **Recheck CLIs** and automatic catalog refreshes
+  (`GET /api/runtime/catalog?refresh=true`) refresh discovery only. They can
+  still observe a genuine file-backed login change, but an unknown revision
+  never requests a handoff. This also protects older clients that use the query
+  during reconnect or server-instance changes.
+- **Reload sign-in** in the desktop Codex CLI Login card uses the separate
+  native-admin `POST /api/admin/codex/auth/reload` with an empty JSON object.
+  Use it after CLI login when an opaque credential store prevents automatic
+  detection. An unchanged known revision remains observational; keyring/auto
+  revisions are unknown and an explicit reload requests a safe handoff.
+  `GET /api/admin/codex/auth` advertises `login_reload_available`; the POST adds
+  `login_reload_pending` when old managers still need to settle. No credential
+  input or browser-origin request is accepted. It changes future process
+  selection, not authentication. Repeated explicit reloads can retire successive
+  process generations. Opening Settings, account reads and model refreshes
+  never issue this POST. Older servers keep the read-only account Recheck.
 - Automatic detection is conservative and is not a complete native credential
   resolver. User configuration selects file detection; managed requirements
   may select another store. A file change is only a hint to load a fresh native
@@ -30,9 +40,16 @@ into another authentication mode, or replay a previously submitted turn.
   environment authentication and process-only `ephemeral` credentials have no
   automatic file detection. An ephemeral login cannot be recovered from an
   unrelated CLI process by rechecking; recognized ephemeral stores and malformed
-  configurations skip explicit handoff so a working process is preserved.
+  configurations reject explicit reload so a working process is preserved.
 - Custom endpoints retain their credential-owned managers and are not retired
   by native login changes or this explicit recheck.
+
+Handoff logs distinguish server-owned sources (`catalog_refresh`,
+`turn_admission`, `account_status`, `manager_lookup`, `manual_login_reload`),
+the observed-change/explicit-reload reason, and blockers such as background
+terminals, goals, pending ownership or failed unload verification. Repeated
+identical blockers are coalesced per manager/chat. No credentials, revision
+digests, account identities, command bodies or credential paths are logged.
 
 Official [authentication guidance](https://learn.chatgpt.com/docs/auth) describes
 the native stores and managed overrides. The documented
@@ -81,7 +98,7 @@ leases, start-lock races, idle/queued/busy chats, goals, side chats, subagents,
 background terminals, unsubscribe proof, cancellation and failed replacement.
 Existing native lifecycle, authentication and client contracts are checked too.
 
-Final local validation: 621 focused server tests and 43 existing desktop
+Original handoff validation: 621 focused server tests and 43 existing desktop
 runtime-catalog/health tests passed, with production-module compilation and
 diff checks. An earlier broader run hit the existing force-send test's
 one-second startup timeout; the final complete focused run passed that case.
@@ -97,4 +114,21 @@ remember a phrase, re-login with the same native account, recheck if needed,
 and continue the same thread while a second chat remains active. Separately
 exercise account switching and a keychain-backed login. Verify no duplicate
 turn, unchanged provider ID/history, and truthful pending/failure states.
-These live OAuth/model/client checks remain unverified in this local change.
+These live OAuth/account-switch/client checks remain unverified.
+
+### Catalog-refresh separation validation
+
+The follow-up fix passed 67 focused server tests and 527 desktop tests, plus
+desktop typecheck and production build. HTTP regressions cover repeated forced
+catalog refreshes with an opaque login and owned background terminals, explicit
+reload, continued ownership protection, native-only authorization, and redacted
+source/waiting logs.
+
+An isolated installed service was exercised using the production desktop
+transport (only the Electron log-directory lookup was substituted for headless
+execution). Account GET, explicit reload POST, browser/bearer rejection, five
+forced catalog refreshes and two real native Codex model turns passed. The
+follow-up retained the same provider thread. No native credentials were changed;
+no running training jobs were used. The opaque-login/background-work combination
+is covered by isolated regressions, not live keychain/long-training acceptance.
+Actual App clicking remains pending because computer control was unavailable.

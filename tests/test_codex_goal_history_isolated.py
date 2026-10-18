@@ -36,7 +36,7 @@ FUNCTIONS = {
     "history_dedup_key",
     "parse_provider_history_delta", "project_legacy_imported_provider_event",
     "project_provider_history_event_for_egress", "client_safe_event",
-    "append_imported_history", "append_staged_imported_history", "filter_codex_history_for_import",
+    "prepare_imported_history_items", "append_imported_history", "append_staged_imported_history", "filter_codex_history_for_import",
     "imported_history_terminal_event", "is_agent_visible_event",
     "should_bump_session_updated_at", "update_session_event_metadata",
     "clear_imported_active_runs", "prepare_codex_goal_history_repair",
@@ -82,7 +82,7 @@ def load_projection():
     namespace = {
         "re": re, "datetime": datetime, "hashlib": hashlib, "hmac": hmac,
         "json": json, "deque": deque, "uuid": uuid, "suppress": suppress, "Path": Path,
-        "asyncio": asyncio, "threading": threading,
+        "asyncio": asyncio, "threading": threading, "QUEUE_CHECKPOINT_DIRTY": set(),
         "MAX_IMPORTED_TEXT_CHARS": 100_000, "MAX_IMPORT_MESSAGES": 400,
         "CODEX_TRANSCRIPT_SCAN_LINES": 1000, "CODEX_APP_SERVER_TOOL_OUTPUT_MAX_CHARS": 100_000,
         "BACKEND_CODEX": "codex", "BACKEND_CLAUDE": "claude", "DEFAULT_BACKEND": "claude",

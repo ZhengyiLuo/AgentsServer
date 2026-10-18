@@ -1,5 +1,6 @@
 """Credential fixtures and generation routing; never a real login/model turn."""
 import asyncio
+import ast
 import base64
 import json
 import os
@@ -10,6 +11,8 @@ import unittest
 from unittest.mock import AsyncMock
 
 from fastapi import HTTPException
+from fastapi import FastAPI
+import httpx
 import codex_auth
 from tests import test_codex_binary_refresh_isolated as binary
 
@@ -118,6 +121,72 @@ class LoginHandoffTests(binary.BinaryRefreshTests):
         self.login = codex_auth.LoginRevision(b"synthetic-second-login")
         await self.ns["refresh_codex_app_server_login"]()
 
+    def catalog_app(self):
+        source = Path(__file__).resolve().parents[1] / "agent_server.py"
+        nodes = [node for node in ast.parse(source.read_text()).body
+                 if isinstance(node, ast.AsyncFunctionDef) and node.name in {"runtime_catalog", "reload_codex_login"}]
+        for node in nodes:
+            node.decorator_list = []
+        module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *nodes], type_ignores=[])
+        self.ns["discover_runtime_catalog"] = lambda **kwargs: {"backends": {}, "forced": kwargs["force_runtime_probe"]}
+        exec(compile(ast.fix_missing_locations(module), str(source), "exec"), self.ns)
+        app = FastAPI()
+        app.get("/api/runtime/catalog")(self.ns["runtime_catalog"])
+        return app
+
+    async def test_http_forced_catalog_keeps_opaque_login_and_training_chat_usable(self):
+        self.login = None
+        old = await self.manager("training")
+        self.load("training", old)
+        old.terminals = [{"id": "synthetic-background-training"}]
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.catalog_app()), base_url="http://test") as client:
+            for _ in range(3):
+                response = await client.get("/api/runtime/catalog?refresh=true")
+                self.assertEqual(response.status_code, 200)
+                self.assertTrue(response.json()["forced"])
+                await self.preflight("training")
+                self.assertIs(await self.manager("training"), old)
+        self.assertFalse(getattr(old, "_agentsdock_login_superseded", False))
+        self.assertFalse(old.closed)
+        self.ns["evict_codex_app_server_thread"].assert_not_awaited()
+
+    async def test_explicit_reload_logs_origin_and_preserves_background_work_until_idle(self):
+        self.login = None
+        old = await self.manager("training")
+        thread = self.load("training", old)
+        old.terminals = [{"id": "synthetic-background-training"}]
+        self.catalog_app()
+        with self.assertLogs(self.ns["logger"], level="INFO") as logs:
+            self.assertTrue(await self.ns["reload_codex_login"]())
+            for _ in range(2):
+                with self.assertRaises(HTTPException) as blocked:
+                    await self.preflight("training")
+                self.assertEqual(blocked.exception.status_code, 409)
+            self.assertFalse(old.closed)
+            self.ns["evict_codex_app_server_thread"].assert_not_awaited()
+            self.assertIsNot(await self.manager("new-chat"), old)
+            old.terminals = []
+            await self.preflight("training")
+        output = "\n".join(logs.output)
+        self.assertIn("source=manual_login_reload", output)
+        self.assertIn("reason=explicit_reload_opaque_login", output)
+        self.assertEqual(output.count("reason=background_terminals"), 1)
+        self.assertIn("handoff released", output)
+        self.assertNotIn("synthetic-background-training", output)
+        self.assertEqual(self.ns["STORE"].sessions["training"]["codex_thread_id"], thread)
+
+    async def test_catalog_still_detects_real_login_change_with_attributed_reason(self):
+        old = await self.manager("training")
+        self.load("training", old)
+        self.login = codex_auth.LoginRevision(b"secret-new-revision")
+        with self.assertLogs(self.ns["logger"], level="INFO") as logs:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.catalog_app()), base_url="http://test") as client:
+                self.assertEqual((await client.get("/api/runtime/catalog?refresh=true")).status_code, 200)
+        output = "\n".join(logs.output)
+        self.assertIn("source=catalog_refresh reason=login_revision_changed", output)
+        self.assertNotIn("secret-new-revision", output)
+        self.assertTrue(old._agentsdock_login_superseded)
+
     async def preflight(self, session_id):
         # Match the production request task registration and lifecycle lock.
         current = asyncio.current_task()
@@ -179,6 +248,47 @@ class LoginHandoffTests(binary.BinaryRefreshTests):
         old.client._pending.clear()
         await self.preflight("idle")
         self.assertIsNot(await self.manager("idle"), old)
+
+    async def test_other_chat_requests_do_not_strand_idle_login_handoff(self):
+        old = await self.manager("idle")
+        self.load("idle", old)
+        await self.manager("working")
+        other_thread = self.load("working", old)
+        self.ns["BUSY_SESSIONS"].add("working")
+        request = asyncio.get_running_loop().create_future()
+        request._codex_thread_id = other_thread
+        old.client._pending[9] = ("thread/read", request, None)
+        callback = asyncio.create_task(asyncio.Event().wait())
+        callback._codex_thread_id = other_thread
+        old.client._callback_tasks.add(callback)
+        old.client._server_request_tasks[10] = callback
+        try:
+            await self.relogin()
+            await self.preflight("idle")
+            self.assertIsNot(await self.manager("idle"), old)
+            self.assertIs(self.ns["CODEX_SESSION_APP_SERVER_MANAGERS"]["working"], old)
+            self.assertFalse(old.closed)
+            self.assertFalse(callback.done())
+            self.assertFalse(request.done())
+        finally:
+            callback.cancel()
+            await asyncio.gather(callback, return_exceptions=True)
+            request.cancel()
+
+    async def test_same_chat_request_still_preserves_its_provider_work(self):
+        old = await self.manager("idle")
+        thread = self.load("idle", old)
+        request = asyncio.get_running_loop().create_future()
+        request._codex_thread_id = thread
+        old.client._pending[9] = ("thread/resume", request, None)
+        try:
+            await self.relogin()
+            with self.assertRaises(HTTPException):
+                await self.preflight("idle")
+            self.assertIs(self.ns["CODEX_SESSION_APP_SERVER_MANAGERS"]["idle"], old)
+            self.assertFalse(old.closed)
+        finally:
+            request.cancel()
 
     async def test_close_rechecks_after_start_lock_wait(self):
         old = await self.manager("idle")
@@ -259,6 +369,19 @@ class LoginHandoffTests(binary.BinaryRefreshTests):
         self.login = codex_auth.LoginRevision(b"changed")
         await asyncio.gather(*[self.ns["refresh_codex_app_server_login"]() for _ in range(5)])
         self.assertEqual(self.ns["CODEX_RETIRED_APP_SERVER_MANAGERS"], [old])
+
+    async def test_recheck_unchanged_login_keeps_existing_writer_and_all_chats_usable(self):
+        old = await self.manager("idle")
+        self.load("idle", old)
+        await self.manager("working")
+        self.load("working", old)
+        self.ns["BUSY_SESSIONS"].add("working")
+        await self.ns["refresh_codex_app_server_login"](request_handoff=True)
+        await self.preflight("idle")
+        self.assertIs(await self.manager("idle"), old)
+        self.assertFalse(old._agentsdock_login_superseded)
+        self.assertNotIn(old, self.ns["CODEX_RETIRED_APP_SERVER_MANAGERS"])
+        self.ns["evict_codex_app_server_thread"].assert_not_awaited()
 
     async def test_explicit_recheck_handles_opaque_store_without_touching_custom_manager(self):
         self.login = None

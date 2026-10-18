@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import plistlib
 import re
+import select
 import shlex
 import shutil
 import socket
@@ -24,7 +25,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import termios
 import time
+import tty
 from urllib.parse import urlsplit
 
 INSTANCE_PROTOCOL = 1
@@ -546,6 +549,20 @@ def describe(instance: Instance) -> dict:
     }
 
 
+def pairing_info(instance: Instance) -> dict:
+    """Private pipe to the CLI QR renderer; never write these details to logs."""
+    for target in (instance.config, instance.config / "env"):
+        check_path(target, instance.home)
+    env = read_config(instance)
+    token = env.get("AGENTSDOCK_AGENT_TOKEN", "")
+    if not token or any(ord(char) < 32 or ord(char) == 127 for char in token):
+        raise ValueError("This instance has no usable saved access token.")
+    port = int(env.get("AGENTSDOCK_AGENT_PORT", "7850"))
+    bind = env.get("AGENTSDOCK_AGENT_BIND", "0.0.0.0")
+    choices = connection_choices(bind, port, candidate_addresses(bind, port), tailscale_status())
+    return {"name": instance.name, "accessToken": token, "choices": choices}
+
+
 def connection_choices(bind: str, port: int, addresses: list[str], network: dict[str, str]) -> dict:
     """Label candidates, never infer Tailscale connectivity from an IP range."""
     choices = {"local": [], "lan": [], "other": [], "tailscale": "", "tailscale_note": ""}
@@ -609,6 +626,312 @@ def show(instance: Instance, *, network: dict[str, str] | None = None):
     if choices["other"]:
         print("  Other / unverified:        " + ", ".join(choices["other"]))
     print()
+
+
+def show_connection_addresses(instance: Instance, item: dict, network: dict[str, str]) -> None:
+    """Use the same binding-aware address order for status and token display."""
+    addresses = []
+    if item["port"]:
+        choices = connection_choices(read_config(instance).get("AGENTSDOCK_AGENT_BIND", "0.0.0.0"),
+                                     item["port"], item["addresses"], network)
+        if choices["tailscale"]:
+            addresses.append(f"{choices['tailscale']} (Tailscale / other networks)")
+        for key, label in (("lan", "Same Wi-Fi / LAN"), ("local", "This machine only"),
+                           ("other", "Other / unverified")):
+            addresses.extend(f"{url} ({label})" for url in choices[key])
+    print("  Address:  " + (addresses[0] if addresses else "Not configured"))
+    for address in addresses[1:]:
+        print("            " + address)
+
+
+def show_status(instance: Instance, *, network: dict[str, str]) -> None:
+    """Read-only per-instance summary; never print configuration or tokens."""
+    item = describe(instance)
+    print(terminal_color(f"Server ({item['name']}):", "34"))
+    print(f"  Status:   {item['status']}")
+    show_connection_addresses(instance, item, network)
+    print(f"  Version:  {item['version'] or 'unknown'}")
+    print(f"  Port:     {item['port'] or 'Not configured'}")
+    print()
+
+
+LOG_READ_BYTES = 1024 * 1024
+
+
+def log_line_count(value: str) -> int:
+    if not re.fullmatch(r"[0-9]{1,5}", value) or int(value) > 10000:
+        raise argparse.ArgumentTypeError("Log lines must be between 0 and 10000.")
+    return int(value)
+
+
+def log_sources(instance: Instance, platform: str) -> tuple[list[Path], list[str]]:
+    """Resolve fixed local log sources; never execute configuration or adopt paths."""
+    manifest = instance.runtime / "execution-layout.json"
+    check_path(manifest, instance.home)
+    if manifest.exists():
+        from execution_install import installed_layout
+
+        layout = installed_layout(instance.runtime)
+        if (instance.name != "default" or layout.install_root != instance.runtime
+                or layout.config_root != instance.config or layout.state_root != instance.state
+                or layout.home != instance.home
+                or layout.platform != ("Darwin" if platform == "darwin" else "Linux")):
+            raise ValueError("Execution log layout does not match the selected instance.")
+        return ([instance.state / "execution/logs" / f"{role}.{stream}.log"
+                 for role in ("gateway", "worker") for stream in ("stdout", "stderr")],
+                ["agents-server-gateway.service", "agents-server.service"])
+    validate_binding(instance, platform)
+    return ([instance.logs / "server.log", instance.logs / "server-error.log"],
+            [service_name(instance.name) + ".service"])
+
+
+def read_log_slice(instance: Instance, path: Path, lines: int,
+                   cursor: tuple[int, int, int] | None = None) -> tuple[bytes, tuple[int, int, int] | None, bool]:
+    """Bounded tail on first read, then bounded appended bytes; reopen on rotation.
+
+    Revalidate every open, including followed replacements. No shell tail process,
+    FIFO, symlink or file outside the selected fixed log roots is followed.
+    """
+    check_path(path, instance.home)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        # Remember that viewing has begun so a file created during --follow is
+        # read from its start, including with --lines 0.
+        return b"", cursor or (0, 0, 0), False
+    with os.fdopen(fd, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o022 or info.st_nlink != 1):
+            raise ValueError(f"Unsafe service log: {path.name}")
+        identity = (info.st_dev, info.st_ino)
+        truncated = False
+        if cursor is None:
+            start = max(0, info.st_size - LOG_READ_BYTES) if lines else info.st_size
+            truncated = bool(start and lines)
+        elif cursor[:2] == identity and info.st_size >= cursor[2]:
+            start = cursor[2]
+        else:
+            start = 0  # The file was replaced or truncated, not a new history scan.
+        handle.seek(start)
+        data = handle.read(min(LOG_READ_BYTES, max(0, info.st_size - start)))
+        next_cursor = (*identity, start + len(data))
+        if cursor is None:
+            if truncated:
+                _partial, separator, rest = data.partition(b"\n")
+                data = rest if separator else b""
+            data = b"\n".join(data.split(b"\n")[-lines - (1 if data.endswith(b"\n") else 0):]) if lines else b""
+        return data, next_cursor, truncated
+
+
+def print_log_data(data: bytes) -> None:
+    # Logs are untrusted text; do not execute terminal escape/control sequences.
+    text = data.decode("utf-8", errors="replace")
+    text = "".join(f"\\x{ord(char):02x}" if (ord(char) < 32 and char not in "\n\t")
+                   or 127 <= ord(char) < 160 else char for char in text)
+    print(text, end="" if text.endswith("\n") else "\n", flush=True)
+
+
+def show_logs(instance: Instance, *, lines: int = 100, follow: bool = False,
+              platform: str = sys.platform) -> int:
+    if platform != "darwin" and not platform.startswith("linux"):
+        raise ValueError("Service logs are supported on macOS and Linux only.")
+    paths, units = log_sources(instance, platform)
+    port = read_config(instance).get("AGENTSDOCK_AGENT_PORT", "")
+    print(terminal_color(f"Logs ({instance.name}):", "34"), flush=True)
+    if port.isdigit() and 1 <= int(port) <= 65535:
+        print(f"  Port: {int(port)}", flush=True)
+    print("  Logs may contain private data. Review before sharing.", flush=True)
+    if follow:
+        print("  Following new entries; Ctrl+C stops viewing, not the server.", flush=True)
+    if platform.startswith("linux"):
+        print(f"  Last {lines} journal entries across: {', '.join(units)}\n", flush=True)
+        command = ["journalctl", "--user", "--no-pager", "--output=short-iso", "--lines", str(lines)]
+        for unit in units:
+            command += ["--unit", unit]
+        if follow:
+            command.append("--follow")
+        try:
+            result = subprocess.run(command, env={**os.environ, "SYSTEMD_COLORS": "0",
+                                    "SYSTEMD_PAGERSECURE": "1"}, check=False,
+                                    timeout=None if follow else 15)
+            return result.returncode if result.returncode >= 0 else 130
+        except subprocess.TimeoutExpired:
+            raise ValueError("Reading the service journal timed out. Try again with fewer lines.") from None
+        except KeyboardInterrupt:
+            print("\nStopped viewing logs.", flush=True)
+            return 0
+    print(f"  Last {lines} lines per file (up to 1 MiB per file).\n", flush=True)
+    cursors: dict[Path, tuple[int, int, int] | None] = {path: None for path in paths}
+    first = True
+    try:
+        while True:
+            for path in paths:
+                data, cursor, truncated = read_log_slice(instance, path, lines, cursors[path])
+                cursors[path] = cursor
+                if first or data or truncated:
+                    print(f"==> {path.name} <==", flush=True)
+                    if truncated:
+                        print("[Older bytes omitted: initial read is limited to 1 MiB.]", flush=True)
+                    if data:
+                        print_log_data(data)
+                    elif first:
+                        print("(no log entries to show)", flush=True)
+            if not follow:
+                return 0
+            first = False
+            time.sleep(0.25)
+    except KeyboardInterrupt:
+        print("\nStopped viewing logs.", flush=True)
+        return 0
+
+
+def read_token_menu_key(fd: int) -> str:
+    key = os.read(fd, 1)
+    if key in (b"", b"\x03", b"\x04"):
+        return "cancel"
+    if key in (b"\r", b"\n"):
+        return "enter"
+    if key != b"\x1b":
+        return "other"
+    sequence = b""
+    while len(sequence) < 16 and select.select([fd], [], [], 0.15)[0]:
+        part = os.read(fd, 1)
+        if not part:
+            return "cancel"
+        sequence += part
+        if sequence in (b"[A", b"OA"):
+            return "up"
+        if sequence in (b"[B", b"OB"):
+            return "down"
+        if sequence[:1] not in (b"[", b"O") or (len(sequence) > 1 and 0x40 <= part[0] <= 0x7e):
+            return "other"
+    return "cancel" if not sequence else "other"
+
+
+def arrow_token_choice(rows: list[str], fd: int, settings: list) -> int | None:
+    """Render a bounded terminal menu and restore input mode before token output."""
+    size = shutil.get_terminal_size(fallback=(80, 24))
+    visible = min(len(rows), max(1, size.lines - 6), 10)
+    width = max(1, size.columns - 1)
+    selected, start = 0, 0
+    hint = "Use ↑/↓ to choose; Enter to select; Esc to cancel."
+
+    def render(redraw=False):
+        if redraw:
+            sys.stdout.write(f"\x1b[{visible + 1}A")
+        for index in range(start, start + visible):
+            row = ("  > " if index == selected else "    ") + rows[index]
+            row = row[:width]
+            if index == selected:
+                row = terminal_color(row, "1;36")
+            sys.stdout.write("\r\x1b[2K" + row + "\n")
+        sys.stdout.write("\r\x1b[2K" + hint[:width] + "\n")
+        sys.stdout.flush()
+
+    try:
+        tty.setcbreak(fd, termios.TCSANOW)
+        sys.stdout.write("\x1b[?25l")
+        render()
+        while True:
+            key = read_token_menu_key(fd)
+            if key == "cancel":
+                return None
+            if key == "enter":
+                return selected
+            if key not in ("up", "down"):
+                continue
+            selected = (selected + (1 if key == "down" else -1)) % len(rows)
+            start = min(start, selected) if selected < start else max(start, selected - visible + 1)
+            render(redraw=True)
+    except KeyboardInterrupt:
+        return None
+    finally:
+        termios.tcsetattr(fd, termios.TCSANOW, settings)
+        sys.stdout.write("\x1b[?25h\n")
+        sys.stdout.flush()
+
+
+def choose_token_instance(registry: Registry, items: list[Instance] | None = None) -> Instance | None:
+    """Select by stable instance name; never default or expose unselected tokens."""
+    if items is None:
+        items = registry.instances()
+    if not items:
+        print("No installations found. Run agentsdock setup to create your first server.")
+        return None
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise ValueError("Choose a server in an interactive terminal, or run agentsdock token NAME "
+                         "(for example: agentsdock token default). No token was shown.")
+    print("\nChoose a server to view its access token:\n")
+    rows = []
+    for index, instance in enumerate(items, 1):
+        config = read_config(instance)
+        port = config.get("AGENTSDOCK_AGENT_PORT") or "not configured"
+        rows.append(f"{instance.name:<20} {service_status(instance):<10} Port: {port}")
+    if os.environ.get("TERM", "dumb") not in ("", "dumb"):
+        try:
+            fd = sys.stdin.fileno()
+            settings = termios.tcgetattr(fd)
+        except (OSError, ValueError, termios.error):
+            pass  # Basic terminals retain the explicit numbered/name prompt.
+        else:
+            index = arrow_token_choice(rows, fd, settings)
+            if index is None:
+                print("Cancelled; no token was shown.")
+                return None
+            selected = items[index]
+            if selected.name not in {item.name for item in registry.instances()}:
+                raise ValueError("That server is no longer available. Run agentsdock token again. No token was shown.")
+            return selected
+    for index, row in enumerate(rows, 1):
+        print(f"  {index}. {row}")
+    print()
+    names = {item.name: item for item in items}
+    while True:
+        try:
+            answer = input("Enter a number or server name (Enter to cancel): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            answer = ""
+        if not answer:
+            print("Cancelled; no token was shown.")
+            return None
+        selected = names.get(answer)
+        if re.fullmatch(r"[1-9][0-9]{0,5}", answer) and int(answer) <= len(items):
+            selected = items[int(answer) - 1]
+        if selected is not None:
+            if selected.name not in {item.name for item in registry.instances()}:
+                raise ValueError("That server is no longer available. Run agentsdock token again. No token was shown.")
+            return selected
+        print(f"Please enter a number from 1 to {len(items)} or a listed server name (Enter cancels).")
+
+
+def show_instance_token(instance: Instance, *, network: dict[str, str] | None = None) -> int:
+    # Redirected explicit token commands retain their raw, single-token output.
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        print(terminal_color(f"\nServer ({instance.name}):", "34"))
+        show_connection_addresses(instance, describe(instance), network if network is not None else tailscale_status())
+        sys.stdout.flush()  # Keep the URL before the child helper's token/prompt.
+    try:
+        run(["/bin/bash", str(ROOT / "install.sh"), "--instance", instance.name, "--show-token"],
+            env=clean_environment(instance), cwd=ROOT)
+        return 0
+    except subprocess.CalledProcessError as exc:
+        return exc.returncode if exc.returncode > 0 else 1
+
+
+def offer_status_token(registry: Registry, items: list[Instance], network: dict[str, str]) -> int:
+    if not items or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return 0
+    try:
+        answer = input("View a server's URL and access token? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 0
+    if answer not in {"y", "yes"}:
+        return 0
+    selected = choose_token_instance(registry, items)
+    return show_instance_token(selected, network=network) if selected is not None else 0
 
 
 def terminal_color(text: str, code: str) -> str:
@@ -747,8 +1070,19 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="Independent AgentsServer instances for the current OS user. Defaults to list.")
     commands = result.add_subparsers(dest="command")
     commands.add_parser("list")
+    token = commands.add_parser("token", help="Choose an existing server and display its URL and access token")
+    token.add_argument("name", nargs="?", type=instance_name)
     info = commands.add_parser("info")
     info.add_argument("name", type=instance_name)
+    pairing = commands.add_parser("_pair-info", help=argparse.SUPPRESS)
+    pairing.add_argument("name", type=instance_name)
+    status = commands.add_parser("status", help="Show readable details for all instances or one name")
+    status.add_argument("name", nargs="?", type=instance_name)
+    logs = commands.add_parser("logs", help="Read recent local service logs; use --follow for live output")
+    logs.add_argument("name", nargs="?", type=instance_name)
+    logs.add_argument("--instance", dest="named", type=instance_name)
+    logs.add_argument("-n", "--lines", type=log_line_count, default=100)
+    logs.add_argument("-f", "--follow", action="store_true")
     new = commands.add_parser("new")
     new.add_argument("--name", type=instance_name)
     new.add_argument("--port", type=int)
@@ -785,13 +1119,45 @@ def main(argv: list[str] | None = None) -> int:
             validate_binding(instance)
             print(instance.shell_bindings())
             return 0
-        if args.command in {None, "list", "info"}:
+        if args.command == "_pair-info":
+            selected = next((item for item in registry.instances() if item.name == args.name), None)
+            if selected is None:
+                raise ValueError("Unknown instance. Use agentsdock list.")
+            print(json.dumps(pairing_info(selected)))
+            return 0
+        if args.command == "logs":
+            if args.name and args.named:
+                raise ValueError("Select the log instance once: NAME or --instance NAME.")
+            name = args.name or args.named or "default"
+            selected = next((item for item in registry.instances() if item.name == name), None)
+            if selected is None:
+                raise ValueError(f"Unknown instance {name!r}. Use agentsdock list to find its name.")
+            return show_logs(selected, lines=args.lines, follow=args.follow)
+        if args.command == "token":
+            if args.name:
+                # The installer retains read-only legacy token discovery even
+                # when an old default install is absent from the new registry.
+                selected = Instance(args.name, registry.home)
+            else:
+                selected = choose_token_instance(registry)
+            if selected is None:
+                return 0
+            return show_instance_token(selected)
+        if args.command in {None, "list", "info", "status"}:
             items = registry.instances()
-            if args.command == "info":
+            if args.command in {"info", "status"} and args.name:
                 items = [item for item in items if item.name == args.name]
                 if not items:
                     raise ValueError("Unknown instance.")
+            if args.command == "info":
                 print(json.dumps(describe(items[0]), indent=2))
+            elif args.command == "status":
+                network = tailscale_status() if items else None
+                for item in items:
+                    show_status(item, network=network)
+                if not items:
+                    print("No installations found. Run agentsdock setup to create your first server.")
+                return offer_status_token(registry, items, network)
             else:
                 network = tailscale_status() if items else None
                 print("NAME                 STATUS     PORT")

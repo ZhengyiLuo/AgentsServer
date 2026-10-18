@@ -68,14 +68,7 @@ def _read_handoff(root: Path, path: Path) -> dict[str, Any]:
 
 
 def _installed_layout(root: Path) -> files.ExecutionLayout:
-    data, _mode = files._read_file(root / files.LAYOUT_NAME, private=True)
-    value = json.loads(data)
-    if not isinstance(value, dict):
-        raise ValueError("installed execution layout is invalid")
-    layout = files.ExecutionLayout.from_dict(value.get("layout"))
-    if layout.install_root != root or value != files.layout_manifest(layout):
-        raise ValueError("installed execution layout changed")
-    return layout
+    return files.installed_layout(root)
 
 
 def _matching_status(handoff: dict, layout: files.ExecutionLayout, record: dict,

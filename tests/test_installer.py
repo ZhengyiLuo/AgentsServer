@@ -2239,6 +2239,7 @@ chmod 755 "$target/bin/python"
             uv_binary_source = root / "fake-uv"
             fake_bin.mkdir()
             home.mkdir()
+            self.write_unavailable_uv(fake_bin)
             self.write_executable(fake_bin / "uname", "#!/bin/sh\necho Linux\n")
             self.write_executable(fake_bin / "systemctl", "#!/bin/sh\nexit 0\n")
             self.write_executable(fake_bin / "tmux", "#!/bin/sh\nexit 0\n")
@@ -2495,6 +2496,7 @@ chmod 755 "$project/.venv/bin/python"
             fake_bin.mkdir()
             home.mkdir()
             self.prepare_preflight_path(fake_bin, os_name="Linux", commands=("tmux",))
+            self.write_unavailable_uv(fake_bin)
             self.write_executable(fake_bin / "tmux", "#!/bin/sh\nexit 127\n")
             self.write_executable(fake_bin / "systemctl", "#!/bin/sh\nexit 1\n")
             result = subprocess.run(
@@ -5730,6 +5732,7 @@ exit 0
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            self.write_unavailable_uv(fake_bin)
             curl_log = root / "curl.log"
             self.write_executable(fake_bin / "curl", """#!/bin/sh
 for argument in "$@"; do
@@ -5765,6 +5768,7 @@ exit 28
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            self.write_unavailable_uv(fake_bin)
             wget_log = root / "wget.log"
             self.write_executable(fake_bin / "curl", "#!/bin/sh\nexit 127\n")
             self.write_executable(fake_bin / "wget", """#!/bin/sh
@@ -7533,6 +7537,15 @@ exit 0
     def write_private_file(path: Path, source: str) -> None:
         path.write_text(source)
         path.chmod(0o600)
+
+    @staticmethod
+    def write_unavailable_uv(directory: Path) -> None:
+        # The installer appends standard package-manager paths, so a restricted
+        # PATH alone does not mask a host uv (e.g. Homebrew). Do not use
+        # write_executable here: it makes uv --version succeed for runtime stubs.
+        path = directory / "uv"
+        path.write_text("#!/bin/sh\nexit 127\n")
+        path.chmod(0o755)
 
     @staticmethod
     def write_executable(path: Path, source: str):

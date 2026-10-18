@@ -1522,6 +1522,28 @@ class UpdateRunnerTests(unittest.TestCase):
                     require_verified_service_cgroup=True,
                 )
 
+    def test_pre_restart_check_accepts_only_proven_preserved_descendants(self):
+        health = self.idle_health()
+        health["update_service_cgroup"] = {
+            "safe": True, "unknown_descendant_count": 8,
+            "inspection": "verified-preserved",
+        }
+        with patch.object(update_runner, "server_health_snapshot", return_value=health):
+            update_runner.assert_server_idle(7850, require_verified_service_cgroup=True)
+            for changes in (
+                {"safe": False}, {"safe": "true"},
+                {"unknown_descendant_count": -1}, {"unknown_descendant_count": True},
+                {"unknown_descendant_count": None}, {"unknown_descendant_count": "8"},
+                {"inspection": "verified"}, {"inspection": "not-systemd-managed"},
+                {"inspection": None},
+            ):
+                with self.subTest(changes=changes):
+                    original = dict(health["update_service_cgroup"])
+                    health["update_service_cgroup"].update(changes)
+                    with self.assertRaisesRegex(RuntimeError, "nonempty service cgroup"):
+                        update_runner.assert_server_idle(7850, require_verified_service_cgroup=True)
+                    health["update_service_cgroup"] = original
+
     def test_pre_restart_check_reports_tracked_work_before_cgroup_proof(self):
         payload = json.dumps({
             "ok": True,

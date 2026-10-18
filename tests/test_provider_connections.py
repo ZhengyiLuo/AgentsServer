@@ -42,6 +42,39 @@ class SettingsTests(unittest.IsolatedAsyncioTestCase):
         self.client = TestClient(self.app)
         self.addCleanup(self.client.close)
 
+    def test_switching_api_backend_before_first_turn_gets_new_binding_not_old_provider_credentials(self):
+        from tests.test_codex_provider_sessions_isolated import make_namespace
+        from tests.test_gemini_api import selected
+        self.store.write("claude", 0, INPUT, "verified")
+        self.store.write("gemini", 0, selected(), "verified")
+        ns = make_namespace(Path(self.temp.name))
+        ns["VALID_BACKENDS"].add("gemini")
+        ns["PROVIDER_CONNECTION_STORE"] = self.store
+        preview = ns["preview_session_runtime_update"]
+        original = preview({"backend": "claude"}, {"provider_connection": "custom"})
+        switched = preview(original, {"backend": "gemini", "provider_connection": "custom", "model": None, "effort": None})
+        self.assertNotEqual(switched["provider_connection_revision"], original["provider_connection_revision"])
+        self.assertEqual(self.store.for_session(switched)["api_key"], selected()["api_key"])
+        self.assertEqual(self.store.for_session(original)["api_key"], KEY)
+        with self.assertRaises(HTTPException):
+            preview({**original, "backend_locked": True}, {"backend": "gemini", "provider_connection": "custom"})
+
+    def test_gemini_default_auto_is_exposed_without_saving_or_checking_a_model(self):
+        from tests.test_gemini_api import selected
+        self.store.write("gemini", 0, selected(), "verified")
+        path = "/api/admin/provider-models/gemini"
+        with patch("gemini_api.catalog", return_value={"models": [], "discovery_status": "unavailable"}):
+            result = self.client.get(path, headers=NATIVE).json()
+        self.assertEqual(result["default_model"], "auto")
+        self.assertEqual(result["models"], [{"value": "auto", "label": "Auto (Gemini CLI)"}])
+        self.assertEqual(result["discovery_status"], "unavailable", "Auto must not imply API discovery succeeded")
+        self.assertIsNone(self.store.public("gemini")["model"])
+        for revision, model, expected in ((1, "gemini-explicit", "gemini-explicit"), (2, None, "auto")):
+            result = self.client.put(path, headers=NATIVE, json={"model": model, "expected_revision": revision})
+            self.assertEqual(result.status_code, 200, result.text)
+            self.assertEqual(result.json()["default_model"], expected)
+        self.check.assert_not_awaited()
+
     def test_success_persists_private_key_and_returns_only_metadata(self):
         self.assertFalse(self.client.get(PATH, headers=NATIVE).json()["configured"])
         response = self.client.put(PATH, headers=NATIVE, json=INPUT)
@@ -205,12 +238,14 @@ class WireProbeTests(unittest.IsolatedAsyncioTestCase):
                 self.wfile.write(json.dumps(case.payload).encode())
 
             def do_POST(self):
-                case.calls.append((self.path, dict(self.headers), json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                case.calls.append((self.path, dict(self.headers), body))
                 self.send_response(case.status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Location", "/credential-leak")
                 self.end_headers()
-                self.wfile.write(json.dumps(case.payload).encode())
+                payload = case.payload(body) if callable(case.payload) else case.payload
+                self.wfile.write(json.dumps(payload).encode())
             def log_message(self, *args):
                 pass
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -221,6 +256,44 @@ class WireProbeTests(unittest.IsolatedAsyncioTestCase):
 
     def stop(self):
         self.server.shutdown(); self.thread.join(); self.server.server_close()
+
+    async def test_two_step_setup_uses_real_http_without_inference_until_model_check(self):
+        self.public_status = 200
+        self.payload = {"data": [{"id": "fixture/model"}]}
+        with tempfile.TemporaryDirectory() as directory:
+            store = connections.ConnectionStore(Path(directory) / "private")
+            fixture = auth_fixture.CodexAuthTests()
+            fixture.setUp()
+            self.addCleanup(fixture.doCleanups)
+            fixture.ns["codex_provider"] = codex_provider
+            app = FastAPI()
+            app.middleware("http")(fixture.ns["require_agent_token"])
+            app.include_router(connections.create_router(authorize=fixture.ns["require_native_admin_control"], store=store))
+            with TestClient(app) as client:
+                route = "/api/admin/provider-connections/opencode"
+                models = "/api/admin/provider-models/opencode"
+                response = client.put(route, headers=NATIVE, json={**INPUT, "base_url": self.base, "model": None})
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertFalse(response.json()["ok"])
+                self.assertEqual(response.json()["status"], "model_required")
+                self.assertTrue(response.json()["configuration"]["configured"])
+                listed = client.get(models, headers=NATIVE)
+                self.assertEqual(listed.json()["models"], [{"value": "fixture/model", "label": "fixture/model"}])
+                self.assertIsNone(listed.json()["default_model"])
+                self.assertTrue(all(call[2] is None for call in self.calls))
+                self.assertFalse(store.catalog("opencode")["available"])
+                chosen = client.put(models, headers=NATIVE, json={"model": "fixture/model", "expected_revision": 1})
+                self.assertEqual(chosen.status_code, 200, chosen.text)
+                self.assertTrue(all(call[2] is None for call in self.calls))
+                self.payload = {"type": "message", "content": [{"type": "text", "text": "OK"}]}
+                verified = client.post(route + "/check", headers=NATIVE, json={"expected_revision": 2})
+                self.assertTrue(verified.json()["ok"])
+                posts = [call for call in self.calls if call[2] is not None]
+                self.assertEqual(len(posts), 1)
+                self.assertEqual(posts[0][2]["model"], "fixture/model")
+                self.assertEqual(posts[0][2]["max_tokens"], 256)
+                self.assertNotIn(KEY, verified.text)
+                self.assertEqual(store.bind({"backend": "opencode", "provider_connection": "custom"})["model"], "fixture/model")
 
     async def test_real_http_protocol_paths_headers_and_response_validation(self):
         cases = [("anthropic", "bearer", "/api", "/api/v1/messages", {"type": "message", "content": [{"type": "text", "text": "OK"}]}),
@@ -248,6 +321,67 @@ class WireProbeTests(unittest.IsolatedAsyncioTestCase):
         for payload in ({}, [], {"type": "message", "content": "wrong"}, {"text": "x" * 150000}):
             self.payload = payload
             self.assertEqual(await connections.probe({**INPUT, "base_url": self.base}), "invalid_response")
+
+    async def test_model_check_leaves_a_bounded_reasoning_budget_without_retrying(self):
+        # A live reasoning model used 76 output tokens to answer "OK". At 32
+        # it returned HTTP 200, empty text and finish_reason=length instead.
+        for protocol in ("anthropic", "responses", "chat_completions"):
+            with self.subTest(protocol=protocol):
+                def reply(body):
+                    enough = body.get("max_output_tokens", body.get("max_tokens", 0)) >= 76
+                    if protocol == "anthropic":
+                        return {"type": "message", "content": [{"type": "text", "text": "OK"}] if enough else [], "stop_reason": "end_turn" if enough else "max_tokens"}
+                    if protocol == "responses":
+                        return {"status": "completed" if enough else "incomplete", "output": [{"content": [{"type": "output_text", "text": "OK"}]}] if enough else []}
+                    return {"choices": [{"finish_reason": "stop" if enough else "length", "message": {"content": "OK" if enough else "", "reasoning_content": "bounded reasoning"}}]}
+                self.payload = reply
+                before = len(self.calls)
+                selected = {**INPUT, "base_url": self.base, "protocol": protocol}
+                self.assertEqual(await connections.probe(selected), "verified")
+                self.assertEqual(len(self.calls), before + 1)
+                body = self.calls[-1][2]
+                self.assertEqual(body.get("max_output_tokens", body.get("max_tokens")), 256)
+                self.assertNotIn("tools", body)
+
+    async def test_reasoning_only_or_empty_output_still_cannot_verify(self):
+        cases = [
+            ("chat_completions", {"choices": [{"finish_reason": "length", "message": {"content": "", "reasoning_content": "not an answer"}}]}),
+            ("chat_completions", {"choices": [{"message": {"content": None}}]}),
+            ("anthropic", {"type": "message", "content": [{"type": "thinking", "thinking": "not an answer"}]}),
+            ("responses", {"status": "incomplete", "output": []}),
+        ]
+        for protocol, payload in cases:
+            with self.subTest(protocol=protocol, payload=payload):
+                self.payload = payload
+                before = len(self.calls)
+                self.assertEqual(await connections.probe({**INPUT, "base_url": self.base, "protocol": protocol}), "invalid_response")
+                self.assertEqual(len(self.calls), before + 1)
+
+    async def test_anthropic_check_catalog_and_opencode_runtime_share_api_prefix(self):
+        for suffix in ("", "/v1", "/proxy/anthropic", "/proxy/anthropic/v1"):
+            for auth in ("bearer", "x-api-key"):
+                with self.subTest(suffix=suffix, auth=auth), tempfile.TemporaryDirectory() as directory:
+                    selected = {**INPUT, "base_url": self.base + suffix, "auth_header": auth}
+                    expected_prefix = suffix if suffix.endswith("/v1") else suffix + "/v1"
+                    self.payload = {"type": "message", "content": [{"type": "text", "text": "OK"}]}
+                    self.assertEqual(await connections.probe(selected), "verified")
+                    checked_path = self.calls[-1][0]
+                    self.assertEqual(checked_path, expected_prefix + "/messages")
+                    store = connections.ConnectionStore(Path(directory) / "private")
+                    store.write("opencode", 0, selected, "verified")
+                    chat = {"backend": "opencode", "provider_connection": "custom"}
+                    chat["provider_connection_revision"] = store.bind(chat)["credential_id"]
+                    original = store.for_session(chat)
+                    env = store.opencode_overrides(chat, {})
+                    config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+                    runtime_base = config["provider"]["agentsdock_custom"]["options"]["baseURL"]
+                    self.assertEqual(runtime_base + "/messages", self.base + checked_path)
+                    self.assertEqual(store.for_session(chat), original)
+                    self.payload = {"data": [{"id": "test/model"}]}
+                    self.assertEqual(await connections.probe_credentials(selected), "verified")
+                    self.assertEqual(self.calls[-1][0], expected_prefix + "/models")
+                    self.assertTrue(connections.discover_models(selected))
+                    self.assertEqual(self.calls[-1][0].split("?")[0], expected_prefix + "/models")
 
     async def test_read_only_key_check_requires_a_protected_endpoint(self):
         self.payload = {"data": [{"id": "fixture/model"}]}

@@ -313,7 +313,11 @@ def render_service(layout: ExecutionLayout, role: str) -> bytes:
     lines += ["ExecStart=" + " ".join(_unit_word(arg, command=True) for arg in command),
               "Restart=always", "RestartSec=2",
               "TimeoutStopSec=180s" if role == "worker" else "TimeoutStopSec=10s",
-              *(["SendSIGKILL=no"] if role == "worker" else []), "UMask=0077",
+              # The worker owns provider cleanup and exclusive state leases.
+              # Detached user jobs must survive its replacement. control-group
+              # plus SendSIGKILL=no also prevents systemd from relaunching the
+              # worker while any such job remains after the worker exits.
+              *(["KillMode=process", "SendSIGKILL=no"] if role == "worker" else []), "UMask=0077",
               "", "[Install]", "WantedBy=default.target", ""]
     return "\n".join(lines).encode()
 
@@ -327,6 +331,35 @@ def layout_manifest(layout: ExecutionLayout) -> dict[str, Any]:
             "token_path": str(layout.runtime_dir / "control.token"),
             "callback": {"bind": "127.0.0.1", "port": 0, "lifetime": "worker-process"},
             "retained_releases": sorted({str(layout.worker_release), str(layout.gateway_release)})}
+
+
+def installed_layout(root: Path) -> ExecutionLayout:
+    """Validate authoritative bindings without discarding retained rollback history."""
+    root = _path(root)
+    data, _mode = _read_file(root / LAYOUT_NAME, private=True)
+    value = json.loads(data)
+    if not isinstance(value, dict):
+        raise ValueError("installed execution layout is invalid")
+    layout = ExecutionLayout.from_dict(value.get("layout"))
+    expected = layout_manifest(layout)
+    retained = value.get("retained_releases")
+    if (layout.install_root != root or set(value) != set(expected)
+            or {key: item for key, item in value.items() if key != "retained_releases"}
+            != {key: item for key, item in expected.items() if key != "retained_releases"}
+            or not isinstance(retained, list) or not all(isinstance(item, str) for item in retained)
+            or len(retained) != len(set(retained))
+            or not set(expected["retained_releases"]).issubset(retained)):
+        raise ValueError("installed execution layout does not match its runtime")
+    # Retention is not activation authority. Each advisory entry must still be
+    # an owned, real version directory inside this installation.
+    for item in retained:
+        path = _path(item)
+        if path.parent != root / "releases" or path.name.startswith("."):
+            raise ValueError("retained release is outside the installation")
+        _owned_directory(path)
+        version, _mode = _read_file(path / "VERSION")
+        _text(version.decode().strip())
+    return layout
 
 
 def prepare_runtime(layout: ExecutionLayout) -> None:

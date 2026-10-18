@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import json
 import os
+import time
 from pathlib import Path
 import re
 import stat
@@ -26,9 +27,13 @@ from claude_goals import ClaudeGoalHistoryNormalizer, is_claude_synthetic_no_res
 from claude_sdk_client import CLAUDE_SDK_LITERAL_MESSAGE_PREFIX
 
 
+from transcript_reader import jsonl_records, scan_check, CHUNK_BYTES, SCAN_SECONDS
+
 MAX_BYTES = 96 * 1024 * 1024
 MAX_EVENTS_BYTES = 32 * 1024 * 1024
-MAX_LINE_BYTES = 4 * 1024 * 1024
+# Bound retained JSON; opaque provider payload bytes are streamed.
+MAX_LINE_BYTES = 32 * 1024 * 1024
+MAX_TEXT_CHARS = 4 * 1024 * 1024
 MAX_RECORDS = 100_000
 MAX_KEYS = 20_000
 MAX_TARGETS = 4_000
@@ -73,24 +78,15 @@ def _records(path: Path, expected: tuple[int, int, int, int]):
         info = os.fstat(stream.fileno())
         if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) != expected:
             raise _Unproven()
-        count = 0
-        offset = 0
-        while offset < expected[2]:
-            line = stream.readline(min(MAX_LINE_BYTES + 1, expected[2] - offset))
-            if len(line) > MAX_LINE_BYTES or not line.endswith(b"\n"):
-                raise _Unproven()
-            count += 1
-            if count > MAX_RECORDS:
-                raise _Unproven()
-            offset += len(line)
-            event = json.loads(line)
-            if not isinstance(event, dict):
-                raise _Unproven()
-            yield event, offset, line
+        try:
+            yield from jsonl_records(stream, end=expected[2], strict=True,
+                max_records=MAX_RECORDS, max_retained_bytes=MAX_LINE_BYTES)
+        except ValueError as exc:
+            raise _Unproven() from exc
         final = os.fstat(stream.fileno())
         if (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns) != expected:
             raise _Unproven()
-    if _stamp(path) != expected:
+    if _regular_stamp(path) != expected:
         raise _Unproven()
 
 
@@ -106,7 +102,7 @@ def _target(event: dict) -> tuple[int, str, str] | None:
         event.get("type") != "turn_started" or event.get("imported") is not True
         or event.get("backend") != "claude" or type(seq) is not int or seq <= 0
         or not isinstance(run, str) or not run.startswith("import_")
-        or not isinstance(prompt, str) or len(prompt) > MAX_LINE_BYTES
+        or not isinstance(prompt, str) or len(prompt) > MAX_TEXT_CHARS
     ):
         return None
     return seq, run, _text_key(prompt)
@@ -118,7 +114,7 @@ def _assistant_target(event: dict) -> tuple | None:
     if (event.get("type") not in ("assistant_text", "reasoning_summary")
             or event.get("imported") is not True or event.get("backend") != "claude"
             or type(seq) is not int or seq <= 0 or not isinstance(run, str) or not run.startswith("import_")
-            or not isinstance(text, str) or not text.strip() or len(text) > MAX_LINE_BYTES
+            or not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT_CHARS
             or not isinstance(origin, dict) or origin.get("provider") != "claude"
             or origin.get("kind") not in (None, "assistant")
             or event.get("provider_user_authored") is True
@@ -173,7 +169,7 @@ class _AssistantReplays:
             return None
         display = self.normalize_assistant(text)
         return (_text_key(display) if isinstance(display, str) and display.strip()
-                and len(display) <= MAX_LINE_BYTES else None)
+                and len(display) <= MAX_TEXT_CHARS else None)
 
     def event(self, event: dict) -> None:
         target = _assistant_target(event)
@@ -193,7 +189,7 @@ class _AssistantReplays:
                     and (event.get("phase") in ("commentary", "final_answer")
                          or (kind == "assistant_text" and event.get("phase") is None))
                     and isinstance(event.get("text"), str) and event["text"].strip()
-                    and len(event["text"]) <= MAX_LINE_BYTES):
+                    and len(event["text"]) <= MAX_TEXT_CHARS):
                 self.native.append((event, _text_key(event["text"].strip())))
         if sum(map(len, (self.starts, self.ends, self.owners, self.native, self.candidates))) > MAX_TARGETS:
             raise _Unproven()
@@ -260,7 +256,7 @@ class _AssistantReplays:
                              and block.get("type") == "text" and isinstance(block.get("text"), str))
         else:
             return
-        if text.strip() and len(text) <= MAX_LINE_BYTES:
+        if text.strip() and len(text) <= MAX_TEXT_CHARS:
             digest = _text_key(text.strip())
             self.sources.setdefault((identity, digest), []).append(offset)
             self.source_display[(identity, digest)] = self.display_key(text)
@@ -440,7 +436,7 @@ class _AsyncDeliveryInputs:
                 or any(event.get(key) for key in ("clientUserMessageId", "clientId", "client_user_message_id", "client_id"))):
             return
         full, display = self.normalize_full_user(event), self.normalize_user(event)
-        match = _ASYNC_WRAPPER.fullmatch(full.strip()) if isinstance(full, str) and len(full) <= MAX_LINE_BYTES else None
+        match = _ASYNC_WRAPPER.fullmatch(full.strip()) if isinstance(full, str) and len(full) <= MAX_TEXT_CHARS else None
         timestamp = _timestamp(identity[2])
         if match and isinstance(display, str) and display and timestamp is not None:
             self.sources.setdefault((match[1], _text_key(match[2]), len(match[2]), int(timestamp)), []).append(
@@ -519,7 +515,7 @@ class _MailboxWakeInputs(_AsyncDeliveryInputs):
             return
         full, display = self.normalize_full_user(event), self.normalize_user(event)
         timestamp = _timestamp(identity[2])
-        if (isinstance(full, str) and full and len(full) <= MAX_LINE_BYTES
+        if (isinstance(full, str) and full and len(full) <= MAX_TEXT_CHARS
                 and _text_key(full) in self.wake_hashes
                 and isinstance(display, str) and display and timestamp is not None):
             self.sources.setdefault(_text_key(full), []).append(
@@ -631,29 +627,18 @@ def filter_native_claude_mailbox_wake_items(
                              "backend": "claude", "imported": True}
                 native.event(candidate)
                 assistant_targets[index] = _assistant_target(candidate)
-        if source_stamp[2] <= MAX_EVENTS_BYTES:
-            digest, verified = hashlib.sha256(), set()
-            for event, offset, line in _records(source, source_stamp):
-                digest.update(line)
-                if offset == start and hmac.compare_digest(digest.hexdigest(), previous):
-                    verified.add(start)
-                if offset == end and hmac.compare_digest(digest.hexdigest(), expected):
-                    verified.add(end)
-                if offset <= end:
-                    proof.source(event, offset)
-                    native.source(event, offset)
-            if end not in verified or start and start not in verified:
-                return items
-        else:
-            # Same bounded proof as historical semantic windows: the caller has
-            # just verified this checkpoint. Recheck file identity and every
-            # candidate's exact source UUID/full hash, without a prefix rescan.
-            window_start = max(0, end - MAX_EVENTS_BYTES)
-            if start < window_start:
-                return items
-            for event, offset in _bounded_records(source, source_stamp, window_start, end):
+        digest, verified = hashlib.sha256(), set()
+        for event, offset, line in _records(source, source_stamp):
+            line.update_hash(digest)
+            if offset == start and hmac.compare_digest(digest.hexdigest(), previous):
+                verified.add(start)
+            if offset == end and hmac.compare_digest(digest.hexdigest(), expected):
+                verified.add(end)
+            if offset <= end:
                 proof.source(event, offset)
                 native.source(event, offset)
+        if end not in verified or start and start not in verified:
+            return items
         eligible = {batch: (0, len(items) + 1, start, end)}
         targets, assistant_replays = proof.prove(eligible), native.prove(eligible)
         _assistants, owned_inputs = native.exact_owned_sources()
@@ -923,7 +908,7 @@ def _prove(session_id: str, provider_id: str, events: Path, root: Path,
         raise _Unproven()
     source = source.resolve(strict=True)
     source.relative_to(root.resolve(strict=True))
-    source_stamp = _stamp(source)
+    source_stamp = _regular_stamp(source)
     prefix_digests = {}
     eligible_batches = {}
     for run, (seq, checkpoint) in batches.items():
@@ -972,7 +957,7 @@ def _prove(session_id: str, provider_id: str, events: Path, root: Path,
                 scheduled_ranges.setdefault(key, []).append((run, start_time, end_time))
     scheduled_sources, scheduled_counts = {}, {}
     for event, offset, line in _records(source, source_stamp):
-        digest.update(line)
+        line.update_hash(digest)
         for wanted in prefix_digests.get(offset, ()):
             if hmac.compare_digest(digest.hexdigest(), wanted):
                 verified.add((offset, wanted))
@@ -1144,25 +1129,25 @@ def _bounded_records(path: Path, expected, start: int, end: int):
         if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) != expected:
             raise _Unproven()
         stream.seek(start)
+        deadline = time.monotonic() + SCAN_SECONDS
         if start:
             stream.seek(start - 1)
             if stream.read(1) != b"\n":
-                skipped = stream.readline(min(MAX_LINE_BYTES + 1, end - start))
-                if len(skipped) > MAX_LINE_BYTES or not skipped.endswith(b"\n"):
+                while stream.tell() < end:
+                    scan_check(deadline)
+                    skipped = stream.readline(min(CHUNK_BYTES, end - stream.tell()))
+                    if not skipped:
+                        raise _Unproven()
+                    if skipped.endswith(b"\n"):
+                        break
+                else:
                     raise _Unproven()
-        count = 0
-        while stream.tell() < end:
-            offset = stream.tell()
-            line = stream.readline(min(MAX_LINE_BYTES + 1, end - offset))
-            if len(line) > MAX_LINE_BYTES or not line.endswith(b"\n"):
-                raise _Unproven()
-            count += 1
-            if count > MAX_RECORDS:
-                raise _Unproven()
-            event = json.loads(line)
-            if not isinstance(event, dict):
-                raise _Unproven()
-            yield event, stream.tell()
+        try:
+            for event, offset, _raw in jsonl_records(stream, end=end, strict=True,
+                    deadline=deadline, max_records=MAX_RECORDS, max_retained_bytes=MAX_LINE_BYTES):
+                yield event, offset
+        except ValueError as exc:
+            raise _Unproven() from exc
         final = os.fstat(stream.fileno())
         if (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns) != expected:
             raise _Unproven()

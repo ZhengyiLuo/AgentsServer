@@ -27,7 +27,7 @@ FUNCTIONS = {"preview_session_runtime_update", "session_backend_locked", "public
     "effective_opencode_permission_mode", "ensure_opencode_permission_mode_update_allowed",
     "session_subagent_limit_control", "validate_session_subagent_limit",
     "record_codex_subagent_limit_application", "broadcast_codex_subagent_limit", "codex_requested_subagent_limit", "codex_applied_subagent_limit",
-    "apply_codex_provider_when_idle", "broadcast_codex_provider_changed", "create_session", "create_session_with_history", "update_session", "ensure_backend_update_allowed", "codex_runtime_settings", "_fork_session_locked"}
+    "apply_codex_provider_when_idle", "broadcast_codex_provider_changed", "create_session", "create_session_with_history", "update_session", "_update_session", "ensure_backend_update_allowed", "codex_runtime_settings", "_fork_session_locked"}
 MODELS = {"CreateSessionRequest", "UpdateSessionRequest"}
 tree = ast.parse(SOURCE.read_text())
 nodes = []
@@ -50,6 +50,7 @@ def make_namespace(root: Path):
     locks = {}
     registry = local_session_ownership.Registry(root)
     ns = {"Any": Any, "Literal": Literal, "BaseModel": BaseModel, "Field": Field,
+        "HISTORY_MAINTENANCE_STATE": {},
         "cancel_generated_session_title": Mock(),
         "local_session_ownership": local_session_ownership,
         "local_history_import_guard": lambda: local_session_ownership.history_import_lock(registry=registry),
@@ -68,7 +69,7 @@ def make_namespace(root: Path):
         "HTTPException": HTTPException, "codex_provider": codex_provider,
         "MAX_SESSION_SYSTEM_PROMPT_CHARS": 10000, "DEFAULT_BACKEND": "codex",
         "BACKEND_CODEX": "codex", "BACKEND_CLAUDE": "claude", "BACKEND_CURSOR": "cursor",
-        "BACKEND_OPENCODE": "opencode",
+        "BACKEND_OPENCODE": "opencode", "BACKEND_GEMINI": "gemini",
         "VALID_BACKENDS": {"codex", "claude", "cursor", "opencode"}, "DEFAULT_CWD": str(root),
         "CODEX_TRANSPORT": "app-server", "CODEX_TRANSPORT_EXEC": "exec",
         "CODEX_PROVIDER_STORE": codex_provider.ProviderStore(root / "providers"),
@@ -99,6 +100,7 @@ def make_namespace(root: Path):
         "codex_user_config_defaults": lambda: ("normal-model", "high", "fast"),
         "CODEX_DEFAULT_MODEL": "normal-model", "CODEX_DEFAULT_EFFORT": "high",
         "clamp_codex_runtime_effort": lambda model, effort: effort,
+        "codex_available_model": lambda model: model,
         "codex_default_service_tier": lambda model: "fast",
         "CODEX_SETTINGS_FILE": root / "codex-settings.json", "CODEX_NONINTERACTIVE_APPROVAL_POLICY": "never",
         "CODEX_PROVIDER_MCP_NAME": "fixture", "codex_provider_mcp_config": lambda: {},
@@ -412,6 +414,8 @@ class PerChatTests(unittest.IsolatedAsyncioTestCase):
             for overrides, safe in cases:
                 with self.subTest(provider=provider, fallback=overrides):
                     ns = {"sess": {"codex_provider": provider}, "codex_provider": codex_provider,
+                        "codex_native_archive_rejection": lambda exc, thread_id: False,
+                        "session_provider_id": lambda session: "thread", "exc": RuntimeError("fixture"),
                         "allow_exec_fallback": True, "provider_command": None, "stop_requested": False,
                         "turn_start_attempted": False, "safe_pre_accept_failure": True, **overrides}
                     exec(codes["fallback"], ns)

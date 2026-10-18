@@ -61,6 +61,54 @@ def handoff_detail(reason: str) -> dict:
             "message": f"Codex sign-in handoff is waiting: {reasons[reason]}. "
                        f"Your message has not been sent. {action}"}
 
+# Native ChatGPT sign-in only. API-key and custom-provider availability is
+# provider-owned. Keep old IDs in saved conversations; this is picker/admission
+# policy, not transcript cleanup. Source: https://learn.chatgpt.com/docs/models
+CHATGPT_RETIRED_MODELS = frozenset({
+    "gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.3-codex-spark",
+    "gpt-5.4", "gpt-5.4-mini", "gpt-5.5",
+})
+
+
+def native_model_auth_mode(env: dict[str, str], *, cwd: str, observed_mode: str = "") -> str:
+    """Read only the auth kind for model policy, never authenticate or refresh.
+
+    An opaque store may use the existing native login-status probe. A file
+    store is checked directly so a switch to an API key cannot inherit a cached
+    ChatGPT restriction. Unknown/managed providers are never globally banned.
+    """
+    try:
+        root, config = _native_login_config(env, cwd)
+        profile = config.get("profile")
+        profiles = config.get("profiles")
+        selected_profile = profiles.get(profile, {}) if isinstance(profiles, dict) and isinstance(profile, str) else {}
+        if not isinstance(selected_profile, dict):
+            return "unknown"
+        provider = selected_profile.get("model_provider", config.get("model_provider", "openai"))
+        if provider != "openai":
+            return "custom"
+        providers = config.get("model_providers") or {}
+        override = providers.get("openai") if isinstance(providers, dict) else None
+        if env.get("OPENAI_BASE_URL") or isinstance(override, dict) and override.get("base_url"):
+            return "custom"
+        if any(env.get(key) for key in ("CODEX_API_KEY", "OPENAI_API_KEY", "OPENAI_IDENTITY_TOKEN_FILE")):
+            return "apiKey"
+        if env.get("CODEX_ACCESS_TOKEN"):
+            return "unknown"
+        store = config.get("cli_auth_credentials_store", "file")
+        if store != "file":
+            return observed_mode if store in {"keyring", "auto"} and observed_mode in {"chatgpt", "apiKey"} else "unknown"
+        data = json.loads(_bounded_file(root / "auth.json"))
+        if not isinstance(data, dict):
+            return "unknown"
+        if isinstance(data.get("OPENAI_API_KEY"), str) and data["OPENAI_API_KEY"]:
+            return "apiKey"
+        if data.get("auth_mode") in (None, "chatgpt") and isinstance(data.get("tokens"), dict):
+            return "chatgpt"
+    except (OSError, ValueError, TypeError, RecursionError):
+        pass
+    return "unknown"
+
 
 @dataclass(frozen=True)
 class LoginRevision:

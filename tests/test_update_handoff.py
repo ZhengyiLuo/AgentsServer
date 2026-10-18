@@ -127,6 +127,34 @@ class FailedHandoffTests(unittest.TestCase):
         self.assertTrue(result["already_released"])
         self.assertEqual(len(self.control.requests), 1)
 
+    def test_retry_preserves_valid_retained_history_for_already_unheld_worker(self):
+        path, status = self.failed_status()
+        manifest_path = self.root / files.LAYOUT_NAME
+        manifest = json.loads(manifest_path.read_bytes())
+        manifest["retained_releases"].append(str(self.support.new))
+        files._atomic_write(manifest_path, files._json_bytes(manifest))
+        before = manifest_path.read_bytes(), path.read_bytes(), self.path.read_bytes()
+        self.control.value.update(lease=None, idle=False,
+                                  blockers={"active_sessions": 1, "managed_update": 0})
+        self.assertTrue(self.retry(path, status)["already_released"])
+        self.assertEqual(self.control.requests, [])
+        self.assertEqual((manifest_path.read_bytes(), path.read_bytes(), self.path.read_bytes()), before)
+
+    def test_retained_history_does_not_authorize_arbitrary_or_linked_paths(self):
+        manifest_path = self.root / files.LAYOUT_NAME
+        original = json.loads(manifest_path.read_bytes())
+        alias = self.root / "releases/alias"
+        alias.symlink_to(self.support.new, target_is_directory=True)
+        for entry in (str(self.root), str(alias), str(self.root / "releases/missing"),
+                      str(self.layout.worker_release)):
+            with self.subTest(entry=entry):
+                manifest = deepcopy(original)
+                manifest["retained_releases"].append(entry)
+                files._atomic_write(manifest_path, files._json_bytes(manifest))
+                with self.assertRaises((ValueError, PermissionError, FileNotFoundError)):
+                    self.release()
+        self.assertEqual(self.control.requests, [])
+
     def test_retry_requires_exact_saved_failed_status_and_handoff(self):
         path, status = self.failed_status()
         mutations = ({"phase": "starting"}, {"error_code": "other"}, {"retryable": False},

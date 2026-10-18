@@ -313,7 +313,11 @@ def render_service(layout: ExecutionLayout, role: str) -> bytes:
     lines += ["ExecStart=" + " ".join(_unit_word(arg, command=True) for arg in command),
               "Restart=always", "RestartSec=2",
               "TimeoutStopSec=180s" if role == "worker" else "TimeoutStopSec=10s",
-              *(["SendSIGKILL=no"] if role == "worker" else []), "UMask=0077",
+              # The worker owns provider cleanup and exclusive state leases.
+              # Detached user jobs must survive its replacement. control-group
+              # plus SendSIGKILL=no also prevents systemd from relaunching the
+              # worker while any such job remains after the worker exits.
+              *(["KillMode=process", "SendSIGKILL=no"] if role == "worker" else []), "UMask=0077",
               "", "[Install]", "WantedBy=default.target", ""]
     return "\n".join(lines).encode()
 

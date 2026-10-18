@@ -666,11 +666,8 @@ def show(instance: Instance, *, network: dict[str, str] | None = None):
     print()
 
 
-def show_status(instance: Instance, *, network: dict[str, str]) -> None:
-    """Read-only per-instance summary; never print configuration or tokens."""
-    item = describe(instance)
-    print(terminal_color(f"Server ({item['name']}):", "34"))
-    print(f"  Status:   {item['status']}")
+def show_connection_addresses(instance: Instance, item: dict, network: dict[str, str]) -> None:
+    """Use the same binding-aware address order for status and token display."""
     addresses = []
     if item["port"]:
         choices = connection_choices(read_config(instance).get("AGENTSDOCK_AGENT_BIND", "0.0.0.0"),
@@ -683,9 +680,148 @@ def show_status(instance: Instance, *, network: dict[str, str]) -> None:
     print("  Address:  " + (addresses[0] if addresses else "Not configured"))
     for address in addresses[1:]:
         print("            " + address)
+
+
+def show_status(instance: Instance, *, network: dict[str, str]) -> None:
+    """Read-only per-instance summary; never print configuration or tokens."""
+    item = describe(instance)
+    print(terminal_color(f"Server ({item['name']}):", "34"))
+    print(f"  Status:   {item['status']}")
+    show_connection_addresses(instance, item, network)
     print(f"  Version:  {item['version'] or 'unknown'}")
     print(f"  Port:     {item['port'] or 'Not configured'}")
     print()
+
+
+LOG_READ_BYTES = 1024 * 1024
+
+
+def log_line_count(value: str) -> int:
+    if not re.fullmatch(r"[0-9]{1,5}", value) or int(value) > 10000:
+        raise argparse.ArgumentTypeError("Log lines must be between 0 and 10000.")
+    return int(value)
+
+
+def log_sources(instance: Instance, platform: str) -> tuple[list[Path], list[str]]:
+    """Resolve fixed local log sources; never execute configuration or adopt paths."""
+    manifest = instance.runtime / "execution-layout.json"
+    check_path(manifest, instance.home)
+    if manifest.exists():
+        from execution_install import installed_layout
+
+        layout = installed_layout(instance.runtime)
+        if (instance.name != "default" or layout.install_root != instance.runtime
+                or layout.config_root != instance.config or layout.state_root != instance.state
+                or layout.home != instance.home
+                or layout.platform != ("Darwin" if platform == "darwin" else "Linux")):
+            raise ValueError("Execution log layout does not match the selected instance.")
+        return ([instance.state / "execution/logs" / f"{role}.{stream}.log"
+                 for role in ("gateway", "worker") for stream in ("stdout", "stderr")],
+                ["agents-server-gateway.service", "agents-server.service"])
+    validate_binding(instance, platform)
+    return ([instance.logs / "server.log", instance.logs / "server-error.log"],
+            [service_name(instance.name) + ".service"])
+
+
+def read_log_slice(instance: Instance, path: Path, lines: int,
+                   cursor: tuple[int, int, int] | None = None) -> tuple[bytes, tuple[int, int, int] | None, bool]:
+    """Bounded tail on first read, then bounded appended bytes; reopen on rotation.
+
+    Revalidate every open, including followed replacements. No shell tail process,
+    FIFO, symlink or file outside the selected fixed log roots is followed.
+    """
+    check_path(path, instance.home)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        # Remember that viewing has begun so a file created during --follow is
+        # read from its start, including with --lines 0.
+        return b"", cursor or (0, 0, 0), False
+    with os.fdopen(fd, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o022 or info.st_nlink != 1):
+            raise ValueError(f"Unsafe service log: {path.name}")
+        identity = (info.st_dev, info.st_ino)
+        truncated = False
+        if cursor is None:
+            start = max(0, info.st_size - LOG_READ_BYTES) if lines else info.st_size
+            truncated = bool(start and lines)
+        elif cursor[:2] == identity and info.st_size >= cursor[2]:
+            start = cursor[2]
+        else:
+            start = 0  # The file was replaced or truncated, not a new history scan.
+        handle.seek(start)
+        data = handle.read(min(LOG_READ_BYTES, max(0, info.st_size - start)))
+        next_cursor = (*identity, start + len(data))
+        if cursor is None:
+            if truncated:
+                _partial, separator, rest = data.partition(b"\n")
+                data = rest if separator else b""
+            data = b"\n".join(data.split(b"\n")[-lines - (1 if data.endswith(b"\n") else 0):]) if lines else b""
+        return data, next_cursor, truncated
+
+
+def print_log_data(data: bytes) -> None:
+    # Logs are untrusted text; do not execute terminal escape/control sequences.
+    text = data.decode("utf-8", errors="replace")
+    text = "".join(f"\\x{ord(char):02x}" if (ord(char) < 32 and char not in "\n\t")
+                   or 127 <= ord(char) < 160 else char for char in text)
+    print(text, end="" if text.endswith("\n") else "\n", flush=True)
+
+
+def show_logs(instance: Instance, *, lines: int = 100, follow: bool = False,
+              platform: str = sys.platform) -> int:
+    if platform != "darwin" and not platform.startswith("linux"):
+        raise ValueError("Service logs are supported on macOS and Linux only.")
+    paths, units = log_sources(instance, platform)
+    port = read_config(instance).get("AGENTSDOCK_AGENT_PORT", "")
+    print(terminal_color(f"Logs ({instance.name}):", "34"), flush=True)
+    if port.isdigit() and 1 <= int(port) <= 65535:
+        print(f"  Port: {int(port)}", flush=True)
+    print("  Logs may contain private data. Review before sharing.", flush=True)
+    if follow:
+        print("  Following new entries; Ctrl+C stops viewing, not the server.", flush=True)
+    if platform.startswith("linux"):
+        print(f"  Last {lines} journal entries across: {', '.join(units)}\n", flush=True)
+        command = ["journalctl", "--user", "--no-pager", "--output=short-iso", "--lines", str(lines)]
+        for unit in units:
+            command += ["--unit", unit]
+        if follow:
+            command.append("--follow")
+        try:
+            result = subprocess.run(command, env={**os.environ, "SYSTEMD_COLORS": "0",
+                                    "SYSTEMD_PAGERSECURE": "1"}, check=False,
+                                    timeout=None if follow else 15)
+            return result.returncode if result.returncode >= 0 else 130
+        except subprocess.TimeoutExpired:
+            raise ValueError("Reading the service journal timed out. Try again with fewer lines.") from None
+        except KeyboardInterrupt:
+            print("\nStopped viewing logs.", flush=True)
+            return 0
+    print(f"  Last {lines} lines per file (up to 1 MiB per file).\n", flush=True)
+    cursors: dict[Path, tuple[int, int, int] | None] = {path: None for path in paths}
+    first = True
+    try:
+        while True:
+            for path in paths:
+                data, cursor, truncated = read_log_slice(instance, path, lines, cursors[path])
+                cursors[path] = cursor
+                if first or data or truncated:
+                    print(f"==> {path.name} <==", flush=True)
+                    if truncated:
+                        print("[Older bytes omitted: initial read is limited to 1 MiB.]", flush=True)
+                    if data:
+                        print_log_data(data)
+                    elif first:
+                        print("(no log entries to show)", flush=True)
+            if not follow:
+                return 0
+            first = False
+            time.sleep(0.25)
+    except KeyboardInterrupt:
+        print("\nStopped viewing logs.", flush=True)
+        return 0
 
 
 def read_token_menu_key(fd: int) -> str:
@@ -754,9 +890,10 @@ def arrow_token_choice(rows: list[str], fd: int, settings: list) -> int | None:
         sys.stdout.flush()
 
 
-def choose_token_instance(registry: Registry) -> Instance | None:
+def choose_token_instance(registry: Registry, items: list[Instance] | None = None) -> Instance | None:
     """Select by stable instance name; never default or expose unselected tokens."""
-    items = registry.instances()
+    if items is None:
+        items = registry.instances()
     if not items:
         print("No installations found. Run agentsdock setup to create your first server.")
         return None
@@ -805,6 +942,34 @@ def choose_token_instance(registry: Registry) -> Instance | None:
                 raise ValueError("That server is no longer available. Run agentsdock token again. No token was shown.")
             return selected
         print(f"Please enter a number from 1 to {len(items)} or a listed server name (Enter cancels).")
+
+
+def show_instance_token(instance: Instance, *, network: dict[str, str] | None = None) -> int:
+    # Redirected explicit token commands retain their raw, single-token output.
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        print(terminal_color(f"\nServer ({instance.name}):", "34"))
+        show_connection_addresses(instance, describe(instance), network if network is not None else tailscale_status())
+        sys.stdout.flush()  # Keep the URL before the child helper's token/prompt.
+    try:
+        run(["/bin/bash", str(ROOT / "install.sh"), "--instance", instance.name, "--show-token"],
+            env=clean_environment(instance), cwd=ROOT)
+        return 0
+    except subprocess.CalledProcessError as exc:
+        return exc.returncode if exc.returncode > 0 else 1
+
+
+def offer_status_token(registry: Registry, items: list[Instance], network: dict[str, str]) -> int:
+    if not items or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return 0
+    try:
+        answer = input("View a server's URL and access token? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 0
+    if answer not in {"y", "yes"}:
+        return 0
+    selected = choose_token_instance(registry, items)
+    return show_instance_token(selected, network=network) if selected is not None else 0
 
 
 def terminal_color(text: str, code: str) -> str:
@@ -952,13 +1117,19 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="Independent AgentsServer instances for the current OS user. Defaults to list.")
     commands = result.add_subparsers(dest="command")
     commands.add_parser("list")
-    commands.add_parser("token", help="Choose an existing server and display only its access token")
+    token = commands.add_parser("token", help="Choose an existing server and display its URL and access token")
+    token.add_argument("name", nargs="?", type=instance_name)
     info = commands.add_parser("info")
     info.add_argument("name", type=instance_name)
     pairing = commands.add_parser("_pair-info", help=argparse.SUPPRESS)
     pairing.add_argument("name", type=instance_name)
     status = commands.add_parser("status", help="Show readable details for all instances or one name")
     status.add_argument("name", nargs="?", type=instance_name)
+    logs = commands.add_parser("logs", help="Read recent local service logs; use --follow for live output")
+    logs.add_argument("name", nargs="?", type=instance_name)
+    logs.add_argument("--instance", dest="named", type=instance_name)
+    logs.add_argument("-n", "--lines", type=log_line_count, default=100)
+    logs.add_argument("-f", "--follow", action="store_true")
     new = commands.add_parser("new")
     new.add_argument("--name", type=instance_name)
     new.add_argument("--port", type=int)
@@ -1001,16 +1172,24 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("Unknown instance. Use agentsdock list.")
             print(json.dumps(pairing_info(selected)))
             return 0
+        if args.command == "logs":
+            if args.name and args.named:
+                raise ValueError("Select the log instance once: NAME or --instance NAME.")
+            name = args.name or args.named or "default"
+            selected = next((item for item in registry.instances() if item.name == name), None)
+            if selected is None:
+                raise ValueError(f"Unknown instance {name!r}. Use agentsdock list to find its name.")
+            return show_logs(selected, lines=args.lines, follow=args.follow)
         if args.command == "token":
-            selected = choose_token_instance(registry)
+            if args.name:
+                # The installer retains read-only legacy token discovery even
+                # when an old default install is absent from the new registry.
+                selected = Instance(args.name, registry.home)
+            else:
+                selected = choose_token_instance(registry)
             if selected is None:
                 return 0
-            try:
-                run(["/bin/bash", str(ROOT / "install.sh"), "--instance", selected.name, "--show-token"],
-                    env=clean_environment(selected), cwd=ROOT)
-                return 0
-            except subprocess.CalledProcessError as exc:
-                return exc.returncode if exc.returncode > 0 else 1
+            return show_instance_token(selected)
         if args.command in {None, "list", "info", "status"}:
             items = registry.instances()
             if args.command in {"info", "status"} and args.name:
@@ -1025,6 +1204,7 @@ def main(argv: list[str] | None = None) -> int:
                     show_status(item, network=network)
                 if not items:
                     print("No installations found. Run agentsdock setup to create your first server.")
+                return offer_status_token(registry, items, network)
             else:
                 network = tailscale_status() if items else None
                 print("NAME                 STATUS     PORT")

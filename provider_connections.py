@@ -28,7 +28,7 @@ MAX_BODY_BYTES = 16 * 1024
 # Reasoning can consume output tokens before the short visible check answer.
 # Keep this explicit probe bounded and single-shot, including for such models.
 MODEL_CHECK_MAX_OUTPUT_TOKENS = 256
-PROTOCOLS = {"claude": {"anthropic"}, "opencode": {"anthropic", "chat_completions", "responses"}, "cursor": {"cursor"}}
+PROTOCOLS = {"claude": {"anthropic"}, "opencode": {"anthropic", "chat_completions", "responses"}, "cursor": {"cursor"}, "gemini": {"gemini"}}
 RESULTS = {"verified", "authentication_failed", "rate_limited", "unsupported", "connection_failed", "invalid_response", "model_required", "cli_update_required"}
 
 
@@ -52,9 +52,11 @@ def selection(backend: str, value: object) -> dict:
         from cursor_api_key import ENDPOINT
         if value["base_url"] != ENDPOINT or value["protocol"] != "cursor" or value["auth_header"] != "bearer":
             raise HTTPException(400, "Cursor API keys use Cursor's official service only.")
-    if not isinstance(value["protocol"], str) or not isinstance(value["auth_header"], str) or value["protocol"] not in PROTOCOLS[backend] or value["auth_header"] not in {"bearer", "x-api-key"}:
+    if not isinstance(value["protocol"], str) or not isinstance(value["auth_header"], str) or value["protocol"] not in PROTOCOLS[backend] or value["auth_header"] not in {"bearer", "x-api-key", "x-goog-api-key"}:
         raise HTTPException(400, "Unsupported API protocol or authentication header.")
-    if value["protocol"] != "anthropic" and value["auth_header"] != "bearer":
+    if (value["protocol"] == "gemini") != (value["auth_header"] == "x-goog-api-key"):
+        raise HTTPException(400, "Gemini API requires x-goog-api-key authentication.")
+    if value["protocol"] not in {"anthropic", "gemini"} and value["auth_header"] != "bearer":
         raise HTTPException(400, "This API protocol requires bearer authentication.")
     selected = validate_selection({"base_url": value["base_url"], "api_key": value["api_key"],
                                    "model": None if value["model"] == "" else value["model"]})
@@ -207,11 +209,15 @@ class ConnectionStore:
         try:
             value = self.for_session(session) if session else self.read(backend)
             configured = value.get("configured") is True and value.get("last_result") == "verified"
+            model = value.get("model")
+            if configured and backend == "gemini":
+                from gemini_api import default_model
+                model = default_model(value)
             if summary:
                 # Large endpoint inventories belong to detail/settings reads,
                 # not repeated once for every row of a session-list response.
                 return {"configured": configured, "available": configured and installed,
-                        "model": value.get("model"), "base_url": value.get("base_url")}
+                        "model": model, "base_url": value.get("base_url")}
             models = []
             if configured:
                 cache_key = (backend, value["revision"])
@@ -225,12 +231,14 @@ class ConnectionStore:
                         self.catalog_cache.pop(next(iter(self.catalog_cache)))
                 if backend == "cursor" and not models:
                     models = [{"value": "auto", "label": "Auto"}]
-                model = value.get("model")
+                if backend == "gemini":
+                    from gemini_api import model_options
+                    models = model_options(value, models)
                 if model and not any(item["value"] == model for item in models):
                     models = [{"value": model, "label": model}, *models]
             return {"configured": configured, "available": configured and installed,
-                    "models": models, "efforts": [], "default_model": value.get("model"),
-                    "model": value.get("model"), "default_effort": None, "base_url": value.get("base_url")}
+                    "models": models, "efforts": [], "default_model": model,
+                    "model": model, "default_effort": None, "base_url": value.get("base_url")}
         except HTTPException:
             return {"configured": False, "available": False, "models": [], "efforts": [], "model": None, "base_url": None}
 
@@ -317,6 +325,9 @@ def require_model(value: dict) -> str:
 
 
 def discover_models(value: dict) -> list[dict]:
+    if value["protocol"] == "gemini":
+        from gemini_api import catalog
+        return catalog(value)["models"]
     return endpoint_model_catalog(value, protocol=value["protocol"])["models"]
 
 
@@ -355,6 +366,9 @@ def native_credentials_present(backend: str, diagnostic: dict) -> bool:
 
 async def probe_credentials(selected: dict) -> str:
     """Read-only key check. Public model lists alone never verify a credential."""
+    if selected.get("protocol") == "gemini":
+        from gemini_api import probe as gemini_probe
+        return await gemini_probe({**selected, "model": None})
     base = selected["base_url"]
     protocol = selected.get("protocol", "responses")
     headers = {"Accept": "application/json", "anthropic-version": "2023-06-01"}
@@ -397,6 +411,9 @@ async def probe_credentials(selected: dict) -> str:
 
 async def probe(selected: dict) -> str:
     """One small, explicit model request; no tools/history, redirects or retries."""
+    if selected.get("protocol") == "gemini":
+        from gemini_api import probe as gemini_probe
+        return await gemini_probe(selected)
     if not selected.get("model"):
         return await probe_credentials(selected)
     protocol = selected["protocol"]
@@ -546,7 +563,7 @@ def create_router(*, authorize, store: ConnectionStore, check=probe, account=nat
         return JSONResponse(value, headers={"Cache-Control": "no-store"})
 
     async def model_selection(backend, session_id=None):
-        if backend not in {"codex", "claude", "opencode", "cursor"}:
+        if backend not in {"codex", "claude", "opencode", "cursor", "gemini"}:
             raise HTTPException(400, "Unsupported custom endpoint.")
         session = session_lookup(session_id) if session_id and session_lookup else None
         if session_id and (not session or session.get("backend") != backend):
@@ -567,6 +584,10 @@ def create_router(*, authorize, store: ConnectionStore, check=probe, account=nat
         if backend == "cursor":
             if cursor_catalog is None: raise HTTPException(501, "Cursor API keys are unavailable.")
             result = await cursor_catalog(selected)
+        elif backend == "gemini":
+            from gemini_api import catalog, model_options
+            result = await asyncio.to_thread(catalog, selected)
+            result["models"] = model_options(selected, result["models"])
         else:
             result = await asyncio.to_thread(endpoint_model_catalog, selected, protocol=selected.get("protocol", "responses"))
         # Fence a settings read that raced replacement/forget. Session bindings
@@ -581,8 +602,12 @@ def create_router(*, authorize, store: ConnectionStore, check=probe, account=nat
             with store.lock:
                 store.catalog_cache[(backend, selected["revision"])] = (time.monotonic(), result["models"])
                 if len(store.catalog_cache) > 32: store.catalog_cache.pop(next(iter(store.catalog_cache)))
+        model = selected.get("model")
+        if backend == "gemini":
+            from gemini_api import default_model
+            model = default_model(selected)
         return reply({"backend": backend, "revision": selected.get("credential_id") if backend == "codex" else selected["revision"],
-                      "models": result["models"], "default_model": selected.get("model"), "discovery_status": result["discovery_status"]})
+                      "models": result["models"], "default_model": model, "discovery_status": result["discovery_status"]})
 
     @router.put("/api/admin/provider-models/{backend}")
     async def default_model(backend: str, request: Request):
@@ -611,7 +636,11 @@ def create_router(*, authorize, store: ConnectionStore, check=probe, account=nat
                     saved = store.write(backend, current["revision"], {**value, "model": model, "expected_revision": current["revision"]}, current["last_result"], checked_at=current["checked_at"])
                     cached = store.catalog_cache.get((backend, current["revision"]))
                     if cached: store.catalog_cache[(backend, saved["revision"])] = cached
-                    return {"backend": backend, "revision": saved["revision"], "default_model": saved["model"]}
+                    effective_model = saved["model"]
+                    if backend == "gemini":
+                        from gemini_api import default_model as gemini_default_model
+                        effective_model = gemini_default_model(saved)
+                    return {"backend": backend, "revision": saved["revision"], "default_model": effective_model}
             return reply(await asyncio.to_thread(save_model))
 
     @router.get("/api/admin/provider-accounts/{backend}")

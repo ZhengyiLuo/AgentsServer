@@ -4176,6 +4176,80 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
 
 
 class StartupQueueRecoveryAdmissionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_completed_timeout_is_failed_and_repeated_admission_stays_closed(self):
+        async def fail():
+            raise TimeoutError("private diagnostic")
+        task = asyncio.create_task(fail())
+        await asyncio.gather(task, return_exceptions=True)
+        with patch.object(agent_server, "QUEUE_RECOVERY_TASK", task):
+            self.assertEqual(agent_server.queue_recovery_readiness()["state"], "failed")
+            for _ in range(3):
+                with self.assertRaises(agent_server.TransientAdmissionWait) as raised:
+                    await agent_server.wait_for_queue_recovery_admission()
+                self.assertIn("did not complete", raised.exception.detail)
+                self.assertNotIn("private diagnostic", raised.exception.detail)
+
+    async def test_request_cancellation_does_not_cancel_recovery(self):
+        released = asyncio.Event()
+        task = asyncio.create_task(released.wait())
+        try:
+            with patch.object(agent_server, "QUEUE_RECOVERY_TASK", task):
+                self.assertEqual(agent_server.queue_recovery_readiness()["state"], "recovering")
+                request = asyncio.create_task(agent_server.wait_for_queue_recovery_admission())
+                await asyncio.sleep(0)
+                request.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await request
+                self.assertFalse(task.done())
+                released.set()
+                await task
+                await agent_server.wait_for_queue_recovery_admission()
+                self.assertTrue(agent_server.queue_recovery_readiness()["ready"])
+        finally:
+            released.set()
+            await task
+
+    async def test_cancelled_recovery_is_failed_except_during_shutdown(self):
+        task = asyncio.create_task(asyncio.sleep(10))
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        with patch.object(agent_server, "QUEUE_RECOVERY_TASK", task):
+            self.assertEqual(agent_server.queue_recovery_readiness()["state"], "failed")
+            with patch.object(agent_server, "SERVER_SHUTTING_DOWN", False):
+                with self.assertRaises(agent_server.TransientAdmissionWait):
+                    await agent_server.wait_for_queue_recovery_admission()
+            with patch.object(agent_server, "SERVER_SHUTTING_DOWN", True):
+                with self.assertRaises(asyncio.CancelledError):
+                    await agent_server.wait_for_queue_recovery_admission()
+
+    async def test_many_waiting_requests_cannot_cancel_or_outlive_failed_recovery(self):
+        release = asyncio.Event()
+        async def recovery_work():
+            await release.wait()
+            raise TimeoutError("scan failed after partial work")
+        recovery = asyncio.create_task(recovery_work())
+        try:
+            with patch.object(agent_server, "QUEUE_RECOVERY_TASK", recovery), patch.object(
+                    agent_server, "QUEUE_RECOVERY_ADMISSION_WAIT_SECONDS", 0.01):
+                pending = [asyncio.create_task(agent_server.wait_for_queue_recovery_admission()) for _ in range(12)]
+                responses = await asyncio.gather(*pending, return_exceptions=True)
+                self.assertTrue(all(isinstance(r, agent_server.TransientAdmissionWait) and "in progress" in r.detail for r in responses))
+                self.assertFalse(recovery.done())
+                release.set()
+                await asyncio.gather(recovery, return_exceptions=True)
+                self.assertEqual(agent_server.queue_recovery_readiness()["state"], "failed")
+                with self.assertRaises(agent_server.TransientAdmissionWait) as raised:
+                    await agent_server.wait_for_queue_recovery_admission()
+                self.assertIn("did not complete", raised.exception.detail)
+        finally:
+            release.set()
+            await asyncio.gather(recovery, return_exceptions=True)
+
+    async def test_recovery_owner_can_enqueue_without_waiting_on_itself(self):
+        with patch.object(agent_server, "QUEUE_RECOVERY_TASK", asyncio.current_task()):
+            async with asyncio.timeout(1):
+                await agent_server.wait_for_queue_recovery_admission()
+
     async def test_new_submission_cannot_leapfrog_undiscovered_durable_row(
         self,
     ) -> None:

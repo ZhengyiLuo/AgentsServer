@@ -126,6 +126,7 @@ from provider_commands import (
     claude_provider_command_inventory,
     codex_provider_command_inventory,
     empty_provider_command_inventory,
+    gemini_provider_skill_inventory,
     opencode_provider_skill_inventory,
     validate_opencode_provider_skill_record,
 )
@@ -208,7 +209,8 @@ BACKEND_CLAUDE = "claude"
 BACKEND_CODEX = "codex"
 BACKEND_CURSOR = "cursor"
 BACKEND_OPENCODE = "opencode"
-VALID_BACKENDS = {BACKEND_CLAUDE, BACKEND_CODEX, BACKEND_CURSOR, BACKEND_OPENCODE}
+BACKEND_GEMINI = "gemini"
+VALID_BACKENDS = {BACKEND_CLAUDE, BACKEND_CODEX, BACKEND_CURSOR, BACKEND_OPENCODE, BACKEND_GEMINI}
 CODEX_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
 CODEX_EFFORT_ALIASES = {
     "extra high": "xhigh",
@@ -662,6 +664,7 @@ def codex_effective_thread_config(sess: dict[str, Any]) -> dict[str, Any]:
 CODEX_GOALS_ENABLED = read_codex_goals_enabled()
 
 CODEX_FALLBACK_MODELS = (
+    ("gpt-6-luna", "GPT-6-Luna"),
     ("gpt-5.6-sol", "GPT-5.6-Sol"),
     ("gpt-5.6-terra", "GPT-5.6-Terra"),
     ("gpt-5.6-luna", "GPT-5.6-Luna"),
@@ -672,6 +675,7 @@ CODEX_FALLBACK_MODELS = (
 CODEX_FALLBACK_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 CODEX_EFFORT_ORDER = ("none", "minimal", *CODEX_FALLBACK_EFFORTS)
 CODEX_FALLBACK_MODEL_EFFORTS = {
+    "gpt-6-luna": ("low", "medium", "high", "xhigh", "max"),
     "gpt-5.6-sol": ("low", "medium", "high", "xhigh", "max", "ultra"),
     "gpt-5.6-terra": ("low", "medium", "high", "xhigh", "max", "ultra"),
     "gpt-5.6-luna": ("low", "medium", "high", "xhigh", "max"),
@@ -1301,6 +1305,7 @@ MAX_LOCAL_SESSION_SCAN_FILES = 10_000
 # Retained text/metadata budget. Opaque native media/tool bytes are streamed.
 # Private timeline/index readers still use this as their raw record bound.
 MAX_LOCAL_TRANSCRIPT_LINE_BYTES = 32 * 1024 * 1024
+HISTORY_SYNC_BATCH_BYTES = 16 * 1024 * 1024
 MAX_LOCAL_TRANSCRIPT_SCAN_LINES = 250_000
 MAX_CODEX_SESSION_INDEX_BYTES = 16 * 1024 * 1024
 MAX_CODEX_SESSION_INDEX_LINES = 100_000
@@ -6317,6 +6322,7 @@ class CreateSessionRequest(BaseModel):
     # Same three names as Cursor, but "default" means OpenCode's own
     # permissions, which do allow shell.
     opencode_permission_mode: Literal["default", "full_access", "plan"] | None = None
+    gemini_permission_mode: Literal["default", "autoEdit", "yolo", "plan"] | None = None
 
 
 MAX_BULK_IMPORT_ITEMS = 25
@@ -6328,9 +6334,10 @@ PROVIDER_SESSION_IDENTIFIER_RE = re.compile(
 
 class BulkImportSessionItem(BaseModel):
     provider_session_id: str = Field(min_length=1, max_length=256)
-    backend: Literal["claude", "codex", "cursor"]
+    backend: Literal["claude", "codex", "cursor", "gemini"]
     cwd: str | None = Field(default=None, max_length=MAX_WORKSPACE_PATH_CHARS)
     title: str | None = Field(default=None, max_length=MAX_LOCAL_SESSION_LABEL_CHARS)
+    provider_connection: Literal["custom"] | None = None
 
     @field_validator("provider_session_id")
     @classmethod
@@ -6354,6 +6361,7 @@ class BulkImportSessionsRequest(BaseModel):
 
 
 class UpdateSessionRequest(BaseModel):
+    gemini_connect_api: bool | None = Field(default=None, strict=True)
     title: str | None = None
     auto_title_enabled: bool | None = None
     folder: str | None = None
@@ -6382,6 +6390,7 @@ class UpdateSessionRequest(BaseModel):
     provider_jobs_access: Literal["full", "read_only", "blocked"] | None = None
     cursor_permission_mode: Literal["default", "full_access", "plan"] | None = None
     opencode_permission_mode: Literal["default", "full_access", "plan"] | None = None
+    gemini_permission_mode: Literal["default", "autoEdit", "yolo", "plan"] | None = None
 
 
 SESSION_LIFECYCLE_UPDATE_FIELDS = frozenset({
@@ -6400,6 +6409,7 @@ SESSION_LIFECYCLE_UPDATE_FIELDS = frozenset({
     "provider_jobs_access",
     "cursor_permission_mode",
     "opencode_permission_mode",
+    "gemini_permission_mode",
     "archived",
 })
 
@@ -6549,11 +6559,24 @@ class EmergencyAlertRequest(BaseModel):
 class AcknowledgeEmergencyRequest(BaseModel):
     model_config = {"extra": "forbid"}
 
-    expected_alert_id: str = Field(
+    expected_alert_id: str | None = Field(
+        default=None,
         min_length=8,
         max_length=80,
         pattern=r"^emergency_[0-9a-f]{32}$",
     )
+    through_alert_id: str | None = Field(
+        default=None,
+        min_length=8,
+        max_length=80,
+        pattern=r"^emergency_[0-9a-f]{32}$",
+    )
+
+    @model_validator(mode="after")
+    def exactly_one_alert_boundary(self):
+        if (self.expected_alert_id is None) == (self.through_alert_id is None):
+            raise ValueError("provide exactly one of expected_alert_id or through_alert_id")
+        return self
 
 
 class ChatReference(BaseModel):
@@ -6723,6 +6746,7 @@ class ProviderCommandSelectionUnavailable(HTTPException):
 
 class TurnRequest(BaseModel):
     prompt: str
+    client_request_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{8,128}$")
     # Server-derived attribution only; the guest router accepts neither field
     # from its JSON body and never accepts arbitrary TurnRequest controls.
     shared_chat_id: str | None = Field(default=None, pattern=r"^interactive_[a-f0-9]{32}$")
@@ -7035,6 +7059,10 @@ def normalize_runtime_effort(backend: str, effort: Any, *, strict: bool = False)
     clean = str(effort or "").strip().lower()
     if not clean:
         return None
+    if backend == BACKEND_GEMINI:
+        if strict:
+            raise HTTPException(400, "Gemini reasoning settings are managed by its native model.")
+        return None
     if str(backend or "").strip().lower() != BACKEND_CODEX:
         return clean
 
@@ -7180,7 +7208,7 @@ def preview_session_runtime_update(
 
     current_connection = sess.get("provider_connection") or "default"
     connection = (patch.get("provider_connection") or "default") if "provider_connection" in patch else "default" if backend_changed else current_connection
-    if connection not in {"default", "custom"} or connection == "custom" and prospective_backend not in {BACKEND_CLAUDE, BACKEND_OPENCODE, BACKEND_CURSOR}:
+    if connection not in {"default", "custom"} or connection == "custom" and prospective_backend not in {BACKEND_CLAUDE, BACKEND_OPENCODE, BACKEND_CURSOR, BACKEND_GEMINI}:
         raise HTTPException(400, "This backend does not support that API connection.")
     connection_changed = current_connection != connection
     if connection_changed and session_backend_locked(sess):
@@ -7192,11 +7220,21 @@ def preview_session_runtime_update(
         if "model" in patch
         else None if backend_changed or provider_changed else sess.get("model")
     )
+    previous_model = prospective_model
+    if prospective_backend == BACKEND_CODEX and prospective_provider == "default" and prospective_model:
+        prospective_model = codex_available_model(str(prospective_model))
     prospective_effort = (
         patch.get("effort")
         if "effort" in patch
         else None if backend_changed or provider_changed else sess.get("effort")
     )
+    if prospective_model != previous_model and prospective_effort:
+        # Saved/queued settings may contain a level unsupported by the new
+        # model. Validate the vocabulary, then preserve the nearest level.
+        prospective_effort = clamp_codex_runtime_effort(
+            str(prospective_model),
+            normalize_runtime_effort(BACKEND_CODEX, prospective_effort, strict="effort" in patch),
+        )
     normalized_effort = (
         normalize_runtime_effort(prospective_backend, prospective_effort, strict="effort" in patch)
         if prospective_provider == "custom" else
@@ -7215,7 +7253,7 @@ def preview_session_runtime_update(
     preview["model"] = prospective_model
     preview["effort"] = normalized_effort
     preview["provider_connection"] = connection
-    if connection_changed or connection == "default":
+    if backend_changed or connection_changed or connection == "default":
         preview.pop("provider_connection_revision", None)
     if connection == "custom":
         selected_connection = PROVIDER_CONNECTION_STORE.bind(preview)
@@ -7237,6 +7275,7 @@ def preview_session_runtime_update(
             BACKEND_CODEX: "codex_thread_id",
             BACKEND_CURSOR: "cursor_session_id",
             BACKEND_OPENCODE: "opencode_session_id",
+            BACKEND_GEMINI: "gemini_session_id",
         }[prospective_backend]
         preview["session_id"] = sess.get(provider_id_field)
     return preview
@@ -9628,35 +9667,66 @@ def normalized_emergency_alert(value: Any) -> dict[str, Any] | None:
     }
 
 
-def reversed_jsonl_events(path: Path) -> Iterator[dict[str, Any]]:
-    """Yield durable JSONL records newest-first without a lossy line cap."""
+def reversed_jsonl_events(
+    path: Path, *, retained_fields: frozenset[str] | None = None,
+) -> Iterator[dict[str, Any]]:
+    """Read newest-first in linear work, without accumulating a giant line.
+
+    Find offsets in fixed blocks. Emergency readers only retain lifecycle
+    fields; unrelated text/media is validated and skipped in bounded chunks.
+    Other consumers retain the full event contract.
+    """
 
     if not path.exists():
         return
     chunk_size = 256 * 1024
     with path.open("rb") as source:
         source.seek(0, os.SEEK_END)
-        position = source.tell()
-        remainder = b""
+        position = end = source.tell()
+
+        def read_event(start: int, stop: int) -> dict[str, Any] | None:
+            if stop <= start:
+                return None
+            source.seek(start)
+            if retained_fields is not None:
+                for event, _, _ in jsonl_records(
+                    source, end=stop, project=False, require_newline=False,
+                    retained_fields=retained_fields, deadline=float("inf"),
+                    # This is a server-owned journal, not a native import.
+                    # A tool payload can legitimately contain many values.
+                    # Keep retained metadata bounded; scan omitted values in
+                    # linear time without the importer's value-count ceiling.
+                    max_nodes=None, max_depth=512,
+                ):
+                    return event
+                return None
+            with suppress(ValueError, UnicodeError):
+                event = json.loads(source.read(stop - start).decode("utf-8", "replace"))
+                if isinstance(event, dict):
+                    return event
+            return None
+
         while position > 0:
             read_size = min(chunk_size, position)
             position -= read_size
             source.seek(position)
-            block = source.read(read_size) + remainder
-            lines = block.split(b"\n")
-            remainder = lines[0]
-            for raw_line in reversed(lines[1:]):
-                if not raw_line.strip():
-                    continue
-                with suppress(Exception):
-                    event = json.loads(raw_line.decode("utf-8", "replace"))
-                    if isinstance(event, dict):
-                        yield event
-        if remainder.strip():
-            with suppress(Exception):
-                event = json.loads(remainder.decode("utf-8", "replace"))
-                if isinstance(event, dict):
+            block = source.read(read_size)
+            offset = len(block)
+            while (offset := block.rfind(b"\n", 0, offset)) >= 0:
+                start = position + offset + 1
+                event = read_event(start, end)
+                if event is not None:
                     yield event
+                end = start - 1
+        event = read_event(0, end)
+        if event is not None:
+            yield event
+
+
+EMERGENCY_EVENT_FIELDS = frozenset({
+    "id", "seq", "type", "ts", "session_id", "run_id",
+    "emergency_alert", "emergency_alert_id", "emergency_request_id", "emergency_request_digest",
+})
 
 
 def emergency_lifecycle_events_after(
@@ -9667,7 +9737,9 @@ def emergency_lifecycle_events_after(
 
     newest_seq = max(0, int(after_seq or 0))
     events: list[dict[str, Any]] = []
-    for event in reversed_jsonl_events(events_path(session_id)):
+    for event in reversed_jsonl_events(
+        events_path(session_id), retained_fields=EMERGENCY_EVENT_FIELDS,
+    ):
         seq = int(event.get("seq") or 0)
         newest_seq = max(newest_seq, seq)
         if seq <= after_seq:
@@ -10158,6 +10230,9 @@ class SessionStore:
             if reconcile_session_emergency_alerts(session_id, sess):
                 runtime_changed = True
             backend = str(sess.get("backend") or DEFAULT_BACKEND).strip().lower()
+            if not sess.get("gemini_permission_mode"):
+                sess["gemini_permission_mode"] = "default"
+                runtime_changed = True
             claude_permission_mode = effective_claude_permission_mode(sess)
             if sess.get("claude_permission_mode") != claude_permission_mode:
                 sess["claude_permission_mode"] = claude_permission_mode
@@ -10522,13 +10597,25 @@ class SessionStore:
         if initializing_fork and parent_id and req.provider_connection == "custom":
             parent = self.sessions.get(parent_id) or {}
             runtime_source.update({name: parent.get(name) for name in ("provider_connection", "provider_connection_revision")})
-        if req.provider_connection == "custom" and not initializing_fork and any((req.provider_session_id, req.session_id, req.claude_session_id, req.opencode_session_id)):
+        if backend != BACKEND_GEMINI and req.provider_connection == "custom" and not initializing_fork and any((req.provider_session_id, req.session_id, req.claude_session_id, req.opencode_session_id)):
             raise HTTPException(409, "Import native conversations with their native login. Create a new chat for a custom API.")
         runtime = preview_session_runtime_update(runtime_source, {
             "codex_provider": req.codex_provider, "provider_connection": req.provider_connection, "model": req.model, "effort": req.effort,
         })
         model, effort = runtime["model"], runtime["effort"]
         session_cwd = req.cwd or DEFAULT_CWD
+        if backend == BACKEND_GEMINI:
+            if req.provider_session_id or req.session_id or req.import_history:
+                from gemini_import import initial_history
+                from gemini_acp_client import GeminiProtocolError
+                try:
+                    await asyncio.to_thread(initial_history, sys.modules[__name__], runner_env(),
+                        req.provider_session_id or req.session_id or "", str(Path(session_cwd).expanduser().resolve()))
+                except (GeminiProtocolError, OSError, ValueError):
+                    raise HTTPException(400, "Gemini history does not uniquely match this session ID and workspace.") from None
+            if not Path(session_cwd).expanduser().is_dir():
+                raise HTTPException(400, "Gemini requires an existing workspace directory.")
+            session_cwd = str(Path(session_cwd).expanduser().resolve())
         if backend == BACKEND_OPENCODE:
             session_cwd = validated_opencode_cwd(
                 session_cwd,
@@ -10565,6 +10652,7 @@ class SessionStore:
             claude_session_id if backend == BACKEND_CLAUDE
             else codex_thread_id if backend == BACKEND_CODEX
             else cursor_session_id if backend == BACKEND_CURSOR
+            else provider_id if backend == BACKEND_GEMINI
             else opencode_session_id
         )
         # A Claude chat can park an inactive Codex identity for later backend
@@ -10631,6 +10719,9 @@ class SessionStore:
             "claude_session_id": claude_session_id,
             "codex_thread_id": codex_thread_id,
             "cursor_session_id": cursor_session_id,
+            "gemini_session_id": provider_id if backend == BACKEND_GEMINI else None,
+            "gemini_native_history": bool(backend == BACKEND_GEMINI and provider_id),
+            "gemini_session_cwd": session_cwd if backend == BACKEND_GEMINI and provider_id else None,
             "opencode_session_id": opencode_session_id,
             "opencode_session_cwd": (
                 session_cwd
@@ -10650,6 +10741,7 @@ class SessionStore:
             "opencode_permission_mode": (
                 req.opencode_permission_mode or OPENCODE_DEFAULT_PERMISSION_MODE
             ),
+            "gemini_permission_mode": req.gemini_permission_mode or "default",
             "codex_approval_policy": (
                 req.codex_approval_policy or CODEX_DEFAULT_APPROVAL_POLICY
             ),
@@ -10846,6 +10938,7 @@ class SessionStore:
             if patch.get("auto_title_enabled") is not None:
                 sess["auto_title_enabled"] = bool(patch["auto_title_enabled"])
             for key, default, allowed in (
+                ("gemini_permission_mode", "default", {"default", "autoEdit", "yolo", "plan"}),
                 (
                     "claude_permission_mode",
                     CLAUDE_DEFAULT_PERMISSION_MODE,
@@ -10921,14 +11014,15 @@ class SessionStore:
                 sess["subagent_limit"] = patch["subagent_limit"]
             if "system_prompt" in patch:
                 sess["system_prompt"] = clean_session_system_prompt(patch["system_prompt"])
+            if {"cwd", "backend", "provider_connection"}.intersection(patch):
+                sess.pop("gemini_permission_modes", None)
             for key in ("model", "effort"):
                 if key in patch:
                     value = patch[key]
                     if key == "effort":
                         sess[key] = normalized_prospective_effort
                     else:
-                        clean = str(value).strip() if value is not None else ""
-                        sess[key] = clean or None
+                        sess[key] = runtime_preview["model"]
             if reset_implicit_incompatible_effort:
                 # Older clients update the model and effort in separate
                 # requests. Let that model change succeed while clearing a
@@ -11048,7 +11142,8 @@ class SessionStore:
             }
             sess.update(title=title, _title_source=source, _title_auto_value=title)
             if source == "prompt" and isinstance(prompt_seed, str):
-                sess["_title_seed"] = prompt_seed[:1600]
+                sess["_title_seed"] = (title_generation.gemini_title_seed(prompt_seed)
+                    if sess.get("backend") == BACKEND_GEMINI else prompt_seed[:1600])
             elif source in {"provider", "generated"}:
                 sess.pop("_title_seed", None)
             sess["updated_at"] = now_iso()
@@ -11185,9 +11280,18 @@ class SessionStore:
         sid: str,
         event: dict[str, Any],
     ) -> dict[str, Any]:
+        # Disk replay must not hold the global sessions lock: other chats and
+        # health/recovery controls must remain usable during a large scan.
+        snapshot = self.sessions.get(sid)
+        if not snapshot:
+            raise HTTPException(status_code=404, detail="session not found")
+        scan_after = max(0, int(snapshot.get("_emergency_reconciled_through_seq") or 0))
+        lifecycle_events, reconciled_through = await asyncio.to_thread(
+            emergency_lifecycle_events_after, sid, scan_after,
+        )
         async with self._lock:
             sess = self.sessions.get(sid)
-            if not sess:
+            if not sess or sess is not snapshot:
                 raise HTTPException(status_code=404, detail="session not found")
             previous_present = "_emergency_alerts" in sess
             previous = sess.get("_emergency_alerts")
@@ -11197,11 +11301,10 @@ class SessionStore:
                 0,
                 int(sess.get("_emergency_reconciled_through_seq") or 0),
             )
-            lifecycle_events, reconciled_through = await asyncio.to_thread(
-                emergency_lifecycle_events_after,
-                sid,
-                previous_reconciled_through,
-            )
+            # A concurrent projection may have advanced while we read. Never
+            # replay an older raise over a newer acknowledgement.
+            lifecycle_events = [candidate for candidate in lifecycle_events
+                                if int(candidate.get("seq") or 0) > previous_reconciled_through]
             event_seq = int(event.get("seq") or 0)
             if (
                 event_seq > previous_reconciled_through
@@ -11372,6 +11475,9 @@ class SessionStore:
                     sess.pop("cursor_instruction_version", None)
             elif backend == BACKEND_OPENCODE:
                 sess["opencode_session_id"] = provider_id
+            elif backend == BACKEND_GEMINI:
+                sess["gemini_session_id"] = provider_id
+                sess["gemini_session_cwd"] = cwd
             if backend == BACKEND_CLAUDE and cwd:
                 sess["claude_session_cwd"] = cwd
             if backend == BACKEND_OPENCODE and cwd:
@@ -13064,6 +13170,9 @@ class JobStore:
                 client_capabilities=[
                     ASYNC_ROUTE_V1_CLIENT_CAPABILITY,
                     *([CROSS_CHAT_HANDOFFS_V2_CLIENT_CAPABILITY] if chat_references else []),
+                    *([GEMINI_CLIENT_CAPABILITY] if (
+                        job.get("backend") or (parent_session or {}).get("backend")
+                    ) == BACKEND_GEMINI else []),
                 ],
                 chat_references=chat_references,
                 team_references=team_references,
@@ -14083,6 +14192,8 @@ RUN_NOW_TURNS: dict[str, dict[str, Any]] = {}
 # that the scan has not discovered yet. A completed failed task intentionally
 # remains installed and keeps admission fail-closed.
 QUEUE_RECOVERY_TASK: asyncio.Task[tuple[int, int]] | None = None
+QUEUE_RECOVERY_READY: set[str] = set()
+QUEUE_CHECKPOINT_DIRTY: set[str] = set()
 QUEUE_RECOVERY_ADMISSION_WAIT_SECONDS = 2.0
 STEERING_SESSIONS: set[str] = set()
 # A non-native Force Send keeps the steering fence while the interrupted
@@ -16543,6 +16654,7 @@ HANDOFF_DIGEST_FINALIZING: set[str] = set()
 RUNTIME_DIAGNOSTICS: dict[str, dict[str, Any]] = {}
 RUNTIME_DIAGNOSTICS_LOCK = threading.RLock()
 RUNTIME_DIAGNOSTIC_GENERATIONS: dict[str, int] = {}
+CODEX_MODEL_MIGRATION_TARGET = "gpt-6-luna"
 ABANDONED_FORK_PROVIDER_THREADS: set[str] = set()
 ABANDONED_FORK_PROVIDER_THREADS_LOCK = asyncio.Lock()
 
@@ -17347,6 +17459,7 @@ def should_bump_session_updated_at(event_type: str, event: dict[str, Any]) -> bo
 
 
 async def update_session_event_metadata(session_id: str, event: dict[str, Any]) -> None:
+    QUEUE_CHECKPOINT_DIRTY.add(session_id)
     sess = STORE.sessions.get(session_id)
     if not sess:
         return
@@ -17474,7 +17587,22 @@ async def update_session_event_metadata(session_id: str, event: dict[str, Any]) 
         await STORE.save(flush=False)
 
 
-async def wait_for_queue_recovery_admission() -> None:
+def queue_recovery_readiness() -> dict[str, Any]:
+    recovery = QUEUE_RECOVERY_TASK
+    if recovery is None or (recovery.done() and not recovery.cancelled() and recovery.exception() is None):
+        return {"ready": True, "state": "ready", "message": None}
+    if not recovery.done():
+        return {
+            "ready": False, "state": "recovering",
+            "message": "Queued messages are being restored after restart. Retry shortly; do not resend accepted messages.",
+        }
+    return {
+        "ready": False, "state": "failed",
+        "message": "Queued message recovery failed. Chat admission remains closed to preserve saved messages. Restart the managed server; if it repeats, inspect server logs.",
+    }
+
+
+async def wait_for_queue_recovery_admission(session_id: str | None = None) -> None:
     """Wait briefly for the one startup queue scan, then fail retryably.
 
     The shared recovery task is shielded because disconnecting one request
@@ -17483,42 +17611,34 @@ async def wait_for_queue_recovery_admission() -> None:
     ordering hole with only a partial in-memory queue.
     """
 
+    if session_id is not None and session_id in QUEUE_RECOVERY_READY:
+        return
     recovery = QUEUE_RECOVERY_TASK
     if recovery is None or recovery is asyncio.current_task():
         return
-    try:
-        await asyncio.wait_for(
-            asyncio.shield(recovery),
-            timeout=max(0.0, QUEUE_RECOVERY_ADMISSION_WAIT_SECONDS),
-        )
-    except asyncio.TimeoutError as exc:
+    # asyncio.wait does not propagate the task's own TimeoutError and never
+    # cancels the shared recovery when this request times out/disconnects.
+    done, _ = await asyncio.wait(
+        {recovery}, timeout=max(0.0, QUEUE_RECOVERY_ADMISSION_WAIT_SECONDS),
+    )
+    if not done:
         raise TransientAdmissionWait(
             status_code=503,
-            detail=(
-                "queued turn recovery is still in progress; retry this "
-                "request shortly"
-            ),
-        ) from exc
+            detail="queued turn recovery is still in progress; retry this request shortly",
+        )
+    try:
+        recovery.result()
     except asyncio.CancelledError:
-        # Caller cancellation propagates normally. If the shared task itself
-        # was cancelled outside shutdown, convert that failed recovery into a
-        # retryable fail-closed admission result.
-        if recovery.cancelled() and not SERVER_SHUTTING_DOWN:
-            raise TransientAdmissionWait(
-                status_code=503,
-                detail=(
-                    "queued turn recovery did not complete; restart or retry "
-                    "the managed server"
-                ),
-            ) from None
-        raise
+        if SERVER_SHUTTING_DOWN:
+            raise
+        raise TransientAdmissionWait(
+            status_code=503,
+            detail="queued turn recovery did not complete; restart the managed server; if it repeats, inspect server logs",
+        ) from None
     except Exception as exc:
         raise TransientAdmissionWait(
             status_code=503,
-            detail=(
-                "queued turn recovery did not complete; restart or retry the "
-                "managed server"
-            ),
+            detail="queued turn recovery did not complete; restart the managed server; if it repeats, inspect server logs",
         ) from exc
 
 
@@ -17531,7 +17651,7 @@ async def enqueue_turn(
     secure_peer_route_snapshots: list[dict[str, Any]] | None = None,
     reciprocal_route_grant: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    await wait_for_queue_recovery_admission()
+    await wait_for_queue_recovery_admission(session_id)
     if not routed_references_match_visible_prompt(
         req.prompt,
         req.display_prompt,
@@ -17803,6 +17923,7 @@ async def enqueue_turn(
                 ),
                 "prompt": display_prompt,
                 "request_prompt": req.prompt,
+                "client_request_id": getattr(req, "client_request_id", None),
                 "display_prompt": req.display_prompt,
                 "file_ids": list(req.file_ids),
                 "position": position,
@@ -18068,7 +18189,7 @@ async def enqueue_turn(
 
 
 async def unqueue_turn(session_id: str, queued_id: str) -> dict[str, Any]:
-    await wait_for_queue_recovery_admission()
+    await wait_for_queue_recovery_admission(session_id)
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
 
@@ -20732,7 +20853,7 @@ def provider_tool_active_matches(
     expected_transport = (
         CODEX_TRANSPORT_APP_SERVER
         if backend == BACKEND_CODEX
-        else "exec" if backend in {BACKEND_CURSOR, BACKEND_OPENCODE}
+        else "exec" if backend in {BACKEND_CURSOR, BACKEND_OPENCODE, BACKEND_GEMINI}
         else CLAUDE_TRANSPORT_AGENT_SDK
     )
     matches = bool(
@@ -20757,7 +20878,7 @@ def provider_tool_active_matches(
             and str(active.get("provider_turn_id") or "") == provider_turn_id
             and active.get("provider_turn_ready") is True
         )
-    elif backend in {BACKEND_CURSOR, BACKEND_OPENCODE}:
+    elif backend in {BACKEND_CURSOR, BACKEND_OPENCODE, BACKEND_GEMINI}:
         proc = active.get("proc")
         matches = bool(
             matches and cursor_owner_token
@@ -20830,7 +20951,7 @@ async def provider_tool_capability_snapshot(
                      and codex_native_mailbox_owner_matches(session_id, run_id, provider_thread_id, provider_turn_id))
         ):
             raise ProviderToolError("provider tool turn is stale")
-    elif backend not in {BACKEND_CURSOR, BACKEND_OPENCODE}:
+    elif backend not in {BACKEND_CURSOR, BACKEND_OPENCODE, BACKEND_GEMINI}:
         raise ProviderToolError("provider tool backend is unsupported")
 
     async with ACTIVE_LOCK:
@@ -22494,7 +22615,7 @@ def public_queued_turn(
 
 
 async def queued_turns_snapshot(session_id: str) -> list[dict[str, Any]]:
-    await wait_for_queue_recovery_admission()
+    await wait_for_queue_recovery_admission(session_id)
     async with QUEUE_LOCK:
         queue = list(QUEUED_TURNS.get(session_id) or [])
         run_now = RUN_NOW_TURNS.get(session_id)
@@ -22554,7 +22675,7 @@ def reject_promoted_queue_mutation(session_id: str, queued_id: str) -> None:
 
 
 async def update_queued_turn(session_id: str, queued_id: str, req: UpdateQueuedTurnRequest) -> dict[str, Any]:
-    await wait_for_queue_recovery_admission()
+    await wait_for_queue_recovery_admission(session_id)
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
     async_result = await update_async_queued_message(session_id, queued_id, req)
@@ -23001,7 +23122,7 @@ async def update_queued_turn(session_id: str, queued_id: str, req: UpdateQueuedT
 
 
 async def move_queued_turn(session_id: str, queued_id: str, req: MoveQueuedTurnRequest) -> dict[str, Any]:
-    await wait_for_queue_recovery_admission()
+    await wait_for_queue_recovery_admission(session_id)
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
     direction = req.direction.strip().lower()
@@ -23516,7 +23637,7 @@ async def reconcile_idle_queued_turns(*, reason: str) -> int:
 
 async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]:
     """Coalesce duplicate Force Send requests without replaying a steer."""
-    await wait_for_queue_recovery_admission()
+    await wait_for_queue_recovery_admission(session_id)
     ensure_session_not_deleting(session_id)
     await reconcile_idle_queue_session(
         session_id,
@@ -25161,7 +25282,7 @@ def schedule_steered_turn_slot_waiter(
 
 
 async def start_next_queued_turn(session_id: str) -> None:
-    await wait_for_queue_recovery_admission()
+    await wait_for_queue_recovery_admission(session_id)
     await reconcile_idle_queue_session(
         session_id,
         schedule=False,
@@ -25803,12 +25924,76 @@ def queued_turn_from_event(event: dict[str, Any], sess: dict[str, Any], position
     }
 
 
-def queued_event_lines(path: Path, *, include_envelopes: bool = False) -> Iterator[bytes]:
+def queued_event_lines(path: Path, *, include_envelopes: bool = False,
+                       scan: dict[str, Any] | None = None) -> Iterator[bytes]:
     with path.open("rb") as source:
-        for raw_line in source:
+        if scan is not None:
+            source.seek(scan["offset"])
+        while True:
+            remaining = scan["end"] - source.tell() if scan is not None else -1
+            if remaining == 0:
+                break
+            raw_line = source.readline(remaining)
+            if not raw_line:
+                break
+            if scan is not None:
+                if not raw_line.endswith(b"\n"):
+                    break
+                scan["offset"] = source.tell()
             if (b'"queued_id"' in raw_line or b'"turn_queue_paused"' in raw_line
                     or (include_envelopes and b'"cross_chat_envelope_id"' in raw_line)):
                 yield raw_line
+
+
+def queue_checkpoint_anchor(path: Path, offset: int) -> str:
+    with path.open("rb") as stream:
+        stream.seek(max(0, offset - 4096))
+        return hashlib.sha256(stream.read(min(offset, 4096))).hexdigest()
+
+
+def queue_checkpoint_seed(path: Path, stamp, *, enabled: bool) -> tuple[dict, list]:
+    if enabled:
+        try:
+            checkpoint_path = path.with_name("queue-recovery.json")
+            if checkpoint_path.stat().st_size > 16 * 1024 * 1024:
+                raise ValueError("oversized queue checkpoint")
+            value = json.loads(checkpoint_path.read_text())
+            offset = value["offset"]
+            rows = value["pending"]
+            if (value["version"] == 1 and value["dev"] == stamp.st_dev
+                    and value["ino"] == stamp.st_ino and isinstance(offset, int)
+                    and 0 <= offset <= stamp.st_size
+                    and (offset != stamp.st_size or value["mtime_ns"] == stamp.st_mtime_ns)
+                    and value["anchor"] == queue_checkpoint_anchor(path, offset)
+                    and isinstance(rows, list)
+                    and all(isinstance(row, dict) and isinstance(row.get("queued_id"), str) for row in rows)):
+                return {"offset": offset, "end": stamp.st_size}, rows
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    return {"offset": 0, "end": stamp.st_size}, []
+
+
+def save_queue_checkpoint(path: Path, stamp, offset: int, rows: list) -> None:
+    # These logs are server-owned append-only journals. Replacement/truncation
+    # invalidates the checkpoint; a bounded boundary anchor detects regrowth.
+    current = path.stat()
+    if (current.st_dev, current.st_ino) != (stamp.st_dev, stamp.st_ino) or current.st_size < offset:
+        return
+    if current.st_size == stamp.st_size and current.st_mtime_ns != stamp.st_mtime_ns:
+        return
+    value = {"version": 1, "dev": stamp.st_dev, "ino": stamp.st_ino,
+             "mtime_ns": stamp.st_mtime_ns, "offset": offset,
+             "anchor": queue_checkpoint_anchor(path, offset), "pending": rows}
+    target = path.with_name("queue-recovery.json")
+    temporary = target.with_suffix(f".{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("x") as stream:
+            json.dump(value, stream, separators=(",", ":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def record_mailbox_migration_evidence(evidence: dict[str, dict[str, Any]], event: dict[str, Any]) -> None:
@@ -25844,11 +26029,13 @@ def scan_queued_turns_from_events(
             value["complete"] = False
         if not path.exists():
             continue
-        proof_stamp = path.stat() if evidence else None
+        scan_stamp = path.stat()
+        proof_stamp = scan_stamp if evidence else None
         proof_complete = True
-        pending: dict[str, dict[str, Any]] = {}
-        order: list[str] = []
-        for raw_line in (queued_event_lines(path, include_envelopes=True) if evidence else queued_event_lines(path)):
+        scan, prior_rows = queue_checkpoint_seed(path, scan_stamp, enabled=not evidence)
+        pending: dict[str, dict[str, Any]] = {row["queued_id"]: row for row in prior_rows}
+        order: list[str] = [row["queued_id"] for row in prior_rows]
+        for raw_line in queued_event_lines(path, include_envelopes=bool(evidence), scan=scan):
             try:
                 event = json.loads(raw_line.decode("utf-8", "replace"))
             except Exception:
@@ -26008,7 +26195,9 @@ def scan_queued_turns_from_events(
             unchanged = ((proof_stamp.st_dev, proof_stamp.st_ino, proof_stamp.st_size, proof_stamp.st_mtime_ns)
                          == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns))
             for value in evidence.values():
-                value["complete"] = proof_complete and unchanged
+                # A snapshot ending in a partial record was not fully scanned.
+                # It may hide a terminal/admission event, so never migrate it.
+                value["complete"] = proof_complete and unchanged and scan["offset"] == scan["end"]
         items = [
             pending[qid]
             for qid in order
@@ -26019,6 +26208,9 @@ def scan_queued_turns_from_events(
         ]
         if items:
             recovered[session_id] = items
+        if proof_complete:
+            with suppress(OSError):
+                save_queue_checkpoint(path, scan_stamp, scan["offset"], [pending[qid] for qid in order if qid in pending])
     return recovered
 
 
@@ -26182,13 +26374,48 @@ async def migrate_unstarted_chat_mailbox_backlog(
     return migrated
 
 
+async def queue_checkpoint_loop() -> None:
+    while True:
+        await asyncio.sleep(60)
+        if QUEUE_RECOVERY_TASK is not None:
+            continue
+        for session_id in tuple(QUEUE_CHECKPOINT_DIRTY):
+            sess = STORE.sessions.get(session_id)
+            QUEUE_CHECKPOINT_DIRTY.discard(session_id)
+            if not sess or session_id in DELETING_SESSIONS:
+                continue
+            try:
+                await asyncio.to_thread(scan_queued_turns_from_events, [(session_id, dict(sess))])
+            except Exception as exc:
+                QUEUE_CHECKPOINT_DIRTY.add(session_id)
+                logger.warning("queue checkpoint deferred session=%s error=%s", session_id, type(exc).__name__)
+
+
 async def recover_queued_turns_after_start() -> tuple[int, int]:
+    QUEUE_RECOVERY_READY.clear()
+    candidates = await CROSS_CHAT.pending_mailbox_migration_candidates()
+    sessions = [(sid, dict(sess)) for sid, sess in STORE.sessions.items()]
+    # Recover small/checkpointed chats first. A legacy giant only fences itself.
+    def recovery_cost(item):
+        path = events_path(item[0])
+        try:
+            checkpoint = json.loads(path.with_name("queue-recovery.json").read_text())
+            return max(0, path.stat().st_size - int(checkpoint.get("offset", 0)))
+        except (OSError, ValueError, TypeError):
+            return path.stat().st_size if path.exists() else 0
+    sessions = await asyncio.to_thread(lambda: sorted(sessions, key=recovery_cost))
+    rebuilt = scheduled = 0
+    for sid, sess in sessions:
+        relevant = [row for row in candidates if row.get("target_session_id") == sid]
+        count, started = await _recover_queued_turns_for_sessions([(sid, sess)], relevant)
+        rebuilt += count
+        scheduled += started
+        QUEUE_RECOVERY_READY.add(sid)
+    return rebuilt, scheduled
+
+
+async def _recover_queued_turns_for_sessions(session_items, migration_candidates) -> tuple[int, int]:
     started = time.monotonic()
-    session_items = [
-        (session_id, dict(sess))
-        for session_id, sess in STORE.sessions.items()
-    ]
-    migration_candidates = await CROSS_CHAT.pending_mailbox_migration_candidates()
     mailbox_evidence = {str(record["id"]): {"target_session_id": record["target_session_id"]}
                        for record in migration_candidates if is_async_route_message(record)}
     recovered = await asyncio.to_thread(scan_queued_turns_from_events, session_items,
@@ -27577,6 +27804,40 @@ def linux_process_still_exists(
     return True
 
 
+def systemd_worker_preserves_descendants(service_cgroup: str) -> bool:
+    """Prove the effective stop policy of this exact native worker, read-only.
+
+    Never infer policy from an on-disk unit: runtime drop-ins and an unloaded
+    replacement can differ. Unknown/malformed ownership retains the existing
+    requirement that the service cgroup contain no other processes.
+    """
+
+    if not sys.platform.startswith("linux"):
+        return False
+    properties = {"LoadState", "ActiveState", "MainPID", "ControlGroup", "KillMode", "SendSIGKILL"}
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show", AGENTS_SERVER_SYSTEMD_UNIT, "--no-pager",
+             "--property=" + ",".join(sorted(properties))],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=2.0, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if result.returncode != 0 or len(result.stdout) > 16_384:
+        return False
+    values: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or key in values or key not in properties:
+            return False
+        values[key] = value
+    return values == {
+        "LoadState": "loaded", "ActiveState": "active", "MainPID": str(os.getpid()),
+        "ControlGroup": service_cgroup, "KillMode": "process", "SendSIGKILL": "no",
+    } and agents_server_systemd_cgroup() == service_cgroup
+
+
 def managed_update_service_cgroup_state(
     *,
     service_cgroup: str | None = None,
@@ -27648,10 +27909,11 @@ def managed_update_service_cgroup_state(
         })
         return state
     unknown = tuple(sorted(service_pids - {os.getpid()}))
+    preserved = bool(unknown) and systemd_worker_preserves_descendants(selected_cgroup)
     state.update({
-        "safe": not unknown,
+        "safe": not unknown or preserved,
         "unknown_descendant_count": len(unknown),
-        "inspection": "verified",
+        "inspection": "verified-preserved" if preserved else "verified",
         "_unknown_descendant_pids": unknown,
     })
     return state
@@ -29963,6 +30225,14 @@ async def reconcile_provider_task_exit(
     prevents delayed cleanup from touching a replacement turn.
     """
 
+    if backend == BACKEND_GEMINI:
+        async with ACTIVE_LOCK:
+            active = ACTIVE.get(session_id) or {}
+            if active.get("run_id") == run_id and active.get("gemini_cleanup_failed"):
+                # Keep the exact owner fenced. A dead consumer is not proof
+                # that its editing tool processes stopped; Stop/Delete retry
+                # the owned cleanup before releasing this slot.
+                return False
     persisted_active = (STORE.sessions.get(session_id) or {}).get("active_run")
     terminal_missing = bool(
         isinstance(persisted_active, dict)
@@ -32373,14 +32643,14 @@ CODEX_GOAL_HISTORY_REPAIR_CACHE = CodexGoalHistoryRepairCache()
 CODEX_NATIVE_HISTORY_REPAIR_CACHE = CodexNativeHistoryRepairCache()
 
 
-def prepare_provider_history_metadata_repair(session_id: str) -> None:
-    """Prepare bounded source proofs only at explicit history-read boundaries."""
+def prepare_provider_history_metadata_repair(session_id: str) -> bool | None:
+    """Prepare bounded source proofs in background history maintenance."""
     prepare_claude_history_metadata_repair(session_id)
     prepare_codex_goal_history_repair(session_id)
-    prepare_codex_native_history_repair(session_id)
+    return prepare_codex_native_history_repair(session_id)
 
 
-def prepare_codex_native_history_repair(session_id: str) -> None:
+def prepare_codex_native_history_repair(session_id: str) -> bool | None:
     session = STORE.sessions.get(session_id)
     if not isinstance(session, dict) or session.get("backend") != BACKEND_CODEX or session.get("_deleting") is True:
         CODEX_NATIVE_HISTORY_REPAIR_CACHE.forget(session_id)
@@ -32408,11 +32678,13 @@ def prepare_codex_native_history_repair(session_id: str) -> None:
             session_id, provider_id, events_path(session_id), source, CODEX_SESSIONS_ROOT,
             lambda event: codex_history_event_item(event, expected_session_id=session_id),
         )
-    except CodexNativeHistoryProofUnavailable:
+    except CodexNativeHistoryProofUnavailable as exc:
+        if getattr(exc, "deterministic", False):
+            raise
         # Incomplete evidence is retryable at a later explicit read boundary,
         # not a successful empty proof and not a reason to break chat opening.
         logger.debug("native history repair deferred session=%s", session_id)
-        return
+        return False
     if changed:
         HISTORY_SEARCH_REPAIR_DIRTY.add(session_id)
         HISTORY_SEARCH_DIRTY.add(session_id)
@@ -32975,7 +33247,6 @@ def build_timeline_index(session_id: str) -> dict[str, Any]:
 
 
 def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
-    prepare_provider_history_metadata_repair(session_id)
     claude_metadata_signature = CLAUDE_METADATA_REPAIR_CACHE.signature(session_id)
     codex_goal_history_signature = (
         CODEX_GOAL_HISTORY_REPAIR_CACHE.signature(session_id),
@@ -33063,6 +33334,15 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
         if can_append
         else []
     )
+    # Keep provisional turn lookup linear in the journal size. Scheduled-job
+    # streams can have hundreds of thousands of events with no ordinary turn;
+    # scanning every preceding landmark for each one makes cold opens quadratic.
+    turn_record_keys_by_run: dict[str, list[str]] = {}
+    for existing in records:
+        existing_key = str(existing.get("key") or "")
+        if existing_key.startswith("turn:"):
+            existing_run = existing_key[5:].split(":start-", 1)[0]
+            turn_record_keys_by_run.setdefault(existing_run, []).append(existing_key)
     dirty_record_keys: set[str] = set()
     active_turn_key: str | None = cached.get("active_turn_key") if can_append else None
     current_turn_by_run: dict[str, str] = (
@@ -33383,6 +33663,8 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
             }
             by_key[key] = record
             records.append(record)
+            if key.startswith("turn:"):
+                turn_record_keys_by_run.setdefault(key[5:].split(":start-", 1)[0], []).append(key)
             if advance_timeline:
                 latest_timeline_landmark_key = key
         record["start_seq"] = min(int(record["start_seq"]), seq)
@@ -33849,16 +34131,10 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                     job_by_run[run_id] = job_id
                 prior_key = current_turn_by_run.pop(run_id, None) if run_id else None
                 if not prior_key and run_id:
-                    base_turn_key = f"turn:{run_id}"
-                    prior_key = next(
-                        (
-                            str(candidate.get("key") or "")
-                            for candidate in reversed(records)
-                            if str(candidate.get("key") or "") == base_turn_key
-                            or str(candidate.get("key") or "").startswith(f"{base_turn_key}:start-")
-                        ),
-                        None,
-                    )
+                    prior_keys = turn_record_keys_by_run.get(run_id, [])
+                    while prior_keys and prior_keys[-1] not in by_key:
+                        prior_keys.pop()
+                    prior_key = prior_keys[-1] if prior_keys else None
                 prior = by_key.get(prior_key or "")
                 group_key, group_created = assign_job_timeline_group(
                     event,
@@ -38383,7 +38659,7 @@ def cross_chat_supported_target_backends() -> list[str]:
     # Only cached diagnostics/private metadata are read here; health must not
     # launch CLIs or authenticate remotely. Each target's actual turn admission
     # still checks its own binding, CLI compatibility and selected login mode.
-    for backend in (BACKEND_CURSOR, BACKEND_OPENCODE):
+    for backend in (BACKEND_CURSOR, BACKEND_OPENCODE, BACKEND_GEMINI):
         with RUNTIME_DIAGNOSTICS_LOCK:
             diagnostic = dict(RUNTIME_DIAGNOSTICS.get(backend) or {})
         ready = diagnostic.get("status") == "ready"
@@ -38509,15 +38785,21 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
             BACKEND_CLAUDE: CLAUDE_TRANSPORT_AGENT_SDK,
             BACKEND_CURSOR: "headless-stream-json",
             BACKEND_OPENCODE: "headless-stream-json",
+            BACKEND_GEMINI: "acp",
         },
     }
 
 
 OPENCODE_CROSS_CHAT_CLIENT_CAPABILITY = "opencode_cross_chat_v1"
+GEMINI_CLIENT_CAPABILITY = "gemini_acp_v1"
 
 
 def cross_chat_delivery_client_capabilities(target: dict[str, Any]) -> list[str]:
     backend = str(target.get("backend") or DEFAULT_BACKEND).strip().lower()
+    if backend == BACKEND_GEMINI:
+        if not cross_chat_target_backend_supported(backend):
+            raise HTTPException(409, "The target Gemini CLI is unavailable.")
+        return [GEMINI_CLIENT_CAPABILITY]
     if backend == BACKEND_CODEX:
         if not cross_chat_target_backend_supported(backend):
             raise HTTPException(
@@ -38560,6 +38842,7 @@ CROSS_CHAT_DELIVERY_CAPABILITIES_BY_BACKEND: dict[str, frozenset[str]] = {
     BACKEND_CLAUDE: frozenset({CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY}),
     BACKEND_CURSOR: frozenset(),
     BACKEND_OPENCODE: frozenset({OPENCODE_CROSS_CHAT_CLIENT_CAPABILITY}),
+    BACKEND_GEMINI: frozenset({GEMINI_CLIENT_CAPABILITY}),
 }
 
 
@@ -43293,7 +43576,9 @@ def find_emergency_request_event(
     request_id: str,
     source_run_id: str,
 ) -> dict[str, Any] | None:
-    for event in reversed_jsonl_events(events_path(session_id)):
+    for event in reversed_jsonl_events(
+        events_path(session_id), retained_fields=EMERGENCY_EVENT_FIELDS,
+    ):
         if (
             event.get("type") == "emergency_alert_raised"
             and event.get("emergency_request_id") == request_id
@@ -43308,7 +43593,9 @@ def emergency_alert_was_acknowledged(
     alert_id: str,
     raised_seq: int,
 ) -> bool:
-    for event in reversed_jsonl_events(events_path(session_id)):
+    for event in reversed_jsonl_events(
+        events_path(session_id), retained_fields=EMERGENCY_EVENT_FIELDS,
+    ):
         seq = int(event.get("seq") or 0)
         if seq <= raised_seq:
             return False
@@ -43324,13 +43611,50 @@ def find_emergency_acknowledgement_event(
     session_id: str,
     alert_id: str,
 ) -> dict[str, Any] | None:
-    for event in reversed_jsonl_events(events_path(session_id)):
+    for event in reversed_jsonl_events(
+        events_path(session_id), retained_fields=EMERGENCY_EVENT_FIELDS,
+    ):
         if (
             event.get("type") == "emergency_alert_acknowledged"
             and event.get("emergency_alert_id") == alert_id
         ):
             return event
     return None
+
+
+def emergency_alert_batch_through(
+    session_id: str,
+    through_alert_id: str,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Freeze active IDs at an exact durable raise boundary, including retries.
+
+    Read lifecycle facts rather than a potentially interrupted summary save.
+    Reverse order lets each alert's newest fact determine whether it is active.
+    A previously acknowledged boundary remains a valid, immutable cut-off.
+    """
+    settled: set[str] = set()
+    active: list[tuple[int, str]] = []
+    boundary = None
+    for event in reversed_jsonl_events(
+        events_path(session_id), retained_fields=EMERGENCY_EVENT_FIELDS,
+    ):
+        if event.get("type") == "emergency_alert_acknowledged":
+            settled.add(str(event.get("emergency_alert_id") or ""))
+        elif event.get("type") == "emergency_alert_raised":
+            alert = normalized_emergency_alert(event.get("emergency_alert"))
+            seq = int(event.get("seq") or 0)
+            if alert is None or seq <= 0:
+                continue
+            alert_id = alert["id"]
+            if alert_id == through_alert_id:
+                boundary = event
+            if alert_id not in settled:
+                active.append((seq, alert_id))
+                settled.add(alert_id)
+    if boundary is None:
+        return None, []
+    boundary_seq = int(boundary["seq"])
+    return boundary, [alert_id for seq, alert_id in reversed(active) if seq <= boundary_seq]
 
 
 def emergency_alert_response(
@@ -44945,7 +45269,7 @@ def bounded_jsonl_events(path: Path, *, preserve_invalid: bool = False) -> Itera
 
 def bounded_jsonl_records_range(
     path: Path, start: int, end: int, *, expected_stat: dict[str, int],
-    require_newline: bool = True,
+    require_newline: bool = True, allow_partial: bool = False,
 ) -> Iterator[tuple[dict[str, Any] | None, int]]:
     """Read every record and ending offset in one immutable JSONL range."""
     if start < 0 or end < start or end > expected_stat["st_size"]:
@@ -44955,10 +45279,12 @@ def bounded_jsonl_records_range(
         if any(int(getattr(before, field)) != int(expected_stat[field]) for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns")):
             raise ValueError("transcript changed before cursor parsing")
         stream.seek(start)
-        for event, offset, _raw in jsonl_records(stream, end=end,
+        for count, (event, offset, _raw) in enumerate(jsonl_records(stream, end=end,
                 require_newline=require_newline, max_records=MAX_LOCAL_TRANSCRIPT_SCAN_LINES,
-                max_retained_bytes=MAX_LOCAL_TRANSCRIPT_LINE_BYTES):
+                max_retained_bytes=MAX_LOCAL_TRANSCRIPT_LINE_BYTES), 1):
             yield event, offset
+            if allow_partial and count >= MAX_LOCAL_TRANSCRIPT_SCAN_LINES:
+                break
         after = os.fstat(stream.fileno())
         if any(int(getattr(after, field)) != int(expected_stat[field]) for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns")):
             raise ValueError("transcript changed during cursor parsing")
@@ -45252,20 +45578,7 @@ def find_codex_history(provider_id: str) -> Path | None:
     clean_provider_id = provider_session_identifier(provider_id)
     if clean_provider_id is None:
         return None
-    if not CODEX_SESSIONS_ROOT.exists():
-        return None
-    selected: Path | None = None
-    selected_mtime = -1.0
-    for path in bounded_jsonl_paths(CODEX_SESSIONS_ROOT):
-        transcript_id, _cwd = codex_transcript_meta(path)
-        if transcript_id != clean_provider_id:
-            continue
-        with suppress(OSError):
-            mtime = path.stat().st_mtime
-            if mtime > selected_mtime:
-                selected = path
-                selected_mtime = mtime
-    return selected
+    return codex_rollout_path(clean_provider_id)
 
 
 def codex_compaction_count(sess: dict[str, Any]) -> int:
@@ -45307,7 +45620,7 @@ def codex_rollout_path(thread_id: str) -> Path | None:
     """Locate ``rollout-*-<thread_id>.jsonl`` under CODEX_SESSIONS_ROOT.
 
     Blocking filesystem work; call from a worker thread. Hits are cached per
-    thread id and re-validated with one stat. Misses are cached briefly so a
+    thread id and re-validated with a bounded metadata read. Misses are cached briefly so a
     thread whose rollout has not been flushed yet does not trigger a directory
     walk on every runtime snapshot.
     """
@@ -45317,7 +45630,7 @@ def codex_rollout_path(thread_id: str) -> Path | None:
         return None
     cached = CODEX_ROLLOUT_PATH_CACHE.get(clean_id)
     if cached is not None:
-        if cached.is_file():
+        if contained_jsonl_path(cached, CODEX_SESSIONS_ROOT) is not None and codex_transcript_meta(cached)[0] == clean_id:
             return cached
         CODEX_ROLLOUT_PATH_CACHE.pop(clean_id, None)
     missed_at = CODEX_ROLLOUT_PATH_MISSES.get(clean_id)
@@ -45330,17 +45643,29 @@ def codex_rollout_path(thread_id: str) -> Path | None:
     suffix = f"-{clean_id}.jsonl"
     selected: Path | None = None
     selected_mtime = -1.0
+    legacy_paths: list[Path] = []
     for path in bounded_jsonl_paths(CODEX_SESSIONS_ROOT):
         name = path.name
         if not (name.startswith("rollout-") and name.endswith(suffix)):
+            legacy_paths.append(path)
             continue
-        if not codex_rollout_head_matches(path, clean_id):
+        if codex_transcript_meta(path)[0] != clean_id:
             continue
         with suppress(OSError):
             mtime = path.stat().st_mtime
             if mtime > selected_mtime:
                 selected = path
                 selected_mtime = mtime
+    if selected is None:
+        # Preserve discovery of renamed/legacy transcripts without reading
+        # unrelated headers on the ordinary filename lookup path.
+        for path in legacy_paths:
+            if codex_transcript_meta(path)[0] != clean_id:
+                continue
+            with suppress(OSError):
+                mtime = path.stat().st_mtime
+                if mtime > selected_mtime:
+                    selected, selected_mtime = path, mtime
     if selected is None:
         CODEX_ROLLOUT_PATH_MISSES[clean_id] = now
         if len(CODEX_ROLLOUT_PATH_MISSES) > 1024:
@@ -46531,6 +46856,8 @@ def session_provider_id(sess: dict[str, Any]) -> str | None:
         return sess.get("cursor_session_id") or sess.get("session_id")
     if backend == BACKEND_OPENCODE:
         return sess.get("opencode_session_id") or sess.get("session_id")
+    if backend == BACKEND_GEMINI:
+        return sess.get("gemini_session_id") or sess.get("session_id")
     return sess.get("session_id")
 
 
@@ -46670,6 +46997,12 @@ def read_native_session_title(sess: dict[str, Any]) -> str | None:
         return native_session_title(codex_session_index_thread_names().get(provider_id))
     if backend == BACKEND_CURSOR:
         return cursor_native_session_title(provider_id, sess.get("cwd"))
+    if backend == BACKEND_GEMINI:
+        from gemini_history import native_snapshot
+        from gemini_runtime import history_environment
+        env = history_environment(runner_env(), sess, PROVIDER_CONNECTION_STORE.for_session(sess), PROVIDER_CONNECTION_STORE.root)
+        record = native_snapshot(env, str(sess.get("cwd") or ""), provider_id)
+        return native_session_title(record.get("summary"))
     if backend == "opencode":
         # Current native storage. A schema change, missing store, or busy DB
         # fails closed. mode=ro must never create or migrate a provider DB.
@@ -46754,7 +47087,8 @@ def generated_title_eligible(sess: dict[str, Any], *, allow_attempted: bool = Fa
     return bool(
         os.environ.get("AGENTSDOCK_AUTO_TITLES", "1").strip().lower() not in {"0", "false", "off"}
         and not SERVER_SHUTTING_DOWN
-        and sess.get("backend") in {BACKEND_CODEX, BACKEND_CURSOR}
+        and (sess.get("backend") in {BACKEND_CODEX, BACKEND_CURSOR}
+             or (sess.get("backend") == BACKEND_GEMINI and sess.get("provider_connection") == "custom"))
         and sess.get("auto_title_enabled", True) is not False
         and not sess.get("archived") and not sess.get("parent_id") and not sess.get("fork_from")
         and sess.get("id") not in DELETING_SESSIONS
@@ -46781,6 +47115,9 @@ async def close_generated_session_titles() -> None:
 
 async def generate_session_title(session_id: str, snapshot: dict, reply: str) -> None:
     async with GENERATED_TITLE_SLOTS:
+        if snapshot["backend"] == BACKEND_GEMINI:
+            # A native summary may arrive while this optional task waits.
+            await refresh_native_session_title(session_id)
         # Persist the claim before spending any provider usage. A restart does
         # not retry an ambiguous request. This is one optional attempt per chat.
         async with STORE._lock:
@@ -46807,6 +47144,27 @@ async def generate_session_title(session_id: str, snapshot: dict, reply: str) ->
             options["model"] = codex_runtime_settings(snapshot)[0]
             options["executable"] = CODEX_BIN
             options["provider_selection"] = CODEX_PROVIDER_STORE.for_session(snapshot, include_key=True)
+        elif snapshot["backend"] == BACKEND_GEMINI:
+            from gemini_api import default_model
+            from gemini_history import native_snapshot
+            connection = PROVIDER_CONNECTION_STORE.for_session(snapshot)
+            model = default_model(connection)
+            if model == "auto":
+                from gemini_runtime import history_environment
+                env = history_environment(runner_env(), snapshot, connection, PROVIDER_CONNECTION_STORE.root)
+                native = await asyncio.wait_for(asyncio.to_thread(native_snapshot, env,
+                    str(snapshot.get("cwd") or ""), session_provider_id(snapshot)), timeout=1.0)
+                model = next((row.get("model") for row in reversed(native["messages"])
+                    if row.get("type") == "gemini" and row.get("model") and row.get("model") != "auto"), None)
+            # Recheck revocation after the awaited metadata read and before
+            # sending anything. Never take credentials from the current default.
+            connection = PROVIDER_CONNECTION_STORE.for_session(snapshot)
+            current = STORE.sessions.get(session_id)
+            if (not current or not generated_title_eligible(current, allow_attempted=True)
+                    or title_runtime_key(current) != title_runtime_key(snapshot)
+                    or current.get("title") != snapshot.get("title")):
+                return
+            options = {"model": model, "provider_selection": connection}
         else:
             options["executable"] = resolve_cursor_executable()
             if not options["executable"]:
@@ -46818,6 +47176,9 @@ async def generate_session_title(session_id: str, snapshot: dict, reply: str) ->
             snapshot["backend"], snapshot["_title_seed"], reply, **options,
         )
         if result:
+            if snapshot["backend"] == BACKEND_GEMINI:
+                await refresh_native_session_title(session_id)
+                PROVIDER_CONNECTION_STORE.for_session(snapshot)  # Forget also fences a pending result.
             changed = await STORE.adopt_auto_title(
                 session_id, result, source="generated", backend=snapshot["backend"],
                 provider_id=session_provider_id(snapshot), expected_title=snapshot.get("title"),
@@ -46968,7 +47329,7 @@ def codex_transcript_meta(
 ) -> tuple[str | None, str | None]:
     """Return (session_id, cwd) from a Codex transcript's session_meta record."""
     with suppress(OSError, ValueError):
-        for index, event in enumerate(bounded_jsonl_events(path)):
+        for index, event in enumerate(codex_transcript_metadata_records(path)):
             if index >= CODEX_TRANSCRIPT_SCAN_LINES:
                 break
             if event.get("type") != "session_meta":
@@ -46982,6 +47343,23 @@ def codex_transcript_meta(
             cwd = normalized_local_session_cwd(payload.get("cwd"))
             return session_id, cwd
     return None, None
+
+
+def codex_transcript_metadata_records(path: Path) -> Iterator[dict[str, Any]]:
+    """Discovery reads a bounded header, independent of total rollout size."""
+    remaining = 1024 * 1024
+    with path.open("rb") as stream:
+        for _ in range(CODEX_TRANSCRIPT_SCAN_LINES):
+            line = stream.readline(min(remaining, MAX_LOCAL_TRANSCRIPT_LINE_BYTES) + 1)
+            if not line or len(line) > remaining or not line.endswith(b"\n"):
+                return
+            remaining -= len(line)
+            try:
+                record = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if isinstance(record, dict):
+                yield record
 
 
 def codex_transcript_preview(path: Path) -> str | None:
@@ -47216,6 +47594,7 @@ def local_session_candidates(
     known_provider_keys: set[tuple[str, str]] | None = None,
     *,
     include_cursor: bool = False,
+    include_gemini: bool = False,
 ) -> list[dict[str, Any]]:
     """Enumerate sessions not already used by this or another local instance."""
 
@@ -47243,6 +47622,11 @@ def local_session_candidates(
     if include_cursor:
         candidates.extend(local_cursor_session_candidates({
             provider_id for backend, provider_id in known_provider_keys if backend == BACKEND_CURSOR
+        }))
+    if include_gemini:
+        from gemini_import import candidates as gemini_candidates
+        candidates.extend(gemini_candidates(sys.modules[__name__], runner_env(), {
+            provider_id for backend, provider_id in known_provider_keys if backend == BACKEND_GEMINI
         }))
     candidates.sort(key=lambda c: c["updated_at"], reverse=True)
     return candidates[:max(1, min(limit, MAX_LOCAL_SESSION_LIST_ITEMS))]
@@ -47291,6 +47675,8 @@ def standalone_provider_session(sess: dict[str, Any]) -> dict[str, Any]:
     isolated["codex_thread_id"] = None
     isolated["cursor_session_id"] = None
     isolated["opencode_session_id"] = None
+    isolated["gemini_session_id"] = None
+    isolated.pop("gemini_session_cwd", None)
     isolated["backend_locked"] = False
     isolated.pop("cursor_instruction_hash", None)
     isolated.pop("cursor_instruction_version", None)
@@ -47330,6 +47716,12 @@ def provider_history_path(sess: dict[str, Any]) -> Path | None:
     if backend == BACKEND_CLAUDE:
         return find_claude_history(provider_id)
     if backend == BACKEND_CODEX:
+        cursor = normalized_history_sync_cursor(sess)
+        if cursor and cursor.get("provider_session_id") == provider_id:
+            path = contained_jsonl_path(Path(cursor["source_path"]), CODEX_SESSIONS_ROOT)
+            if path is not None and codex_transcript_meta(path)[0] == provider_id:
+                CODEX_ROLLOUT_PATH_CACHE[provider_id] = path
+                return path
         return find_codex_history(provider_id)
     return None
 
@@ -47452,6 +47844,8 @@ def normalized_history_sync_cursor(
             raw.get("timeline_pending_through_seq") or 0
         ),
         "timeline_pending_active": timeline_pending_active,
+        **({"bootstrap_timeline_seq": raw["bootstrap_timeline_seq"]}
+           if type(raw.get("bootstrap_timeline_seq")) is int and raw["bootstrap_timeline_seq"] >= 0 else {}),
         "checkpoint_seq": int(raw.get("checkpoint_seq", raw["timeline_seq"])),
     }
     # Distinguish a pre-feature cursor from an initialized conservative empty
@@ -47633,7 +48027,12 @@ def provider_history_source_snapshot(
             int(opened.st_mtime_ns),
         ) != expected_identity:
             raise ValueError("transcript changed before cursor snapshot")
-        remaining = int(initial.st_size)
+        # Verify the existing prefix, then prepare at most one bounded suffix.
+        # Total file size is not an import limit. Prefix verification remains
+        # necessary: provider transcripts can be replaced or rewritten.
+        snapshot_limit = min(int(initial.st_size), (verify_offset or 0) + HISTORY_SYNC_BATCH_BYTES)
+        remaining = snapshot_limit
+        consumed = 0
         while remaining > 0:
             chunk = stream.read(min(1024 * 1024, remaining))
             if not chunk:
@@ -47648,10 +48047,15 @@ def provider_history_source_snapshot(
             if newline >= 0:
                 running_digest.update(chunk[:newline + 1])
                 complete_digest = running_digest.copy()
-                complete_size = int(initial.st_size) - remaining - len(chunk) + newline + 1
+                complete_size = consumed + newline + 1
                 running_digest.update(chunk[newline + 1:])
             else:
                 running_digest.update(chunk)
+            consumed += len(chunk)
+            # A single streamed record may exceed a batch. Extend only until
+            # at least one new complete record exists, under the scan deadline.
+            if remaining == 0 and complete_size <= (verify_offset or 0) and consumed < int(initial.st_size):
+                remaining = min(1024 * 1024, int(initial.st_size) - consumed)
         finished = os.fstat(stream.fileno())
         if (
             int(finished.st_dev),
@@ -47804,6 +48208,7 @@ def parse_provider_history_delta(
         start,
         end,
         expected_stat=expected_stat,
+        allow_partial=True,
     ):
         if blocked_on_unseen_message:
             # Exhaust the fixed range so its final fstat validation still
@@ -47934,51 +48339,27 @@ def load_provider_history_with_cursor(
             if "claude_interruption_context" in previous
             else seed_claude_interruption_context(path, start, expected_stat=snapshot["expected_stat"], provider_session_id=provider_id)
         )
-    if continued and previous:
-        (
-            items,
-            cursor_offset,
-            last_item_digest,
-            delta_overflow,
-        ) = parse_provider_history_delta(
-            path,
-            backend,
-            start,
-            end,
-            limit=limit,
-            expected_stat=snapshot["expected_stat"],
-            previous_last_item_digest=str(
-                previous.get("last_item_digest") or ""
-            ),
-            expected_session_id=str(sess.get("id") or "") or None,
-            interruption_context=interruption_context,
-            codex_phase_context=codex_phase_context,
-            source_text_context=source_text_context,
-        )
-        caught_up = not delta_overflow and cursor_offset == end
-    else:
-        events = bounded_jsonl_events_range(
-            path,
-            0,
-            end,
-            expected_stat=snapshot["expected_stat"],
-            preserve_invalid=backend == BACKEND_CLAUDE,
-        )
-        if backend == BACKEND_CLAUDE:
-            items = parse_claude_history_events(events, limit, expected_session_id=str(sess.get("id") or "") or None, interruption_context=interruption_context)
-        elif backend == BACKEND_CODEX:
-            items = parse_codex_history_events(events, limit, expected_session_id=str(sess.get("id") or "") or None)
-        else:
-            return None, [], None, False
-        cursor_offset = end
-        last_item_digest = (
-            history_item_cursor_digest(items[-1]) if items else ""
-        )
-        if items and items[-1].get("source_text_sha256"):
-            source_text_context["sha256"] = items[-1]["source_text_sha256"]
-        if backend == BACKEND_CODEX and items and items[-1].get("phase") in ("commentary", "final_answer"):
-            codex_phase_context["phase"] = items[-1]["phase"]
-        caught_up = True
+    (
+        items,
+        cursor_offset,
+        last_item_digest,
+        delta_overflow,
+    ) = parse_provider_history_delta(
+        path,
+        backend,
+        start,
+        end,
+        limit=limit,
+        expected_stat=snapshot["expected_stat"],
+        previous_last_item_digest=str(
+            (previous or {}).get("last_item_digest") or ""
+        ),
+        expected_session_id=str(sess.get("id") or "") or None,
+        interruption_context=interruption_context,
+        codex_phase_context=codex_phase_context,
+        source_text_context=source_text_context,
+    )
+    caught_up = not delta_overflow and cursor_offset == end and end == int(snapshot["source_size"])
     source_digest = (
         str(snapshot["source_digest"])
         if cursor_offset == end
@@ -48341,6 +48722,7 @@ def reconcile_cursor_history_items(
     *,
     timeline_after_seq: int,
     timeline_through_seq: int,
+    bootstrap: bool = False,
 ) -> tuple[list[dict[str, str]], int]:
     """Subtract timeline-owned occurrences from one exact provider delta.
 
@@ -48364,14 +48746,15 @@ def reconcile_cursor_history_items(
         timeline_after_seq=after_seq,
         timeline_through_seq=through_seq,
         tail=False,
-        include_imported=False,
+        include_imported=bootstrap,
         message_details=message_details,
     )
 
     fresh: list[dict[str, str]] = []
     timeline_index = 0
     consumed_seq = after_seq
-    for item in items:
+    last_match_index = -1
+    for item_index, item in enumerate(items):
         item_details = history_message_match_details(item.get("kind", ""), item.get("text", ""), item, provider_item=True)
         if (
             timeline_index < len(timeline_messages)
@@ -48381,6 +48764,7 @@ def reconcile_cursor_history_items(
         ):
             consumed_seq = timeline_messages[timeline_index][0]
             timeline_index += 1
+            last_match_index = item_index
         else:
             fresh.append(item)
 
@@ -48395,6 +48779,11 @@ def reconcile_cursor_history_items(
             if timeline_window_truncated and timeline_messages
             else through_seq
         )
+    if bootstrap:
+        # Initial backfill uses the same conservative tail semantics as a
+        # single full import. Old imported rows are credits too; keep only
+        # source items after the entire captured preexisting timeline.
+        fresh = items[last_match_index + 1:] if consumed_seq == through_seq and not timeline_window_truncated else []
     return fresh, consumed_seq
 
 
@@ -48516,10 +48905,48 @@ def unsynced_history_items(
     return items[last_matched + 1:]
 
 
+class HistoryPreparationStale(RuntimeError):
+    """The read-only plan lost its ownership or immutable input generation."""
+
+
+def history_file_stamp(path: Path) -> tuple[int, int, int, int] | None:
+    try:
+        value = path.stat()
+        return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns
+    except FileNotFoundError:
+        return None
+
+
+@asynccontextmanager
+async def history_commit_guard(sess, cursor, timeline_stamp, source_stamp, enabled):
+    if not enabled:
+        yield
+        return
+    session_id = str(sess["id"])
+    async with session_lifecycle_lock(session_id):
+        current = STORE.sessions.get(session_id)
+        if (not current or session_id in DELETING_SESSIONS
+                or session_id in DELETED_SESSION_TOMBSTONES
+                or session_id in BUSY_SESSIONS or ACTIVE.get(session_id) is not None
+                or session_id in SERVER_MAINTENANCE_SESSIONS
+                or any(not task.done() for task in SESSION_TURN_TASKS.get(session_id, ()))
+                or current.get("backend") != sess.get("backend")
+                or session_provider_id(current) != session_provider_id(sess)
+                or normalized_history_sync_cursor(current) != cursor
+                or history_file_stamp(events_path(session_id)) != timeline_stamp):
+            raise HistoryPreparationStale("chat changed during history preparation")
+        if source_stamp is not None:
+            path, size, mtime, dev, ino = source_stamp
+            if history_file_stamp(Path(path)) != (dev, ino, size, mtime):
+                raise HistoryPreparationStale("provider transcript changed during history preparation")
+        yield
+
+
 async def sync_provider_history(
     sess: dict[str, Any],
     *,
     limit: int | None = None,
+    background: bool = False,
 ) -> dict[str, Any]:
     """Append provider messages added outside this chat since the last sync.
 
@@ -48540,6 +48967,7 @@ async def sync_provider_history(
         }
     live_session = STORE.sessions.get(session_id) or {}
     previous_cursor = normalized_history_sync_cursor(live_session)
+    timeline_stamp = history_file_stamp(events_path(session_id))
     # A durable cursor makes the unchanged fast path survive process restart;
     # all five stat/identity fields must still describe the fully-consumed
     # source before parsing can be skipped.
@@ -48562,6 +48990,10 @@ async def sync_provider_history(
             "source_path": None,
             "message": "No provider transcript found.",
         }
+    if (previous_cursor is not None and next_cursor is not None
+            and next_cursor["source_offset"] == previous_cursor["source_offset"]
+            and not next_cursor.get("source_caught_up", True)):
+        return {"imported": 0, "deferred": True, "reason": "incomplete_source_record"}
     if next_cursor is not None and previous_cursor is not None:
         recovered = await asyncio.to_thread(
             committed_history_sync_checkpoint,
@@ -48570,11 +49002,11 @@ async def sync_provider_history(
         )
         if recovered is not None:
             recovered_cursor, _terminal_seq = recovered
-            await persist_history_sync_cursor(
-                sess,
-                recovered_cursor,
-                timeline_seq=int(recovered_cursor.get("timeline_seq") or 0),
-            )
+            async with history_commit_guard(sess, previous_cursor, timeline_stamp, stamp, background):
+                await persist_history_sync_cursor(
+                    sess, recovered_cursor,
+                    timeline_seq=int(recovered_cursor.get("timeline_seq") or 0),
+                )
             return {
                 "imported": 0,
                 "source_path": str(source_path),
@@ -48584,14 +49016,18 @@ async def sync_provider_history(
         last_event_seq_from_file,
         events_path(session_id),
     )
-    if continued and previous_cursor is not None:
-        timeline_scan_through_seq = timeline_latest_seq
+    bootstrap_boundary = (previous_cursor or {}).get("bootstrap_timeline_seq") if continued else None
+    if not continued and next_cursor is not None and not next_cursor.get("source_caught_up", True):
+        bootstrap_boundary = timeline_latest_seq
+    if (continued and previous_cursor is not None) or (next_cursor is not None and not next_cursor.get("source_caught_up", True)):
+        timeline_scan_through_seq = timeline_latest_seq if bootstrap_boundary is None else bootstrap_boundary
         fresh, consumed_timeline_seq = await asyncio.to_thread(
             reconcile_cursor_history_items,
             session_id,
             items,
-            timeline_after_seq=int(previous_cursor.get("timeline_seq") or 0),
+            timeline_after_seq=int((previous_cursor or {}).get("timeline_seq") or 0) if continued else 0,
             timeline_through_seq=timeline_scan_through_seq,
+            **({"bootstrap": True} if bootstrap_boundary is not None else {}),
         )
     else:
         # First sync or invalidated/rotated source: retain the conservative
@@ -48612,11 +49048,11 @@ async def sync_provider_history(
         )
         if recovered is not None:
             recovered_cursor, _terminal_seq = recovered
-            await persist_history_sync_cursor(
-                sess,
-                recovered_cursor,
-                timeline_seq=int(recovered_cursor.get("timeline_seq") or 0),
-            )
+            async with history_commit_guard(sess, previous_cursor, timeline_stamp, stamp, background):
+                await persist_history_sync_cursor(
+                    sess, recovered_cursor,
+                    timeline_seq=int(recovered_cursor.get("timeline_seq") or 0),
+                )
             return {
                 "imported": 0,
                 "source_path": str(source_path),
@@ -48627,6 +49063,8 @@ async def sync_provider_history(
     timeline_seq = timeline_latest_seq
     if next_cursor is not None:
         caught_up = bool(next_cursor.pop("source_caught_up", True))
+        if bootstrap_boundary is not None and not caught_up:
+            next_cursor["bootstrap_timeline_seq"] = bootstrap_boundary
         next_cursor["timeline_pending_through_seq"] = 0
         next_cursor["timeline_pending_active"] = False
         if not caught_up:
@@ -48642,50 +49080,59 @@ async def sync_provider_history(
             caught_up=caught_up,
         )
 
-    result: dict[str, Any]
-    if not fresh:
-        result = {
-            "imported": 0,
-            "source_path": str(source_path),
-            "message": "Already up to date with the provider transcript.",
-        }
-    else:
-        # The imported batch is fsynced atomically together with its exact next
-        # cursor. A cursor moves only after that authoritative commit; if the
-        # registry save then fails, retry recovers the embedded checkpoint
-        # without relying on ambiguous content alignment.
+    if background and fresh:
         try:
-            result = await append_imported_history(
-                sess,
-                source_path,
-                fresh,
-                sync_checkpoint=checkpoint,
-            )
+            fresh = await prepare_imported_history_items(sess, source_path, fresh, checkpoint)
         except CodexNativeHistoryProofUnavailable:
-            # Do not persist next_cursor: these source bytes have not yet been
-            # proven against native history. A later explicit sync can retry.
-            return {
-                "imported": 0, "source_path": str(source_path), "deferred": True,
-                "reason": "native_history_proof_unavailable",
-                "message": "History reconciliation deferred; no messages were imported.",
+            return {"imported": 0, "deferred": True, "reason": "native_history_proof_unavailable"}
+    async with history_commit_guard(sess, previous_cursor, timeline_stamp, stamp, background):
+        result: dict[str, Any]
+        if not fresh:
+            result = {
+                "imported": 0,
+                "source_path": str(source_path),
+                "message": "Already up to date with the provider transcript.",
             }
-    if next_cursor is not None:
-        if caught_up:
-            timeline_seq = max(
+        else:
+            # The imported batch is fsynced atomically together with its exact next
+            # cursor. A cursor moves only after that authoritative commit; if the
+            # registry save then fails, retry recovers the embedded checkpoint
+            # without relying on ambiguous content alignment.
+            try:
+                result = await append_imported_history(
+                    sess,
+                    source_path,
+                    fresh,
+                    sync_checkpoint=checkpoint,
+                    _prepared=background,
+                    _expected_timeline_stamp=timeline_stamp,
+                )
+            except CodexNativeHistoryProofUnavailable:
+                # Do not persist next_cursor: these source bytes have not yet been
+                # proven against native history. A later explicit sync can retry.
+                return {
+                    "imported": 0, "source_path": str(source_path), "deferred": True,
+                    "reason": "native_history_proof_unavailable",
+                    "message": "History reconciliation deferred; no messages were imported.",
+                }
+        if next_cursor is not None:
+            if caught_up:
+                timeline_seq = max(
+                    timeline_latest_seq,
+                    int(result.get("timeline_seq") or 0),
+                )
+            next_cursor["checkpoint_seq"] = max(
+                int(next_cursor.get("checkpoint_seq") or 0),
                 timeline_latest_seq,
                 int(result.get("timeline_seq") or 0),
             )
-        next_cursor["checkpoint_seq"] = max(
-            int(next_cursor.get("checkpoint_seq") or 0),
-            timeline_latest_seq,
-            int(result.get("timeline_seq") or 0),
-        )
-        await persist_history_sync_cursor(
-            sess,
-            next_cursor,
-            timeline_seq=timeline_seq,
-        )
-    return result
+            await persist_history_sync_cursor(
+                sess,
+                next_cursor,
+                timeline_seq=timeline_seq,
+            )
+        result["pending"] = not caught_up
+        return result
 
 
 def provider_history_source_stamp(sess: dict[str, Any]) -> list[Any] | None:
@@ -48767,73 +49214,115 @@ async def persist_history_sync_cursor(
     return True
 
 
-async def run_provider_history_sync(session_id: str) -> None:
-    """Sync one chat in the background; never surface failure to the opener."""
+HISTORY_MAINTENANCE_SLOTS = asyncio.Semaphore(2)
+HISTORY_MAINTENANCE_STATE: dict[str, dict[str, Any]] = {}
+HISTORY_MAINTENANCE_TASKS: dict[str, asyncio.Task] = {}
+HISTORY_PROJECTION_REVISIONS: dict[str, int] = {}
 
+
+def history_projection_notice(session_id: str) -> dict[str, Any]:
+    return {"type": "history_projection_changed", "session_id": session_id,
+            "revision": f"{SERVER_INSTANCE_ID}:{HISTORY_PROJECTION_REVISIONS.get(session_id, 0)}"}
+
+
+def history_maintenance_key(sess: dict[str, Any]) -> list[Any]:
+    provider_id = session_provider_id(sess)
+    cursor = normalized_history_sync_cursor(sess)
+    source = (Path(cursor["source_path"]) if cursor else CODEX_ROLLOUT_PATH_CACHE.get(provider_id))
+    return [2, sess.get("backend"), provider_id,
+            list(history_file_stamp(events_path(str(sess["id"]))) or ()),
+            str(source) if source else None,
+            list(history_file_stamp(source) or ()) if source else None]
+
+
+def history_maintenance_state(session_id: str) -> dict[str, Any]:
+    if session_id not in HISTORY_MAINTENANCE_STATE:
+        try:
+            raw = json.loads((events_path(session_id).parent / "history-maintenance.json").read_text())
+            HISTORY_MAINTENANCE_STATE[session_id] = raw if isinstance(raw, dict) else {}
+        except (OSError, ValueError):
+            HISTORY_MAINTENANCE_STATE[session_id] = {}
+    return HISTORY_MAINTENANCE_STATE[session_id]
+
+
+def save_history_maintenance_state(session_id: str, value: dict[str, Any]) -> None:
+    path = events_path(session_id).parent / "history-maintenance.json"
+    if not path.parent.is_dir():
+        return
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value, separators=(",", ":")))
+    temporary.replace(path)
+
+
+async def run_provider_history_sync(session_id: str) -> None:
+    """Prepare in the background; hold admission only for validated commit."""
+    state = history_maintenance_state(session_id)
+    key = None
+    pending = False
     try:
-        # Turn admission, deletion, backend changes, and provider-native
-        # controls use this same lifecycle lock. Revalidate after acquiring it
-        # so a sync scheduled while idle cannot import a transcript that a new
-        # live turn is concurrently extending.
-        async with session_lifecycle_lock(session_id):
+        async with HISTORY_MAINTENANCE_SLOTS:
             sess = STORE.sessions.get(session_id)
-            if (
-                not sess
-                or session_id in DELETING_SESSIONS
-                or session_id in DELETED_SESSION_TOMBSTONES
-            ):
+            if (not sess or session_id in DELETING_SESSIONS
+                    or session_id in DELETED_SESSION_TOMBSTONES
+                    or session_id in BUSY_SESSIONS or ACTIVE.get(session_id) is not None
+                    or session_id in SERVER_MAINTENANCE_SESSIONS):
                 return
-            async with ACTIVE_LOCK:
-                if (
-                    session_id in BUSY_SESSIONS
-                    or ACTIVE.get(session_id) is not None
-                    or session_id in SERVER_MAINTENANCE_SESSIONS
-                    or any(
-                        task is not asyncio.current_task() and not task.done()
-                        for task in tuple(SESSION_TURN_TASKS.get(session_id) or ())
-                    )
-                ):
-                    return
+            key = history_maintenance_key(sess)
+            state.update(status="running", reason=None)
             await refresh_native_session_title(session_id)
-            result = await sync_provider_history(dict(sess))
-        if result.get("imported"):
-            logger.info(
-                "synced %d provider message(s) added outside session=%s",
-                result["imported"],
-                session_id,
-            )
+            repair_caches = (CLAUDE_METADATA_REPAIR_CACHE, CODEX_GOAL_HISTORY_REPAIR_CACHE,
+                             CODEX_NATIVE_HISTORY_REPAIR_CACHE)
+            before_repair = tuple(cache.signature(session_id) for cache in repair_caches)
+            result = await sync_provider_history(dict(sess), background=True)
+            pending = bool(result.get("pending")) and not result.get("deferred")
+            # Forward imports have already proved their own batch. Repair of
+            # older displayed rows must not starve the remaining source suffix.
+            repaired = None if pending else await asyncio.to_thread(prepare_provider_history_metadata_repair, session_id)
+            if before_repair != tuple(cache.signature(session_id) for cache in repair_caches):
+                HISTORY_PROJECTION_REVISIONS[session_id] = HISTORY_PROJECTION_REVISIONS.get(session_id, 0) + 1
+                await HUB.broadcast(session_id, history_projection_notice(session_id))
+            deferred = result.get("deferred") or repaired is False
+            state.update(status="deferred" if deferred else "pending" if pending else "idle", deterministic=False,
+                         reason=result.get("reason") or ("native_history_proof_unavailable" if repaired is False else None))
+            if result.get("imported"):
+                logger.info("synced %d provider message(s) added outside session=%s", result["imported"], session_id)
     except asyncio.CancelledError:
+        state.update(status="deferred", reason="cancelled")
         raise
     except Exception as exc:
-        # A read-only catch-up must never break opening a chat.
-        logger.warning(
-            "provider history sync failed session=%s error=%s",
-            session_id,
-            type(exc).__name__,
-        )
+        state.update(status="deferred", reason=type(exc).__name__, deterministic=isinstance(exc, ValueError))
+        logger.warning("provider history sync deferred session=%s error=%s", session_id, type(exc).__name__)
     finally:
+        if key is not None:
+            # A changing input retries on its next open; unchanged failures
+            # survive reconnects and process restarts without a scan storm.
+            current = STORE.sessions.get(session_id)
+            state.update(key=history_maintenance_key(current) if current else key,
+                         retry_at=time.time() + (60 if state.get("status") == "deferred" else 1 if pending else 15))
+            with suppress(OSError):
+                await asyncio.to_thread(save_history_maintenance_state, session_id, dict(state))
         HISTORY_SYNC_SCHEDULED.discard(session_id)
+        HISTORY_MAINTENANCE_TASKS.pop(session_id, None)
+        if pending and state.get("status") == "pending" and not SERVER_SHUTTING_DOWN:
+            def continue_history():
+                current = STORE.sessions.get(session_id)
+                if current is not None:
+                    schedule_provider_history_sync(current)
+            asyncio.get_running_loop().call_later(1.1, continue_history)
 
 
 def schedule_provider_history_sync(sess: dict[str, Any]) -> None:
-    """Catch one chat's transcript up when opened, without blocking the open.
-
-    Opening a chat must stay fast, and the client is already subscribed to
-    the event stream, so recovered messages arrive live instead of delaying
-    the response.
-    """
-
     session_id = str(sess.get("id") or "")
-    if not session_id or session_id in HISTORY_SYNC_SCHEDULED:
+    if not session_id or session_id in HISTORY_SYNC_SCHEDULED or not session_provider_id(sess):
         return
-    if not session_provider_id(sess):
-        return
-    # A turn in flight is already streaming the provider's own output and its
-    # transcript writes are still landing.
     if session_id in BUSY_SESSIONS or ACTIVE.get(session_id) is not None:
         return
+    state = history_maintenance_state(session_id)
+    if state.get("key") == history_maintenance_key(sess) and (
+            state.get("deterministic") or time.time() < state.get("retry_at", 0)):
+        return
     HISTORY_SYNC_SCHEDULED.add(session_id)
-    asyncio.create_task(run_provider_history_sync(session_id))
+    HISTORY_MAINTENANCE_TASKS[session_id] = asyncio.create_task(run_provider_history_sync(session_id))
 
 
 async def filter_codex_history_for_import(
@@ -48861,13 +49350,10 @@ async def filter_codex_history_for_import(
         raise
 
 
-async def append_imported_history(
-    sess: dict[str, Any],
-    source_path: Path,
-    items: list[dict[str, Any]],
-    *,
-    sync_checkpoint: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+async def prepare_imported_history_items(
+    sess: dict[str, Any], source_path: Path, items: list[dict[str, Any]],
+    sync_checkpoint: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
     session_id = str(sess["id"])
     provider_id = str(session_provider_id(sess) or "")
     backend = str(sess.get("backend") or DEFAULT_BACKEND).lower()
@@ -48894,6 +49380,23 @@ async def append_imported_history(
             normalize_user=normalize_wake_user, normalize_full_user=normalize_full_wake_user,
             normalize_assistant=clean_assistant_text,
         )
+    return items
+
+
+async def append_imported_history(
+    sess: dict[str, Any],
+    source_path: Path,
+    items: list[dict[str, Any]],
+    *,
+    sync_checkpoint: dict[str, Any] | None = None,
+    _prepared: bool = False,
+    _expected_timeline_stamp: tuple | None = None,
+) -> dict[str, Any]:
+    session_id = str(sess["id"])
+    provider_id = str(session_provider_id(sess) or "")
+    backend = str(sess.get("backend") or DEFAULT_BACKEND).lower()
+    if not _prepared:
+        items = await prepare_imported_history_items(sess, source_path, items, sync_checkpoint)
     metadata_only = bool(items) and all(item.get("kind") == "interruption" or (
         item.get("provider_history_repair") in {"source_proven_import", "source_proven_native_replay", "source_proven_assistant_replay"}
         and item.get("text") == ""
@@ -48983,7 +49486,13 @@ async def append_imported_history(
     imported_events.append(imported_history_terminal_event(
         run_id, backend, metadata_only=metadata_only, source_timestamp=last_source_timestamp,
     ))
-    committed = await append_durable_event_batch(session_id, imported_events)
+    if _prepared:
+        async with event_delivery_lock(session_id):
+            if history_file_stamp(events_path(session_id)) != _expected_timeline_stamp:
+                raise HistoryPreparationStale("timeline changed before history publication")
+            committed = await append_durable_event_batch_locked(session_id, imported_events)
+    else:
+        committed = await append_durable_event_batch(session_id, imported_events)
     if len(committed) != len(imported_events):
         raise RuntimeError("history event batch was not fully persisted")
     if backend == BACKEND_CODEX:
@@ -49121,6 +49630,12 @@ async def import_session_history(sess: dict[str, Any], *, force: bool = False, l
     backend = (sess.get("backend") or DEFAULT_BACKEND).lower()
     if not provider_id:
         return {"imported": 0, "source_path": None, "message": "No provider session ID set."}
+    if backend == BACKEND_GEMINI:
+        if await asyncio.to_thread(lambda: any(event.get("type") == "history_imported" for event in iter_session_events(session_id))):
+            return {"imported": 0, "source_path": None, "message": "Gemini initial text history already imported; automatic reconciliation is not supported."}
+        from gemini_import import initial_history
+        source, items = await asyncio.to_thread(initial_history, sys.modules[__name__], runner_env(), provider_id, str(sess.get("cwd") or ""), limit)
+        return await append_imported_history(sess, source, items)
     if backend == BACKEND_CURSOR:
         # Initial public-text snapshot only. The private native store, not these
         # display messages, supplies resume context. Cursor exports are rewritable
@@ -50158,9 +50673,10 @@ def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, 
     detail_fields = () if summary else (
         "auto_title_enabled",
         "system_prompt", "session_id", "claude_session_id", "codex_thread_id",
-        "cursor_session_id", "opencode_session_id",
+        "cursor_session_id", "opencode_session_id", "gemini_session_id",
         "claude_permission_mode", "cursor_permission_mode",
         "opencode_permission_mode",
+        "gemini_permission_mode", "gemini_permission_modes",
         "codex_approval_policy", "codex_sandbox_mode",
         "codex_permission_profile", "codex_approvals_reviewer",
         "provider_jobs_access",
@@ -50181,6 +50697,11 @@ def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, 
             "last_read_agent_event_seq", "last_read_agent_event_at", "manual_unread",
         )
     }
+    maintenance = HISTORY_MAINTENANCE_STATE.get(str(sess.get("id") or ""), {})
+    # Never-started maintenance adds no useful information to high-volume lists.
+    # Once observed, retain idle/cleared fields so caches can retire old errors.
+    if not summary or maintenance:
+        public["history_maintenance"] = {key: maintenance.get(key) for key in ("status", "reason", "retry_at")}
     # Omit only never-configured defaults from high-volume lists. A stored null
     # is a clear tombstone and must survive summary/cache merges.
     if not summary or "subagent_limit" in sess:
@@ -57165,6 +57686,9 @@ def resolve_cursor_executable(*, require_compatible: bool = True) -> str | None:
 
 
 def runtime_executable(backend: str) -> str:
+    if backend == BACKEND_GEMINI:
+        from gemini_runtime import resolve_executable
+        return resolve_executable(runner_env()) or "gemini"
     if backend == BACKEND_CLAUDE:
         return CLAUDE_BIN
     if backend == BACKEND_OPENCODE:
@@ -57183,6 +57707,8 @@ def runtime_executable(backend: str) -> str:
 
 
 def runtime_display_name(backend: str) -> str:
+    if backend == BACKEND_GEMINI:
+        return "Gemini CLI"
     if backend == BACKEND_CLAUDE:
         return "Claude Code"
     if backend == BACKEND_CURSOR:
@@ -57412,6 +57938,9 @@ def cursor_auth_failure_confirmed(executable: str) -> bool:
 
 
 def probe_runtime(backend: str) -> dict[str, Any]:
+    if backend == BACKEND_GEMINI:
+        from gemini_runtime import probe
+        return probe(runner_env(), timeout=runtime_probe_timeout(8.0))
     if backend == BACKEND_OPENCODE:
         (
             resolved,
@@ -57635,7 +58164,14 @@ def probe_runtime(backend: str) -> dict[str, Any]:
 
     combined = f"{auth_result.stdout}\n{auth_result.stderr}"
     if auth_result.returncode == 0:
-        return runtime_diagnostic_payload(backend, "ready", installed=True, authenticated=True, version=version)
+        result = runtime_diagnostic_payload(backend, "ready", installed=True, authenticated=True, version=version)
+        if backend == BACKEND_CODEX:
+            # Retain only the kind, never login-status output (which may show a
+            # masked API key). No additional auth/refresh subprocess is needed.
+            text = combined.lower()
+            result["_codex_auth_mode"] = "apiKey" if "api key" in text else "chatgpt" if "chatgpt" in text else "unknown"
+            result["_codex_auth_mode_checked_at_epoch"] = result["checked_at_epoch"]
+        return result
     if auth_failure_text(combined):
         return runtime_diagnostic_payload(backend, "unauthenticated", installed=True, authenticated=False, version=version)
     return runtime_diagnostic_payload(backend, "error", installed=True, authenticated=None, version=version)
@@ -57658,10 +58194,14 @@ def store_runtime_diagnostic(diagnostic: dict[str, Any], *, preserve_last_error:
 
 def expire_codex_login_diagnostic() -> None:
     """A login hint requires new native evidence, never reuse a cached denial."""
+    global CODEX_MODEL_MIGRATION_TARGET
     with RUNTIME_DIAGNOSTICS_LOCK:
+        CODEX_MODEL_MIGRATION_TARGET = "gpt-6-luna"
         current = dict(RUNTIME_DIAGNOSTICS.get(BACKEND_CODEX) or runtime_diagnostic_payload(
             BACKEND_CODEX, "unknown", installed=None, authenticated=None))
         current["checked_at_epoch"] = 0.0
+        current.pop("_codex_auth_mode", None)
+        current.pop("_codex_auth_mode_checked_at_epoch", None)
         store_runtime_diagnostic(current)
 
 
@@ -57670,6 +58210,8 @@ def runtime_diagnostic(backend: str, *, force: bool = False) -> dict[str, Any]:
         cached = dict(RUNTIME_DIAGNOSTICS.get(backend) or {})
         generation = RUNTIME_DIAGNOSTIC_GENERATIONS.get(backend, 0)
     checked_at = cached.get("_installation_checked_at_epoch", cached.get("checked_at_epoch"))
+    if backend == BACKEND_CODEX and cached.get("_codex_auth_mode_checked_at_epoch") is not None:
+        checked_at = min(checked_at or 0, cached["_codex_auth_mode_checked_at_epoch"])
     if not force and isinstance(checked_at, (int, float)) and time.time() - checked_at < RUNTIME_DIAGNOSTIC_TTL_SECONDS:
         return cached
     try:
@@ -57814,14 +58356,34 @@ def record_runtime_success(backend: str) -> None:
         version=previous.get("version"),
         executable=(
             str(previous.get("_executable") or "") or None
-            if backend in (BACKEND_CURSOR, BACKEND_OPENCODE)
+            if backend in (BACKEND_CURSOR, BACKEND_OPENCODE, BACKEND_GEMINI)
             else None
         ),
     )
+    if backend == BACKEND_CODEX and previous.get("_codex_auth_mode"):
+        # A successful turn does not establish which login kind was used.
+        # Preserve the existing observation without extending its lifetime.
+        current["_codex_auth_mode"] = previous["_codex_auth_mode"]
+        current["_codex_auth_mode_checked_at_epoch"] = previous.get(
+            "_codex_auth_mode_checked_at_epoch", previous.get("checked_at_epoch", 0),
+        )
     store_runtime_diagnostic(current, preserve_last_error=False)
 
 
 async def ensure_runtime_available(backend: str, *, session: dict[str, Any] | None = None) -> dict[str, Any]:
+    if backend == BACKEND_GEMINI:
+        from gemini_runtime import probe, API_ONLY_MESSAGE
+        if (session or {}).get("provider_connection") != "custom":
+            raise HTTPException(409, API_ONLY_MESSAGE)
+        diagnostic = await asyncio.to_thread(probe, runner_env())
+        store_runtime_diagnostic(diagnostic)
+        if diagnostic.get("status") != "ready":
+            raise HTTPException(503, diagnostic.get("message"))
+        if (session or {}).get("provider_connection") == "custom":
+            from gemini_api import default_model
+            selected = PROVIDER_CONNECTION_STORE.for_session(session)
+            provider_connections.require_model({**selected, "model": default_model(selected)})
+        return diagnostic
     diagnostic = await asyncio.to_thread(runtime_diagnostic, backend)
     if (session or {}).get("provider_connection") == "custom":
         selected = PROVIDER_CONNECTION_STORE.for_session(session)
@@ -57986,6 +58548,26 @@ def codex_default_service_tier(model: str) -> str:
     return CODEX_FALLBACK_SERVICE_TIERS.get(str(model or "").strip(), "")
 
 
+def codex_retired_model_replacements() -> dict[str, str]:
+    """Scope retirement to native ChatGPT auth, never API/custom endpoints."""
+    with RUNTIME_DIAGNOSTICS_LOCK:
+        diagnostic = RUNTIME_DIAGNOSTICS.get(BACKEND_CODEX) or {}
+        checked_at = diagnostic.get("_codex_auth_mode_checked_at_epoch", diagnostic.get("checked_at_epoch")) or 0
+        observed = (str(diagnostic.get("_codex_auth_mode") or "")
+                    if time.time() - checked_at < RUNTIME_DIAGNOSTIC_TTL_SECONDS else "")
+        replacement = CODEX_MODEL_MIGRATION_TARGET
+    mode = codex_auth.native_model_auth_mode(
+        codex_app_server_env(), cwd=existing_cwd(DEFAULT_CWD), observed_mode=observed,
+    )
+    if mode != "chatgpt":
+        return {}
+    return {model: replacement for model in sorted(codex_auth.CHATGPT_RETIRED_MODELS)}
+
+
+def codex_available_model(model: str) -> str:
+    return codex_retired_model_replacements().get(model, model)
+
+
 # The Codex app-server's thread/start and turn-override JSON-RPC params only
 # accept a narrower serviceTier enum ("fast"/"flex") than the canonical
 # service_tier values used for `codex exec` CLI config overrides (see
@@ -58002,6 +58584,7 @@ def codex_app_server_service_tier(service_tier: str) -> str:
 
 
 def discover_codex_catalog() -> dict[str, Any]:
+    global CODEX_MODEL_MIGRATION_TARGET
     models: list[dict[str, Any]] = []
     model_options: list[dict[str, Any]] = []
     effort_options: list[dict[str, Any]] = []
@@ -58024,16 +58607,29 @@ def discover_codex_catalog() -> dict[str, Any]:
         model_source = f"{model_source} failed"
         effort_source = f"{effort_source} failed"
 
+    replacements = codex_retired_model_replacements()
     visible_models = [
         model for model in models
         if str(model.get("visibility") or "list") == "list" and model.get("supported_in_api", True) is not False
+        and str(model.get("slug") or model.get("id") or "").strip() not in replacements
     ]
     visible_models.sort(key=runtime_priority)
+    if replacements and visible_models:
+        # Use an available configured default, then the native default/priority.
+        # The fallback is only needed when the CLI cannot return a catalog.
+        slugs = [str(entry.get("slug") or entry.get("id") or "").strip() for entry in visible_models]
+        preferred = next((slug for slug in (configured_model, CODEX_DEFAULT_MODEL) if slug in slugs), None)
+        if preferred is None:
+            preferred = next((str(entry.get("slug") or entry.get("id")) for entry in visible_models if entry.get("is_default") is True or entry.get("isDefault") is True), slugs[0])
+        if preferred:
+            with RUNTIME_DIAGNOSTICS_LOCK:
+                CODEX_MODEL_MIGRATION_TARGET = preferred
+            replacements = {model: preferred for model in replacements}
     # The selectable "Server default" must describe the exact settings that
     # codex_runtime_settings() launches for a chat with no explicit override.
     # The CLI's discovered list can omit a configured/custom default (or a
     # legacy fallback), so the first discovered model is not a safe proxy.
-    default_model = configured_model or CODEX_DEFAULT_MODEL
+    default_model = replacements.get(configured_model or CODEX_DEFAULT_MODEL, configured_model or CODEX_DEFAULT_MODEL)
     default_effort = clamp_codex_runtime_effort(
         default_model,
         configured_effort or CODEX_DEFAULT_EFFORT,
@@ -58080,6 +58676,8 @@ def discover_codex_catalog() -> dict[str, Any]:
 
     if not model_options:
         for slug, label in CODEX_FALLBACK_MODELS:
+            if slug in replacements:
+                continue
             fallback_efforts = [
                 runtime_option(effort, title_effort_label(effort))
                 for effort in CODEX_FALLBACK_MODEL_EFFORTS.get(slug, CODEX_FALLBACK_EFFORTS)
@@ -58089,7 +58687,7 @@ def discover_codex_catalog() -> dict[str, Any]:
             model_options.append(runtime_option(slug, label, efforts=fallback_efforts, service_tier=service_tier or None))
     if not effort_options:
         effort_options.extend(runtime_option(effort, title_effort_label(effort)) for effort in CODEX_FALLBACK_EFFORTS)
-    if configured_model and not any(option.get("value") == configured_model for option in model_options):
+    if configured_model and configured_model not in replacements and not any(option.get("value") == configured_model for option in model_options):
         model_options.insert(0, runtime_option(configured_model, title_model_label(configured_model)))
     if configured_effort and not any(option.get("value") == configured_effort for option in effort_options):
         effort_options.append(runtime_option(configured_effort, title_effort_label(configured_effort)))
@@ -58112,6 +58710,7 @@ def discover_codex_catalog() -> dict[str, Any]:
         "default_model": default_model or None,
         "default_effort": default_effort or None,
         "default_service_tier": default_service_tier or None,
+        "model_replacements": replacements,
     }
 
 
@@ -58607,6 +59206,13 @@ def discover_runtime_backend_catalog(backend: str, *, force_runtime_probe: bool 
     diagnostic = runtime_diagnostic(backend, force=force_runtime_probe)
     ready = diagnostic.get("status") == "ready"
     executable = str(diagnostic.get("_executable") or "") or None
+    if backend == BACKEND_GEMINI:
+        return {"models": [], "default_model": None,
+                "efforts": [], "default_effort": None, "effort_source": "none",
+                "model_source": "Configure a Gemini API connection in My Agents",
+                "available": False, "diagnostic": public_runtime_diagnostic(diagnostic),
+                "native_credentials_present": False,
+                "custom_provider": PROVIDER_CONNECTION_STORE.catalog(backend, installed=ready)}
     if backend == BACKEND_CLAUDE:
         catalog = parse_claude_help_catalog()
     elif backend == BACKEND_CODEX:
@@ -58699,13 +59305,46 @@ def codex_runtime_settings(sess: dict[str, Any]) -> tuple[str, str, str]:
         catalog = CODEX_PROVIDER_STORE.cached_catalog(selected)
         return model, codex_provider.runtime_effort(selected, catalog, sess.get("effort")), ""
     configured_model, configured_effort, configured_service_tier = codex_user_config_defaults()
-    model = str(sess.get("model") or configured_model or CODEX_DEFAULT_MODEL).strip()
+    model = codex_available_model(str(sess.get("model") or configured_model or CODEX_DEFAULT_MODEL).strip())
     effort = clamp_codex_runtime_effort(
         model,
         sess.get("effort") or configured_effort or CODEX_DEFAULT_EFFORT,
     )
     service_tier = configured_service_tier or codex_default_service_tier(model)
     return model, effort, service_tier
+
+
+async def migrate_retired_codex_selection(
+    session_id: str, sess: dict[str, Any], *, standalone: bool = False,
+    previous_model: str | None = None,
+) -> dict[str, Any]:
+    """Migrate future work under the existing admission lock; retain history.
+
+    No native transcript edits, forks, auth changes, or retries. Native
+    compaction/recovery remains Codex-owned and can still fail independently.
+    """
+    if sess.get("backend") != BACKEND_CODEX or sess.get("codex_provider") == "custom":
+        return sess
+    configured_model, _effort, _tier = codex_user_config_defaults()
+    previous = str(previous_model or sess.get("model") or configured_model or CODEX_DEFAULT_MODEL).strip()
+    replacement = codex_available_model(previous)
+    if previous == replacement:
+        return sess
+    patch = {"model": replacement, "effort": clamp_codex_runtime_effort(replacement, sess.get("effort") or _effort or CODEX_DEFAULT_EFFORT)}
+    if standalone:
+        migrated = {**sess, **patch}
+    elif all(sess.get(key) == value for key, value in patch.items()):
+        migrated = sess
+    else:
+        migrated = await STORE.update(session_id, patch)
+    await append_event(session_id, "runtime_model_migrated", {
+        "backend": BACKEND_CODEX, "previous_model": previous, "model": replacement,
+        "standalone": standalone,
+        "message": (f"{previous} is no longer available with ChatGPT sign-in. "
+                    f"This {'scheduled run' if standalone else 'chat'} will use {replacement}. "
+                    "Conversation history is unchanged."),
+    })
+    return migrated
 
 
 def codex_goal_time_budget_remaining(sess: dict[str, Any]) -> float | None:
@@ -59975,7 +60614,7 @@ async def discover_session_provider_commands(
 
     backend = str(session.get("backend") or DEFAULT_BACKEND).strip().lower()
     requested_cwd = str(session.get("cwd") or DEFAULT_CWD)
-    if backend == BACKEND_OPENCODE:
+    if backend in {BACKEND_OPENCODE, BACKEND_GEMINI}:
         try:
             cwd = validated_opencode_cwd(requested_cwd)
         except HTTPException:
@@ -59989,7 +60628,7 @@ async def discover_session_provider_commands(
             support = provider_command_support(
                 False,
                 "unavailable",
-                "OpenCode local skills require the chat working directory to be available.",
+                f"{'Gemini' if backend == BACKEND_GEMINI else 'OpenCode'} local skills require the chat working directory to be available.",
             )
             return provider_command_snapshot(fallback_empty, support), fallback_empty
     else:
@@ -60029,7 +60668,7 @@ async def discover_session_provider_commands(
                 provider_command_snapshot(fallback_empty, support),
                 fallback_empty,
             )
-    elif backend == BACKEND_OPENCODE:
+    elif backend in {BACKEND_OPENCODE, BACKEND_GEMINI}:
         pass
     else:
         support = provider_command_support(
@@ -60123,6 +60762,26 @@ async def discover_session_provider_commands(
                 f"Showing the first {MAX_PROVIDER_COMMANDS} provider commands."
             )
         return provider_command_snapshot(inventory, support), inventory
+    if backend == BACKEND_GEMINI:
+        from gemini_runtime import build_environment, list_native_skills, resolve_executable, GeminiConfigurationError
+        def discover_gemini():
+            connection = PROVIDER_CONNECTION_STORE.for_session(session)
+            profile = PROVIDER_CONNECTION_STORE.root / ("gemini-runtime-" + connection["credential_id"]) if connection else None
+            env = build_environment(runner_env(), cwd=cwd, api_home=profile,
+                api_key=connection.get("api_key") if connection else None,
+                base_url=connection.get("base_url") if connection else None,
+                native_history=bool(session.get("gemini_native_history")))
+            executable = resolve_executable(env)
+            if not executable:
+                raise GeminiConfigurationError("Install Gemini CLI to discover its skills.")
+            return gemini_provider_skill_inventory(list_native_skills(executable, env, cwd),
+                cwd=cwd, selector_secret=identity, binding_context=session_id)
+        try:
+            inventory = await asyncio.to_thread(discover_gemini)
+        except (GeminiConfigurationError, ProviderCommandDiscoveryError, HTTPException, OSError, ValueError):
+            return provider_command_snapshot(empty, provider_command_support(False, "unavailable",
+                "Gemini skills could not be read. Check gemini skills list --all in this workspace and refresh.")), empty
+        return provider_command_snapshot(inventory, provider_command_support(True, "native_activation_request")), inventory
     if backend == BACKEND_OPENCODE:
         try:
             env = runner_env()
@@ -60200,6 +60859,8 @@ async def resolve_provider_command_selection(
         if backend == BACKEND_CLAUDE
         else OPENCODE_PROVIDER_COMMANDS_CLIENT_CAPABILITY
         if backend == BACKEND_OPENCODE
+        else GEMINI_CLIENT_CAPABILITY
+        if backend == BACKEND_GEMINI
         else None
     )
     if required_capability is None:
@@ -60637,7 +61298,9 @@ async def update_reasoning_summary_stream(
     phase: str = "summary",
 ) -> None:
     """Keep provider-exposed summary and plaintext reasoning channels distinct."""
-    if phase not in {"summary", "reasoning"}:
+    if phase not in {"summary", "reasoning", "assistant"}:
+        return
+    if phase == "assistant" and (metadata or {}).get("backend") != "gemini":
         return
     index = params.get("contentIndex" if phase == "reasoning" else "summaryIndex", 0)
     delta = params.get("delta", "")
@@ -60657,7 +61320,7 @@ async def update_reasoning_summary_stream(
                 after_seq = await asyncio.to_thread(last_event_seq_from_file, events_path(session_id))
             state = {"parts": {}, "item": {
                 **dict(metadata or {}), "run_id": run_id, "item_id": item_id,
-                "backend": BACKEND_CODEX, "phase": phase, "text": "",
+                "backend": (metadata or {}).get("backend", BACKEND_CODEX), "phase": phase, "text": "",
                 "ts": now_iso(), "after_seq": after_seq,
             }}
             streams[(run_id, item_id, phase)] = state
@@ -68856,6 +69519,35 @@ async def retain_codex_goal_run_owner(
             return True
 
 
+def codex_native_archive_rejection(exc: BaseException, thread_id: str) -> bool:
+    """Only the owning native resume RPC can report this state, not chat text."""
+    return bool(
+        thread_id and isinstance(exc, CodexAppServerRequestError)
+        and exc.method == "thread/resume" and isinstance(exc.error, dict)
+        and exc.error.get("message") == (
+            f"session {thread_id} is archived. Run `codex unarchive {thread_id}` to unarchive it first."
+        )
+    )
+
+
+async def archive_rejected_codex_session(session_id: str, thread_id: str, run_id: str) -> None:
+    """Mirror a confirmed native archive through the normal local archive path.
+
+    This never archives/unarchives/deletes the native thread. It retires local
+    routes and jobs exactly like the user's Archive action, preserving history.
+    Identity is stable while this run owns the chat; ignore stale/deleted runs.
+    """
+    current = STORE.sessions.get(session_id)
+    active = ACTIVE.get(session_id) or {}
+    if (not current or current.get("archived") or session_id in DELETING_SESSIONS
+            or current.get("backend") != BACKEND_CODEX
+            or str(session_provider_id(current) or "") != thread_id
+            or active.get("run_id") != run_id):
+        return
+    await _update_session(session_id, UpdateSessionRequest(archived=True),
+                          native_archive_owner=(thread_id, run_id))
+
+
 async def run_codex_app_server(
     session_id: str,
     run_id: str,
@@ -71279,6 +71971,7 @@ async def run_codex_app_server(
             thread_pinned = False
         can_fallback = (
             allow_exec_fallback
+            and not codex_native_archive_rejection(exc, str(session_provider_id(sess) or ""))
             and codex_provider.session_choice(sess.get("codex_provider")) == "default"
             and provider_command is None
             and not stop_requested
@@ -71343,6 +72036,15 @@ async def run_codex_app_server(
                 **current_metadata(),
             })
             error_emitted = True
+            if codex_native_archive_rejection(exc, str(session_provider_id(sess) or "")):
+                try:
+                    await archive_rejected_codex_session(
+                        session_id, str(session_provider_id(sess)), current_run_id,
+                    )
+                except Exception:
+                    # Preserve the actual provider error if local retirement
+                    # fails. Never pretend the native thread was unarchived.
+                    logger.exception("Could not mirror native Codex archive session=%s", session_id)
     finally:
         async def settle_transport_finalizer() -> None:
             """Retire every owner before cancellation can escape the runner."""
@@ -71738,7 +72440,7 @@ async def start_turn(
     scheduled_job_revision: str | None = None,
     scheduled_job_manual_run: bool = False,
 ) -> dict[str, Any]:
-    await wait_for_queue_recovery_admission()
+    await wait_for_queue_recovery_admission(session_id)
     if queue_if_busy and provider_context_mode == "chat":
         await reconcile_idle_queue_session(
             session_id,
@@ -71811,7 +72513,7 @@ async def _start_turn_locked(
     # Internal delivery paths can enter with the lifecycle lock already held
     # and intentionally bypass ``start_turn``. They still must not start or
     # queue ahead of an undiscovered durable startup row.
-    await wait_for_queue_recovery_admission()
+    await wait_for_queue_recovery_admission(session_id)
     if (
         req.purpose == SECURE_PEER_DELIVERY_PURPOSE
         and not SECURE_PEER_AGENT_RELAY_ENABLED
@@ -71833,6 +72535,8 @@ async def _start_turn_locked(
         raise HTTPException(status_code=404, detail="session not found")
     if sess.get("archived"):
         raise HTTPException(status_code=409, detail="archived chats cannot start turns")
+    if sess.get("gemini_cleanup_pending_run_id"):
+        raise HTTPException(status_code=409, detail="Gemini runtime cleanup is unconfirmed. Retry Stop; after a server restart, server-side runtime verification is required before this chat can continue.")
     if req.purpose == "chat_mailbox_wake" or mailbox_wake_claim is not None:
         if (req.purpose != "chat_mailbox_wake" or mailbox_wake_claim is None
                 or mailbox_wake_claim.get("target_session_id") != session_id
@@ -72122,6 +72826,9 @@ async def _start_turn_locked(
         ),
         runtime_validation_patch,
     )
+    if runtime_preview_session.get("backend") == BACKEND_GEMINI:
+        if GEMINI_CLIENT_CAPABILITY not in req.client_capabilities:
+            raise HTTPException(409, "Update AgentsDock to a Gemini-capable client before sending messages.")
     if str(runtime_preview_session.get("backend") or DEFAULT_BACKEND).strip().lower() == BACKEND_CODEX:
         await prepare_codex_login_turn(runtime_preview_session)
     opencode_cwd: str | None = None
@@ -72168,6 +72875,10 @@ async def _start_turn_locked(
             session_id,
             list(item.get("file_ids") or []),
         )
+    if runtime_preview_session.get("backend") == BACKEND_GEMINI:
+        from gemini_content import attachments as gemini_attachments
+        await asyncio.to_thread(gemini_attachments, sys.modules[__name__], session_id,
+            list(normalized_lineage[-1].get("file_ids") or []) if len(normalized_lineage) >= 2 else list(req.file_ids))
     # OpenCode's native --file path has no provider-side size ceiling and can
     # eagerly ingest local data. Resolve and bound the exact current message
     # before either reserving a slot or durably accepting it into the queue.
@@ -72384,6 +73095,9 @@ async def _start_turn_locked(
             if team_mail_grant_mutation:
                 team_mail_route_snapshot = team_mail_grants.admission_snapshot(team_mail_grant_mutation, sess)
         fields_set = runtime_fields_set
+        migration_previous_model = str(
+            req.model if "model" in fields_set and req.model else sess.get("model") or ""
+        ).strip() or None
         runtime_patch: dict[str, Any] = {}
         if req.backend:
             runtime_patch["backend"] = req.backend
@@ -72412,14 +73126,20 @@ async def _start_turn_locked(
 
         backend = sess.get("backend") or DEFAULT_BACKEND
         runtime_status = await ensure_runtime_available(backend, session=sess)
+        if backend == BACKEND_CODEX:
+            sess = await migrate_retired_codex_selection(
+                session_id, sess, standalone=provider_context_mode == "standalone",
+                previous_model=migration_previous_model,
+            )
         if provider_context_mode == "chat":
             sess = await STORE.mark_backend_started(session_id, str(backend))
-        if backend in (BACKEND_CURSOR, BACKEND_OPENCODE):
+        if backend in (BACKEND_CURSOR, BACKEND_OPENCODE, BACKEND_GEMINI):
             # Keep the exact compatibility-probed executable pinned through
             # admission; mark_backend_started returns a fresh durable snapshot.
             sess = dict(sess)
             executable_key = (
-                "_opencode_executable" if backend == BACKEND_OPENCODE
+                "_gemini_executable" if backend == BACKEND_GEMINI
+                else "_opencode_executable" if backend == BACKEND_OPENCODE
                 else "_cursor_executable"
             )
             sess[executable_key] = runtime_status.get("_executable")
@@ -72733,7 +73453,7 @@ async def _start_turn_locked(
                     else None
                 ),
             )
-        if turn_obligation_ids and backend in (BACKEND_CURSOR, BACKEND_OPENCODE):
+        if turn_obligation_ids and backend in (BACKEND_CURSOR, BACKEND_OPENCODE, BACKEND_GEMINI):
             provider_authority_context += (
                 "\n\n[AgentsDock final-result handoff]\n"
                 "Your successful non-empty final answer will be delivered once to the explicitly referenced chat. "
@@ -72763,7 +73483,7 @@ async def _start_turn_locked(
             prompt,
         )
         provider_prompt = provider_turn_payload.user_prompt
-        if backend == BACKEND_CURSOR or (
+        if backend in {BACKEND_CURSOR, BACKEND_GEMINI} or (
             backend == BACKEND_OPENCODE and resolved_provider_command is None
         ):
             # These print-mode CLIs have no separate system/application-context
@@ -72833,6 +73553,8 @@ async def _start_turn_locked(
         else:
             started_payload["model"] = sess.get("model")
             started_payload["effort"] = sess.get("effort")
+        if getattr(req, "client_request_id", None):
+            started_payload["client_request_id"] = req.client_request_id
         if queued_id:
             started_payload["queued_id"] = queued_id
         run_metadata = {
@@ -72912,6 +73634,7 @@ async def _start_turn_locked(
                     or mailbox_wake_claim is not None
                     or getattr(req, "shared_chat_id", None) is not None
                     or queued_id is not None
+                    or getattr(req, "client_request_id", None) is not None
                 )
                 else append_event(session_id, "turn_started", started_payload)
             )
@@ -73085,6 +73808,21 @@ async def _start_turn_locked(
                     else {}
                 ),
             )
+        elif backend == BACKEND_GEMINI:
+            from gemini_runner import run as run_gemini
+            task = run_gemini(sys.modules[__name__], session_id, run_id, provider_prompt,
+                             dict(sess), manifest_path,
+                             file_ids=prompt_file_ids,
+                             communication_required=bool(
+                                 any(reference.action in {"route", "direct_message", "instruction", "request_reply"}
+                                     for reference in req.chat_references)
+                                 or req.team_references or team_mail_command
+                                 or mailbox_wake_claim is not None
+                                 or req.purpose in {"cross_chat_handoff_delivery", "secure_peer_handoff_delivery"}
+                             ),
+                             provider_command=resolved_provider_command,
+                             provider_runtime_env=provider_turn_payload.runtime_env,
+                             standalone_provider_context=provider_context_mode == "standalone")
         elif backend == BACKEND_OPENCODE:
             task = run_opencode(
                 session_id,
@@ -76274,7 +77012,7 @@ def ensure_managed_update_service_cgroup_clear(
     *,
     service_cgroup: str | None = None,
 ) -> dict[str, Any]:
-    """Fail closed unless only this server remains in its service cgroup."""
+    """Require no children, or prove this worker's stop policy preserves them."""
 
     state = managed_update_service_cgroup_state(
         service_cgroup=service_cgroup,
@@ -77375,6 +78113,7 @@ async def lifespan(app: FastAPI):
         cleanup_abandoned_fork_provider_threads(startup_abandoned_fork_threads)
     )
     host_monitor_task = asyncio.create_task(host_monitor_loop())
+    queue_checkpoint_task = asyncio.create_task(queue_checkpoint_loop())
     history_search_task = asyncio.create_task(history_search_index_loop())
     runtime_probe_task = asyncio.create_task(asyncio.to_thread(refresh_runtime_diagnostics, force=True))
     if CONFIG_ENV_APPLIED:
@@ -77452,6 +78191,10 @@ async def lifespan(app: FastAPI):
         cross_chat_expiry_task.cancel()
         digest_recovery_task.cancel()
         queue_recovery_task.cancel()
+        queue_checkpoint_task.cancel()
+        history_tasks = (*HISTORY_MAINTENANCE_TASKS.values(), *(item[1] for item in TURN_RECEIPT_TASKS.values()))
+        for task in history_tasks:
+            task.cancel()
         server_update_pending_waiter_task.cancel()
         await bounded_shutdown_phase(
             "startup-reconciliation",
@@ -77460,6 +78203,8 @@ async def lifespan(app: FastAPI):
                 cross_chat_expiry_task,
                 digest_recovery_task,
                 queue_recovery_task,
+                queue_checkpoint_task,
+                *history_tasks,
                 server_update_pending_waiter_task,
                 *(
                     (health_queue_reconcile_task,)
@@ -80779,6 +81524,7 @@ async def health() -> dict[str, Any]:
     team_hub_capability = await team_hub_capability_for_health()
     return {
         "ok": True,
+        "chat_readiness": queue_recovery_readiness(),
         "server_version": SERVER_VERSION,
         "api_contract_version": API_CONTRACT_VERSION,
         "server_identity": server_identity(),
@@ -80800,7 +81546,7 @@ async def health() -> dict[str, Any]:
             "side_questions": side_questions.capability(),
             "codex_auth_v1": codex_auth.capability(available=bool(AGENT_TOKEN) and CODEX_TRANSPORT != CODEX_TRANSPORT_EXEC),
             "codex_provider_v1": {"available": bool(AGENT_TOKEN) and CODEX_TRANSPORT != CODEX_TRANSPORT_EXEC, "wire_api": "responses", "per_chat": True, "per_chat_models": True, "model_discovery": True, "model_compatibility": True},
-            "provider_connections_v1": {"available": bool(AGENT_TOKEN), "per_chat": True, "backends": [BACKEND_CLAUDE, BACKEND_OPENCODE, BACKEND_CURSOR]},
+            "provider_connections_v1": {"available": bool(AGENT_TOKEN), "per_chat": True, "backends": [BACKEND_CLAUDE, BACKEND_OPENCODE, BACKEND_CURSOR, BACKEND_GEMINI]},
             "team_mail_hints_v1": SECURE_PEER_RUNTIME.team_mail_hint_capability(),
             "team_mail_hints_v2": SECURE_PEER_RUNTIME.team_notification_hint_capability(),
             "websocket_auth_v1": {
@@ -80815,6 +81561,7 @@ async def health() -> dict[str, Any]:
                 "event_protocol": EVENTS_WEBSOCKET_PROTOCOL,
                 "terminal_protocol": TERMINAL_WEBSOCKET_PROTOCOL,
             },
+            "event_stream_liveness_v1": {"available": True, "version": 1},
             "team_hub_v1": team_hub_capability,
             "team_hub_host_control_v1": team_hub_host_control_capability(),
             "agent_team_mail_routes_v1": {
@@ -80921,16 +81668,19 @@ async def health() -> dict[str, Any]:
                     BACKEND_CODEX,
                     BACKEND_CLAUDE,
                     BACKEND_OPENCODE,
+                    BACKEND_GEMINI,
                 ],
                 "client_capability_by_backend": {
                     BACKEND_CODEX: CODEX_INTERACTIVE_CLIENT_CAPABILITY,
                     BACKEND_CLAUDE: CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY,
                     BACKEND_OPENCODE: OPENCODE_PROVIDER_COMMANDS_CLIENT_CAPABILITY,
+                    BACKEND_GEMINI: GEMINI_CLIENT_CAPABILITY,
                 },
                 "supported_kinds_by_backend": {
                     BACKEND_CODEX: ["skill"],
                     BACKEND_CLAUDE: ["command"],
                     BACKEND_OPENCODE: ["skill"],
+                    BACKEND_GEMINI: ["skill"],
                 },
                 "opencode_scope": {
                     "discovery": "bounded_documented_default_skill_roots",
@@ -81000,6 +81750,25 @@ async def health() -> dict[str, Any]:
                 ),
                 "max_client_frame_bytes": PORT_TUNNEL_MAX_CLIENT_FRAME_BYTES,
                 **port_tunnel_status,
+            },
+            "gemini_backend": {
+                # Server support is always advertised; CLI installation and
+                # API connection readiness are checked separately at runtime.
+                "available": True, "required": False, "version": 1, "transport": "acp",
+                "permission_modes": ["default", "autoEdit", "yolo"],
+                "default_permission_mode": "default",
+                "message": "Gemini requires a compatible Gemini CLI and a configured API connection in My Agents.", "action": None,
+                "client_capability": GEMINI_CLIENT_CAPABILITY,
+                "history_mode": "initial_text_snapshot",
+                "features": {"resume": True, "external_import": True, "fork": False,
+                             "native_import_api": True,
+                             "history_reconciliation": False,
+                             "approvals": True, "skills_picker": True, "custom_api": True,
+                             "attachments": True, "live_text": True, "token_usage": True,
+                             "scheduled_jobs": True, "interactive_shares": True,
+                             "native_goals": False, "native_side_questions": False,
+                             "managed_subagents": False, "native_compaction_control": False,
+                             "permission_mode_control": True},
             },
             "opencode_backend": {
                 # ``available`` advertises the server contract. Runtime
@@ -81156,6 +81925,7 @@ async def health() -> dict[str, Any]:
                 "max_active_alerts": EMERGENCY_ACTIVE_ALERT_LIMIT,
                 "stream_path": "/api/emergency-alerts/events",
                 "stream_protocol": EMERGENCY_WEBSOCKET_PROTOCOL,
+                "acknowledge_through_alert_id": True,
             },
             "cross_chat_handoffs_v1": cross_chat_handoffs_capability(),
             "codex_controls": {
@@ -82443,6 +83213,9 @@ app.include_router(provider_connections.create_router(
     ),
 ))
 
+from gemini_runner import router as gemini_router
+app.include_router(gemini_router(sys.modules[__name__]))
+
 app.include_router(codex_provider.create_router(
     authorize=require_native_admin_control,
     store=CODEX_PROVIDER_STORE,
@@ -82863,6 +83636,7 @@ async def submit_interactive_chat_prompt(
     result = await post_turn(session_id, TurnRequest(
         prompt=prompt, file_ids=file_ids, shared_chat_id=share_id,
         shared_chat_request_id=request_id,
+        client_capabilities=(["gemini_acp_v1"] if (STORE.sessions.get(session_id) or {}).get("backend") == "gemini" else []),
     ))
     if not isinstance(result, dict) or type(result.get("queued")) is not bool:
         raise HTTPException(503, "Message acceptance could not be confirmed")
@@ -82969,13 +83743,21 @@ async def interactive_chat_native_snapshot(session_id: str) -> dict[str, Any]:
                 projected[key] = strip_agentsdock_generated_user_text(projected[key], expected_session_id=session_id)
         queue.append(projected)
     model, effort = str(session.get("model") or ""), str(session.get("effort") or "")
+    gemini_fields = {}
+    if backend == "gemini":
+        from gemini_runner import PERMISSIONS, owns
+        gemini_fields["gemini_runtime"] = {"available": True, "pending_interactions": [
+            shared_native_value(row["public"]) for row in PERMISSIONS.values()
+            if row["public"]["session_id"] == session_id and owns(sys.modules[__name__], session_id, row["run_id"])]}
     snapshot = shared_native_value({
         "session": public, "events": page["events"], "queue": queue, "active": active,
         "hasMoreEvents": page["has_more"], "nextTimelineBefore": page.get("next_before"),
         "eventsTotal": page.get("semantic_total"), "goal": goal,
         "jobs": (await list_session_jobs(session_id))["jobs"],
         "codex_runtime": codex_runtime, "claude_runtime": claude_runtime,
+        **gemini_fields,
         "health": {"capabilities": {
+            **({"gemini_backend": {"available": True, "version": 1}} if backend == "gemini" else {}),
             "codex_controls": {"available": codex_available},
             "claude_controls": {"available": claude_available,
                                 "interactive_client_capability": CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY},
@@ -83006,6 +83788,7 @@ async def interactive_chat_native_snapshot(session_id: str) -> dict[str, Any]:
 async def steer_interactive_chat_prompt(session_id: str, prompt: str, *, share_id: str, request_id: str) -> dict[str, Any]:
     receipt = await post_turn(session_id, TurnRequest(
         prompt=prompt, shared_chat_id=share_id, shared_chat_request_id=request_id,
+        client_capabilities=(["gemini_acp_v1"] if (STORE.sessions.get(session_id) or {}).get("backend") == "gemini" else []),
     ))
     if not isinstance(receipt, dict) or type(receipt.get("queued")) is not bool:
         raise HTTPException(503, "Message acceptance could not be confirmed")
@@ -83102,6 +83885,9 @@ async def control_interactive_chat(session_id: str, action: str, payload: dict[s
                     INTERACTIVE_CHAT_CATALOG = (time.monotonic(), shared_native_value(await runtime_catalog()))
                 value = INTERACTIVE_CHAT_CATALOG[1]
         return shared_native_value(value)
+    async def shared_gemini_approval(sid, interaction_id, response):
+        from gemini_runner import resolve_permission
+        return await resolve_permission(sys.modules[__name__], sid, interaction_id, response)
     callbacks = {
         "turn.stop": stop_turn_endpoint, "turn.steer": steer_interactive_chat_prompt,
         "queue.run_now": post_run_queued_turn_now, "queue.edit": patch_queued_turn,
@@ -83111,6 +83897,7 @@ async def control_interactive_chat(session_id: str, action: str, payload: dict[s
         "job.create": create_session_job, "job.update": update_session_job,
         "job.toggle": update_session_job, "job.delete": delete_session_job, "job.run": run_interactive_chat_job,
         "approval.codex": post_codex_interaction_response, "approval.claude": post_claude_interaction_response,
+        "approval.gemini": shared_gemini_approval,
     }
     models = {model.__name__: model for model in (
         UpdateSessionRequest, CodexGoalRequest, CreateScopedJobRequest, UpdateJobRequest,
@@ -85903,6 +86690,7 @@ async def create_session_with_history(req: CreateSessionRequest) -> dict[str, An
 async def get_local_sessions(
     limit: int = Query(default=200, ge=1, le=MAX_LOCAL_SESSION_LIST_ITEMS),
     include_cursor: bool = False,
+    include_gemini: bool = False,
 ) -> dict[str, Any]:
     """List main conversations unused by any installed same-user local instance."""
 
@@ -85913,6 +86701,8 @@ async def get_local_sessions(
             for key in local_session_ownership.provider_session_keys(session, DEFAULT_BACKEND)
         }
     options = {"include_cursor": True} if include_cursor else {}
+    if include_gemini:
+        options["include_gemini"] = True
     sessions = await asyncio.to_thread(local_session_candidates, limit, known_provider_keys, **options)
     return {"sessions": sessions}
 
@@ -85986,6 +86776,7 @@ async def bulk_import_sessions_guarded(
             MAX_LOCAL_SESSION_LIST_ITEMS,
             set(),
             **({"include_cursor": True} if any(item.backend == BACKEND_CURSOR for item in req.items) else {}),
+            **({"include_gemini": True} if any(item.backend == BACKEND_GEMINI for item in req.items) else {}),
         )
         candidate_by_key = {
             (str(candidate["backend"]), str(candidate["provider_session_id"])): candidate
@@ -85995,6 +86786,10 @@ async def bulk_import_sessions_guarded(
         results: list[dict[str, Any]] = []
         for item in req.items:
             key = (item.backend, item.provider_session_id)
+            if item.provider_connection and item.backend != BACKEND_GEMINI:
+                results.append(bulk_import_result(item, ok=False, code="invalid_connection",
+                    error="API binding on import is only supported for Gemini."))
+                continue
             if key in requested_keys:
                 results.append(bulk_import_result(
                     item,
@@ -86035,7 +86830,11 @@ async def bulk_import_sessions_guarded(
 
             staged_session: dict[str, Any] | None = None
             try:
-                if item.backend == BACKEND_CURSOR:
+                if item.backend == BACKEND_GEMINI:
+                    from gemini_import import initial_history
+                    source_path, history_items = await asyncio.to_thread(initial_history,
+                        sys.modules[__name__], runner_env(), item.provider_session_id, candidate_cwd or "")
+                elif item.backend == BACKEND_CURSOR:
                     source_path, history_items = await asyncio.to_thread(
                         cursor_initial_history, item.provider_session_id, candidate_cwd or "",
                     )
@@ -86077,6 +86876,7 @@ async def bulk_import_sessions_guarded(
                 staged_session = await STORE.create(
                     CreateSessionRequest(
                         backend=item.backend,
+                        provider_connection=item.provider_connection,
                         provider_session_id=item.provider_session_id,
                         cwd=candidate_cwd or DEFAULT_CWD,
                         title=(item.title or str(candidate.get("label") or "")).strip()
@@ -86353,8 +87153,6 @@ async def get_session(
     normalized_page_mode = str(page_mode or "").strip().lower()
     if normalized_page_mode not in {"", "semantic"}:
         raise HTTPException(status_code=400, detail="page_mode must be semantic")
-    if normalized_page_mode != "semantic":
-        await asyncio.to_thread(prepare_provider_history_metadata_repair, session_id)
     page_tail = tail and after <= 0
     semantic_page: dict[str, Any] | None = None
     if normalized_page_mode == "semantic":
@@ -86418,6 +87216,23 @@ async def get_session(
             "next_semantic_before": semantic_page["next_semantic_before"],
         })
     return response
+
+
+@app.post("/api/sessions/{session_id}/history/maintenance", status_code=202)
+async def retry_history_maintenance(session_id: str) -> dict[str, Any]:
+    """Explicit retry clears backoff, never provenance or lifecycle guards."""
+    ensure_session_not_initializing(session_id)
+    ensure_session_not_deleting(session_id)
+    sess = STORE.sessions.get(session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="session not found")
+    if session_id in BUSY_SESSIONS or ACTIVE.get(session_id) is not None:
+        raise HTTPException(status_code=409, detail="history maintenance waits for this chat to become idle")
+    if session_id not in HISTORY_SYNC_SCHEDULED:
+        history_maintenance_state(session_id).clear()
+        schedule_provider_history_sync(sess)
+    return {"scheduled": session_id in HISTORY_SYNC_SCHEDULED,
+            "history_maintenance": dict(history_maintenance_state(session_id))}
 
 
 @app.post("/api/sessions/{session_id}/import-history")
@@ -86715,6 +87530,68 @@ async def ensure_backend_update_allowed(
 
 @app.patch("/api/sessions/{session_id}")
 async def update_session(session_id: str, req: UpdateSessionRequest) -> dict[str, Any]:
+    if req.gemini_connect_api:
+        if set(req.model_dump(exclude_unset=True)) != {"gemini_connect_api"}:
+            raise HTTPException(400, "Connect the Gemini API separately from other chat edits.")
+        return await connect_gemini_import_api(session_id)
+    return await _update_session(session_id, req)
+
+
+async def connect_gemini_import_api(session_id: str) -> dict[str, Any]:
+    """Explicit one-way binding of a native import, not general account switching."""
+    from gemini_import import initial_history
+    from gemini_history import native_snapshot, snapshot_replay
+    from gemini_acp_client import GeminiProtocolError
+    ensure_session_not_initializing(session_id)
+    async with session_lifecycle_lock(session_id):
+        current = STORE.sessions.get(session_id)
+        if not current:
+            raise HTTPException(404, "session not found")
+        if current.get("backend") != BACKEND_GEMINI or not session_provider_id(current):
+            raise HTTPException(400, "Only an imported Gemini conversation can use this action.")
+        if current.get("archived") or session_id in DELETING_SESSIONS:
+            raise HTTPException(409, "Unarchive this chat before connecting its API.")
+        if (session_id in BUSY_SESSIONS or session_id in ACTIVE or QUEUED_TURNS.get(session_id)
+                or current.get("gemini_cleanup_pending_run_id")
+                or any(not task.done() for task in SESSION_TURN_TASKS.get(session_id, ()))):
+            raise HTTPException(409, "Stop active work and clear queued messages before connecting this API.")
+        if current.get("provider_connection") == "custom":
+            PROVIDER_CONNECTION_STORE.for_session(current)  # No silent rebind on Forget.
+            return {"session": public_session(current)}
+        provider_id, cwd = session_provider_id(current), str(current.get("cwd") or "")
+        def validate():
+            initial_history(sys.modules[__name__], runner_env(), provider_id, cwd)
+            snapshot_replay(native_snapshot(runner_env(), cwd, provider_id))
+        try:
+            await asyncio.to_thread(validate)
+        except (GeminiProtocolError, OSError, ValueError):
+            raise HTTPException(409, "The original Gemini history is unavailable or changed; refresh Import Chat.") from None
+        async with STORE._lock:
+            if (STORE.sessions.get(session_id) is not current or session_id in DELETING_SESSIONS
+                    or current.get("archived") or session_id in BUSY_SESSIONS or session_id in ACTIVE
+                    or QUEUED_TURNS.get(session_id) or current.get("gemini_cleanup_pending_run_id")
+                    or any(not task.done() for task in SESSION_TURN_TASKS.get(session_id, ()))):
+                raise HTTPException(409, "This chat changed while connecting; wait for active work to finish and retry.")
+            previous = dict(current)
+            selected = PROVIDER_CONNECTION_STORE.bind({"backend": BACKEND_GEMINI, "provider_connection": "custom"})
+            current.update(provider_connection="custom", provider_connection_revision=selected["credential_id"],
+                gemini_native_history=True, gemini_session_cwd=cwd, model=selected.get("model"), updated_at=now_iso())
+            try:
+                await STORE.save(durable=True)
+            except BaseException:
+                current.clear(); current.update(previous)
+                raise
+        return {"session": public_session(current)}
+
+
+async def _update_session(
+    session_id: str, req: UpdateSessionRequest, *,
+    native_archive_owner: tuple[str, str] | None = None,
+) -> dict[str, Any]:
+    # Internal provenance is not an HTTP parameter. Recheck after acquiring
+    # the same lock as Stop, replacement and new-turn admission.
+    if native_archive_owner is not None and req.archived is not True:
+        raise ValueError("native archive ownership only applies to archive")
     ensure_session_not_initializing(session_id)
     patch = req.model_dump(exclude_unset=True)
     if SESSION_LIFECYCLE_UPDATE_FIELDS.intersection(patch):
@@ -86722,6 +87599,12 @@ async def update_session(session_id: str, req: UpdateSessionRequest) -> dict[str
             current = STORE.sessions.get(session_id)
             if not current:
                 raise HTTPException(status_code=404, detail="session not found")
+            if native_archive_owner is not None:
+                thread_id, run_id = native_archive_owner
+                if (session_id in DELETING_SESSIONS or current.get("backend") != BACKEND_CODEX
+                        or str(session_provider_id(current) or "") != thread_id
+                        or (ACTIVE.get(session_id) or {}).get("run_id") != run_id):
+                    return {"session": public_session(current)}
             if req.archived is False and current.get("archived"):
                 try:
                     # An earlier archive may have failed to save jobs.json
@@ -88583,7 +89466,7 @@ async def _put_codex_goal_locked(
     if req.status == "active":
         if (STORE.sessions.get(session_id) or {}).get("archived"):
             raise HTTPException(status_code=409, detail="archived chats cannot resume goals")
-        await wait_for_queue_recovery_admission()
+        await wait_for_queue_recovery_admission(session_id)
     manager, thread_id, control_session = await acquire_codex_control_thread(
         session_id,
         reserve_session=req.status == "active",
@@ -89370,6 +90253,26 @@ async def acknowledge_session_emergency(
         sess = STORE.sessions.get(session_id)
         if not sess:
             raise HTTPException(status_code=404, detail="session not found")
+        if req.through_alert_id is not None:
+            boundary, alert_ids = await asyncio.to_thread(
+                emergency_alert_batch_through, session_id, req.through_alert_id,
+            )
+            if boundary is None:
+                raise HTTPException(status_code=409, detail="that emergency alert boundary was not found")
+            if alert_ids:
+                events = await append_durable_event_batch(session_id, [
+                    ("emergency_alert_acknowledged", {
+                        "emergency_alert_id": alert_id,
+                        "message": "Emergency acknowledged by the user.",
+                    })
+                    for alert_id in alert_ids
+                ])
+                committed = events[-1]
+            else:
+                committed = boundary
+            sess = await project_committed_emergency_event(session_id, committed)
+            return {"session": public_session(sess), "acknowledged": bool(alert_ids),
+                    "acknowledged_count": len(alert_ids)}
         alert_id = req.expected_alert_id
         acknowledged_event = await asyncio.to_thread(
             find_emergency_acknowledgement_event,
@@ -89535,6 +90438,13 @@ async def discard_empty_session(session_id: str, expected_updated_at: str) -> di
 async def delete_session(session_id: str, discard_updated_at: str | None = None) -> dict[str, Any]:
     async with session_lifecycle_lock(session_id):
         ensure_session_not_initializing(session_id)
+        pending_gemini_cleanup = (STORE.sessions.get(session_id) or {}).get("gemini_cleanup_pending_run_id")
+        live_gemini_owner = ACTIVE.get(session_id) or {}
+        if pending_gemini_cleanup and (
+            live_gemini_owner.get("run_id") != pending_gemini_cleanup
+            or not callable(live_gemini_owner.get("gemini_cleanup"))
+        ):
+            raise HTTPException(409, "Gemini runtime cleanup requires server-side verification after restart; the chat and native history were not deleted.")
         if session_id in DELETED_SESSION_TOMBSTONES:
             # A previous delete can have committed before its request was
             # canceled. Retry any tracked bridge retirement on idempotent
@@ -89702,6 +90612,16 @@ async def delete_session(session_id: str, discard_updated_at: str | None = None)
                                 "shortly."
                             ),
                         )
+                elif active.get("backend") == BACKEND_GEMINI:
+                    cleanup = active.get("gemini_cleanup")
+                    try:
+                        if not callable(cleanup):
+                            raise RuntimeError("Missing Gemini cleanup owner")
+                        await cleanup()
+                    except Exception:
+                        raise HTTPException(status_code=409, detail=(
+                            "Gemini runtime cleanup could not be verified; the chat was not deleted. Retry Stop."
+                        )) from None
                 elif proc:
                     await terminate_process_tree(proc)
 
@@ -89800,6 +90720,17 @@ async def delete_session(session_id: str, discard_updated_at: str | None = None)
             # initial session record but before its task acknowledges stop.
             # The task registry is now drained, so this reread is stable.
             late_session = STORE.sessions.get(session_id) or {}
+            gemini_active = ACTIVE.get(session_id) or {}
+            if gemini_active.get("backend") == BACKEND_GEMINI and gemini_active.get("gemini_cleanup_failed"):
+                # A completed consumer task does not prove its owned runtime
+                # was reaped. Retry only this chat's cleanup, before deletion.
+                try:
+                    await gemini_active["gemini_cleanup"]()
+                    from gemini_runner import clear_cleanup_fence
+                    await clear_cleanup_fence(sys.modules[__name__], session_id, str(gemini_active.get("run_id") or ""))
+                except Exception:
+                    raise HTTPException(409, "Gemini runtime cleanup is incomplete; the chat was not deleted. Retry after stopping its runtime.") from None
+                gemini_active["gemini_cleanup_failed"] = False
             late_provider_thread_id = str(
                 session_provider_id(late_session) or ""
             )
@@ -90149,6 +91080,8 @@ async def fork_session(session_id: str, req: ForkSessionRequest) -> dict[str, An
     async with session_lifecycle_lock(session_id):
         try:
             ensure_session_not_deleting(session_id)
+            if (STORE.sessions.get(session_id) or {}).get("backend") == BACKEND_GEMINI:
+                raise HTTPException(409, "Gemini native fork is not available; create a new chat instead.")
             if (STORE.sessions.get(session_id) or {}).get("backend") == BACKEND_OPENCODE:
                 raise HTTPException(status_code=409, detail="OpenCode native chat fork is unavailable; no transcript-copy fallback is enabled.")
             async with ACTIVE_LOCK:
@@ -90561,8 +91494,123 @@ async def _fork_session_locked(
     return {"session": public_session(child), "sessions": [public_session(sess) for sess in ordered_sessions]}
 
 
+TURN_RECEIPT_TASKS: dict[tuple[str, str], tuple[str, asyncio.Task]] = {}
+
+
+def turn_receipt_path(session_id: str, request_id: str) -> Path:
+    return events_path(session_id).parent / "turn-receipts" / f"{request_id}.json"
+
+
+def write_turn_receipt(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = path.with_suffix(".tmp")
+    with temporary.open("w") as stream:
+        json.dump(value, stream, separators=(",", ":"))
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(path)
+    descriptor = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def recover_turn_receipt(session_id: str, value: dict) -> dict | None:
+    path = events_path(session_id)
+    stamp = history_file_stamp(path)
+    before = value.get("journal")
+    offset = before[2] if before else 0
+    if stamp is None:
+        if before is not None:
+            raise ValueError("send receipt journal disappeared")
+        return None
+    if before and (stamp[:2] != tuple(before[:2]) or stamp[2] < offset):
+        raise ValueError("send receipt journal was replaced")
+    # An ambiguous old receipt must not cause an unbounded scan or a resend.
+    if stamp[2] - offset > 32 * 1024 * 1024:
+        raise ValueError("send receipt recovery requires a larger journal scan")
+    with path.open("rb") as stream:
+        stream.seek(offset)
+        while stream.tell() < stamp[2]:
+            line = stream.readline(stamp[2] - stream.tell())
+            if not line.endswith(b"\n"):
+                raise ValueError("send receipt journal has an incomplete record")
+            if b'"client_request_id"' not in line:
+                continue
+            event = json.loads(line)
+            if event.get("client_request_id") != value["request_id"]:
+                continue
+            if event.get("type") == "turn_started":
+                return {"run_id": event["run_id"], "queued": False}
+            if event.get("type") == "turn_queued":
+                return {"queued_id": event["queued_id"], "queued": True,
+                        "position": event.get("position", 1)}
+    return None
+
+
+async def execute_receipted_turn(session_id: str, req: TurnRequest, fingerprint: str) -> dict:
+    path = turn_receipt_path(session_id, req.client_request_id)
+    try:
+        value = await asyncio.to_thread(lambda: json.loads(path.read_text()))
+    except FileNotFoundError:
+        value = {"request_id": req.client_request_id, "fingerprint": fingerprint,
+                 "journal": history_file_stamp(events_path(session_id)), "status": "pending"}
+        await asyncio.to_thread(write_turn_receipt, path, value)
+    else:
+        if value.get("fingerprint") != fingerprint:
+            raise HTTPException(status_code=409, detail="request ID was already used for a different message")
+        if value.get("status") == "accepted":
+            return {**value["response"], "session": public_session(STORE.sessions[session_id])}
+        try:
+            recovered = await asyncio.to_thread(recover_turn_receipt, session_id, value)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=409, detail="message acceptance is uncertain; retain this request ID") from exc
+        if recovered is not None:
+            recovered["session"] = public_session(STORE.sessions[session_id])
+            value.update(status="accepted", response=recovered)
+            await asyncio.to_thread(write_turn_receipt, path, value)
+            return recovered
+    response = await post_turn_without_receipt(session_id, req)
+    value.update(status="accepted", response=response)
+    await asyncio.to_thread(write_turn_receipt, path, value)
+    return response
+
+
+async def post_turn_with_receipt(session_id: str, req: TurnRequest) -> Any:
+    if session_id not in STORE.sessions or session_id in DELETED_SESSION_TOMBSTONES:
+        raise HTTPException(status_code=404, detail="session not found")
+    fingerprint = hashlib.sha256(json.dumps(req.model_dump(mode="json"), sort_keys=True,
+                                           separators=(",", ":")).encode()).hexdigest()
+    key = (session_id, req.client_request_id)
+    existing = TURN_RECEIPT_TASKS.get(key)
+    if existing is not None and existing[0] != fingerprint:
+        raise HTTPException(status_code=409, detail="request ID was already used for a different message")
+    if existing is None:
+        task = asyncio.create_task(execute_receipted_turn(session_id, req, fingerprint))
+        TURN_RECEIPT_TASKS[key] = (fingerprint, task)
+        def completed(done):
+            TURN_RECEIPT_TASKS.pop(key, None)
+            if not done.cancelled():
+                done.exception()
+        task.add_done_callback(completed)
+    else:
+        task = existing[1]
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=10)
+    except asyncio.TimeoutError:
+        return JSONResponse(status_code=202, content={"request_id": req.client_request_id,
+                            "acceptance": "pending", "retry_same_request": True})
+
+
 @app.post("/api/sessions/{session_id}/turns")
-async def post_turn(session_id: str, req: TurnRequest) -> dict[str, Any]:
+async def post_turn(session_id: str, req: TurnRequest) -> Any:
+    if req.client_request_id is not None:
+        return await post_turn_with_receipt(session_id, req)
+    return await post_turn_without_receipt(session_id, req)
+
+
+async def post_turn_without_receipt(session_id: str, req: TurnRequest) -> dict[str, Any]:
     while True:
         try:
             return await start_turn(session_id, req)
@@ -94032,6 +95080,12 @@ async def stop_turn(
                     "superseded": True,
                     "message": "The requested run no longer owns this chat.",
                 }
+        if ((STORE.sessions.get(session_id) or {}).get("gemini_cleanup_pending_run_id")
+                and (not active or not callable(active.get("gemini_cleanup")))):
+            if _admission_ready is not None:
+                _admission_ready.set()
+            return {"ok": False, "stopped": False, "pending": True,
+                    "message": "Gemini runtime cleanup requires server-side verification after restart; this chat remains fenced."}
         if preserve_active_goal and codex_goal_followup_requires_native(
             STORE.sessions.get(session_id) or {}, active or {}, current_turn,
         ):
@@ -94754,7 +95808,20 @@ async def stop_turn(
     # The app-server process may serve multiple Codex chats and must never be
     # terminated as a per-chat Stop action.
     if proc and active.get("transport") != CODEX_TRANSPORT_APP_SERVER:
-        await terminate_process_tree(proc)
+        if active.get("backend") == BACKEND_GEMINI:
+            # Gemini owns a verified-cleanup guard. Generic tree termination
+            # can kill it before startup or during verification, destroying the
+            # cleanup evidence and leaving the chat permanently fenced.
+            cleanup = active.get("gemini_cleanup")
+            try:
+                if not callable(cleanup):
+                    raise RuntimeError("Missing Gemini cleanup owner")
+                await cleanup()
+            except Exception:
+                return {"ok": False, "stopped": False, "pending": True,
+                        "message": "Gemini runtime cleanup is incomplete. Retry Stop; this chat remains fenced."}
+        else:
+            await terminate_process_tree(proc)
     if transition_ready is not None:
         try:
             await asyncio.wait_for(
@@ -94822,6 +95889,18 @@ async def stop_turn(
                 and not owner_task.done()
             ):
                 dynamic_tasks.add(owner_task)
+        if (current is active and active.get("backend") == BACKEND_GEMINI
+                and active.get("gemini_cleanup_failed") and not dynamic_tasks):
+            try:
+                await active["gemini_cleanup"]()
+                from gemini_runner import clear_cleanup_fence
+                await clear_cleanup_fence(sys.modules[__name__], session_id, str(active.get("run_id") or ""))
+            except Exception:
+                return {"ok": False, "stopped": False, "pending": True,
+                        "message": "Gemini runtime cleanup is incomplete. Retry Stop; this chat remains fenced."}
+            active["gemini_cleanup_failed"] = False
+            await reconcile_provider_task_exit(session_id, str(active.get("run_id") or ""), BACKEND_GEMINI)
+            return {"ok": True, "stopped": True, "pending": False}
         if current is not active:
             if not goal_pause_ok:
                 return await terminal_goal_pause_failure_result(native_interrupt)
@@ -95667,6 +96746,17 @@ async def session_terminal(
             await ws.close()
 
 
+EVENT_STREAM_HEARTBEAT_SECONDS = 15.0
+
+
+async def send_event_stream_status(ws: WebSocket, session_id: str, phase: str) -> None:
+    # Ephemeral, opt-in control frames: never persisted or assigned a seq.
+    await asyncio.wait_for(ws.send_json({
+        "type": "event_stream_status", "version": 1,
+        "session_id": session_id, "phase": phase,
+    }), timeout=WEBSOCKET_SEND_TIMEOUT_SECONDS)
+
+
 @app.websocket("/api/sessions/{session_id}/events")
 async def session_events(
     session_id: str,
@@ -95675,6 +96765,8 @@ async def session_events(
     visible: bool | None = None,
     reasoning_stream: bool = False,
     reasoning_text: bool = False,
+    liveness: bool = False,
+    history_projection: bool = False,
 ) -> None:
     selected_subprotocol = websocket_endpoint_subprotocol(
         ws,
@@ -95689,6 +96781,7 @@ async def session_events(
         await ws.close(code=4404)
         return
     await ws.accept(subprotocol=selected_subprotocol)
+    schedule_provider_history_sync(STORE.sessions[session_id])
     try:
         if not await HUB.reserve(session_id, ws):
             await close_event_websocket_over_capacity(ws)
@@ -95704,7 +96797,6 @@ async def session_events(
         # is ready. Reading its fsynced rows earlier can replay raw scheduled
         # inputs before this socket is registered for the repaired broadcast.
         async with event_delivery_lock(session_id):
-            await asyncio.to_thread(prepare_provider_history_metadata_repair, session_id)
             boundary = await asyncio.to_thread(
                 last_event_seq_from_file,
                 events_path(session_id),
@@ -95755,12 +96847,28 @@ async def session_events(
                     return
                 if reasoning_snapshot is not None:
                     await asyncio.wait_for(ws.send_json(reasoning_snapshot), timeout=WEBSOCKET_SEND_TIMEOUT_SECONDS)
+                if liveness:
+                    await send_event_stream_status(ws, session_id, "ready")
+                if history_projection:
+                    # A proof may finish between the HTTP page and subscription.
+                    # The revision closes that gap without replaying old rows.
+                    await asyncio.wait_for(ws.send_json(history_projection_notice(session_id)), timeout=WEBSOCKET_SEND_TIMEOUT_SECONDS)
                 break
             boundary = gap_boundary
         while True:
-            await ws.receive_text()
+            if not liveness:
+                await ws.receive_text()
+                continue
+            try:
+                await asyncio.wait_for(ws.receive_text(), timeout=EVENT_STREAM_HEARTBEAT_SECONDS)
+            except asyncio.TimeoutError:
+                # No history scan, provider call, or sequence acknowledgement.
+                # This confirms that the application event path is still alive.
+                await send_event_stream_status(ws, session_id, "heartbeat")
     except WebSocketDisconnect:
         pass
+    except (asyncio.TimeoutError, ConnectionError):
+        await close_event_websocket_after_delivery_failure(ws)
     finally:
         await HUB.unsubscribe(session_id, ws)
 

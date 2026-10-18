@@ -30,12 +30,110 @@ class FakeWebSocket:
 
 
 class EventWebSocketCatchupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_opted_in_projection_revision_covers_reconnect_gap(self) -> None:
+        sid = "projection-reconnect"
+        socket = FakeWebSocket()
+        with tempfile.TemporaryDirectory() as root, \
+                patch.object(agent_server, "AGENT_TOKEN", ""), \
+                patch.dict(agent_server.STORE.sessions, {sid: {"id": sid}}, clear=True), \
+                patch.object(agent_server, "events_path", return_value=Path(root) / "events.jsonl"), \
+                patch.object(agent_server, "schedule_provider_history_sync"), \
+                patch.dict(agent_server.HISTORY_PROJECTION_REVISIONS, {sid: 7}, clear=True):
+            (Path(root) / "events.jsonl").write_text("")
+            await agent_server.session_events(sid, socket, visible=True, history_projection=True)
+        self.assertEqual(socket.events, [{"type": "history_projection_changed", "session_id": sid,
+            "revision": f"{agent_server.SERVER_INSTANCE_ID}:7"}])
+
     def setUp(self) -> None:
         super().setUp()
         # Earlier cases in a shard leave cyclic mock/fixture graphs behind.
         # Collect them before this fresh loop enters real socket deadlines;
         # otherwise an unrelated full collection can stall a timed fake send.
         gc.collect()
+
+    async def test_projection_notice_and_liveness_share_one_caught_up_stream(self) -> None:
+        socket = FakeWebSocket()
+        with (
+            patch.object(agent_server, "HUB", agent_server.SubscriberHub()),
+            patch.object(agent_server, "websocket_authorized", return_value=True),
+            patch.dict(agent_server.STORE.sessions, {"chat": {"id": "chat"}}, clear=True),
+            patch.object(agent_server, "schedule_provider_history_sync"),
+            patch.object(agent_server, "last_event_seq_from_file", return_value=5),
+            patch.object(agent_server, "send_event_catchup", new=AsyncMock(return_value=5)),
+            patch.dict(agent_server.HISTORY_PROJECTION_REVISIONS, {"chat": 7}, clear=True),
+        ):
+            await agent_server.session_events("chat", socket, after=5, liveness=True, history_projection=True)
+            self.assertEqual(socket.events, [
+                {"type": "event_stream_status", "version": 1, "session_id": "chat", "phase": "ready"},
+                {"type": "history_projection_changed", "session_id": "chat",
+                 "revision": f"{agent_server.SERVER_INSTANCE_ID}:7"},
+            ])
+            self.assertFalse(agent_server.HUB._subscribers)
+            self.assertFalse(agent_server.HUB._reservations)
+
+    async def test_opted_in_liveness_confirms_catchup_then_heartbeats_without_log_scans(self) -> None:
+        class ListeningSocket(FakeWebSocket):
+            async def receive_text(self) -> str:
+                if len(self.events) >= 3:
+                    raise agent_server.WebSocketDisconnect()
+                await asyncio.sleep(10)
+                return ""
+
+        socket = ListeningSocket()
+        with (
+            patch.object(agent_server, "HUB", agent_server.SubscriberHub()),
+            patch.object(agent_server, "websocket_authorized", return_value=True),
+            patch.dict(agent_server.STORE.sessions, {"chat": {"id": "chat"}}, clear=True),
+            patch.object(agent_server, "prepare_provider_history_metadata_repair"),
+            patch.object(agent_server, "last_event_seq_from_file", return_value=5) as scan,
+            patch.object(agent_server, "send_event_catchup", new=AsyncMock(return_value=5)),
+            patch.object(agent_server, "EVENT_STREAM_HEARTBEAT_SECONDS", 0.01),
+        ):
+            await asyncio.wait_for(agent_server.session_events("chat", socket, after=5, liveness=True), timeout=2)
+            self.assertEqual([e["phase"] for e in socket.events], ["ready", "heartbeat", "heartbeat"])
+            self.assertTrue(all(e == {"type": "event_stream_status", "version": 1,
+                "session_id": "chat", "phase": e["phase"]} for e in socket.events))
+            self.assertEqual(scan.call_count, 2)  # No history scan for heartbeats.
+            self.assertFalse(agent_server.HUB._subscribers)
+            self.assertFalse(agent_server.HUB._reservations)
+
+    async def test_ready_is_not_sent_before_all_catchup_pages_and_registration(self) -> None:
+        socket = FakeWebSocket()
+        async def catchup(_sid, ws, **kw):
+            await ws.send_json({"seq": kw["through"], "type": "assistant_text"})
+            self.assertFalse(any(e.get("phase") == "ready" for e in ws.events))
+            return kw["through"]
+        with (
+            patch.object(agent_server, "HUB", agent_server.SubscriberHub()),
+            patch.object(agent_server, "websocket_authorized", return_value=True),
+            patch.dict(agent_server.STORE.sessions, {"chat": {"id": "chat"}}, clear=True),
+            patch.object(agent_server, "prepare_provider_history_metadata_repair"),
+            patch.object(agent_server, "last_event_seq_from_file", side_effect=[500, 1000, 1000]),
+            patch.object(agent_server, "send_event_catchup", side_effect=catchup),
+        ):
+            await agent_server.session_events("chat", socket, liveness=True)
+        self.assertEqual([e.get("seq") for e in socket.events], [500, 1000, None])
+        self.assertEqual(socket.events[-1]["phase"], "ready")
+
+    async def test_liveness_write_timeout_closes_transport_and_releases_capacity(self) -> None:
+        class BlockedSocket(FakeWebSocket):
+            closed = False
+            async def send_json(self, event):
+                raise asyncio.TimeoutError()
+            async def close(self, **kwargs):
+                self.closed = True
+        socket = BlockedSocket()
+        with (
+            patch.object(agent_server, "HUB", agent_server.SubscriberHub()),
+            patch.object(agent_server, "websocket_authorized", return_value=True),
+            patch.dict(agent_server.STORE.sessions, {"chat": {"id": "chat"}}, clear=True),
+            patch.object(agent_server, "prepare_provider_history_metadata_repair"),
+            patch.object(agent_server, "last_event_seq_from_file", return_value=0),
+        ):
+            await agent_server.session_events("chat", socket, liveness=True)
+            self.assertTrue(socket.closed)
+            self.assertFalse(agent_server.HUB._subscribers)
+            self.assertFalse(agent_server.HUB._reservations)
 
     async def test_live_summary_is_opt_in_and_does_not_wake_share_projection(self) -> None:
         hub = agent_server.SubscriberHub()

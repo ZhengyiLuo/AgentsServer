@@ -13,6 +13,9 @@ import sys
 import tempfile
 import time
 import unicodedata
+from urllib.parse import quote
+
+import httpx
 
 from codex_app_server import CodexAppServerClient
 from codex_side_question import isolated_config
@@ -33,6 +36,12 @@ INSTRUCTIONS = (
 
 class TitleGenerationError(Exception):
     """Keep errors content-free: prompts, credentials and output are private."""
+
+
+def gemini_title_seed(text: str) -> str:
+    # Pasted logs often put the actual question at the end. Keep the same
+    # bounded budget as other providers without storing the full log twice.
+    return text if len(text) <= 1600 else text[:780] + '\n[excerpt omitted]\n' + text[-800:]
 
 
 def title_prompt(user_text: str, reply: str) -> str:
@@ -329,8 +338,58 @@ async def generate_cursor_title(prompt: str, *, executable: str, model: str | No
         return clean_title(result)
 
 
+async def generate_gemini_title(prompt: str, *, model: str | None, provider_selection: dict) -> str | None:
+    """One tool-free API request on the exact chat binding; no native session.
+
+    No CLI, hooks, MCP, filesystem tools, account fallback or model discovery.
+    The caller resolves CLI Auto from this conversation's native model metadata.
+    """
+    from gemini_api import MODEL, api_base
+
+    if (not isinstance(model, str) or model == 'auto' or not MODEL.fullmatch(model)
+            or provider_selection.get('protocol') != 'gemini'
+            or provider_selection.get('auth_header') != 'x-goog-api-key'
+            or not provider_selection.get('api_key')):
+        raise TitleGenerationError('Gemini title connection/model unavailable')
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS, follow_redirects=False, trust_env=False) as client:
+            async with client.stream('POST', api_base(provider_selection) + '/models/' + quote(model, safe='') + ':generateContent',
+                    headers={'x-goog-api-key': provider_selection['api_key']},
+                    json={'contents': [{'role': 'user', 'parts': [{'text': prompt}]}],
+                          'generationConfig': {'maxOutputTokens': 1024, 'candidateCount': 1}}) as response:
+                if response.status_code != 200:
+                    raise TitleGenerationError('Gemini title request failed')
+                raw = bytearray()
+                async for chunk in response.aiter_bytes(chunk_size=8192):
+                    raw.extend(chunk)
+                    if len(raw) > 64 * 1024:
+                        raise TitleGenerationError('Excessive Gemini title output')
+                value = json.loads(raw)
+        candidates = value.get('candidates')
+        if not isinstance(candidates, list) or len(candidates) != 1 or candidates[0].get('finishReason') != 'STOP':
+            raise TitleGenerationError('Gemini title request did not complete')
+        parts = candidates[0].get('content', {}).get('parts')
+        if not isinstance(parts, list) or not parts or len(parts) > 32:
+            raise TitleGenerationError('Invalid Gemini title output')
+        text = []
+        for part in parts:
+            if (not isinstance(part, dict) or not isinstance(part.get('text'), str)
+                    or set(part) - {'text', 'thought', 'thoughtSignature'}
+                    or ('thought' in part and not isinstance(part['thought'], bool))):
+                raise TitleGenerationError('Unexpected Gemini title content')
+            if part.get('thought') is not True:
+                text.append(part['text'])
+        title = clean_title(''.join(text))
+        if title and provider_selection['api_key'] in title:
+            return None
+        return title
+    except (httpx.HTTPError, ValueError, TypeError, AttributeError, KeyError):
+        raise TitleGenerationError('Gemini title request failed') from None
+
+
 async def generate_title(backend: str, user_text: str, reply: str, **options) -> str | None:
-    generator = {'codex': generate_codex_title, 'cursor': generate_cursor_title}.get(backend)
+    generator = {'codex': generate_codex_title, 'cursor': generate_cursor_title,
+                 'gemini': generate_gemini_title}.get(backend)
     if generator is None:
         return None
     return await asyncio.wait_for(generator(title_prompt(user_text, reply), **options), TIMEOUT_SECONDS)

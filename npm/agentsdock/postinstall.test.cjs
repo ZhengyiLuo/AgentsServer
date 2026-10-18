@@ -6,7 +6,7 @@ const os = require('node:os')
 const path = require('node:path')
 const { EventEmitter } = require('node:events')
 const { PassThrough } = require('node:stream')
-const { postinstall, skipReason } = require('./postinstall.cjs')
+const { postinstall, skipReason, terminalPrint } = require('./postinstall.cjs')
 const { persistentPath } = require('../cli.cjs')
 
 function fixture(t) {
@@ -21,6 +21,7 @@ function fixture(t) {
   const context = { env: { npm_config_global: 'true', npm_config_prefix: prefix,
     npm_command: 'install', npm_lifecycle_event: 'postinstall' }, packageRoot,
     home: root, uid: 1000, platform: 'linux', load: () => runtime,
+    terminalPrint: () => false,
     print: value => output.push(value), launch: (...args) => {
       calls.push({ launch: args })
       const child = new EventEmitter()
@@ -63,6 +64,54 @@ test('automatic setup strips npm lifecycle/cache paths without losing stable cus
   assert.deepEqual(f.calls[1].launch[2].env, { HOME: f.root, PATH: stable })
   assert.ok(f.context.env.PATH.includes(transient))
   assert.doesNotMatch(f.output.join('\n'), /private-token|private-inherited-token|secret-|baseline|\/cache|node_modules/)
+})
+
+test('fresh setup shows URL and token only on the controlling terminal, never npm output', async t => {
+  const f = fixture(t), terminal = []
+  f.context.terminalPrint = value => { terminal.push(value); return true }
+  assert.equal(await postinstall(f.context), 0)
+  assert.match(terminal[0], /Setting up your first/)
+  assert.match(terminal[1], /Your new service is up!/)
+  assert.match(terminal[1], /URL:     http:\/\/127.0.0.1:7850/)
+  assert.match(terminal[1], /Access token \(default\):\nprivate-token\n/)
+  assert.match(terminal[1], /Keep this token private/)
+  assert.doesNotMatch(terminal.join('\n'), /secret-stdout|secret-stderr/)
+  assert.equal(f.output.length, 0)
+})
+
+test('terminal output failure falls back to a public summary, never the token', async t => {
+  const f = fixture(t)
+  assert.equal(await postinstall(f.context), 0)
+  assert.match(f.output.at(-1), /ready at http/)
+  assert.doesNotMatch(f.output.join('\n'), /private-token/)
+})
+
+test('controlling terminal writer requires a tty, handles partial writes and closes on failure', () => {
+  for (const mode of ['ok', 'not-tty', 'no-terminal', 'write-error', 'zero-write']) {
+    let closed = false, written = '', opened = false
+    const io = {
+      openSync: (name, flags) => {
+        assert.equal(name, '/dev/tty')
+        assert.ok(flags & fs.constants.O_NONBLOCK)
+        if (mode === 'no-terminal') throw new Error('no controlling terminal')
+        opened = true
+        return 17
+      },
+      isatty: fd => { assert.equal(fd, 17); return mode !== 'not-tty' },
+      writeSync: (fd, bytes, offset, length) => {
+        assert.equal(fd, 17)
+        if (mode === 'write-error') throw new Error('closed terminal')
+        if (mode === 'zero-write') return 0
+        const count = Math.min(3, length)
+        written += bytes.subarray(offset, offset + count).toString()
+        return count
+      },
+      closeSync: fd => { assert.equal(fd, 17); closed = true },
+    }
+    assert.equal(terminalPrint('private-token', io), mode === 'ok')
+    assert.equal(written, mode === 'ok' ? 'private-token' : '')
+    assert.equal(closed, opened)
+  }
 })
 
 test('existing installation/state is a successful no-op, not an automatic upgrade', async t => {
@@ -125,6 +174,8 @@ test('a concurrently detected installation remains a no-op without claiming a re
 
 test('setup spawn failure, signal termination and wrong-version receipt cannot report success', async t => {
   const f = fixture(t)
+  const terminal = []
+  f.context.terminalPrint = value => { terminal.push(value); return true }
   for (const result of ['spawn-error', 'signal', 'wrong-version']) {
     f.output.length = 0
     f.context.launch = () => {
@@ -143,6 +194,28 @@ test('setup spawn failure, signal termination and wrong-version receipt cannot r
     await assert.rejects(postinstall(f.context), error =>
       /Could not launch|did not complete/.test(error.message) && !error.message.includes('private'))
     assert.doesNotMatch(f.output.join('\n'), /ready|private-token/)
+    assert.doesNotMatch(terminal.join('\n'), /ready|private-token|Your new service is up/)
+  }
+})
+
+test('unsafe or missing token is never rendered as terminal control content', async t => {
+  const f = fixture(t)
+  for (const token of [null, '', '\u001b[2J', 'token\nextra-line', 'x'.repeat(4097)]) {
+    const terminal = []
+    const launch = () => {
+      const child = new EventEmitter()
+      child.stdout = new PassThrough(); child.stderr = new PassThrough()
+      queueMicrotask(() => {
+        child.stdout.write('AGENTSDOCK_SETUP_RESULT=' + JSON.stringify({server_url: 'http://127.0.0.1:7850',
+          server_version: f.runtime.version, access_token: token}) + '\n')
+        child.emit('close', 0)
+      })
+      return child
+    }
+    assert.equal(await postinstall({ ...f.context, launch,
+      terminalPrint: value => { terminal.push(value); return true } }), 0)
+    assert.doesNotMatch(terminal.join('\n'), /Access token \(default\):|\u001b|extra-line|xxxx/)
+    assert.match(terminal.at(-1), /agentsdock token default/)
   }
 })
 
@@ -198,7 +271,63 @@ test('failed setup and invalid receipts cannot report ready or disclose raw diag
       return child
     }
     await assert.rejects(postinstall({ ...f.context, launch }), error =>
-      /did not complete.*uv.*AGENTSDOCK_SKIP_SETUP/.test(error.message) && !error.message.includes('private-token'))
+      /did not complete.*uv[\s\S]*AGENTSDOCK_SKIP_SETUP/.test(error.message) && !error.message.includes('private-token'))
     assert.doesNotMatch(f.output.join('\n'), /ready|private-token|xxx/)
   }
+})
+
+test('uv failures provide platform-appropriate installation and exact-version retry commands', async t => {
+  for (const platform of ['darwin', 'linux']) {
+    for (const version of ['1.0.10', '1.0.11-beta.1']) {
+      const f = fixture(t)
+      f.runtime.version = version
+      let launches = 0
+      const launch = () => {
+        launches++
+        const child = new EventEmitter()
+        child.stdout = new PassThrough(); child.stderr = new PassThrough()
+        queueMicrotask(() => {
+          child.stderr.write('private-token\nUnavailable prerequisite: uv\nInstall the trusted ')
+          child.stderr.write('uv package manager before running this installer.\n')
+          child.emit('close', 1)
+        })
+        return child
+      }
+      await assert.rejects(postinstall({ ...f.context, platform, launch }), error => {
+        assert.match(error.message, /uv is missing from PATH or cannot run/)
+        assert.match(error.message, /needs uv to prepare its Python environment/)
+        assert.match(error.message, /https:\/\/docs\.astral\.sh\/uv\/getting-started\/installation\//)
+        assert.match(error.message, /\n  uv --version\n/)
+        assert.ok(error.message.includes(`npm install -g agentsdock@${version} --foreground-scripts`))
+        assert.ok(error.message.includes(`AGENTSDOCK_SKIP_SETUP=1 npm install -g agentsdock@${version}`))
+        assert.match(error.message, /\n  agentsdock setup\n/)
+        assert.equal(error.message.includes('brew install uv'), platform === 'darwin')
+        assert.match(error.message, /Existing state is never deleted automatically/)
+        assert.doesNotMatch(error.message, /private-token|Unavailable prerequisite/)
+        return true
+      })
+      assert.equal(launches, 1) // Guidance never executes brew, a download or a retry.
+      assert.equal(f.calls.length, 1) // Existing read-only preflight only.
+      assert.doesNotMatch(f.output.join('\n'), /ready|private-token/)
+    }
+  }
+})
+
+test('unrelated setup failures do not suggest that installing uv will fix them', async t => {
+  const f = fixture(t)
+  f.context.launch = () => {
+    const child = new EventEmitter()
+    child.stdout = new PassThrough(); child.stderr = new PassThrough()
+    queueMicrotask(() => {
+      child.stderr.write('private diagnostic: service manager failed\n')
+      child.emit('close', 1)
+    })
+    return child
+  }
+  await assert.rejects(postinstall(f.context), error => {
+    assert.match(error.message, /Automatic setup did not complete successfully/)
+    assert.match(error.message, /AGENTSDOCK_SKIP_SETUP/)
+    assert.doesNotMatch(error.message, /brew install uv|uv is missing|private diagnostic/)
+    return true
+  })
 })

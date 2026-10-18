@@ -1,5 +1,6 @@
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -19,6 +20,26 @@ class TimelineIndexJobTests(unittest.TestCase):
         agent_server.TIMELINE_INDEX_LOCKS.clear()
         agent_server.STATE_DIR = self.previous_state_dir
         self.temporary.cleanup()
+
+    def test_job_event_storm_does_not_rescan_all_ordinary_turns(self) -> None:
+        session_id = "chat-job-storm"
+        path = agent_server.events_path(session_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as target:
+            seq = 0
+            for number in range(4000):
+                for kind in ("turn_started", "turn_finished"):
+                    seq += 1
+                    target.write(json.dumps(self.event(seq, kind, run_id=f"user-{number}", prompt="Question")) + "\n")
+            for number in range(20000):
+                seq += 1
+                target.write(json.dumps(self.event(seq, "assistant_text", run_id="scheduled-run", job_id="job-storm", text="Progress")) + "\n")
+        started = time.monotonic()
+        index = agent_server.build_timeline_index(session_id)
+        elapsed = time.monotonic() - started
+        self.assertEqual(len(index["landmarks"]), 4001)
+        self.assertEqual(index["landmarks"][-1]["key"], "job:job-storm")
+        self.assertLess(elapsed, 8, "Job events must not repeatedly scan all prior ordinary turns")
 
     def test_scheduled_run_stays_at_its_original_timeline_position(self) -> None:
         session_id = "chat-1"

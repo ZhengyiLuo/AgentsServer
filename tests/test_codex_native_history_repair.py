@@ -238,6 +238,21 @@ class CodexNativeHistoryRepairTests(unittest.TestCase):
                 items = [self.parse(row) for row in self.raw]
                 self.assertEqual(filter_native_codex_history_items("chat", PROVIDER, self.events, items)[0], items[0])
 
+    def test_large_compaction_source_record_retains_native_ownership_proof(self):
+        self.fixture(source_headers=[{"type": "session_meta", "payload": {"id": PROVIDER}},
+            {"type": "compacted", "payload": {"replacement_history": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "x" * (5 * 1024 * 1024)}]}]}}])
+        self.prepare()
+        self.assertEqual(self.cache.project_event("chat", self.imports[0])["prompt"], "")
+        self.assertIsNone(self.cache.project_event("chat", self.native[0]))
+
+    def test_source_record_budget_still_fails_closed(self):
+        with mock.patch.object(repair, "NATIVE_PROOF_LINE_BYTES", 100):
+            with self.assertRaises(CodexNativeHistoryProofUnavailable):
+                self.prepare()
+        self.assertFalse(self.cache.is_prepared("chat", PROVIDER))
+
     def test_unowned_same_text_different_turn_and_changed_import_stay_visible(self):
         self.raw.append({**self.raw[0], "timestamp": "2026-09-11T12:09:00Z", "payload": {**self.raw[0]["payload"],
             "id": "other-source-item", "internal_chat_message_metadata_passthrough": {"turn_id": "unowned-turn", "content_item_kinds": ["user.text"]}}})
@@ -323,6 +338,24 @@ class CodexNativeHistoryRepairTests(unittest.TestCase):
                 if alteration == "different-tail":
                     self.prepare()
                     self.assertIsNone(self.cache.project_event("chat", self.imports[2]))
+    def test_import_proof_does_not_retain_unrelated_native_text_keys(self):
+        # A large chat can have more text keys than the proof's memory budget;
+        # only exact candidate bodies need retention, while sequence validation
+        # and all native ownership/ambiguity checks still cover the full ledger.
+        rows = [json.loads(line) for line in self.events.read_text().splitlines()]
+        for index in range(40):
+            rows.append({"seq": 201 + index, "id": f"unrelated-{index}", "session_id": "chat",
+                         "run_id": "native-1", "type": "assistant_text", "text": f"unrelated body {index}"})
+        self.events.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        items = [self.parse(row) for row in self.raw]
+        with mock.patch("codex_history_repair.MAX_KEYS", 12):
+            result = filter_native_codex_history_items("chat", PROVIDER, self.events, items)
+        self.assertEqual([item["text"] for item in result], ["", ""])
+
+    def test_legacy_repair_capacity_failure_is_not_retried_on_unchanged_input(self):
+        with mock.patch("codex_history_repair.MAX_KEYS", 1), self.assertRaises(CodexNativeHistoryProofUnavailable) as error:
+            self.prepare()
+        self.assertTrue(getattr(error.exception, "deterministic", False))
 
     def test_assistant_normalization_matches_actual_native_cleaner(self):
         tree = ast.parse((Path(__file__).resolve().parents[1] / "agent_server.py").read_text())
@@ -528,6 +561,113 @@ class CodexNativeHistoryRepairTests(unittest.TestCase):
         self.cache.forget("chat"); self.prepare()
         self.assertEqual(self.cache.project_event("chat", self.imports[0]), projected)
         self.assertEqual(before, (self.events.read_bytes(), self.source.read_bytes()))
+
+    def exchange_delivery_fixture(self, *, terminal="failed", kind="reply"):
+        self.async_delivery_fixture()
+        label = "Agent-prepared reply/result" if kind in {"reply", "final_result"} else "Agent-prepared handoff message"
+        self.delivery_wrapper = (
+            f"[AgentsDock delivery kind={kind} leg=2/2 origin=route from=Release helper]\n"
+            "[Source user instruction — verbatim, user-authored]\nReview the synthetic checklist.\n[End source user instruction]\n"
+            f"[{label}]\n{self.delivery_body}\n[End {label.lower()}]\n"
+            "reply: use Chats respond-current through the AgentsDock provider tool only if a reply or follow-up is needed.\n[End delivery]"
+        )
+        self.raw[0]["payload"]["content"][0]["text"] = self.delivery_wrapper
+        exchange_fields = {"exchange_id": "exchange-synthetic", "cross_chat_exchange_id": "exchange-synthetic",
+            "exchange_leg_id": "leg-synthetic", "cross_chat_exchange_leg_id": "leg-synthetic"}
+        receipt_kind = "reply" if kind == "final_result" else kind
+        stages = {"chat_conversation_message_received": "cross_chat_exchange_leg_received",
+            "chat_conversation_message_started": "cross_chat_exchange_leg_started",
+            "chat_conversation_message_delivered": f"cross_chat_exchange_leg_{terminal}"}
+        for row in self.native:
+            if row["type"] == "assistant_text":
+                continue
+            for key in ("conversation_mode", "cross_chat_envelope_id", "handoff_id", "message_id", "message_revision", "message_edited_by_user"):
+                row.pop(key, None)
+            row.update(exchange_fields)
+            if row["type"] in stages:
+                row.update(type=stages[row["type"]], exchange_leg_kind=receipt_kind, exchange_ordinal=2, exchange_max_legs=2)
+            elif row["type"] == "turn_started":
+                # Legacy exchange starts kept a placeholder, never the body.
+                row["prompt"] = "Handle the incoming chat reply."
+        self.fixture()
+
+    def test_legacy_exchange_tail_repair_uses_durable_receipts_and_source_checkpoint(self):
+        for terminal in ("delivered", "failed"):
+            for kind in ("reply", "final_result", "request", "instruction"):
+                with self.subTest(terminal=terminal, kind=kind):
+                    self.exchange_delivery_fixture(terminal=terminal, kind=kind)
+                    before = self.events.read_bytes(), self.source.read_bytes()
+                    self.cache.forget("chat"); self.prepare()
+                    # Egress projects just the imported tail; original receipts
+                    # were found in the durable journal, not the requested page.
+                    projected = self.cache.project_event("chat", self.imports[0])
+                    self.assertIsNotNone(projected)
+                    self.assertEqual(projected["prompt"], "")
+                    self.assertTrue(projected["metadata_only"])
+                    self.assertTrue(projected["provider_user_authored"])
+                    self.assertEqual(projected["provider_history_repair"], "source_proven_native_replay")
+                    self.assertEqual(projected["provider_origin"]["native_event_id"], "delivery-input")
+                    self.assertEqual(projected["provider_origin"]["source_text_sha256"], hashlib.sha256(self.delivery_wrapper.encode()).hexdigest())
+                    item = self.parse(self.raw[0])
+                    self.assertEqual(filter_native_codex_history_items("chat", PROVIDER, self.events, [item]), [item])
+                    self.assertEqual(self.filter_async_delivery([item])[0]["text"], "")
+                    self.assertTrue(all(self.cache.project_event("chat", row) is None for row in self.native))
+                    self.assertEqual(before, (self.events.read_bytes(), self.source.read_bytes()))
+
+    def test_legacy_exchange_missing_or_conflicting_proof_keeps_wrapper_visible(self):
+        for mutation in ("received", "started", "hash", "length", "kind", "ordinal", "total", "target", "source", "run",
+                         "exchange", "leg", "finish-turn", "finish-thread", "failed-run", "stopped", "human-start", "forked-start"):
+            with self.subTest(mutation=mutation):
+                self.exchange_delivery_fixture()
+                if mutation in ("received", "started"):
+                    self.native = [row for row in self.native if row["type"] != f"cross_chat_exchange_leg_{mutation}"]
+                elif mutation in ("finish-turn", "finish-thread", "failed-run", "stopped"):
+                    key, value = {"finish-turn": ("provider_turn_id", "another-turn"),
+                        "finish-thread": ("provider_thread_id", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+                        "failed-run": ("exit_code", 1), "stopped": ("stopped", True)}[mutation]
+                    self.native[4][key] = value
+                elif mutation in ("human-start", "forked-start"):
+                    self.native[1]["provider_user_authored" if mutation == "human-start" else "forked"] = True
+                else:
+                    key, value = {"hash": ("handoff_body_sha256", "0" * 64), "length": ("handoff_body_chars", 1),
+                        "kind": ("exchange_leg_kind", "status"), "ordinal": ("exchange_ordinal", 1),
+                        "total": ("exchange_max_legs", 4), "target": ("target_session_id", "another-chat"),
+                        "source": ("source_session_id", "another-source"), "run": ("target_run_id", "unrelated-run"),
+                        "exchange": ("exchange_id", "another-exchange"), "leg": ("exchange_leg_id", "another-leg")}[mutation]
+                    self.native[-1][key] = value
+                self.assert_async_delivery_visible()
+
+    def test_legacy_exchange_human_quotes_and_incomplete_wrappers_remain_visible(self):
+        for mutation in ("another-turn", "before-start", "after-finish", "body", "missing-end", "added-instruction", "unknown-footer"):
+            with self.subTest(mutation=mutation):
+                self.exchange_delivery_fixture()
+                if mutation == "another-turn":
+                    self.raw[0]["payload"]["internal_chat_message_metadata_passthrough"]["turn_id"] = "human-quote-turn"
+                elif mutation in ("before-start", "after-finish"):
+                    self.raw[0]["timestamp"] = "2026-09-11T12:00:58Z" if mutation == "before-start" else "2026-09-11T12:01:03Z"
+                else:
+                    text = self.delivery_wrapper
+                    text = {"body": lambda: text.replace("release checklist", "different checklist"),
+                        "missing-end": lambda: text.removesuffix("[End delivery]"),
+                        "added-instruction": lambda: text + "\nA genuine additional request.",
+                        "unknown-footer": lambda: text.replace("reply: use Chats", "reply: custom Chats")}[mutation]()
+                    self.raw[0]["payload"]["content"][0]["text"] = text
+                self.assert_async_delivery_visible()
+
+    def test_legacy_exchange_same_turn_human_steer_and_literal_quote_are_not_suppressed(self):
+        self.exchange_delivery_fixture()
+        second = json.loads(json.dumps(self.raw[0]))
+        second["payload"]["id"] = "genuine-human-quote"
+        second["timestamp"] = "2026-09-11T12:01:01.500Z"
+        self.raw.append(second)
+        self.assert_async_delivery_visible()
+        self.assertIsNone(self.cache.project_event("chat", self.imports[-1]))
+        for event_type in ("turn_steered", "turn_stopped", "turn_queue_run_now"):
+            with self.subTest(event_type=event_type):
+                self.exchange_delivery_fixture()
+                self.native.append({"seq": 7, "id": "human-steer", "type": event_type, "run_id": "native-1",
+                    "interrupted_run_id": "native-1", "backend": "codex", "native_steer": True})
+                self.assert_async_delivery_visible()
 
     def test_async_delivery_uses_existing_proof_body_limit_and_skips_irrelevant_tool_metadata(self):
         self.async_delivery_fixture(body="Synthetic prepared detail.\n" * 800)

@@ -83,6 +83,88 @@ class GeneratedTitleLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.generator.call_args.kwargs['provider_selection'], {'api_key': 'synthetic'})
         self.assertTrue(self.provider_store.for_session.call_args.kwargs['include_key'])
 
+    def gemini(self, model='gemini-flash-latest'):
+        self.sess.update(backend='gemini', provider_connection='custom', provider_connection_revision='a' * 32, model=model)
+        selection = {'model': model, 'credential_id': 'a' * 32, 'base_url': 'https://generativelanguage.googleapis.com',
+            'api_key': 'synthetic-key', 'protocol': 'gemini', 'auth_header': 'x-goog-api-key'}
+        connections = SimpleNamespace(root=Path('/synthetic'), for_session=Mock(return_value=selection))
+        self.enterContext(patch.object(server, 'PROVIDER_CONNECTION_STORE', connections))
+        refresh = self.enterContext(patch.object(server, 'refresh_native_session_title', new_callable=AsyncMock))
+        return connections, refresh
+
+    async def test_gemini_success_once_uses_bound_api_without_cli_or_timeline(self):
+        connections, _ = self.gemini()
+        self.schedule(exit_code=1)
+        self.assertFalse(self.tasks)
+        self.schedule()
+        await self.drain()
+        self.generator.assert_awaited_once_with('gemini', 'Write a song about cats', 'A playful song',
+            model='gemini-flash-latest', provider_selection=connections.for_session.return_value)
+        self.assertEqual(self.sess['session_id'], 'native-parent')
+        self.append.assert_not_awaited()
+        self.schedule()
+        self.assertFalse(self.tasks)
+
+    async def test_gemini_auto_uses_exact_native_model_no_catalog_guess(self):
+        self.gemini('auto')
+        with patch('gemini_history.native_snapshot', return_value={'messages': [
+                {'type': 'gemini', 'model': 'gemini-resolved-model'}, {'type': 'user', 'model': 'wrong'}]}) as reader:
+            self.schedule()
+            await self.drain()
+        self.assertEqual(self.generator.call_args.kwargs['model'], 'gemini-resolved-model')
+        self.assertEqual(reader.call_args.args[2], 'native-parent')
+        self.assertTrue(reader.call_args.args[0]['GEMINI_CLI_HOME'].endswith('gemini-runtime-' + 'a' * 32))
+
+    async def test_gemini_native_title_arriving_while_waiting_wins(self):
+        _, refresh = self.gemini()
+        async def native(*args):
+            await self.store.adopt_auto_title('title-chat', 'Native title', source='provider', backend='gemini', provider_id='native-parent')
+        refresh.side_effect = native
+        self.schedule()
+        await self.drain()
+        self.generator.assert_not_awaited()
+        self.assertEqual(self.sess['title'], 'Native title')
+
+    async def test_gemini_native_title_arriving_during_generation_wins(self):
+        _, refresh = self.gemini()
+        async def generated(*args, **kwargs):
+            await self.store.adopt_auto_title('title-chat', 'Late native title', source='provider', backend='gemini', provider_id='native-parent')
+            return 'Stale generated title'
+        self.generator.side_effect = generated
+        self.schedule()
+        await self.drain()
+        self.assertEqual(self.sess['title'], 'Late native title')
+
+    async def test_gemini_forget_or_manual_name_blocks_pending_result(self):
+        connections, _ = self.gemini()
+        async def forgotten(*args, **kwargs):
+            connections.for_session.side_effect = server.HTTPException(409, 'Disconnected')
+            return 'Late result'
+        self.generator.side_effect = forgotten
+        self.schedule()
+        await self.drain()
+        self.assertEqual(self.sess['title'], 'Write a song')
+        connections.for_session.side_effect = None
+        self.sess.pop('_title_generation_attempted')
+        async def renamed(*args, **kwargs):
+            self.sess.update(title='My manual name', _title_source='manual')
+            return 'Late result'
+        self.generator.side_effect = renamed
+        self.schedule()
+        await self.drain()
+        self.assertEqual(self.sess['title'], 'My manual name')
+
+    async def test_gemini_legacy_login_is_not_eligible_and_seed_keeps_tail(self):
+        self.gemini()
+        self.sess['provider_connection'] = 'default'
+        self.schedule()
+        self.assertFalse(self.tasks)
+        self.sess.update(title='New chat', _title_source='placeholder', _title_auto_value='New chat')
+        text = 'log\n' * 1000 + '请调查超时原因'
+        await self.store.adopt_auto_title('title-chat', 'log', source='prompt', prompt_seed=text)
+        self.assertLessEqual(len(self.sess['_title_seed']), 1600)
+        self.assertTrue(self.sess['_title_seed'].endswith('请调查超时原因'))
+
     async def test_codex_server_default_model_is_not_replaced_by_cli_default(self):
         self.sess.update(backend='codex', model=None)
         self.runtime_settings.return_value = ('server-configured-model', 'medium', '')

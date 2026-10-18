@@ -654,6 +654,13 @@ On macOS, the installer creates the LaunchAgent
 `com.agentsdock.server` and writes logs under
 `~/Library/Logs/AgentsServer/`.
 
+The source CLI also provides `agentsdock logs [NAME]` (`default` when omitted),
+with `--lines N` and `--follow`. It selects the installed service layout,
+including both gateway and worker logs for split default installations. This
+command is not in the published 1.0.10 / 1.0.11-beta.1 packages yet; use the
+platform commands above until a CLI release includes it. See
+[the log command guide](../npm/agentsdock/README.md#read-service-logs).
+
 ### Managed updates from AgentsDock
 
 Managed update endpoints use the same access token as the rest of the API.
@@ -1459,6 +1466,27 @@ The endpoint uses the same bearer-token authentication as the rest of the API.
 Binary changes remain compact Git binary markers rather than being copied into
 the event log.
 
+## Dismissing emergency alerts
+
+`POST /api/sessions/{session_id}/emergency/acknowledge` accepts exactly one
+of these fields:
+
+- `expected_alert_id`: acknowledge that one alert (existing behavior).
+- `through_alert_id`: acknowledge every still-active alert raised through
+  that alert's durable position, including the boundary alert itself.
+
+Clients discover the batch option through
+`capabilities.agent_emergency_alerts_v1.acknowledge_through_alert_id`. Capture
+the displayed alert ID when the user clicks; alerts raised after that boundary
+remain active. The boundary remains valid after another device acknowledges
+it, and repeating the request is harmless. An unknown boundary returns 409;
+a missing chat returns 404; both fields or neither field returns 422.
+
+Batch responses contain `session`, `acknowledged`, and `acknowledged_count`.
+The server persists ordinary acknowledgement events together and broadcasts
+the resulting summary. Reopening the chat or connecting another device sees
+the same result. Dismissal retains alert history and does not stop running work.
+
 ## Public API Sketch
 
 The server exposes JSON endpoints under `/api`.
@@ -1501,6 +1529,20 @@ The server exposes JSON endpoints under `/api`.
 
 The event stream is append-only JSONL on disk and paged through the events API.
 Large clients should page history instead of loading every event at once.
+
+Servers advertising `event_stream_liveness_v1` (available, version 1) support
+`liveness=true` on `/api/sessions/{session_id}/events`. After complete catch-up
+and live registration, the socket sends
+`{"type":"event_stream_status","version":1,"session_id":"…","phase":"ready"}`.
+Idle sockets then receive the same control shape with `phase:"heartbeat"`
+every 15 seconds. These opt-in frames are ephemeral: they have no event `seq`,
+never change history, and do not invoke an agent or scan its transcript.
+Clients must not advance their durable cursor from a control frame. A quiet
+model is not a broken connection. Desktop uses a 45-second no-progress deadline
+and resumes after its last successfully accepted event; it never resends a turn
+to repair a disconnected stream. Older clients and servers retain their existing
+protocol, without imposing heartbeat expectations on servers lacking this capability.
+
 The subagents endpoint folds Claude local-agent lifecycle records into bounded
 `subagent_state` snapshots without returning provider prompts, raw events,
 tool-result output, commands, or output-file paths.
@@ -1612,3 +1654,19 @@ An unsupported endpoint, stale session or failed proof preserves the chat. The
 new client never falls back to DELETE or the legacy `discard-empty` route.
 Explicit user deletion retains its existing behavior. Updating only the server
 or only an older client does not provide the complete new cleanup workflow.
+
+### Chat readiness after restart
+
+`GET /api/health` keeps transport health (`ok`) available for diagnostics and
+recovery controls. `chat_readiness` separately reports `ready`, `recovering`, or
+`failed`, with a boolean `ready` and a bounded, non-private message. Queue
+restoration must succeed before new turns can be admitted. A failed restoration
+remains closed to protect durable message ordering; restarting the managed
+server retries the restoration. Repeated failures require server log diagnosis,
+not repeated message submissions. A completed recovery task's own timeout is a
+failure, not a still-running scan.
+
+Emergency acknowledgement reads lifecycle metadata without retaining unrelated
+message/media bodies, and scans outside the global session-store lock. Exact
+alert IDs, durable acknowledgement receipts and cancellation-safe projection
+remain unchanged.

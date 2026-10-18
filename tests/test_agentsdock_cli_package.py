@@ -1,6 +1,7 @@
 """Real npm packing/bin checks in disposable homes/prefixes; no service install."""
 import hashlib
 import errno
+import fcntl
 import json
 import os
 import pty
@@ -102,9 +103,12 @@ module.exports = {ensureFreshInstall, run: () => 0,
   persistentPath: require('./actual-cli.cjs').persistentPath};
 if (require.main === module) {
   assert.deepEqual(process.argv.slice(2), ['install', '--non-interactive']);
-  console.log('private installer output secret-lifecycle-sentinel');
-  console.error('private installer diagnostic secret-lifecycle-sentinel');
-  if (fs.existsSync(path.join(process.env.HOME, 'synthetic-failure'))) process.exit(7);
+  console.log('private installer output secret-installer-sentinel');
+  console.error('private installer diagnostic secret-installer-sentinel');
+  if (fs.existsSync(path.join(process.env.HOME, 'synthetic-failure'))) {
+    console.error('A trusted uv installation is not available on PATH.');
+    process.exit(7);
+  }
   fs.writeFileSync(marker, 'one synthetic service start');
   console.log('AGENTSDOCK_SETUP_RESULT=' + JSON.stringify({server_url:'http://127.0.0.1:7850',
     server_version:require('../package.json').version, access_token:'secret-lifecycle-sentinel'}));
@@ -126,7 +130,7 @@ if (require.main === module) {
         prefix = self.work / "hook-global"
         command = ["npm", "install", "--global", "--prefix", str(prefix),
                    "--no-audit", "--no-fund", "--offline", *archives]
-        result = subprocess.run(command, cwd=self.work, env=env, text=True, capture_output=True, timeout=45)
+        result = subprocess.run(command, cwd=self.work, env=env, text=True, capture_output=True, timeout=45, start_new_session=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         marker = home / "synthetic-service-started"
         self.assertEqual(marker.read_text(), "one synthetic service start")
@@ -159,11 +163,64 @@ if (require.main === module) {
                                 env={**env, "HOME": str(failed_home)}, text=True, capture_output=True, timeout=45)
         self.assertNotEqual(failed.returncode, 0)
         self.assertIn("Automatic setup did not complete", failed.stderr)
+        self.assertIn("uv is missing from PATH or cannot run", failed.stderr)
+        self.assertIn("uv --version", failed.stderr)
+        self.assertIn(f"npm install -g agentsdock@{version} --foreground-scripts", failed.stderr)
+        self.assertIn("https://docs.astral.sh/uv/getting-started/installation/", failed.stderr)
+        if sys.platform == "darwin":
+            self.assertIn("brew install uv", failed.stderr)
+        else:
+            self.assertNotIn("brew install uv", failed.stderr)
         self.assertFalse((failed_home / "synthetic-service-started").exists())
         for output in (result.stdout, result.stderr, repeated.stdout, repeated.stderr, failed.stdout, failed.stderr):
             self.assertNotIn("secret-lifecycle-sentinel", output)
+            self.assertNotIn("secret-installer-sentinel", output)
+
+        # npm normally captures successful lifecycle output. A real controlling
+        # terminal still gets the URL/token directly, including without the
+        # foreground flag. This uses a synthetic installer, not a real service.
+        for foreground in (False, True):
+            tty_home = self.work / f"tty-home-{foreground}"
+            tty_home.mkdir(mode=0o700)
+            master, slave = pty.openpty()
+            tty_process = subprocess.Popen(
+                [*command, "--force", *(["--foreground-scripts"] if foreground else [])],
+                cwd=self.work, env={**env, "HOME": str(tty_home), "TERM": "xterm"},
+                stdin=slave, stdout=slave, stderr=slave, start_new_session=True,
+                preexec_fn=lambda: fcntl.ioctl(slave, termios.TIOCSCTTY, 0),
+            )
+            os.close(slave)
+            output = bytearray()
+            try:
+                deadline = time.monotonic() + 45
+                while time.monotonic() < deadline:
+                    if select.select([master], [], [], 0.1)[0]:
+                        try:
+                            chunk = os.read(master, 65536)
+                        except OSError as error:
+                            if error.errno == errno.EIO:
+                                break
+                            raise
+                        if not chunk:
+                            break
+                        output.extend(chunk)
+                    elif tty_process.poll() is not None:
+                        break
+                self.assertEqual(tty_process.wait(timeout=2), 0, output.decode(errors="replace"))
+            finally:
+                os.close(master)
+                if tty_process.poll() is None:
+                    tty_process.terminate()
+                    tty_process.wait(timeout=5)
+            text = output.decode().replace("\r\n", "\n")
+            self.assertIn("Setting up your first AgentsDock server", text)
+            self.assertIn("Your new service is up!", text)
+            self.assertIn("URL:     http://127.0.0.1:7850", text)
+            self.assertIn("Access token (default):\nsecret-lifecycle-sentinel\n", text)
+            self.assertNotIn("secret-installer-sentinel", text)
         for log in (self.work / "hook-cache/_logs").glob("*.log"):
             self.assertNotIn("secret-lifecycle-sentinel", log.read_text())
+            self.assertNotIn("secret-installer-sentinel", log.read_text())
 
     @unittest.skipUnless(shutil.which("npm") and shutil.which("node") and os.getuid() != 0,
                          "real npm CLI smoke needs npm/node and a non-root user")
@@ -253,11 +310,17 @@ if (require.main === module) {
         self.assertIn("No installations found", invoke(["agentsdock", "list"]))
         self.assertIn("No installations found", invoke(["agentsdock", "status"]))
         self.assertIn("No unfinished default", invoke(["agentsdock", "recover"]))
+        legacy = home / "Zenithbot/.env"
+        legacy.parent.mkdir(mode=0o700)
+        legacy.write_text("ZENITHBOT_AGENT_TOKEN=legacy-fixture-token\n")
+        legacy.chmod(0o600)
+        self.assertEqual(invoke(["agentsdock", "token", "default"]).strip(), "legacy-fixture-token")
+        legacy.unlink()
         # Private synthetic config; no service or real credential is involved.
         config = home / ".config/agents-server"
         config.mkdir(parents=True, mode=0o700)
         private_env = config / "env"
-        private_env.write_text("AGENTSDOCK_AGENT_TOKEN=fixture-only-token\n")
+        private_env.write_text("AGENTSDOCK_AGENT_TOKEN=fixture-only-token\nAGENTSDOCK_AGENT_BIND=127.0.0.1\nAGENTSDOCK_AGENT_PORT=7850\n")
         private_env.chmod(0o600)
         self.assertEqual(invoke(["agentsdock", "token", "default"]).strip(), "fixture-only-token")
         no_selector = subprocess.run(["agentsdock", "token"], cwd=outside, env=env,
@@ -268,7 +331,7 @@ if (require.main === module) {
         named_config = home / ".config/agents-server-instances/work"
         named_config.mkdir(parents=True, mode=0o700)
         named_env = named_config / "env"
-        named_env.write_text("AGENTSDOCK_AGENT_TOKEN=separate-fixture-token\n")
+        named_env.write_text("AGENTSDOCK_AGENT_TOKEN=separate-fixture-token\nAGENTSDOCK_AGENT_BIND=127.0.0.1\nAGENTSDOCK_AGENT_PORT=7851\n")
         named_env.chmod(0o600)
         self.assertEqual(invoke(["agentsdock", "token", "--instance", "work"]).strip(), "separate-fixture-token")
         self.assertEqual(invoke(["agentsdock", "token", "work"]).strip(), "separate-fixture-token")
@@ -279,6 +342,7 @@ if (require.main === module) {
         self.assertIn("Please enter a number from 1 to 2", chosen)
         self.assertIn("Access token (work):", chosen)
         self.assertIn("separate-fixture-token", chosen)
+        self.assertIn("http://127.0.0.1:7851 (This machine only)", chosen)
         self.assertNotIn("fixture-only-token", chosen)
         chosen = invoke_terminal(["agentsdock", "token"], [(prompt, "default\n"), ("[y/N] ", "n\n")])
         self.assertIn("Access token (default):", chosen)
@@ -314,6 +378,41 @@ if (require.main === module) {
         named_status = invoke(["agentsdock", "status", "work"])
         self.assertIn("Server (work):", named_status)
         self.assertNotIn("Server (default):", named_status)
+        status_prompt = "View a server's URL and access token? [y/N] "
+        selected_status = invoke_terminal(["agentsdock", "status"],
+            [(status_prompt, "y\n"), (arrow_hint, "\x1b[B\r"), ("[y/N] ", "n\n")], term="xterm-256color")
+        self.assertIn("Access token (work):", selected_status)
+        self.assertIn("separate-fixture-token", selected_status)
+        self.assertNotIn("fixture-only-token", selected_status)
+        self.assertIn("http://127.0.0.1:7851 (This machine only)", selected_status)
+        for replies in ([(status_prompt, "n\n")], [(status_prompt, "y\n"), (arrow_hint, "\x1b")]):
+            declined_status = invoke_terminal(["agentsdock", "status"], replies, term="xterm-256color")
+            self.assertNotIn("Access token (", declined_status)
+            self.assertNotIn("fixture-only-token", declined_status)
+            self.assertNotIn("separate-fixture-token", declined_status)
+        direct_token = invoke_terminal(["agentsdock", "token", "work"], [("[y/N] ", "n\n")])
+        self.assertIn("http://127.0.0.1:7851 (This machine only)", direct_token)
+        self.assertIn("separate-fixture-token", direct_token)
+        # Exercise packaged logs through the public executable, with no service
+        # installation. Native Linux journal behavior has separate argv tests.
+        if sys.platform == "darwin":
+            logs = home / "Library/Logs/AgentsServer-instances/work"
+            logs.mkdir(parents=True, mode=0o700)
+            (logs / "server.log").write_text("old entry\nrecent entry\n")
+            (logs / "server-error.log").write_text("error entry\n")
+            snapshot = invoke(["agentsdock", "logs", "work", "--lines", "1"])
+            self.assertIn("Logs (work):", snapshot)
+            self.assertIn("recent entry", snapshot)
+            self.assertIn("error entry", snapshot)
+            self.assertNotIn("old entry", snapshot)
+            self.assertNotIn("separate-fixture-token", snapshot)
+            empty = invoke(["agentsdock", "logs", "--instance", "work", "-n", "0"])
+            self.assertNotIn("recent entry", empty)
+            self.assertIn("Logs (default):", invoke(["agentsdock", "logs", "-n", "0"]))
+        for arguments in (["missing"], ["work", "-n", "10001"], ["--all"]):
+            rejected = subprocess.run(["agentsdock", "logs", *arguments], cwd=outside,
+                                      env=env, capture_output=True, text=True, timeout=20)
+            self.assertNotEqual(rejected.returncode, 0)
         before = private_env.read_bytes()
         rejected = subprocess.run(["agentsdock", "install", "--dry-run"], cwd=outside,
                                   env=env, capture_output=True, text=True, timeout=20)

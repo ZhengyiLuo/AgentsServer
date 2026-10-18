@@ -12,6 +12,30 @@ from provider_commands import ProviderCommandRecord, codex_provider_command_inve
 
 
 class ProviderCommandAPIContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_gemini_native_selection_requires_capability_and_revalidates_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            skill = root / 'SKILL.md'
+            skill.write_text('---\nname: test\ndescription: Test\n---\nOriginal')
+            raw = f'Discovered Agent Skills:\n\ntest [Enabled]\n  Description: Test\n  Location:    {skill}\n\n'
+            session = {'id': 'gemini-chat', 'backend': 'gemini', 'cwd': tmp}
+            with patch('gemini_runtime.build_environment', return_value={}), patch('gemini_runtime.resolve_executable', return_value='gemini'), \
+                    patch('gemini_runtime.list_native_skills', return_value=raw), patch.object(agent_server, 'PROVIDER_COMMAND_SELECTOR_SECRET', 'a'*64):
+                snapshot, _ = await agent_server.discover_session_provider_commands('gemini-chat', session)
+                self.assertEqual(snapshot['support']['mode'], 'native_activation_request')
+                selection = agent_server.SkillSelection(id=snapshot['commands'][0]['id'], revision=snapshot['revision'])
+                options = dict(prompt='/test argument', purpose=None, provider_context_mode='chat', client_capabilities=['gemini_acp_v1'])
+                record = await agent_server.resolve_provider_command_selection('gemini-chat', session, selection, **options)
+                self.assertEqual(record.native['name'], 'test')
+                self.assertNotIn('content', record.native, 'Activation must remain native, not injected file contents')
+                with self.assertRaises(HTTPException):
+                    await agent_server.resolve_provider_command_selection('gemini-chat', session, selection, **{**options, 'client_capabilities': []})
+                with self.assertRaises(HTTPException):
+                    await agent_server.resolve_provider_command_selection('gemini-chat', session, selection, **{**options, 'prompt': '/other'})
+                skill.write_text('Changed after selection')
+                with self.assertRaises(HTTPException):
+                    await agent_server.resolve_provider_command_selection('gemini-chat', session, selection, **options)
+
     async def test_opencode_default_root_skill_requires_its_exact_client_capability(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

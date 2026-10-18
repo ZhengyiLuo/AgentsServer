@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+from contextlib import asynccontextmanager
 import asyncio
 from copy import deepcopy
 from pathlib import Path
@@ -20,6 +21,7 @@ SOURCE = (Path(__file__).resolve().parents[1] / "agent_server.py")
 PROVIDER = "11111111-2222-3333-4444-555555555555"
 FUNCTIONS = {
     "sync_provider_history", "import_session_history", "append_imported_history",
+    "history_file_stamp", "history_commit_guard", "prepare_imported_history_items",
     "append_staged_imported_history", "filter_codex_history_for_import",
     "normalized_history_sync_cursor", "history_sync_checkpoint", "persist_history_sync_cursor",
     "history_cursor_matches_source_stamp", "imported_history_terminal_event",
@@ -33,7 +35,7 @@ def load_deferral_glue():
              if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in FUNCTIONS]
     assert {node.name for node in nodes} == FUNCTIONS
     future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
-    namespace = dict(asyncio=asyncio, threading=threading, re=re, uuid=uuid, Path=Path,
+    namespace = dict(asynccontextmanager=asynccontextmanager, asyncio=asyncio, threading=threading, re=re, uuid=uuid, Path=Path,
                      CodexNativeHistoryProofUnavailable=CodexNativeHistoryProofUnavailable)
     exec(compile(ast.fix_missing_locations(ast.Module(body=[future, *nodes], type_ignores=[])),
                  "<isolated-codex-history-deferral>", "exec"), namespace)
@@ -66,7 +68,7 @@ class CodexHistoryDeferralTests(unittest.IsolatedAsyncioTestCase):
         self.store = SimpleNamespace(sessions={"chat": self.session}, _lock=asyncio.Lock(), save=AsyncMock())
         self.ns = self.functions
         self.ns.update(
-            STORE=self.store, logger=Mock(), BACKEND_CODEX="codex", BACKEND_CLAUDE="claude", BACKEND_CURSOR="cursor", DEFAULT_BACKEND="codex",
+            STORE=self.store, logger=Mock(), BACKEND_CODEX="codex", BACKEND_CLAUDE="claude", BACKEND_CURSOR="cursor", BACKEND_GEMINI="gemini", DEFAULT_BACKEND="codex",
             HISTORY_SYNC_CURSOR_VERSION=1, HISTORY_SYNC_CHECKPOINT_VERSION=1,
             MAX_WORKSPACE_PATH_CHARS=4096, MAX_LOCAL_TRANSCRIPT_BYTES=1 << 40,
             session_provider_id=lambda session: session.get("codex_thread_id"),

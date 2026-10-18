@@ -166,6 +166,58 @@ class InstanceTests(unittest.TestCase):
         self.assertEqual(before, {item.name: (item.config / "env").read_bytes() for item in (self.default, self.work)})
         self.assertFalse(self.registry.root.exists())
 
+    def test_token_addresses_prefer_verified_tailscale_and_preserve_loopback_binding(self):
+        self.configured(self.work, 7951)
+        for bind, expected in (("0.0.0.0", "http://100.64.0.2:7951"), ("127.0.0.1", "http://127.0.0.1:7951")):
+            env = self.work.config / "env"
+            text = env.read_text()
+            env.write_text(re.sub(r"AGENTSDOCK_AGENT_BIND=.*", f"AGENTSDOCK_AGENT_BIND={bind}", text))
+            with patch("sys.stdin.isatty", return_value=True):
+                code, output, errors, mocks = self.cli("token", "work", terminal=True, run={},
+                    candidate_addresses={"return_value": ["http://127.0.0.1:7951"]},
+                    tailscale_status={"return_value": {"status": "connected", "ipv4": "100.64.0.2"}})
+            self.assertEqual(code, 0, errors)
+            self.assertIn(f"Address:  {expected}", output)
+            if bind == "127.0.0.1":
+                self.assertNotIn("100.64.0.2", output)
+            mocks["run"].assert_called_once()
+
+    def test_status_token_offer_selects_only_after_yes_and_can_cancel(self):
+        self.configured(self.default, 7850)
+        self.configured(self.work, 7951)
+        for answers, selected in ((["y", "work"], "work"), (["YES", "1"], "default"),
+                                  (["y", ""], None), (["n"], None), ([""], None),
+                                  ([EOFError()], None), ([KeyboardInterrupt()], None)):
+            with self.subTest(answers=answers), patch("sys.stdin.isatty", return_value=True), \
+                    patch("builtins.input", side_effect=answers) as prompt:
+                code, output, errors, mocks = self.cli("status", terminal=True, run={})
+            self.assertEqual(code, 0, errors)
+            self.assertEqual(prompt.call_args_list[0].args[0], "View a server's URL and access token? [y/N] ")
+            if selected:
+                self.assertEqual(mocks["run"].call_args.args[0][-2:], [selected, "--show-token"])
+            else:
+                mocks["run"].assert_not_called()
+
+    def test_status_named_picker_cannot_select_an_unlisted_server(self):
+        self.configured(self.default, 7850)
+        self.configured(self.work, 7951)
+        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", side_effect=["y", "default", "1"]):
+            code, output, errors, mocks = self.cli("status", "work", terminal=True, run={})
+        self.assertEqual(code, 0, errors)
+        self.assertNotIn("Server (default)", output)
+        self.assertIn("Please enter a number", output)
+        self.assertEqual(mocks["run"].call_args.args[0][-2:], ["work", "--show-token"])
+
+    def test_status_no_terminal_never_prompts_or_reads_token(self):
+        self.configured(self.work)
+        for stdin_tty, stdout_tty in ((False, True), (True, False), (False, False)):
+            with patch("sys.stdin.isatty", return_value=stdin_tty), patch("builtins.input") as prompt:
+                code, output, errors, mocks = self.cli("status", terminal=stdout_tty, run={})
+            self.assertEqual(code, 0, errors)
+            prompt.assert_not_called()
+            mocks["run"].assert_not_called()
+            self.assertNotIn("access token", output)
+
     def test_token_chooser_invalid_input_retries_without_defaulting(self):
         self.configured(self.work)
         with patch("sys.stdin.isatty", return_value=True), \

@@ -4,6 +4,7 @@ const path = require('node:path')
 const fs = require('node:fs')
 const os = require('node:os')
 const { isIP } = require('node:net')
+const { isatty } = require('node:tty')
 const { spawn, spawnSync } = require('node:child_process')
 const { loadRuntime, localEnvironment } = require('./cli.cjs')
 
@@ -47,10 +48,31 @@ function lines(accept) {
   }
 }
 
+function terminalPrint(text, io = { ...fs, isatty }) {
+  // npm captures lifecycle stdout/stderr, including --foreground-scripts in
+  // its debug logs. Only the controlling terminal may receive credentials.
+  // No terminal (CI/headless installs): fail closed, never fall back to a log.
+  let fd
+  try {
+    fd = io.openSync('/dev/tty', fs.constants.O_WRONLY | fs.constants.O_NOCTTY | fs.constants.O_NONBLOCK)
+    if (!io.isatty(fd)) return false
+    const bytes = Buffer.from(text)
+    let offset = 0
+    while (offset < bytes.length) {
+      const written = io.writeSync(fd, bytes, offset, bytes.length - offset)
+      if (!written) return false
+      offset += written
+    }
+    return true
+  } catch { return false }
+  finally { if (fd !== undefined) { try { io.closeSync(fd) } catch { /* best effort */ } } }
+}
+
 async function postinstall(overrides = {}) {
   const context = { env: process.env, home: os.homedir(), uid: process.getuid?.(),
     platform: process.platform, packageRoot: __dirname, spawn: spawnSync,
-    launch: spawn, load: loadRuntime, print: text => process.stdout.write(`agentsdock: ${text}\n`), ...overrides }
+    launch: spawn, load: loadRuntime, terminalPrint,
+    print: text => process.stdout.write(`agentsdock: ${text}\n`), ...overrides }
   const skipped = skipReason(context)
   if (skipped) { context.print(skipped); return 0 }
   const environment = localEnvironment(context)
@@ -70,11 +92,13 @@ async function postinstall(overrides = {}) {
     context.print('Existing server installation or state found; left unchanged. Use agentsdock list to inspect it.')
     return 0
   }
-  context.print('Setting up your first AgentsDock server. This may take a few minutes.')
+  const starting = 'Setting up your first AgentsDock server. This may take a few minutes.'
+  if (!context.terminalPrint(`agentsdock: ${starting}\n`)) context.print(starting)
   let receipt, missingUv = false, racedInstallation = false
   // Do not forward installer output into npm's captured logs: the setup JSON
-  // contains an access token. Retain only a validated non-secret summary and
-  // fixed diagnostics, never raw output (even when the installer fails).
+  // contains an access token. Only a validated success receipt may go directly
+  // to the terminal; stdout/stderr receive a non-secret summary. Never forward
+  // raw output (even when the installer fails).
   const stdout = lines(line => {
     if (!line.startsWith('AGENTSDOCK_SETUP_RESULT=')) return
     try {
@@ -84,7 +108,9 @@ async function postinstall(overrides = {}) {
       if (result.server_version === runtime.version && url.protocol === 'http:' &&
           (host === 'localhost' || isIP(host)) &&
           !url.username && !url.password && !url.search && !url.hash && url.pathname === '/') {
-        receipt = { url: url.origin, version: runtime.version }
+        const token = typeof result.access_token === 'string' && /^[\x21-\x7e]{1,4096}$/.test(result.access_token)
+          ? result.access_token : ''
+        receipt = { url: url.origin, version: runtime.version, token }
       }
     } catch { /* A malformed/missing success receipt must not become success. */ }
   })
@@ -106,11 +132,37 @@ async function postinstall(overrides = {}) {
     return 0
   }
   if (status !== 0 || !receipt) {
-    const detail = missingUv ? ' A trusted uv installation is required on PATH.' : ''
-    throw new Error('Automatic setup did not complete successfully.' + detail +
+    if (missingUv) {
+      // Fixed guidance only: never echo the installer's potentially private
+      // diagnostics. Preserve the selected version, including a beta.
+      const install = `npm install -g agentsdock@${runtime.version}`
+      throw new Error([
+        'Automatic setup did not complete: uv is missing from PATH or cannot run.',
+        'AgentsDock Server needs uv to prepare its Python environment.',
+        ...(context.platform === 'darwin'
+          ? ['On macOS with Homebrew, install uv:', '  brew install uv'] : []),
+        'Installation guide: https://docs.astral.sh/uv/getting-started/installation/',
+        'Then verify and retry the same AgentsDock version:',
+        '  uv --version',
+        `  ${install} --foreground-scripts`,
+        'If uv works but setup still fails, run these for interactive diagnostics:',
+        `  AGENTSDOCK_SKIP_SETUP=1 ${install}`,
+        '  agentsdock setup',
+        'Existing state is never deleted automatically.',
+      ].join('\n'))
+    }
+    throw new Error('Automatic setup did not complete successfully.' +
       ' For interactive diagnostics, install the CLI with AGENTSDOCK_SKIP_SETUP=1 npm install -g agentsdock, then run agentsdock setup. Existing state is never deleted automatically.')
   }
-  context.print(`Server ${receipt.version} is ready at ${receipt.url}. Open AgentsDock to connect. Use agentsdock token to view/copy its private token.`)
+  const summary = `Server ${receipt.version} is ready at ${receipt.url}. Open AgentsDock to connect. Use agentsdock token to view/copy its private token.`
+  const shown = context.terminalPrint([
+    '', 'Your new service is up!', '', 'Server (default):',
+    `  Version: ${receipt.version}`, `  URL:     ${receipt.url}`, '',
+    ...(receipt.token ? ['Access token (default):', receipt.token, '', 'Keep this token private.'] : []),
+    'Open AgentsDock and add this server using its URL and token.',
+    'To view or copy the token again: agentsdock token default', '',
+  ].join('\n'))
+  if (!shown) context.print(summary)
   return 0
 }
 
@@ -118,4 +170,4 @@ if (require.main === module) postinstall().then(code => { process.exitCode = cod
   process.stderr.write(`agentsdock: ${error.message}\n`)
   process.exitCode = 1
 })
-module.exports = { skipReason, lines, postinstall }
+module.exports = { skipReason, lines, terminalPrint, postinstall }

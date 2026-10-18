@@ -1,11 +1,20 @@
 import unittest
+from unittest.mock import patch
 
 from fastapi.responses import JSONResponse
 
-from agent_server import public_session
+from agent_server import HISTORY_MAINTENANCE_STATE, public_session, session_provider_id
 
 
 class SessionSummaryTests(unittest.TestCase):
+    def test_gemini_identity_is_available_in_detail_not_summary(self):
+        native_id = "11111111-1111-4111-8111-111111111111"
+        session = {"id": "chat-gemini", "backend": "gemini", "gemini_session_id": native_id}
+        self.assertEqual(public_session(session).get("gemini_session_id"), native_id)
+        self.assertEqual(session_provider_id(session), native_id)
+        self.assertNotIn("gemini_session_id", public_session(session, summary=True))
+        self.assertIsNone(public_session({"id": "failed-first-turn", "backend": "gemini"}).get("gemini_session_id"))
+
     def test_summary_omits_provider_and_prompt_payloads(self):
         session = {
             "id": "chat-1",
@@ -36,6 +45,17 @@ class SessionSummaryTests(unittest.TestCase):
         self.assertEqual(full["unacknowledged_emergency_count"], 0)
         self.assertNotIn("provider_connection", summary)
         self.assertEqual(full["provider_connection"], "default")
+        self.assertNotIn("history_maintenance", summary)
+        self.assertEqual(full["history_maintenance"], {"status": None, "reason": None, "retry_at": None})
+
+    def test_maintenance_failure_and_cleared_status_survive_summary(self):
+        session = {"id": "maintenance-summary", "backend": "codex"}
+        with patch.dict(HISTORY_MAINTENANCE_STATE, {}, clear=True):
+            state = {"status": "deferred", "reason": "native_history_proof_unavailable", "retry_at": 123}
+            HISTORY_MAINTENANCE_STATE[session["id"]] = state
+            self.assertEqual(public_session(session, summary=True)["history_maintenance"], state)
+            state.update(status="idle", reason=None, retry_at=None)
+            self.assertEqual(public_session(session, summary=True)["history_maintenance"], state)
 
     def test_explicit_native_connection_survives_summary_as_a_cache_tombstone(self):
         summary = public_session({"id": "changed-chat", "backend": "cursor", "provider_connection": "default"}, summary=True)

@@ -8,9 +8,20 @@ supported.
 
 ## Install the command
 
+Run these commands on the **server machine**, which can be the same computer as
+your desktop app. Use Apple silicon macOS with a desktop login, or Linux with a
+working user systemd session. Install [Node.js 22.14 or later with npm](https://nodejs.org/en/download)
+and [uv](https://docs.astral.sh/uv/getting-started/installation/) for the Python
+environment. Install **tmux** for persistent terminals and in-app managed
+updates; basic chats work without it. On macOS with Homebrew, use
+`brew install node uv tmux`. Run npm as the server owner without `sudo`.
+Client-only devices do not need these prerequisites. The npm server installer
+does not run natively on Windows.
+
 ```sh
 npm install -g agentsdock@beta
 agentsdock list
+agentsdock token default
 ```
 
 On a fresh machine, the global install automatically sets up and starts the
@@ -20,11 +31,19 @@ state, including named instances; repeat installs leave these unchanged and do
 not restart, overwrite or upgrade a running service. The runtime lives in its
 managed installation directory, independently of the npm package/cache.
 
-The first short-command release is on Beta. Use the explicit `@beta` above;
-untagged `npm install -g agentsdock` is for a future approved stable CLI release.
-This documentation describes the package being prepared; commands are available
-from the registry only after that package/channel has been published. Do not
-infer name ownership from an npm 404 response.
+Wait for installation to finish, then confirm `default` is `running` in
+`agentsdock list`. No npm account is needed to install the public package.
+Add its URL and the token from `agentsdock token default` in the separately
+downloaded [AgentsDock app](https://agentsdock.net/#downloads). Keep the token
+private. Use the listed local URL on the same computer, a LAN URL on the same
+network, or a Tailscale URL on your private tailnet. `127.0.0.1` cannot reach
+the server from another device.
+
+Install and sign in to your preferred provider CLI on the server before
+starting a chat. npm setup does not install provider CLIs or authenticate them.
+
+For a beta, select `npm install -g agentsdock@beta`. Stable and beta packages are
+published on npm; this README describes the matched 1.0.11-beta.2 CLI/runtime.
 
 `-g` makes the command available outside the current project when npm's global
 bin directory is on your PATH. A local `npm install agentsdock` is also supported;
@@ -33,17 +52,25 @@ installs, linked source checkouts, CI installs and npx do not automatically star
 a service. Use `npx agentsdock setup` when you deliberately want a server from a
 local install. No installation changes shell configuration or logs into a provider.
 
-Use Node >=22.14, `uv`, and Apple silicon macOS with a desktop login or Linux with
-a working user systemd session. Run as the server owner without `sudo`. Install
-and authenticate your preferred provider CLI separately. `setup` (also `install`)
-refuses to overwrite an existing default installation or history. Global auto
-setup uses the same `uv` and native service prerequisites; it does not install
-Homebrew, provider CLIs or Tailscale without a separate user action.
+`setup` (also `install`) refuses to overwrite an existing default installation
+or history. Global auto setup uses the same prerequisites; it does not install
+uv, Homebrew, provider CLIs or Tailscale automatically. If a prerequisite is
+missing, install it and check it in the same terminal before retrying
+`agentsdock setup`; if the CLI was not installed, rerun the npm install command.
 
-The npm lifecycle may hide successful script output. Add `--foreground-scripts`
-to the npm command if you want to see its status messages. Automatic setup never
-copies raw installer output or access tokens into npm logs. Use `agentsdock list`
-for connection addresses and `agentsdock token` to view/copy the token afterward.
+The connection-output improvements below are included starting in
+1.0.11-beta.2. With 1.0.10 or 1.0.11-beta.1, use `agentsdock list` and
+`agentsdock token default` even if npm's installation output does not show
+connection details.
+
+With the improved output, a successful first setup shows the default server URL and
+access token together directly in your terminal, even when npm hides successful
+lifecycle output. Keep the token private. Raw installer output and access tokens
+are not copied into npm's captured output/debug logs. Headless installations
+without a controlling terminal show only a non-secret summary; use
+`agentsdock token default` explicitly to retrieve a token later. Reinstalling
+over existing server state remains a no-op, not a setup or restart.
+`--foreground-scripts` can still help display non-secret lifecycle diagnostics.
 A failed auto setup makes npm report failure instead of claiming the server is
 ready. To obtain interactive diagnostics or choose a custom port/bind:
 
@@ -70,6 +97,7 @@ agentsdock list
 agentsdock status
 agentsdock new work --port 7854 --bind 127.0.0.1
 agentsdock status work
+agentsdock logs work
 agentsdock token
 agentsdock token work
 agentsdock pair work
@@ -90,7 +118,9 @@ Without a name, `agentsdock token` lists this OS user's existing servers on the
 machine (including stopped instances). Use Up/Down arrows to highlight a server
 and Enter to select it; Esc, Ctrl+C or Ctrl+D cancels without showing a token.
 The menu scrolls when needed and restores terminal input before showing a token.
-It displays only the selected token, retaining the optional clipboard prompt.
+It displays the selected server's connection URLs alongside its token, retaining
+the optional clipboard prompt. Verified Tailscale addresses appear first;
+local-only bindings are never advertised as reachable from another device.
 Basic terminals without cursor control retain the numbered/name prompt, where
 empty input cancels. Even a single server requires confirmation. In a script or with
 redirected output, select explicitly: `agentsdock token default` or
@@ -98,7 +128,12 @@ redirected output, select explicitly: `agentsdock token default` or
 explicitly if another device needs access.
 
 `agentsdock status` prints a separate readable block for every instance: status,
-addresses, installed version and port. `agentsdock status work` selects just one.
+addresses, installed version and port. In an interactive terminal it then asks
+whether to view a token. Answer `y`, use Up/Down and Enter to select a server,
+and its URL/token appear together. Declining or cancelling shows no token.
+`agentsdock status work` limits both the summary and picker to that instance.
+Redirected/non-interactive status never prompts or prints tokens; explicitly
+named `agentsdock token work` still outputs only the token when redirected.
 The status is the native service-manager state, not an authenticated health probe;
 the version comes from that instance's installed runtime, not the npm CLI package.
 `agentsdock info work` retains JSON output. If `setup` finds an existing default
@@ -114,16 +149,34 @@ Busy work, pending updates, changed native registrations or uncertain ownership
 prevent a forced stop. Interrupted operations retain an owned retry journal;
 follow the command's retry guidance rather than deleting it manually.
 
-Exact-package native setup, lifecycle and removal acceptance for beta.5 remains
-pending. Source/fixture tests are not proof of fresh macOS or Linux service
-operation. Earlier Linux auto-setup results do not substitute for the new pair.
+See the repository's [release validation record](../../../docs/NPM_CLI_RELEASES.md)
+for exact-package native setup, lifecycle and removal acceptance. Source tests
+alone do not establish native service operation.
 
-The packaged CLI has also been installed and reinstalled on Apple silicon
-macOS with existing services. Disposable named launchd instances passed real
-creation (explicit and automatic name/port), token/authenticated-health,
-start/stop/restart, uninstall cancellation and removal/name-release checks.
-Saved test data remained in its private backup. This does not close the
-fresh-default or split-service acceptance gaps above.
+## Read service logs
+
+Service logs are available starting in 1.0.11-beta.2, not in 1.0.10 or
+1.0.11-beta.1.
+
+```sh
+agentsdock logs                       # Default server: recent entries, then exit
+agentsdock logs work                  # One named server; find names with agentsdock list
+agentsdock logs work --lines 20       # -n 20 also works
+agentsdock logs work --follow         # -f also works; Ctrl+C stops only this viewer
+agentsdock logs work -n 0 -f           # Only entries arriving after viewing starts
+```
+
+Run on the server machine as its OS user; this is not a remote log-download API.
+The default is 100 lines, with a range of 0–10,000. macOS shows separate stdout
+and stderr sections (the last N lines per file, with a 1 MiB initial-read cap).
+Split default installations include both gateway and worker logs. Linux uses
+the current user's journal and shows the last N entries across the selected
+instance's units, without a pager. Log sources follow the installed layout,
+not the CLI's version. Missing/empty Mac log files are reported and watched if
+following; unsafe paths fail rather than being followed. Nothing is restarted
+or installed, and no token/configuration file is printed. Service log entries
+can still contain private data; review them before sharing. macOS control
+characters are escaped for terminal safety, not credential redaction.
 
 ## Connect a phone by QR
 
@@ -169,6 +222,7 @@ mailbox/jobs/team tools supplied to agents inside an authorized chat.
 | All instance statuses, addresses, versions and ports | `./instances.sh status` | `agentsdock status` (separate blocks) |
 | One instance's readable status | `./instances.sh status work` | `agentsdock status work` |
 | One instance's details as JSON | `./instances.sh info work` | `agentsdock info work` |
+| Recent service logs | Platform-specific `tail` / `journalctl` | `agentsdock logs [NAME]` |
 | New automatic name/free port | `./instances.sh new` | `agentsdock new` |
 | New named instance | `./instances.sh new --name work --port 7854` | `agentsdock new work --port 7854` |
 | Start one | `./instances.sh start work` | `agentsdock start work` |
@@ -197,6 +251,8 @@ Supported options retain their native meanings:
 - `remove`/`uninstall`: also `--yes` and `--purge-state`. Purge retains the native
   interactive confirmation and cannot be made unattended with `--yes`.
 - `token`/`status`: positional name or `--instance NAME`, never both.
+- `logs`: optional name or `--instance NAME` (default: `default`), `-n`/`--lines`
+  and `-f`/`--follow`. No bulk selector or arbitrary log path.
 - `update`: the six required arguments in the example below. Bare `update` or
   `update work` does not select a registry tag or silently restart a server.
 
@@ -213,7 +269,7 @@ Differences from the old source scripts:
   changing the port of an existing installation; manifest-based bulk creation
   (`./instances.sh install --manifest ...`); Team Hub configuration/reactivation;
   foreground development `python agent_server.py serve`. There are no implemented
-  `agentsdock configure`, `agentsdock logs`, `agentsdock login`, or `agentsdock serve`
+  `agentsdock configure`, `agentsdock login`, or `agentsdock serve`
   commands in this package.
 - Direct checkout reinstalls (`./instances.sh update`, installer's version or
   custom-root overrides) are not aliases for the signed `update` command. Split

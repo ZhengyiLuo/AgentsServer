@@ -83,6 +83,7 @@ FILES = (
     "interactive_chat_runtime.py",
     "interactive_chat_native.py",
     "shared_chat_videos.py",
+    "shared_chat_analytics_web.py",
     "shared_chat_video_stream.py",
     "interactive_chat_controls.py",
     "install.sh",

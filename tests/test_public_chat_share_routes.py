@@ -73,6 +73,32 @@ class PublicChatShareRouteTests(unittest.TestCase):
             data={"access_token": share["access_token"] if token is None else token, **({"remember": "1"} if remember else {})},
             follow_redirects=False)
 
+    def test_analytics_is_exact_hash_gated_and_only_on_authenticated_get(self):
+        import base64
+        import hashlib
+        import re
+        share = self.create()
+        gate = self.client.get(share["path"])
+        self.assertNotIn("<script", gate.text)
+        self.assertIn("script-src 'none'", gate.headers["Content-Security-Policy"])
+        self.unlock(share)
+        response = self.client.get(share["path"])
+        self.assertEqual(response.status_code, 200)
+        scripts = re.findall(r'<script data-share-analytics>(.*?)</script>', response.text, re.S)
+        self.assertEqual(len(scripts), 1)
+        digest = base64.b64encode(hashlib.sha256(scripts[0].encode()).digest()).decode()
+        csp = response.headers["Content-Security-Policy"]
+        self.assertIn(f"script-src 'sha256-{digest}'", csp)
+        self.assertIn("connect-src https://api.mixpanel.com", csp)
+        self.assertNotIn("unsafe-inline", csp)
+        head = self.client.head(share["path"] + "?page=0")
+        self.assertEqual(head.content, b"")
+        self.assertIn("script-src 'none'", head.headers["Content-Security-Policy"])
+        legacy = self.client.get("/share/" + share["access_token"])
+        self.assertIn("<script data-share-analytics>", legacy.text)
+        self.client.delete(self.admin + "/" + share["share_id"], headers=self.auth)
+        self.assertNotIn("<script", self.client.get(share["path"]).text)
+
     def create_video_share(self):
         self.video_bytes = b"0123456789video-contents"
         self.video_path = self.root / "published.mp4"

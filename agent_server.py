@@ -82459,6 +82459,22 @@ async def codex_provider_mcp(request: Request) -> Response:
     })
 
 
+@app.get("/api/connection-addresses")
+async def connection_addresses(request: Request) -> dict[str, Any]:
+    require_native_admin_control(request)
+    # Discover only on explicit QR sharing, never on the frequently polled health path.
+    from server_instances import candidate_addresses, connection_choices, tailscale_status
+
+    def discover() -> list[str]:
+        choices = connection_choices(
+            SERVER_BIND_ADDRESS, SERVER_PORT,
+            candidate_addresses(SERVER_BIND_ADDRESS, SERVER_PORT), tailscale_status(),
+        )
+        return list(dict.fromkeys(filter(None, [choices["tailscale"], *choices["lan"]])))[:6]
+
+    return {"version": 1, "server_identity": server_identity(), "urls": await asyncio.to_thread(discover)}
+
+
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
     await reconcile_idle_queued_turns_from_health_poll()

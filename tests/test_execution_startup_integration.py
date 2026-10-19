@@ -59,6 +59,7 @@ class ExecutionStartupProcessTests(unittest.IsolatedAsyncioTestCase):
         self.release = self.root / "releases" / version
         self.release.mkdir(mode=0o700, parents=True)
         for name in FILES:
+            (self.release / name).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             shutil.copyfile(SOURCE / name, self.release / name)
             (self.release / name).chmod(0o600)
         for directory, names in DIRECTORY_FILES.items():

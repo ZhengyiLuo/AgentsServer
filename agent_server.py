@@ -49878,6 +49878,23 @@ def history_timeline_message_keys(
                 if len(provider_runs) > maximum:
                     provider_runs.pop(next(iter(provider_runs)))
             before_window = raw_seq <= after_seq
+            if (event_type == "turn_started" and event.get("backend") == BACKEND_CODEX
+                    and event.get("purpose") == "codex_goal_resume"
+                    and event.get("imported") is not True and event.get("prompt") in (None, "")
+                    and event.get("provider_user_authored") is not True):
+                # Resuming a native goal records a lifecycle boundary, not a
+                # provider user message. An empty ownership credit would block
+                # every subsequent assistant match in this cursor window.
+                continue
+            if (event.get("purpose") == "codex_goal_resume" and event.get("imported") is not True
+                    and event.get("backend") in (None, "", BACKEND_CODEX)
+                    and (event_type in {"assistant_text", "turn_finished", "job_summary"} or (
+                        event_type == "reasoning_summary" and event.get("phase") == "commentary"))):
+                # Goal continuations can repeat words in distinct native items.
+                # Their exact item/turn/thread ownership is reconciled by the
+                # native import filter; a text credit could consume a genuine
+                # external repeat before reaching the owned source item.
+                continue
             if event_type == "turn_started" or is_native_goal_steer_event(event):
                 key = history_dedup_key("user", event.get("prompt"), source_text_sha256=event.get("source_text_sha256"))
             elif event_type == "assistant_text":
@@ -57882,6 +57899,8 @@ async def consume_codex_native_turn(
                                 **({"phase": phase} if phase in {"commentary", "final_answer"} else {}),
                                 "text": text,
                                 "purpose": f"codex_{operation}",
+                                **({"backend": BACKEND_CODEX, "provider_thread_id": thread_id}
+                                   if goal_resume else {}),
                             },
                         )
                 elif item_type in {"reasoning", "plan"}:

@@ -259,6 +259,78 @@ def _native_assistant_item_owners(assistant_items: dict, completed_runs: set[str
     return owners
 
 
+class _NativeGoalAssistantReplays:
+    """Match goal output by its exact native item/turn and one local owner.
+
+    Older goal consumers recorded the thread only on their promptless start.
+    Do not promote that boundary into general turn ownership: another public
+    item may legitimately repeat the same words within that native turn.
+    """
+    def __init__(self, provider_id: str):
+        self.provider_id = provider_id
+        self.starts: dict[str, tuple[int, str] | None] = {}
+        self.items: dict[tuple[str, str, str], list[tuple[str, dict]]] = {}
+        self.count = 0
+
+    def event(self, event: dict) -> None:
+        run = event.get("run_id")
+        if not isinstance(run, str) or not 0 < len(run) <= 256 or run.startswith("import_"):
+            return
+        if event.get("type") == "turn_started":
+            if run in self.starts:
+                self.starts[run] = None
+                return
+            self.count += 1
+            thread = event.get("thread_id")
+            valid = (event.get("backend") == "codex" and event.get("purpose") == "codex_goal_resume"
+                     and event.get("imported") is not True and event.get("forked") is not True
+                     and event.get("prompt") in (None, "") and not _runtime_human_provenance(event)
+                     and isinstance(thread, str) and _PROVIDER_ID.fullmatch(thread)
+                     and event.get("provider_thread_id") in (None, "", thread)
+                     and isinstance(event.get("id"), str) and 0 < len(event["id"]) <= 256
+                     and type(event.get("seq")) is int and event["seq"] > 0)
+            self.starts[run] = (event["seq"], thread) if valid else None
+            return
+        item_id = _public_assistant_item_id(event)
+        turn = event.get("provider_turn_id")
+        body = event.get("text")
+        if (event.get("purpose") != "codex_goal_resume" or item_id is None
+            or event.get("imported") is True or event.get("forked") is True
+            or event.get("backend") not in (None, "codex")
+            or not isinstance(turn, str) or not 0 < len(turn) <= 256
+            or not isinstance(body, str) or not 0 < len(body) <= NATIVE_PROOF_TEXT_CHARS
+            or not isinstance(event.get("id"), str) or not 0 < len(event["id"]) <= 256
+            or type(event.get("seq")) is not int or event["seq"] <= 0):
+            return
+        key = (turn, item_id, _text_key(body))
+        entries = self.items.setdefault(key, [])
+        if len(entries) < 2:
+            entries.append((run, _native_event_identity(event)))
+            self.count += 1
+
+    def match(self, origin: dict, text_key: str, *, before_seq: int | None = None,
+              provider_id: str | None = None) -> dict | None:
+        provider_id = provider_id or self.provider_id
+        if (origin.get("provider") != "codex" or origin.get("kind") != "assistant"
+            or origin.get("session_id", provider_id) != provider_id):
+            return None
+        entries = self.items.get((origin.get("turn_id"), origin.get("event_id"), text_key), ())
+        if len(entries) != 1:
+            return None
+        run, event = entries[0]
+        start = self.starts.get(run)
+        if (event.get("provider_thread_id") not in (None, "", provider_id)
+            or before_seq is not None and event["seq"] >= before_seq):
+            return None
+        if event.get("provider_thread_id") == provider_id:
+            # New output carries its own thread receipt, including inline goal
+            # continuations whose original start was an ordinary human turn.
+            return event
+        if start is not None and start[1] == provider_id and start[0] < event["seq"]:
+            return event
+        return None
+
+
 @dataclass
 class _SourceBudget:
     bytes_remaining: int
@@ -913,6 +985,7 @@ def _prove_native_replays(session_id: str, provider_id: str, events: Path, sourc
     stamp = _native_stamp(events)
     batches, terminals, candidates, native, owners = {}, {}, [], {}, {}
     deliveries = _AsyncDeliveryIndex()
+    goal_assistants = _NativeGoalAssistantReplays(provider_id)
     previous_seq, retained = 0, 0
     for event, _offset, _line in _native_records(events, stamp, budget):
         seq = event.get("seq")
@@ -922,7 +995,8 @@ def _prove_native_replays(session_id: str, provider_id: str, events: Path, sourc
         if event.get("session_id") not in (None, "", session_id):
             continue
         deliveries.observe(event)
-        if len(candidates) + len(batches) + len(terminals) + retained + deliveries.count > MAX_KEYS:
+        goal_assistants.event(event)
+        if len(candidates) + len(batches) + len(terminals) + retained + deliveries.count + goal_assistants.count > MAX_KEYS:
             raise CodexNativeHistoryProofCapacityExceeded("native history proof key budget exceeded")
         run = event.get("run_id")
         if not isinstance(run, str) or not 0 < len(run) <= 256:
@@ -941,6 +1015,10 @@ def _prove_native_replays(session_id: str, provider_id: str, events: Path, sourc
                 if target:
                     candidates.append(target)
         elif event.get("imported") is not True and event.get("backend") in (None, "codex"):
+            if event.get("purpose") == "codex_goal_resume":
+                # Goal replies use exact item/turn proof, never a run-wide
+                # matching-text credit for another native message.
+                continue
             if event.get("type") == "turn_finished" and event.get("backend") == "codex" and event.get("transport") == "app-server":
                 thread = event.get("provider_thread_id")
                 if isinstance(thread, str) and _PROVIDER_ID.fullmatch(thread):
@@ -956,7 +1034,7 @@ def _prove_native_replays(session_id: str, provider_id: str, events: Path, sourc
             elif kind == "user" and (wake_hash := _native_mailbox_wake_hash(event)):
                 native.setdefault((run, kind, wake_hash), []).append(_native_event_identity(event))
                 retained += 1
-        if len(candidates) + len(batches) + len(terminals) + retained + deliveries.count > MAX_KEYS:
+        if len(candidates) + len(batches) + len(terminals) + retained + deliveries.count + goal_assistants.count > MAX_KEYS:
             raise CodexNativeHistoryProofCapacityExceeded("native history proof key budget exceeded")
     if not candidates:
         return _NativeProof(provider_id)
@@ -982,7 +1060,7 @@ def _prove_native_replays(session_id: str, provider_id: str, events: Path, sourc
     proofs = {}
     for thread, path in selected:
         proofs.update(_prove_native_source(thread, Path(path), root, groups[(thread, path)], candidates, native, owners, parse_item, budget,
-                                          session_id=session_id, deliveries=deliveries))
+                                          session_id=session_id, deliveries=deliveries, goal_assistants=goal_assistants))
     budget.check()
     return _NativeProof(provider_id, proofs)
 
@@ -990,7 +1068,8 @@ def _prove_native_replays(session_id: str, provider_id: str, events: Path, sourc
 def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, candidates: list,
                          native: dict, owners: dict, parse_item: Callable, budget: _NativeReadBudget,
                          *, session_id: str, deliveries: _AsyncDeliveryIndex,
-                         require_verified_checkpoint: bool = False) -> dict:
+                         require_verified_checkpoint: bool = False,
+                         goal_assistants: _NativeGoalAssistantReplays | None = None) -> dict:
     if (not source.is_absolute() or source.is_symlink() or source.suffix != ".jsonl"
         or not (source.stem == thread or source.stem.endswith("-" + thread))):
         raise _Unproven()
@@ -1162,6 +1241,15 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
             and compactions[identity][0] <= end]
         if kind == "assistant" and source_hash is None and len(compaction_matches) == 1:
             proofs[target] = compaction_matches[0][1]
+            if len(proofs) > MAX_TARGETS:
+                raise _Unproven()
+            continue
+        goal_origin = timestamp_origins[0] if len(timestamp_origins) == 1 else None
+        goal_match = goal_assistants.match(goal_origin, assistant_native_keys.get(key, ""),
+                                           before_seq=first, provider_id=thread) if (
+            goal_assistants and goal_origin and kind == "assistant" and source_hash is None) else None
+        if goal_match is not None:
+            proofs[target] = {**goal_origin, "native_event_id": goal_match["id"], "source_text_sha256": body_key}
             if len(proofs) > MAX_TARGETS:
                 raise _Unproven()
             continue
@@ -1368,6 +1456,7 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
                               and isinstance(item.get("text"), str))
         owners, native, assistant_items, wake_keys, native_count = {}, {}, {}, set(), 0
         deliveries = _AsyncDeliveryIndex()
+        goal_assistants = _NativeGoalAssistantReplays(provider_id)
         prove_deliveries = (source_path is not None and root is not None
             and isinstance(sync_checkpoint, dict) and callable(parse_item)
             and any(item.get("kind") == "user" and isinstance(item.get("text"), str)
@@ -1379,6 +1468,10 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
                 raise _Unproven()
             previous_seq = seq
             run = event.get("run_id")
+            if event.get("session_id") in (None, "", session_id):
+                goal_assistants.event(event)
+                if native_count + owner_count + len(assistant_items) + deliveries.count + goal_assistants.count > MAX_KEYS:
+                    raise _Unproven()
             if prove_deliveries and event.get("session_id") in (None, "", session_id):
                 deliveries.observe(event)
                 if native_count + owner_count + len(assistant_items) + deliveries.count > MAX_KEYS:
@@ -1386,6 +1479,8 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
             if (event.get("session_id") not in (None, "", session_id) or event.get("imported") is True
                 or event.get("backend") not in (None, "codex") or not isinstance(run, str)
                 or not 0 < len(run) <= 256 or run.startswith("import_")):
+                continue
+            if event.get("purpose") == "codex_goal_resume":
                 continue
             if (event.get("type") == "turn_finished" and event.get("backend") == "codex"
                 and event.get("transport") == "app-server" and event.get("provider_thread_id") == provider_id):
@@ -1411,7 +1506,7 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
             item_id = _public_assistant_item_id(event)
             if item_id is not None and key is not None:
                 assistant_items[(run, item_id, key[1])] = _native_event_identity(event)
-            if native_count + owner_count + len(assistant_items) + deliveries.count > MAX_KEYS:
+            if native_count + owner_count + len(assistant_items) + deliveries.count + goal_assistants.count > MAX_KEYS:
                 raise _Unproven()
         assistant_item_owners = _native_assistant_item_owners(
             assistant_items, {run for runs in owners.values() for run in runs}, provider_id,
@@ -1450,6 +1545,10 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
         for index, item in enumerate(items):
             budget.check()
             origin = item.get("provider_origin")
+            if (item.get("kind") == "assistant" and isinstance(origin, dict)
+                and isinstance(item.get("text"), str) and item.get("source_text_sha256") is None
+                and goal_assistants.match(origin, _text_key(_native_assistant_text(item["text"]))) is not None):
+                continue
             runs = owners.get(origin.get("turn_id"), set()) if isinstance(origin, dict) else set()
             owned = (isinstance(origin, dict) and origin.get("provider") == "codex"
                      and origin.get("kind") == item.get("kind") and isinstance(origin.get("event_id"), str)

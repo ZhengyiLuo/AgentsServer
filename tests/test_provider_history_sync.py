@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import agent_server
+from codex_history_repair import filter_native_codex_history_items
 
 
 def user(text: str) -> dict[str, str]:
@@ -1174,6 +1175,66 @@ class ClaudeHistoryMessageIdentityTests(unittest.TestCase):
         summary = agent_server.prune_duplicate_imported_history_sync("test-chat", dry_run=True)
         self.assertEqual(summary["removed_events"], 0)
         self.assertEqual(self.event_path.read_bytes(), before)
+
+
+class CodexGoalHistoryMatchingTests(unittest.TestCase):
+    provider = "11111111-2222-3333-4444-555555555555"
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory(prefix="codex-goal-history-")
+        self.addCleanup(folder.cleanup)
+        self.path = Path(folder.name) / "events.jsonl"
+        patcher = patch.object(agent_server, "events_path", return_value=self.path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        owner = {"run_id": "goal-run", "purpose": "codex_goal_resume"}
+        self.events = [
+            {"type": "turn_started", "backend": "codex", "thread_id": self.provider, **owner},
+            {"type": "assistant_text", "item_id": "item-1", "provider_turn_id": "turn-1", "text": "First answer.", **owner},
+            {"type": "reasoning_summary", "phase": "commentary", "item_id": "item-2",
+             "provider_turn_id": "turn-2", "text": "Second answer.", **owner},
+            {"type": "turn_finished", "backend": "codex", "status": "interrupted",
+             "result_text": "Second answer.", **owner},
+        ]
+        self.write()
+
+    def write(self):
+        self.path.write_text("".join(json.dumps({"seq": index, "id": f"native-{index}", **event}) + "\n"
+                                     for index, event in enumerate(self.events, 1)))
+
+    def source(self, number, *, distinct=False):
+        return {"kind": "assistant", "text": "First answer." if number == 1 else "Second answer.",
+                "provider_origin": {"provider": "codex", "kind": "assistant", "session_id": self.provider,
+                    "turn_id": f"turn-{number}", "event_id": f"{'external' if distinct else 'item'}-{number}",
+                    "timestamp": f"2026-10-01T10:0{number}:00Z"}}
+
+    def test_promptless_goal_and_public_output_use_exact_filter_in_all_sync_modes(self):
+        source = [self.source(1, distinct=True), self.source(1), self.source(2, distinct=True), self.source(2)]
+        expected = [source[0], source[2]]
+        for tail in (False, True):
+            keys, _has_messages, _truncated = agent_server.history_timeline_message_keys(
+                "chat", timeline_after_seq=0, timeline_through_seq=4, tail=tail, include_imported=True,
+            )
+            self.assertEqual(keys, [])
+        first_sync = agent_server.unsynced_history_items("chat", source, timeline_through_seq=4)
+        for bootstrap in (False, True):
+            fresh, consumed = agent_server.reconcile_cursor_history_items(
+                "chat", source, timeline_after_seq=0, timeline_through_seq=4, bootstrap=bootstrap,
+            )
+            self.assertEqual(consumed, 4)
+            self.assertEqual(fresh, source)
+            self.assertEqual(filter_native_codex_history_items("chat", self.provider, self.path, fresh), expected)
+        self.assertEqual(filter_native_codex_history_items("chat", self.provider, self.path, first_sync), expected)
+
+    def test_real_prompt_and_imported_goal_lookalike_keep_existing_credits(self):
+        self.events[0]["prompt"] = "A real human message"
+        self.events[1]["imported"] = True
+        self.write()
+        keys, _has_messages, _truncated = agent_server.history_timeline_message_keys(
+            "chat", timeline_after_seq=0, timeline_through_seq=4, tail=True, include_imported=True,
+        )
+        self.assertEqual(keys, [(1, agent_server.history_dedup_key("user", "A real human message")),
+                               (2, agent_server.history_dedup_key("assistant", "First answer."))])
 
 
 class SyncProviderHistoryTests(unittest.IsolatedAsyncioTestCase):

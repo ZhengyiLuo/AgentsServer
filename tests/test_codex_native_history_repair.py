@@ -76,6 +76,120 @@ class CodexNativeHistoryRepairTests(unittest.TestCase):
         self.assertTrue(all(self.cache.project_event("chat", row) is None for row in self.native))
         self.assertEqual(before, (self.events.read_bytes(), self.source.read_bytes()))
 
+    def goal_fixture(self, *, stamped=False):
+        self.raw = [{"type": "response_item", "timestamp": f"2026-09-11T12:0{number}:01.123Z",
+            "payload": {"type": "message", "role": "assistant", "id": f"goal-item-{number}",
+                "phase": "final_answer", "content": [{"type": "output_text", "text": text}],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": f"goal-turn-{number}", "content_item_kinds": []}}}
+            for number, text in enumerate(("First goal answer.", "Second goal answer."), 1)]
+        owner = {"run_id": "goal-run", "purpose": "codex_goal_resume"}
+        self.native = [
+            {"seq": 1, "id": "goal-start", "type": "turn_started", "backend": "codex",
+             "thread_id": PROVIDER, **owner},
+            *[{"seq": number + 1, "id": f"goal-answer-{number}", "type": "assistant_text",
+               "provider_turn_id": f"goal-turn-{number}", "item_id": f"goal-item-{number}",
+               "phase": "final_answer", "text": source["payload"]["content"][0]["text"], **owner,
+               **({"backend": "codex", "provider_thread_id": PROVIDER} if stamped else {})}
+              for number, source in enumerate(self.raw, 1)],
+            {"seq": 4, "id": "goal-end", "type": "turn_finished", "backend": "codex",
+             "turn_id": "goal-turn-2", "status": "interrupted", **owner},
+        ]
+        self.fixture()
+
+    def test_interrupted_goal_multiple_finals_repair_and_forward_import_are_idempotent(self):
+        for stamped in (False, True):
+            with self.subTest(stamped=stamped):
+                self.goal_fixture(stamped=stamped)
+                before = self.events.read_bytes(), self.source.read_bytes()
+                self.cache.forget("chat")
+                self.prepare()
+                projected = [self.cache.project_event("chat", row) for row in self.imports]
+                self.assertTrue(all(row is not None for row in projected), "Exact native goal replies must be recognized")
+                self.assertEqual([row["text"] for row in projected], ["", ""])
+                self.assertEqual([row["provider_origin"]["native_event_id"] for row in projected],
+                                 ["goal-answer-1", "goal-answer-2"])
+                self.prepare()
+                self.assertEqual(projected, [self.cache.project_event("chat", row) for row in self.imports])
+                self.assertTrue(all(self.cache.project_event("chat", row) is None for row in self.native))
+                items = [self.parse(row) for row in self.raw]
+                self.assertEqual(filter_native_codex_history_items("chat", PROVIDER, self.events, items), [])
+                self.assertEqual(before, (self.events.read_bytes(), self.source.read_bytes()))
+
+    def test_goal_replay_keeps_distinct_same_text_item_and_turn(self):
+        for stamped in (False, True):
+            for change in ({"id": "another-item"}, {"turn_id": "another-turn"}):
+                with self.subTest(stamped=stamped, change=change):
+                    self.goal_fixture(stamped=stamped)
+                    extra = json.loads(json.dumps(self.raw[0]))
+                    extra["timestamp"] = "2026-09-11T12:09:00Z"
+                    if "id" in change:
+                        extra["payload"].update(change)
+                    else:
+                        extra["payload"]["internal_chat_message_metadata_passthrough"].update(change)
+                    self.raw.append(extra)
+                    self.fixture(); self.cache.forget("chat"); self.prepare()
+                    self.assertTrue(all(self.cache.project_event("chat", row) is not None for row in self.imports[:2]))
+                    self.assertIsNone(self.cache.project_event("chat", self.imports[-1]))
+                    items = [self.parse(row) for row in self.raw]
+                    self.assertEqual(filter_native_codex_history_items("chat", PROVIDER, self.events, items), [items[-1]])
+
+    def test_legacy_goal_requires_one_exact_native_start_before_output(self):
+        for change in (
+            {"thread_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"},
+            {"provider_thread_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"},
+            {"session_id": "another-chat"}, {"imported": True}, {"forked": True},
+            {"backend": "claude"}, {"purpose": "scheduled_job"}, {"prompt": "A real user prompt"},
+            {"provider_user_authored": True}, {"id": None},
+        ):
+            with self.subTest(change=change):
+                self.goal_fixture()
+                self.native[0].update(change)
+                self.fixture(); self.cache.forget("chat"); self.prepare()
+                self.assertTrue(all(self.cache.project_event("chat", row) is None for row in self.imports))
+                items = [self.parse(row) for row in self.raw]
+                self.assertEqual(filter_native_codex_history_items("chat", PROVIDER, self.events, items), items)
+        for scenario in ("missing", "duplicate", "late"):
+            with self.subTest(scenario=scenario):
+                self.goal_fixture()
+                start = self.native.pop(0)
+                if scenario == "duplicate":
+                    self.native = [start, {**start, "id": "second-start"}, *self.native]
+                elif scenario == "late":
+                    self.native.append(start)
+                for seq, row in enumerate(self.native, 1):
+                    row["seq"] = seq
+                self.fixture(); self.cache.forget("chat"); self.prepare()
+                self.assertTrue(all(self.cache.project_event("chat", row) is None for row in self.imports))
+                items = [self.parse(row) for row in self.raw]
+                self.assertEqual(filter_native_codex_history_items("chat", PROVIDER, self.events, items), items)
+
+    def test_goal_replay_rejects_conflicting_native_item_provenance(self):
+        for change in (
+            {"provider_thread_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"},
+            {"provider_turn_id": "another-turn"}, {"item_id": "another-item"},
+            {"session_id": "another-chat"}, {"imported": True}, {"backend": "claude"},
+            {"phase": "summary", "type": "reasoning_summary"},
+        ):
+            with self.subTest(change=change):
+                self.goal_fixture()
+                self.native[1].update(change)
+                self.fixture(); self.cache.forget("chat"); self.prepare()
+                self.assertIsNone(self.cache.project_event("chat", self.imports[0]))
+                items = [self.parse(row) for row in self.raw]
+                self.assertEqual(filter_native_codex_history_items("chat", PROVIDER, self.events, items), [items[0]])
+
+    def test_goal_replay_rejects_ambiguous_item_ownership(self):
+        self.goal_fixture()
+        self.native.extend([
+            {**self.native[0], "seq": 5, "id": "other-start", "run_id": "another-goal"},
+            {**self.native[1], "seq": 6, "id": "other-answer", "run_id": "another-goal"},
+        ])
+        self.fixture(); self.prepare()
+        self.assertIsNone(self.cache.project_event("chat", self.imports[0]))
+        items = [self.parse(row) for row in self.raw]
+        self.assertEqual(filter_native_codex_history_items("chat", PROVIDER, self.events, items), [items[0]])
+
     def test_large_tool_record_keeps_native_replay_proof_and_genuine_user(self):
         self.raw.append({**self.raw[0], "timestamp": "2026-09-11T12:09:00Z", "payload": {
             **self.raw[0]["payload"], "id": "genuine-user-item",

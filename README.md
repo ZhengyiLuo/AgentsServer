@@ -16,7 +16,7 @@ The desktop and mobile client is also open source:
 
 - Run agent chats from desktop and mobile, with persistent history.
 - Work with files, images, videos, scheduled jobs, and persistent terminals.
-- Use Claude Code, Codex, Cursor, or OpenCode where supported by your server
+- Use Claude Code, Codex, Cursor, OpenCode, or Gemini where supported by your server
   release, client, and installed CLI.
 - Run independent servers on the same machine.
 
@@ -92,6 +92,9 @@ Install and sign in to your preferred agent CLI on the **server machine**.
 AgentsDock does not install or authenticate Claude Code, Codex, Cursor or
 OpenCode for you. In the desktop app, check **Settings → My Agents**, then
 create a chat with that agent and a working directory on the server.
+Gemini uses an API connection in My Agents, not Google/CLI sign-in, and requires
+Gemini CLI 0.64.0. It is built in without a feature flag in versions containing
+the integration; see [Gemini setup and supported features](docs/GEMINI_PROVIDER_PREVIEW.md).
 The npm package installs the server and CLI; the app is a separate download.
 
 ### If setup did not finish
@@ -178,7 +181,7 @@ git pull --ff-only
 - [Setup and connection help](https://agentsdock.net/setup.html)
 - [AgentsDock features](https://agentsdock.net/features.html)
 - [Server releases](https://github.com/ZhengyiLuo/AgentsServer/releases)
-- [Report a server issue](https://github.com/ZhengyiLuo/AgentsServer/issues)
+- [Report a server issue](https://github.com/ZhengyiLuo/AgentsDock/issues)
 - [Contributing and tests](CONTRIBUTING.md)
 
 Features in this checkout may not yet be in a published release. The maintained server source is this repository's `server/` directory. The

@@ -1,5 +1,6 @@
 """Real npm packing/bin checks in disposable homes/prefixes; no service install."""
 import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import errno
 import fcntl
 import json
@@ -13,6 +14,7 @@ import sys
 import tarfile
 import tempfile
 import termios
+import threading
 import time
 import unittest
 
@@ -92,6 +94,33 @@ class AgentsDockCliPackageTests(unittest.TestCase):
         version = cli["version"]
         (core / "package.json").write_text(json.dumps({"name": "@agentsdock/server", "version": version}))
         (core / "server/VERSION").write_text(version)
+        health_requests = []
+
+        class PairingHealth(BaseHTTPRequestHandler):
+            def do_GET(self):
+                authenticated = self.headers.get("X-AgentsDock-Token") == "secret-lifecycle-sentinel"
+                health_requests.append((self.path, authenticated))
+                self.send_response(200 if authenticated and self.path == "/api/health" else 403)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": authenticated, "server_identity": "npm-hook-fixture"}).encode())
+
+            def log_message(self, *args):
+                pass
+
+        health_server = ThreadingHTTPServer(("127.0.0.1", 0), PairingHealth)
+        health_thread = threading.Thread(target=health_server.serve_forever, daemon=True)
+        health_thread.start()
+        self.addCleanup(health_thread.join)
+        self.addCleanup(health_server.server_close)
+        self.addCleanup(health_server.shutdown)
+        # Only the instance lookup and service creation are synthetic. Exercise
+        # real npm, authenticated HTTP, QR encoding and controlling-terminal I/O.
+        pair_info = json.dumps({"name": "default", "accessToken": "secret-lifecycle-sentinel",
+                                "choices": {"lan": [f"http://127.0.0.1:{health_server.server_port}"]}})
+        (core / "server/instances.sh").write_text(
+            "#!/bin/bash\n[[ $1 == _pair-info && $2 == default && $# == 2 ]] || exit 1\n"
+            + "printf '%s\\n' '" + pair_info + "'\n")
         (core / "npm/cli.cjs").write_text(r'''
 const fs = require('node:fs'), path = require('node:path'), assert = require('node:assert/strict');
 const marker = path.join(process.env.HOME, 'synthetic-service-started');
@@ -130,6 +159,17 @@ if (require.main === module) {
                    "--no-audit", "--no-fund", "--offline", *archives]
         result = subprocess.run(command, cwd=self.work, env=env, text=True, capture_output=True, timeout=45, start_new_session=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(health_requests, [], "Headless npm install must not generate a credential QR")
+        expected_qr = subprocess.check_output([
+            "node", "-e", "const dir = process.argv[1]; "
+            "const { connectionLink } = require(dir + '/pair.cjs'); "
+            "const link = connectionLink({name: 'default', accessToken: 'secret-lifecycle-sentinel', "
+            "serverUrl: process.argv[2], serverIdentity: 'npm-hook-fixture'}); "
+            "require(dir + '/qr-renderer.cjs').toString(link, "
+            "{type: 'terminal', small: true, errorCorrectionLevel: 'M', margin: 4})"
+            ".then(value => process.stdout.write(value));",
+            str(prefix / "lib/node_modules/agentsdock"), f"http://127.0.0.1:{health_server.server_port}",
+        ], env=env, text=True, timeout=10)
         marker = home / "synthetic-service-started"
         self.assertEqual(marker.read_text(), "one synthetic service start")
         before = marker.stat().st_mtime_ns
@@ -210,15 +250,27 @@ if (require.main === module) {
                 if tty_process.poll() is None:
                     tty_process.terminate()
                     tty_process.wait(timeout=5)
-            text = output.decode().replace("\r\n", "\n")
+            try:
+                text = output.decode().replace("\r\n", "\n")
+            except UnicodeDecodeError as error:
+                self.fail(f"Terminal QR contains incomplete UTF-8: {bytes(output[max(0, error.start - 12):error.end + 50])!r}")
             self.assertIn("Setting up your first AgentsDock server", text)
             self.assertIn("Your new service is up!", text)
             self.assertIn("URL:     http://127.0.0.1:7850", text)
             self.assertIn("Access token (default):\nsecret-lifecycle-sentinel\n", text)
+            self.assertIn("Pair default\nServer addresses:", text)
+            self.assertIn(f"http://127.0.0.1:{health_server.server_port}", text)
+            self.assertIn("Add server > Scan QR code", text)
+            self.assertIn("\x1b[47m\x1b[30m", text, "The terminal must contain a rendered QR, not just a command/link")
+            self.assertIn(expected_qr, text, "The complete QR must survive terminal pressure and npm progress output")
+            self.assertNotIn("Connection QR unavailable", text)
             self.assertNotIn("secret-installer-sentinel", text)
+        self.assertEqual(health_requests, [("/api/health", True), ("/api/health", True)])
         for log in (self.work / "hook-cache/_logs").glob("*.log"):
             self.assertNotIn("secret-lifecycle-sentinel", log.read_text())
             self.assertNotIn("secret-installer-sentinel", log.read_text())
+            self.assertNotIn("Pair default", log.read_text())
+            self.assertNotIn("\x1b[47m\x1b[30m", log.read_text())
 
     @unittest.skipUnless(shutil.which("npm") and shutil.which("node") and os.getuid() != 0,
                          "real npm CLI smoke needs npm/node and a non-root user")

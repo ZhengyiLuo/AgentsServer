@@ -67,6 +67,7 @@ class EmergencyAlertServerTests(unittest.IsolatedAsyncioTestCase):
         self.stack.enter_context(patch.object(agent_server, "EVENT_DELIVERY_LOCKS", {}))
         self.stack.enter_context(patch.object(agent_server, "SESSION_LIFECYCLE_LOCKS", {}))
         self.stack.enter_context(patch.object(agent_server, "HISTORY_SEARCH_DIRTY", set()))
+        self.stack.enter_context(patch.object(agent_server, "QUEUE_RECOVERY_READY", set()))
         self.stack.enter_context(patch.object(agent_server, "DELETING_SESSIONS", set()))
         self.stack.enter_context(patch.object(agent_server, "DELETED_SESSION_TOMBSTONES", set()))
         self.stack.enter_context(patch.object(agent_server, "CROSS_CHAT_CAPABILITIES", {}))

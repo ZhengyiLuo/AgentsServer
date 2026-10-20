@@ -21,20 +21,21 @@ class CrossChatConnectionTests(unittest.TestCase):
                    "claude_sdk_dependency_available": lambda: True,
                    "BACKEND_CODEX": "codex", "BACKEND_CLAUDE": "claude",
                    "BACKEND_CURSOR": "cursor", "BACKEND_OPENCODE": "opencode",
+                   "BACKEND_GEMINI": "gemini",
                    "RUNTIME_DIAGNOSTICS": {}, "RUNTIME_DIAGNOSTICS_LOCK": threading.RLock(),
                    "PROVIDER_CONNECTION_STORE": self.store, "HTTPException": HTTPException}
         exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), self.ns)
 
     def test_verified_api_supports_cross_chat_without_native_login(self):
         self.store.public.return_value = {"configured": True, "last_result": "verified"}
-        for backend in ("cursor", "opencode"):
+        for backend in ("cursor", "opencode", "gemini"):
             with self.subTest(backend=backend):
                 self.ns["RUNTIME_DIAGNOSTICS"] = {backend: {"status": "unauthenticated", "installed": True}}
                 self.assertIn(backend, self.ns["cross_chat_supported_target_backends"]())
                 self.assertEqual(self.ns["RUNTIME_DIAGNOSTICS"][backend]["status"], "unauthenticated")
 
     def test_missing_cli_forgotten_or_unverified_api_cannot_enable_transport(self):
-        for backend in ("cursor", "opencode"):
+        for backend in ("cursor", "opencode", "gemini"):
             for installed, configured, result in ((False, True, "verified"),
                     (True, False, None), (True, True, "authentication_failed"), (True, True, None)):
                 with self.subTest(backend=backend, installed=installed, configured=configured, result=result):

@@ -41,13 +41,13 @@ CONTROL_ACTIONS = frozenset({
 })
 CONTROL_READ_ACTIONS = frozenset({"timeline.older", "timeline.around", "timeline.trace", "timeline.index", "jobs.runs", "runtime.catalog", "handoffs.get"})
 NATIVE_STATE_FIELDS = frozenset({"revision", "session", "events", "queue", "active", "goal", "jobs",
-    "codex_runtime", "claude_runtime", "health", "runtime_catalog", "hasMoreEvents", "nextTimelineBefore", "eventsTotal"})
+    "codex_runtime", "claude_runtime", "gemini_runtime", "health", "runtime_catalog", "hasMoreEvents", "nextTimelineBefore", "eventsTotal"})
 COOKIE = "__Secure-AgentsDock-Chat"
 HTTP_COOKIE = "AgentsDock-Chat"
 HEADERS = {
     "Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff",
     "X-Robots-Tag": "noindex, nofollow, noarchive", "Cross-Origin-Resource-Policy": "same-origin",
-    "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+    "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://api.mixpanel.com; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
 }
 
 

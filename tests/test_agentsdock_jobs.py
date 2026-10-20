@@ -12,6 +12,14 @@ import agentsdock_jobs
 
 
 class AgentsDockJobsCLITests(unittest.TestCase):
+    def test_gemini_and_opencode_backend_selectors_use_the_existing_job_contract(self):
+        parser = agentsdock_jobs.build_parser()
+        for backend in ("gemini", "opencode"):
+            for argv in (["create", "--title", "Fixture", "--prompt", "Fixture", "--interval-seconds", "60", "--backend", backend],
+                         ["update", "job_fixture", "--backend", backend]):
+                with self.subTest(argv=argv):
+                    self.assertEqual(parser.parse_args(argv).backend, backend)
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.authority_path = Path(self.temporary.name) / "authority.json"

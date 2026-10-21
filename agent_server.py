@@ -51941,6 +51941,50 @@ def is_codex_compaction_failure(message: str) -> bool:
     return "remote compact task" in lowered and "stream disconnected" in lowered
 
 
+def codex_compaction_retry_mode(turns: Any, failed_turn_id: str, run_id: str) -> str | None:
+    """Prove which input, if any, a same-thread compaction retry can use.
+
+    An empty/summary snapshot is not evidence. Unknown items, a later turn,
+    or any execution forbid recovery, even if no final reply was seen. When
+    Codex persisted this exact user message before failing, continue with empty
+    input: native turn/start supports that without adding another user item.
+    """
+    if not failed_turn_id or not isinstance(turns, list) or not turns:
+        return None
+    turn = turns[0]
+    if not isinstance(turn, dict) or (
+        turn.get("id") != failed_turn_id
+        or turn.get("status") != "failed"
+        or turn.get("itemsView") != "full"
+    ):
+        return None
+    items = turn.get("items")
+    if not isinstance(items, list) or not items or any(
+        not isinstance(item, dict) or item.get("type") not in {"contextCompaction", "userMessage"}
+        for item in items
+    ):
+        return None
+    users = [item for item in items if item.get("type") == "userMessage"]
+    if not users:
+        return "resubmit"
+    if len(users) == 1 and run_id and users[0].get("clientId") == run_id:
+        return "continue"
+    return None
+
+
+def codex_compaction_error_message(model: str, native_error: str) -> str:
+    # The native error may name the previous model even after native fallback.
+    # Do not invent its hidden fallback error or infer retirement from a stream error.
+    return (
+        f"Codex context compaction failed with {model or 'the current model'} selected. "
+        "The original conversation and history were kept. The provider error below "
+        "may refer to an earlier model; it does not mean your selection was ignored. "
+        "Any additional native fallback failure may not be exposed by Codex. "
+        "Try Compact context in Codex Thread Controls, then send again. "
+        f"Provider error: {native_error}"
+    )
+
+
 def is_codex_resume_failure(message: str) -> bool:
     lowered = str(message or "").lower()
     return any(
@@ -51996,11 +52040,14 @@ def should_recover_codex_resume(
         or stream_error
         or idle_killed
         or produced_activity
+        # Compaction is not evidence of a missing thread. Never silently
+        # replace original context with a bounded-memory fork on this error.
+        or is_codex_compaction_failure(terminal_error)
     ):
         return False
     if resume_stalled or returncode in (0, None):
         return True
-    return is_codex_resume_failure(terminal_error) or is_codex_compaction_failure(terminal_error)
+    return is_codex_resume_failure(terminal_error)
 
 
 async def rollover_codex_provider_session(
@@ -55698,6 +55745,34 @@ async def project_codex_notification(notification: dict[str, Any]) -> None:
             thread_id,
             turn_id,
         )
+        if completed_turn.get("status") in {"failed", "interrupted"}:
+            failed_compaction = None
+            async with ACTIVE_LOCK:
+                active = ACTIVE.get(session_id)
+                if (
+                    active and not active.get("codex_native_operation")
+                    and active.get("codex_compaction_in_progress")
+                    and active.get("provider_thread_id") == thread_id
+                    and active.get("codex_compaction_turn_id") == turn_id
+                ):
+                    failed_compaction = {
+                        "run_id": active.get("run_id"), "thread_id": thread_id,
+                        "turn_id": turn_id, "item_id": active.get("codex_compaction_item_id"),
+                        "token_usage_before": active.get("codex_compaction_token_usage_before"),
+                        "token_usage_after": None,
+                        "status": completed_turn["status"],
+                        "message": "Codex automatic context compaction did not complete.",
+                    }
+                    for key in ("codex_compaction_in_progress", "codex_compaction_turn_id",
+                                "codex_compaction_item_id", "codex_compaction_token_usage_before",
+                                "codex_compaction_token_usage_after"):
+                        active.pop(key, None)
+            if failed_compaction is not None:
+                item_id = failed_compaction["item_id"]
+                if not codex_native_compaction_was_terminal(session_id, thread_id, turn_id, item_id):
+                    failed_compaction["compaction_id"] = native_codex_compaction_id(thread_id, turn_id, item_id)
+                    await append_event(session_id, "codex_compaction_completed", failed_compaction)
+                    remember_codex_native_compaction_terminal(session_id, thread_id, turn_id, item_id)
         if turn_id is not None and run_id is not None:
             async with STORE._lock:
                 session = STORE.sessions.get(session_id)
@@ -70645,6 +70720,8 @@ async def run_codex_app_server(
     allow_exec_fallback: bool,
     interactive_app_server: bool = False,
     allow_resume_rollover: bool = True,
+    allow_compaction_retry: bool = True,
+    compaction_continuation: bool = False,
     diff_baseline: dict[str, Any] | None = None,
     standalone_provider_context: bool = False,
     provider_command: ProviderCommandRecord | None = None,
@@ -70699,6 +70776,9 @@ async def run_codex_app_server(
     turn_start_epoch = 0.0
     terminal_status = "failed"
     terminal_error: str | None = None
+    pending_compaction_items: set[str] = set()
+    compaction_failed = False
+    compaction_execution_seen = False
     error_emitted = False
     cancelled_provisional_turn = False
     provisional_thread_invalidated = False
@@ -72087,6 +72167,7 @@ async def run_codex_app_server(
         nonlocal pending_unknown_message, pending_unknown_item_id
         nonlocal ambiguous_turn_start, error_emitted
         nonlocal native_answer_turn_id, waiting_for_child_continuation
+        nonlocal compaction_failed, compaction_execution_seen
         method = str(notification.get("method") or "")
         params = (
             notification.get("params")
@@ -72095,6 +72176,9 @@ async def run_codex_app_server(
         )
         item = params.get("item") if isinstance(params.get("item"), dict) else {}
         item_id = str(params.get("itemId") or item.get("id") or "")
+        if method.startswith(("item/agentMessage/", "item/reasoning/", "item/plan/",
+                              "item/commandExecution/", "item/fileChange/")):
+            compaction_execution_seen = True
 
         native_turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
         native_turn_id = str(params.get("turnId") or native_turn.get("id") or "")
@@ -72104,6 +72188,8 @@ async def run_codex_app_server(
             return False
         if method == "turn/started" and native_turn_id:
             waiting_for_child_continuation = False
+            if native_answer_turn_id != native_turn_id:
+                pending_compaction_items.clear()
             if native_answer_turn_id and native_answer_turn_id != native_turn_id:
                 # Preserve previous answers as their original timeline events;
                 # only the latest native answer belongs in terminal result_text.
@@ -72175,12 +72261,20 @@ async def run_codex_app_server(
             append_tool_output_delta(item_id, params.get("delta"))
             return False
         if method == "item/started" and item:
+            if item.get("type") == "contextCompaction" and item_id:
+                pending_compaction_items.add(item_id)
+            elif item.get("type") != "userMessage":
+                compaction_execution_seen = True
             tool = codex_app_server_tool(item)
             if tool:
                 await emit_tool_started(tool)
             changed_paths.update(codex_app_server_changed_paths(item))
             return False
         if method == "item/completed" and item:
+            if item.get("type") == "contextCompaction":
+                pending_compaction_items.discard(item_id)
+            elif item.get("type") != "userMessage":
+                compaction_execution_seen = True
             if codex_app_server_tool(item):
                 await maybe_notify_chat_mailbox_codex(session_id)
             item_type = str(item.get("type") or "")
@@ -72243,6 +72337,7 @@ async def run_codex_app_server(
                 else {}
             )
             terminal_status = str(completed_turn.get("status") or "failed")
+            compaction_failed = terminal_status == "failed" and bool(pending_compaction_items)
             if completed_turn.get("error"):
                 terminal_error = concise_error_message(completed_turn.get("error"))
             elif terminal_status == "completed":
@@ -72603,12 +72698,14 @@ async def run_codex_app_server(
                     overrides["serviceTier"] = codex_app_server_service_tier(service_tier)
 
                 turn_start_attempted = True
+                if compaction_continuation:
+                    overrides.pop("clientUserMessageId", None)
                 turn_start_epoch = time.time()
                 install_child_continuation_observer()
                 try:
                     turn = await manager.start_turn(
                         provider_id,
-                        codex_provider_command_turn_input(
+                        [] if compaction_continuation else codex_provider_command_turn_input(
                             prompt,
                             provider_command,
                         ),
@@ -73239,6 +73336,80 @@ async def run_codex_app_server(
         or finished_tools
         or seen_artifacts
     )
+    compaction_failed = terminal_status == "failed" and (
+        compaction_failed or is_codex_compaction_failure(terminal_error or "")
+    )
+    async def prepare_compaction_retry() -> str | None:
+        nonlocal thread_pinned
+        if not (
+            compaction_failed and allow_compaction_retry and not stopped
+            and not standalone_provider_context and resumed_provider_id == provider_id
+            and not produced_activity and not compaction_execution_seen
+            and not delivery_unknown and not ambiguous_turn_start
+            and not goal_steer_recovery_fenced and not child_continuation_attempts
+            and goal_continuation_result is None and turn_completed
+            and current_run_id == run_id and turn is not None
+        ):
+            return None
+        # The ordered stream alone is insufficient: corroborate it with a
+        # full, terminal native snapshot. Unsupported/failed reads fail closed.
+        retry_mode = None
+        try:
+            turns = await asyncio.wait_for(
+                manager.list_turns(provider_id, limit=1, items_view="full", sort_direction="desc"),
+                timeout=5.0,
+            )
+            retry_mode = codex_compaction_retry_mode(turns, turn.turn_id, current_run_id)
+        except Exception:
+            pass
+        if (retry_mode and await turn_slot_is_owned(session_id, current_run_id)
+                and not stop_requested_for_current_run()):
+            await append_event(session_id, "codex_compaction_retry", {
+                "run_id": current_run_id, "backend": BACKEND_CODEX,
+                "provider_thread_id": provider_id, "model": model,
+                "message": (
+                    f"Context compaction failed before a reply. Retrying once with {model} "
+                    "in the same Codex conversation, without duplicating the message or tool execution."
+                ),
+            })
+            if thread_pinned:
+                await unpin_codex_app_server_thread(manager, provider_id)
+                thread_pinned = False
+            return retry_mode
+        return None
+
+    retry_mode = None
+    try:
+        retry_mode = await prepare_compaction_retry()
+    except asyncio.CancelledError:
+        # Recovery runs after the original stream has closed. Stop/restart
+        # must still release the same run's slot and exact thread lease.
+        cleanup = asyncio.create_task(reconcile_cancelled_runner_exit())
+        await join_task_despite_caller_cancellation(cleanup)
+        raise
+    except Exception:
+        # Failed recovery preparation must leave the original failure visible,
+        # not skip the normal terminal/lease finalizer below.
+        pass
+    if retry_mode:
+        # The continuation owns terminal cleanup. Do not catch its failure and
+        # finalize the original attempt a second time.
+        await run_codex_app_server(
+            session_id, current_run_id, current_provider_prompt, sess, manifest_path,
+            allow_exec_fallback=False, interactive_app_server=interactive_app_server,
+            allow_resume_rollover=False, allow_compaction_retry=False,
+            compaction_continuation=retry_mode == "continue",
+            diff_baseline=current_diff_baseline,
+            standalone_provider_context=standalone_provider_context,
+            provider_command=provider_command, provider_runtime_env=runtime_env,
+        )
+        return
+    if stop_requested_for_current_run():
+        stopped = True
+        terminal_status = "interrupted"
+        terminal_error = None
+    if compaction_failed and terminal_error:
+        terminal_error = codex_compaction_error_message(model, terminal_error)
     if selected_provider and not produced_activity and not stopped and (
         first_activity_stalled or terminal_status == "completed"
     ):
@@ -73250,6 +73421,7 @@ async def run_codex_app_server(
         )
     recover_resume = (
         not delivery_unknown
+        and not compaction_failed
         and not (selected_provider and (first_activity_stalled or not produced_activity))
         and not goal_steer_recovery_fenced
         and not child_continuation_attempts
@@ -73317,7 +73489,7 @@ async def run_codex_app_server(
     try:
         if terminal_status == "failed":
             terminal_error = terminal_error or "Codex app-server turn failed."
-            if selected_provider:
+            if selected_provider and not compaction_failed:
                 failure_kind = codex_provider.classify_failure(terminal_error)
                 if failure_kind != "failed":
                     terminal_error = codex_provider.test_result(failure_kind)["message"]

@@ -1285,6 +1285,33 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("codex_token_usage_snapshot", session)
         save.assert_not_awaited()
 
+    async def test_failed_compaction_closes_live_status_without_false_success(self) -> None:
+        active = {"chat": {
+            "run_id": "run", "provider_thread_id": "thread", "provider_turn_id": "turn",
+            "codex_compaction_in_progress": True,
+            "codex_compaction_turn_id": "turn", "codex_compaction_item_id": "compact",
+            "codex_compaction_token_usage_before": {"context_tokens": 1200},
+        }}
+        recorded = AsyncMock(return_value={})
+        with patch.object(agent_server, "ACTIVE", active), \
+                patch.object(agent_server, "codex_session_id_for_thread", return_value="chat"), \
+                patch.object(agent_server, "append_event", recorded), \
+                patch.object(agent_server.STORE, "save", AsyncMock()):
+            terminal = {"method": "turn/completed", "params": {
+                "threadId": "thread", "turn": {"id": "turn", "status": "failed"},
+            }}
+            await agent_server.project_codex_notification(terminal)
+            await agent_server.project_codex_notification(terminal)
+            await agent_server.project_codex_notification({"method": "item/completed", "params": {
+                "threadId": "thread", "turnId": "turn",
+                "item": {"type": "contextCompaction", "id": "compact"},
+            }})
+        completions = [c.args[2] for c in recorded.await_args_list if c.args[1] == "codex_compaction_completed"]
+        self.assertEqual(len(completions), 1)
+        self.assertEqual(completions[0]["status"], "failed")
+        self.assertIsNone(completions[0]["token_usage_after"])
+        self.assertNotIn("codex_compaction_in_progress", active["chat"])
+
     async def test_automatic_compaction_preserves_before_and_after_usage(self) -> None:
         before_usage = {
             "last": {

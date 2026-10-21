@@ -291,6 +291,135 @@ def reasoning_item(
 
 
 class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
+    async def compaction_case(self, *, repeat=False, user_item=False,
+                              read_error=False, cancel_during_read=False,
+                              success=False, accepted_input=False, execution=False):
+        error = "The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account."
+        compact = {"method":"item/started", "params":{
+            "threadId":"thread-native", "turnId":"turn-native",
+            "item":{"type":"contextCompaction", "id":"compact"}}}
+        failed = completed_notification("failed")
+        failed["params"]["turn"]["error"] = {"message":error}
+        initial = [compact, failed]
+        if accepted_input:
+            user = {"method":"item/completed", "params":{
+                "threadId":"thread-native", "turnId":"turn-native",
+                "item":{"type":"userMessage", "id":"user", "clientId":"run-original"}}}
+            initial.insert(1,user)
+        if execution:
+            initial.insert(1, agent_message("partial", "already acted", "commentary"))
+        if success:
+            initial = [compact, {**compact, "method":"item/completed"},
+                       agent_message("reply", "recovered natively", "final_answer"),
+                       completed_notification()]
+        recovered = FakeTurn([
+            agent_message("reply", "recovered", "final_answer"),
+            completed_notification()], turn_id="turn-retry")
+        manager = FakeManager(turns=[FakeTurn(initial), FakeTurn([compact, failed]) if repeat else recovered])
+        snapshot = {"id":"turn-native", "status":"failed", "itemsView":"full",
+                    "items":[{"type":"contextCompaction", "id":"compact"}]}
+        if user_item:
+            snapshot["items"].append({"type":"userMessage", "id":"user"})
+        if accepted_input:
+            snapshot["items"] = [{"type":"userMessage", "id":"user", "clientId":"run-original"}]
+
+        async def list_turns(*args, **kwargs):
+            if read_error:
+                raise RuntimeError("unsupported native read")
+            if cancel_during_read:
+                agent_server.STOPPED_RUNS.add("run-original")
+            return [snapshot]
+        manager.list_turns = list_turns
+        rollover = AsyncMock()
+        stack, events, finished, fallback = self.runner_patches(manager)
+        with stack, patch.object(agent_server, "rollover_codex_provider_session", rollover):
+            await asyncio.wait_for(agent_server.run_codex_app_server(
+                "chat-native", "run-original", "Original request", dict(self.session),
+                Path(self.cwd) / ".runner-test-manifest.json",
+                allow_exec_fallback=True, allow_resume_rollover=True), timeout=3)
+        rollover.assert_not_awaited()
+        fallback.assert_not_awaited()
+        self.assertEqual(self.session["codex_thread_id"], "thread-native")
+        self.assertEqual(self.session["session_id"], "thread-native")
+        self.assertNotIn("memory_seed", self.session)
+        return manager, events, finished
+
+    async def test_compaction_failure_retries_once_only_with_no_input_proof(self):
+        manager, events, finished = await self.compaction_case()
+        self.assertEqual(len(manager.turn_calls), 2)
+        self.assertEqual(manager.turn_calls[0], manager.turn_calls[1])
+        self.assertEqual(sum(c.args[1] == "codex_compaction_retry" for c in events.await_args_list), 1)
+        self.assertFalse(any(c.args[1] == "error" for c in events.await_args_list))
+        self.assertEqual(finished.await_count, 1)
+
+    async def test_compaction_persistent_failure_keeps_original_and_explains_selected_model(self):
+        manager, events, _ = await self.compaction_case(repeat=True)
+        self.assertEqual(len(manager.turn_calls), 2)
+        errors = [c.args[2]["message"] for c in events.await_args_list if c.args[1] == "error"]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("context compaction failed", errors[0])
+        self.assertIn(manager.turn_calls[0][2]["model"], errors[0])
+        self.assertIn("gpt-5.5", errors[0])
+        self.assertIn("may not be exposed", errors[0])
+
+    async def test_compaction_persisted_user_message_forbids_replay(self):
+        manager, _, _ = await self.compaction_case(user_item=True)
+        self.assertEqual(len(manager.turn_calls), 1)
+
+    async def test_compaction_accepted_input_continues_without_resending(self):
+        manager, events, finished = await self.compaction_case(accepted_input=True)
+        self.assertEqual(len(manager.turn_calls), 2)
+        self.assertEqual(manager.turn_calls[1][0], "thread-native")
+        self.assertEqual(manager.turn_calls[1][1], [])
+        self.assertNotIn("clientUserMessageId", manager.turn_calls[1][2])
+        self.assertEqual(finished.await_count, 1)
+        self.assertFalse(any(c.args[1] == "error" for c in events.await_args_list))
+
+    async def test_compaction_after_any_execution_does_not_continue(self):
+        manager, _, _ = await self.compaction_case(accepted_input=True, execution=True)
+        self.assertEqual(len(manager.turn_calls), 1)
+
+    async def test_compaction_unreadable_acceptance_forbids_replay(self):
+        manager, _, _ = await self.compaction_case(read_error=True)
+        self.assertEqual(len(manager.turn_calls), 1)
+
+    async def test_compaction_stop_during_proof_read_forbids_replay(self):
+        manager, _, _ = await self.compaction_case(cancel_during_read=True)
+        self.assertEqual(len(manager.turn_calls), 1)
+
+    async def test_native_compaction_fallback_success_does_not_replay(self):
+        manager, events, _ = await self.compaction_case(success=True)
+        self.assertEqual(len(manager.turn_calls), 1)
+        self.assertFalse(any(c.args[1] in {"error", "codex_compaction_retry"} for c in events.await_args_list))
+
+    async def test_cancel_during_compaction_recovery_releases_slot_and_pin(self):
+        compact = {"method":"item/started", "params":{
+            "threadId":"thread-native", "turnId":"turn-native",
+            "item":{"type":"contextCompaction", "id":"compact"}}}
+        failed = completed_notification("failed")
+        failed["params"]["turn"]["error"] = {"message":"compaction stream failed"}
+        manager = FakeManager(FakeTurn([compact, failed]))
+        entered = asyncio.Event()
+        async def blocked_read(*args, **kwargs):
+            entered.set()
+            await asyncio.Event().wait()
+        manager.list_turns = blocked_read
+        cleanup = AsyncMock()
+        unpin = AsyncMock()
+        stack, _, _, _ = self.runner_patches(manager)
+        with stack, patch.object(agent_server, "reconcile_provider_task_exit", cleanup), \
+                patch.object(agent_server, "unpin_codex_app_server_thread", unpin):
+            task = asyncio.create_task(agent_server.run_codex_app_server(
+                "chat-native", "run-original", "Original request", dict(self.session),
+                Path(self.cwd)/".runner-test-manifest.json", allow_exec_fallback=True))
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        cleanup.assert_awaited_once_with("chat-native", "run-original", agent_server.BACKEND_CODEX)
+        unpin.assert_awaited_once_with(manager, "thread-native")
+        self.assertEqual(len(manager.turn_calls), 1)
+
     async def asyncSetUp(self) -> None:
         self.previous_sessions = agent_server.STORE.sessions
         self.previous_active = agent_server.ACTIVE

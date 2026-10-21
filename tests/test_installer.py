@@ -50,6 +50,7 @@ class InstallerContractTests(unittest.TestCase):
             source.mkdir()
             for name in package_release.FILES:
                 path = source / name
+                path.parent.mkdir(parents=True, exist_ok=True)
                 if name == "install.sh":
                     shutil.copy2(INSTALLER, path)
                 elif name == "VERSION":
@@ -85,6 +86,26 @@ class InstallerContractTests(unittest.TestCase):
             self.assertIn("agent_server.py", result.stderr)
             self.assertIn("not a regular release file", result.stderr)
             self.assertFalse((root / "install").exists())
+
+            (source / "agent_server.py").unlink()
+            (source / "agent_server.py").write_text("release file\n")
+            for name in ("npm/agentsdock", "npm"):
+                with self.subTest(linked_directory=name):
+                    directory = source / name
+                    external = root / "external-qr"
+                    directory.rename(external)
+                    directory.symlink_to(external, target_is_directory=True)
+                    with self.assertRaisesRegex(SystemExit, "linked release files"):
+                        package_release.validate_release_files(source)
+                    result = subprocess.run(
+                        ["/bin/bash", str(source / "install.sh"), "--execution-mode", "legacy", "--no-team-hub-host"],
+                        env=environment, capture_output=True, text=True, check=False,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("not a real directory", result.stderr)
+                    self.assertFalse((root / "install").exists())
+                    directory.unlink()
+                    external.rename(directory)
 
     def test_team_hub_release_directory_is_closed_and_cache_free(self):
         self.assertIn(
@@ -2535,6 +2556,7 @@ chmod 755 "$project/.venv/bin/python"
             home.mkdir()
             source.mkdir()
             for name in package_release.FILES:
+                (source / name).parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(ROOT / name, source / name)
             for directory, names in package_release.DIRECTORY_FILES.items():
                 for name in names:

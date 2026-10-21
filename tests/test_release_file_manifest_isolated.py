@@ -40,6 +40,7 @@ NEW_MODULES = {
     "interactive_chat_shares.py", "interactive_chat_share_routes.py",
     "interactive_chat_share_web.py", "interactive_chat_projection.py", "interactive_chat_runtime.py",
     "interactive_chat_native.py", "interactive_chat_controls.py", "shared_chat_videos.py", "shared_chat_video_stream.py",
+    "shared_chat_analytics_web.py",
 }
 NEW_MIGRATION = "migrations/0020_team_mail_arrivals.sql"
 THREAD_MIGRATION = "migrations/0021_team_mail_threads.sql"
@@ -99,6 +100,7 @@ class ReleaseFileManifestTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="release-legal-manifest-") as temporary:
             root = Path(temporary)
             for name in self.manifest["FILES"]:
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
                 (root / name).write_text("synthetic release member\n")
             for name in sorted(legal_files):
                 selected = root / name
@@ -133,6 +135,7 @@ class ReleaseFileManifestTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="release-manifest-") as temporary:
             root = Path(temporary)
             for name in self.manifest["FILES"]:
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
                 (root / name).write_text("synthetic release member\n")
             for name in sorted(NEW_MODULES | EXECUTION_MODULES):
                 selected = root / name

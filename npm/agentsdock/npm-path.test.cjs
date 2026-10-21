@@ -78,7 +78,9 @@ if(require.main===module) actual.run(process.argv.slice(2),{spawn:inert}).then(c
     const quote = value => "'" + value.replaceAll("'", "'\\''") + "'"
     fs.writeFileSync(path.join(core, 'server/instances.sh'), '#!/bin/bash\nexec ' + quote(process.execPath) +
       ' "$(dirname "$0")/../npm/probe.cjs" "$@"\n')
-    for (const file of ['cli.cjs', 'postinstall.cjs']) fs.copyFileSync(path.join(__dirname, file), path.join(cli, file))
+    for (const file of ['cli.cjs', 'postinstall.cjs', 'pair.cjs', 'qr-renderer.cjs']) {
+      fs.copyFileSync(path.join(__dirname, file), path.join(cli, file))
+    }
     const metadata = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'))
     fs.writeFileSync(path.join(cli, 'package.json'), JSON.stringify({...metadata, private: false, version,
       dependencies: {'@agentsdock/server':version}}))

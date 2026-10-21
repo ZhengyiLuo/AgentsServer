@@ -256,9 +256,9 @@ def create_public_chat_share_router(
             raise ValueError("Invalid page")
         return page
 
-    def render_page(value, path):
+    def render_page(value, path, *, analytics=False):
         return render_public_chat_html(value["snapshot"], page=value["page"], page_count=value["page_count"],
-            message_count=value["message_count"], navigation_base=path)
+            message_count=value["message_count"], navigation_base=path, analytics=analytics)
 
     def last_page_redirect(path, page):
         return Response(status_code=303, headers={**public_chat_share_headers(),
@@ -292,10 +292,11 @@ def create_public_chat_share_router(
         if page is None:
             return last_page_redirect(request.url.path, value["page"])
         try:
-            content = await worker(lambda: render_page(value, request.url.path), public=True)
+            content = await worker(lambda: render_page(value, request.url.path, analytics=request.method == "GET"), public=True)
         except Exception:
             return Response("Shared conversation temporarily unavailable.", status_code=503, headers=headers)
-        return Response(content if request.method == "GET" else b"", headers=headers)
+        return Response(content if request.method == "GET" else b"",
+                        headers=public_chat_share_headers(analytics=request.method == "GET"))
 
     @router.post("/shared-chat/{share_id}/unlock", include_in_schema=False)
     async def unlock(share_id: str, request: Request):
@@ -348,7 +349,7 @@ def create_public_chat_share_router(
             value = await worker(lambda: store().get_snapshot_page(token, page=page), public=True)
             if page is None:
                 return last_page_redirect(request.url.path, value["page"])
-            content = await worker(lambda: render_page(value, request.url.path), public=True)
+            content = await worker(lambda: render_page(value, request.url.path, analytics=request.method == "GET"), public=True)
         except PublicChatShareUnavailable:
             return Response("Shared conversation unavailable.", status_code=404, headers=headers)
         except HTTPException as exc:
@@ -360,7 +361,8 @@ def create_public_chat_share_router(
             # Never expose filesystem, database, or implementation details on
             # the unauthenticated viewer, including an unexpected failure.
             return Response("Shared conversation temporarily unavailable.", status_code=503, headers=headers)
-        return Response(content if request.method == "GET" else b"", media_type="text/html", headers=headers)
+        return Response(content if request.method == "GET" else b"", media_type="text/html",
+                        headers=public_chat_share_headers(analytics=request.method == "GET"))
 
     async def video_response(request, token, page, message_index, video_index, *, share_id=None):
         headers = {**public_chat_share_headers(), "Cross-Origin-Resource-Policy": "same-origin"}

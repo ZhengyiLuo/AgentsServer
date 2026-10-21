@@ -43,7 +43,8 @@ Install and sign in to your preferred provider CLI on the server before
 starting a chat. npm setup does not install provider CLIs or authenticate them.
 
 For a beta, select `npm install -g agentsdock@beta`. Stable and beta packages are
-published on npm; this README describes the matched 1.0.11-beta.2 CLI/runtime.
+published on npm. This checkout prepares the matched 1.0.11-beta.12 CLI/runtime;
+its publication and native candidate acceptance are pending.
 
 `-g` makes the command available outside the current project when npm's global
 bin directory is on your PATH. A local `npm install agentsdock` is also supported;
@@ -63,9 +64,10 @@ The connection-output improvements below are included starting in
 `agentsdock token default` even if npm's installation output does not show
 connection details.
 
-With the improved output, a successful first setup shows the default server URL and
-access token together directly in your terminal, even when npm hides successful
-lifecycle output. Keep the token private. Raw installer output and access tokens
+With the improved output, a successful first setup shows the default server URL,
+access token and a scannable terminal QR together, even when npm hides successful
+lifecycle output. The QR includes reachable LAN/Tailscale addresses after
+authenticated health checks. Keep the token and QR private. Raw installer output and access tokens
 are not copied into npm's captured output/debug logs. Headless installations
 without a controlling terminal show only a non-secret summary; use
 `agentsdock token default` explicitly to retrieve a token later. Reinstalling
@@ -89,6 +91,14 @@ Node locations remain available; empty/relative entries are not persisted.
 This lexical filter does not resolve symlink aliases or authenticate executables.
 It prevents new temporary npm-path dependencies; it does not rewrite the saved
 PATH of an already-installed server or change managed-update policy.
+
+To show the connection details again, run `agentsdock token`: choose the server
+and its URLs, token and QR appear together. Use `agentsdock token default` to skip
+the chooser, or `agentsdock pair default` for just the addresses and QR. These
+commands are read-only and require no source-checkout path. Interactive
+`agentsdock setup` and `agentsdock new work` also show the connection details on
+success. If the server is local-only or not reachable yet, setup still succeeds
+and explains how to generate the QR after networking is ready.
 
 ## Manage servers
 
@@ -182,19 +192,33 @@ characters are escaped for terminal safety, not credential redaction.
 
 ```sh
 agentsdock pair                      # default instance
-agentsdock pair work                 # terminal QR, Tailscale preferred then LAN
+agentsdock pair work                 # terminal QR with Tailscale and LAN candidates
 agentsdock pair work --network lan   # same Wi-Fi/LAN
 agentsdock pair work --output connection.png
 ```
 
-In a mobile build with pairing support, open **Servers → Scan connection QR**,
-scan the terminal or choose the saved image, and tap **Connect and save**. URL and
-token are filled automatically; authenticated health and server identity must
-match before the profile is saved. A repeat scan reuses the existing server.
+For URLs, the token and a terminal QR in one interactive display, use
+`agentsdock token work`. Redirected token output remains token-only.
 
-If several LAN addresses exist, the command asks you to select a listed address
-with `--url http://192.168.1.20:7851`; it never guesses between a Wi-Fi interface
-and a virtual-machine bridge. Arbitrary URLs are rejected.
+In a mobile build with pairing support, open **Servers > Add server > Scan QR code**,
+allow camera access, and scan the terminal. Review the scanned server name and URL;
+authenticated health and the QR's server identity must match before **Add** is
+enabled. Tap **Add** to save and switch. A saved identity reuses the existing
+profile. Manual entry remains available; image import and connection deep links
+are not enabled on mobile.
+
+Interactive setup and token display also show a connection QR when a reachable
+address passes authenticated health. Fresh global npm installation writes the QR
+only to the controlling terminal, never to captured npm logs. Headless setup emits
+no QR. A missing camera-reachable address or failed QR generation does not fail
+installation; use `agentsdock pair` once networking is ready. This requires the
+updated server/CLI package and does not change existing published versions.
+
+Automatic mode includes up to six discovered LAN/Tailscale addresses that pass
+authenticated health with the same identity. Mobile tries these addresses and
+retains alternatives for reconnect. `--url http://192.168.1.20:7851` restricts the
+QR to one listed address; arbitrary URLs are rejected. Conflicting identities
+fail closed. Older single-address QRs remain supported by updated mobile apps.
 
 `qrcode` is an alias for `pair`. `--link` explicitly prints the credential-bearing
 `agentsdock://connect#...` URL instead of a QR. Treat the link/image like the
@@ -206,7 +230,7 @@ Both devices must be on a reachable LAN or private Tailscale network. A server
 bound only to localhost cannot connect to a physical phone; automatic selection
 refuses that case. `--network local` is an explicit same-computer/simulator test
 option. `--network tailscale` requires a confirmed Tailscale address and binding.
-The QR includes the identity returned by authenticated health at the chosen URL.
+The QR includes the identity returned by authenticated health at the included URLs.
 
 ## Complete public command comparison
 

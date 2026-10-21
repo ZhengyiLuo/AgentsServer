@@ -7,6 +7,7 @@ const { isIP } = require('node:net')
 const { isatty } = require('node:tty')
 const { spawn, spawnSync } = require('node:child_process')
 const { loadRuntime, localEnvironment } = require('./cli.cjs')
+const { showSetupQr } = require('./pair.cjs')
 
 function skipReason(context) {
   const env = context.env
@@ -48,20 +49,29 @@ function lines(accept) {
   }
 }
 
-function terminalPrint(text, io = { ...fs, isatty }) {
+function terminalPrint(text, io = { ...fs, isatty }, pause = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)) {
   // npm captures lifecycle stdout/stderr, including --foreground-scripts in
   // its debug logs. Only the controlling terminal may receive credentials.
   // No terminal (CI/headless installs): fail closed, never fall back to a log.
   let fd
   try {
-    fd = io.openSync('/dev/tty', fs.constants.O_WRONLY | fs.constants.O_NOCTTY | fs.constants.O_NONBLOCK)
+    // Use normal blocking tty writes. Nonblocking writes can split a large QR
+    // mid-character and let npm's progress indicator overwrite its contents.
+    fd = io.openSync('/dev/tty', fs.constants.O_WRONLY | fs.constants.O_NOCTTY)
     if (!io.isatty(fd)) return false
     const bytes = Buffer.from(text)
-    let offset = 0
+    let offset = 0, retries = 0
     while (offset < bytes.length) {
-      const written = io.writeSync(fd, bytes, offset, bytes.length - offset)
-      if (!written) return false
-      offset += written
+      try {
+        const written = io.writeSync(fd, bytes, offset, bytes.length - offset)
+        if (!written) return false
+        offset += written
+      } catch (error) {
+        // Preserve the exact byte offset after interruptions; cap retries when
+        // a terminal rejects a write instead of forwarding credentials to logs.
+        if (!['EAGAIN', 'EWOULDBLOCK', 'EINTR'].includes(error.code) || retries++ >= 100) return false
+        pause(10)
+      }
     }
     return true
   } catch { return false }
@@ -71,7 +81,7 @@ function terminalPrint(text, io = { ...fs, isatty }) {
 async function postinstall(overrides = {}) {
   const context = { env: process.env, home: os.homedir(), uid: process.getuid?.(),
     platform: process.platform, packageRoot: __dirname, spawn: spawnSync,
-    launch: spawn, load: loadRuntime, terminalPrint,
+    launch: spawn, load: loadRuntime, terminalPrint, showSetupQr,
     print: text => process.stdout.write(`agentsdock: ${text}\n`), ...overrides }
   const skipped = skipReason(context)
   if (skipped) { context.print(skipped); return 0 }
@@ -163,6 +173,9 @@ async function postinstall(overrides = {}) {
     'To view or copy the token again: agentsdock token default', '',
   ].join('\n'))
   if (!shown) context.print(summary)
+  else if (receipt.token) await context.showSetupQr('default', runtime, {
+    ...context, print: text => { context.terminalPrint(`${text}\n`) },
+  }, environment)
   return 0
 }
 

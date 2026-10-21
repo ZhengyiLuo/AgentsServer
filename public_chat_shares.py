@@ -26,6 +26,7 @@ import time
 from typing import Any, Callable, Iterator
 
 from shared_chat_videos import normalize_shared_chat_videos
+from shared_chat_analytics_web import SCRIPT as _ANALYTICS_SCRIPT, CSP_HASH as _ANALYTICS_HASH
 
 
 # Pagination targets, not quotas: one complete message may exceed a page target.
@@ -644,16 +645,21 @@ def _render_message_markdown(text: str) -> str:
     return "".join(parts)
 
 
-def public_chat_share_headers(*, allow_unlock_form: bool = False) -> dict[str, str]:
+def public_chat_share_headers(*, allow_unlock_form: bool = False, analytics: bool = False) -> dict[str, str]:
     """Use these headers for both successful viewer pages and unavailable pages."""
+    analytics = analytics and not allow_unlock_form
     return {
         "Content-Type": "text/html; charset=utf-8",
         "Content-Security-Policy": (
-            "default-src 'none'; script-src 'none'; "
-            f"style-src 'sha256-{_STYLE_HASH}'; "
-            "img-src 'none'; media-src 'self'; connect-src 'none'; base-uri 'none'; "
+            "default-src 'none'; "
+            + (f"script-src 'sha256-{_ANALYTICS_HASH}'; " if analytics else "script-src 'none'; ")
+            + f"style-src 'sha256-{_STYLE_HASH}'; "
+            "img-src 'none'; media-src 'self'; "
+            + ("connect-src https://api.mixpanel.com; " if analytics else "connect-src 'none'; ")
+            + "base-uri 'none'; "
             + ("form-action 'self'; frame-ancestors 'none'; sandbox allow-forms allow-same-origin"
-               if allow_unlock_form else "form-action 'none'; frame-ancestors 'none'; sandbox allow-same-origin")
+               if allow_unlock_form else "form-action 'none'; frame-ancestors 'none'; sandbox allow-same-origin"
+               + (" allow-scripts" if analytics else ""))
         ),
         "Cache-Control": "no-store",
         # A native navigation form under no-referrer submits Origin: null in
@@ -694,7 +700,8 @@ def render_public_chat_unlock_html(share_id: str, *, invalid_token: bool = False
 
 
 def render_public_chat_html(snapshot: dict[str, Any], *, page: int = 0, page_count: int = 1,
-                            message_count: int | None = None, navigation_base: str | None = None) -> bytes:
+                            message_count: int | None = None, navigation_base: str | None = None,
+                            analytics: bool = False) -> bytes:
     """Render a static transcript with escaped, presentation-only Markdown."""
     if not isinstance(snapshot, dict) or set(snapshot) != {"title", "created_at", "messages"}:
         raise PublicChatShareValidationError("Invalid public snapshot fields.")
@@ -753,5 +760,8 @@ def render_public_chat_html(snapshot: dict[str, Any], *, page: int = 0, page_cou
                          f'<figcaption>{filename}</figcaption></figure>')
         parts.append('</div>')
         parts.append('</section>')
-    parts.append(f'</div>{navigation}<footer class="conversation-footer"><p>This is a saved copy. Replies and updates stay in the original chat.</p><p class="footer-brand">Shared with AgentsDock</p></footer><div id="conversation-end"></div></main></body></html>')
+    parts.append(f'</div>{navigation}<footer class="conversation-footer"><p>This is a saved copy. Replies and updates stay in the original chat.</p><p class="footer-brand">Shared with AgentsDock</p></footer><div id="conversation-end"></div></main>')
+    if analytics:
+        parts.append(f'<script data-share-analytics>{_ANALYTICS_SCRIPT}</script>')
+    parts.append('</body></html>')
     return "".join(parts).encode("utf-8")

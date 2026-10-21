@@ -23,7 +23,7 @@ const HELP = `Usage: agentsdock setup [--port PORT] [--bind IP] [--non-interacti
 
 setup/install creates a fresh default server. Use new for another instance.
 remove (also uninstall) asks for confirmation and preserves history by default.
-token lists existing servers; use Up/Down and Enter to see its URL and token, or token NAME for direct access. Keep tokens private.
+token lists existing servers; use Up/Down and Enter to see its URLs, token and connection QR, or token NAME for direct access. Keep tokens and QR codes private.
 pair displays a connection QR for mobile (default instance if NAME is omitted); qrcode is an alias.
 status shows each instance's status, addresses, installed version and port; add NAME for one instance. In a terminal, it offers a token picker afterward.
 logs shows recent local service logs (default instance when NAME is omitted); -n sets the line count and -f follows. Review logs before sharing.
@@ -31,7 +31,8 @@ update uses the signed managed updater; npm installation alone never upgrades a 
 start/stop/restart/remove also accept --all [--exclude NAME]; an omitted target never selects all.
 new --name NAME, token/status --instance NAME, and servers/instances ACTION remain supported.
 Install this command globally with npm install -g agentsdock, or use npx agentsdock.
-The first global installation automatically sets up the server; existing installations are left unchanged.
+The first global installation automatically sets up the server and shows its URLs, token and connection QR in your terminal.
+Existing installations are left unchanged; use agentsdock token to show their connection details again.
 `
 const ROOT_SELECTORS = ['AGENTS_SERVER_INSTALL_DIR', 'AGENTS_SERVER_CONFIG_DIR',
   'AGENTS_SERVER_STATE_DIR', 'AGENTSDOCK_STATE_DIR', 'ZENITHBOT_AGENT_DIR',

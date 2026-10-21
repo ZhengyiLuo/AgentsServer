@@ -32364,6 +32364,9 @@ SEMANTIC_TIMELINE_EVENT_BUDGET_PER_ITEM = 4
 SEMANTIC_TIMELINE_ESSENTIAL_LIMIT_PER_ITEM = 32
 SEMANTIC_TIMELINE_ESSENTIAL_PAGE_OVERFLOW_LIMIT = 128
 SEMANTIC_TIMELINE_TRACE_ANCHOR_PAGE_OVERFLOW_LIMIT = 128
+# Same-ID history corrections clear previously cached replay bubbles. They
+# need their own bounded allowance, not the slots reserved for chat content.
+SEMANTIC_TIMELINE_REPAIR_PAGE_OVERFLOW_LIMIT = 256
 JOB_RUN_HISTORY_TEXT_LIMIT = 64 * 1024
 SEMANTIC_TIMELINE_ESSENTIAL_DETAIL_TYPES = {
     "artifact_created",
@@ -35760,9 +35763,6 @@ def collect_semantic_timeline_events(
         deduplicated[identity] = event
         return True
 
-    for event in page_repairs:
-        append_with_limit(event, event_limit)
-
     # Every selected semantic item gets one representative before any item
     # receives detail. The page-size clamp in read_semantic_timeline_page()
     # guarantees that this baseline always fits.
@@ -35776,6 +35776,22 @@ def collect_semantic_timeline_events(
     for _primary, secondary, _essential, _optional in reversed(bundles):
         for event in secondary:
             append_with_limit(event, event_limit)
+
+    # Reserve both sides of ordinary turns before emitting repair receipts.
+    # A single imported run can contain hundreds of corrected boundaries:
+    # charging them to the ordinary budget used to leave only trace anchors
+    # for recent turns. Extend that budget only by receipts actually added,
+    # retaining its remaining detail capacity and the absolute response cap.
+    repair_allowance = min(
+        SEMANTIC_TIMELINE_REPAIR_PAGE_OVERFLOW_LIMIT,
+        MAX_EVENT_RESPONSE_LIMIT - event_limit,
+    )
+    repair_limit = len(deduplicated) + repair_allowance
+    repair_count = 0
+    for event in page_repairs:
+        if append_with_limit(event, repair_limit):
+            repair_count += 1
+    event_limit += repair_count
 
     # Files and reviewable diffs are semantic output, not optional trace
     # detail. Give each selected item a generous but bounded overflow and also
@@ -50729,6 +50745,10 @@ def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, 
     if sess.get("title") == "New chat" and not public["backend_locked"]:
         public["empty_chat_cleanup"] = "client-v1"
     public["codex_provider"] = codex_provider.session_choice(sess.get("codex_provider"))
+    if summary and "codex_goal" in sess:
+        goal = sess.get("codex_goal")
+        public["codex_goal_status"] = goal.get("status") if isinstance(goal, dict) else None
+        public["codex_goal_updated_at"] = goal.get("updatedAt") if isinstance(goal, dict) else None
     connection = sess.get("provider_connection") or "default"
     # Keep legacy native summaries sparse, but retain a stored default as the
     # tombstone that clears a previously selected custom API in client caches.
@@ -81506,6 +81526,22 @@ async def codex_provider_mcp(request: Request) -> Response:
     })
 
 
+@app.get("/api/connection-addresses")
+async def connection_addresses(request: Request) -> dict[str, Any]:
+    require_native_admin_control(request)
+    # Discover only on explicit QR sharing, never on the frequently polled health path.
+    from server_instances import candidate_addresses, connection_choices, tailscale_status
+
+    def discover() -> list[str]:
+        choices = connection_choices(
+            SERVER_BIND_ADDRESS, SERVER_PORT,
+            candidate_addresses(SERVER_BIND_ADDRESS, SERVER_PORT), tailscale_status(),
+        )
+        return list(dict.fromkeys(filter(None, [choices["tailscale"], *choices["lan"]])))[:6]
+
+    return {"version": 1, "server_identity": server_identity(), "urls": await asyncio.to_thread(discover)}
+
+
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
     await reconcile_idle_queued_turns_from_health_poll()
@@ -91026,7 +91062,15 @@ def claude_completed_fork_boundary(
     # final projected message can identify the inclusive native cutoff.
     expected_text = projected_text if projected_text and final_text.endswith(projected_text) else final_text
     recorded_uuid = str(final_projection.get("provider_message_id") or "") if expected_text == projected_text else ""
-    cutoff_time = parse_job_timestamp(str(terminal.get("ts") or ""))
+    cutoff_ts = str(terminal.get("ts") or "")
+    cutoff_time = parse_job_timestamp(cutoff_ts)
+    # now_iso() truncates server events to whole seconds; native Claude
+    # records retain milliseconds. Only an exact completed-message UUID can
+    # disambiguate another turn in that same second. Keep legacy text-only
+    # matching and explicitly fractional timestamps on the strict cutoff.
+    cutoff_second_is_truncated = bool(recorded_uuid and re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", cutoff_ts,
+    ))
     started = next((
         event for event in reversed(events[:-1])
         if event.get("type") == "turn_started" and str(event.get("run_id") or "") == run_id
@@ -91047,7 +91091,11 @@ def claude_completed_fork_boundary(
             if not record_uuid or (recorded_uuid and record_uuid != recorded_uuid):
                 continue
             record_time = parse_job_timestamp(str(record.get("timestamp") or ""))
-            if cutoff_time is None or record_time is None or record_time > cutoff_time:
+            if cutoff_time is None or record_time is None:
+                continue
+            if record_time > cutoff_time and not (
+                cutoff_second_is_truncated and record_time < cutoff_time + 1
+            ):
                 continue
             if not recorded_uuid and (start_time is None or record_time < start_time):
                 continue

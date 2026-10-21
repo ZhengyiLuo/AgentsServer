@@ -61,6 +61,14 @@ class SessionSummaryTests(unittest.TestCase):
         summary = public_session({"id": "changed-chat", "backend": "cursor", "provider_connection": "default"}, summary=True)
         self.assertEqual(summary["provider_connection"], "default")
 
+    def test_summary_keeps_compact_goal_status_and_clear_tombstone(self):
+        goal = {"status": "complete", "updatedAt": 123, "objective": "x" * 2000}
+        summary = public_session({"id": "goal-chat", "backend": "codex", "codex_goal": goal}, summary=True)
+        self.assertEqual(summary["codex_goal_status"], "complete")
+        self.assertEqual(summary["codex_goal_updated_at"], 123)
+        self.assertNotIn("codex_goal", summary)
+        self.assertEqual(public_session({"id": "goal-chat", "backend": "codex", "codex_goal": None}, summary=True)["codex_goal_status"], None)
+
     def test_summary_keeps_large_session_lists_bounded(self):
         raw_sessions = [
             {

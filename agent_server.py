@@ -51986,6 +51986,10 @@ def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, 
     if sess.get("title") == "New chat" and not public["backend_locked"]:
         public["empty_chat_cleanup"] = "client-v1"
     public["codex_provider"] = codex_provider.session_choice(sess.get("codex_provider"))
+    if summary and "codex_goal" in sess:
+        goal = sess.get("codex_goal")
+        public["codex_goal_status"] = goal.get("status") if isinstance(goal, dict) else None
+        public["codex_goal_updated_at"] = goal.get("updatedAt") if isinstance(goal, dict) else None
     connection = sess.get("provider_connection") or "default"
     # Keep legacy native summaries sparse, but retain a stored default as the
     # tombstone that clears a previously selected custom API in client caches.

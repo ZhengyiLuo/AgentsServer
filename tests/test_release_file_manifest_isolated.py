@@ -99,6 +99,7 @@ class ReleaseFileManifestTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="release-legal-manifest-") as temporary:
             root = Path(temporary)
             for name in self.manifest["FILES"]:
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
                 (root / name).write_text("synthetic release member\n")
             for name in sorted(legal_files):
                 selected = root / name
@@ -133,6 +134,7 @@ class ReleaseFileManifestTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="release-manifest-") as temporary:
             root = Path(temporary)
             for name in self.manifest["FILES"]:
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
                 (root / name).write_text("synthetic release member\n")
             for name in sorted(NEW_MODULES | EXECUTION_MODULES):
                 selected = root / name

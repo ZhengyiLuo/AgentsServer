@@ -22,6 +22,7 @@ class InstallerSourceCacheTests(unittest.TestCase):
         self.source.mkdir()
         self.stage.mkdir()
         for name in package_release.FILES:
+            (self.source / name).parent.mkdir(parents=True, exist_ok=True)
             (self.source / name).write_text("synthetic release file\n")
         self.hub = self.source / "agentsdock_team_hub"
         for name in package_release.DIRECTORY_FILES["agentsdock_team_hub"]:

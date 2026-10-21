@@ -45,7 +45,7 @@ class NpmReleasePackageTests(unittest.TestCase):
             target.write_text(f"fixture: {name}\n")
         (self.root / "VERSION").write_text("1.2.3-beta.4\n")
         (self.root / "agent_server.py").write_text("API_CONTRACT_VERSION = 28\n")
-        (self.root / "npm").mkdir()
+        (self.root / "npm").mkdir(exist_ok=True)
         for name in ("README.md", "cli.cjs"):
             shutil.copyfile(ROOT / "npm" / name, self.root / "npm" / name)
         shutil.copyfile(ROOT / "package.json", self.root / "package.json")

@@ -99,6 +99,9 @@ FILES = (
     "uninstall.sh",
     "instances.sh",
     "server_instances.py",
+    "npm/agentsdock/pair.cjs",
+    "npm/agentsdock/qr-renderer.cjs",
+    "npm/agentsdock/QR-NOTICES.txt",
     "update_runner.py",
     "pyproject.toml",
     "uv.lock",
@@ -152,9 +155,12 @@ DIRECTORIES = tuple(DIRECTORY_FILES)
 
 
 def validate_release_files(root: Path) -> None:
-    """Require every top-level release member to be a real regular file."""
+    """Require real release files without linked parent directories."""
 
-    linked = [name for name in FILES if (root / name).is_symlink()]
+    linked = [
+        name for name in FILES
+        if any((root / part).is_symlink() for part in (Path(name), *Path(name).parents) if part != Path("."))
+    ]
     if linked:
         raise SystemExit(f"linked release files are not allowed: {', '.join(linked)}")
     missing = [name for name in FILES if not (root / name).is_file()]

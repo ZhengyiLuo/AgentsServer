@@ -70,13 +70,33 @@ test('terminal output failure falls back to a public summary, never the token', 
   assert.doesNotMatch(f.output.join('\n'), /private-token/)
 })
 
+test('automatic QR goes only to the controlling terminal, never lifecycle logs', async t => {
+  const f = fixture(t), terminal = []
+  let generated = 0
+  f.context.showSetupQr = async (name, runtime, context, env) => {
+    generated++
+    assert.equal(name, 'default')
+    assert.equal(runtime, f.runtime)
+    assert.deepEqual(env, { HOME: f.root })
+    context.print('private-qr-content')
+  }
+  await postinstall(f.context)
+  assert.equal(generated, 0, 'headless installation must not even generate a QR')
+  f.context.terminalPrint = text => { terminal.push(text); return true }
+  await postinstall(f.context)
+  assert.equal(generated, 1)
+  assert.match(terminal.join('\n'), /private-qr-content/)
+  assert.doesNotMatch(f.output.join('\n'), /private-qr-content|private-token/)
+})
+
 test('controlling terminal writer requires a tty, handles partial writes and closes on failure', () => {
   for (const mode of ['ok', 'not-tty', 'no-terminal', 'write-error', 'zero-write']) {
     let closed = false, written = '', opened = false
     const io = {
       openSync: (name, flags) => {
         assert.equal(name, '/dev/tty')
-        assert.ok(flags & fs.constants.O_NONBLOCK)
+        assert.ok(flags & fs.constants.O_NOCTTY)
+        assert.equal(flags & fs.constants.O_NONBLOCK, 0)
         if (mode === 'no-terminal') throw new Error('no controlling terminal')
         opened = true
         return 17
@@ -96,6 +116,42 @@ test('controlling terminal writer requires a tty, handles partial writes and clo
     assert.equal(written, mode === 'ok' ? 'private-token' : '')
     assert.equal(closed, opened)
   }
+})
+
+test('terminal QR resumes exact bytes after temporary backpressure and interrupted writes', () => {
+  const expected = Buffer.from('QR ' + String.fromCodePoint(0x2588, 0x2580).repeat(20) + '\n')
+  const chunks = []
+  let calls = 0, pauses = 0, closed = false
+  const io = {
+    openSync: () => 17,
+    isatty: () => true,
+    writeSync: (_fd, bytes, offset, length) => {
+      calls++
+      const code = { 2: 'EAGAIN', 3: 'EWOULDBLOCK', 5: 'EINTR' }[calls]
+      if (code) throw Object.assign(new Error('temporary terminal pressure'), { code })
+      const count = Math.min(5, length)
+      chunks.push(Buffer.from(bytes.subarray(offset, offset + count)))
+      return count
+    },
+    closeSync: () => { closed = true },
+  }
+  assert.equal(terminalPrint(expected.toString(), io, () => { pauses++ }), true)
+  assert.deepEqual(Buffer.concat(chunks), expected)
+  assert.equal(pauses, 3)
+  assert.equal(closed, true)
+})
+
+test('repeated transient terminal write errors have a bounded retry budget and still close', () => {
+  let pauses = 0, closed = false
+  const io = {
+    openSync: () => 17,
+    isatty: () => true,
+    writeSync: () => { throw Object.assign(new Error('busy'), { code: 'EAGAIN' }) },
+    closeSync: () => { closed = true },
+  }
+  assert.equal(terminalPrint('private QR', io, () => { pauses++ }), false)
+  assert.equal(pauses, 100)
+  assert.equal(closed, true)
 })
 
 test('existing installation/state is a successful no-op, not an automatic upgrade', async t => {

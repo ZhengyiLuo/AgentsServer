@@ -1387,6 +1387,13 @@ print_token_for_copy() {
   local copy_reply=""
   local clipboard_command=()
   printf '\nAccess token (%s):\n%s\n\n' "$INSTANCE_NAME" "$access_token"
+  # Render locally, only in an interactive terminal. No credentials in argv.
+  local pairing_script="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/npm/agentsdock/pair.cjs"
+  if [[ -f "$pairing_script" ]] && command -v node >/dev/null 2>&1; then
+    node "$pairing_script" "$INSTANCE_NAME" || true
+  else
+    printf 'Show a connection QR with: agentsdock pair %s\n' "$INSTANCE_NAME"
+  fi
   # A remote clipboard is not the user's local clipboard. Do not emit OSC 52
   # sequences or attempt to modify a remote desktop's clipboard over SSH.
   if [[ -n "${SSH_CONNECTION:-}${SSH_CLIENT:-}${SSH_TTY:-}" ]]; then
@@ -1839,7 +1846,7 @@ if [[ "$TEAM_HUB_MODE" == "host" && "$TEAM_HUB_OPERATION_PENDING" != "true" \
   fi
 fi
 
-RELEASE_FILES=(activation_transaction.py execution_activation.py execution_legacy_runner.py execution_preparation.py update_preparation.py update_handoff.py update_recovery.py execution_update_status.py execution_uninstall.py execution_recovery.py execution_recovery_status.py execution_http.py execution_durability.py execution_control.py execution_install.py execution_maintenance.py execution_manage.py execution_ownership.py execution_service.py execution_transport.py agent_server.py local_session_ownership.py cursor_history.py workspace_git.py team_hub_host.py secure_peer_runtime.py team_mail_runtime.py team_mail_websocket.py team_mail_grants.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py chat_mailbox.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py provider_commands.py provider_usage.py claude_sdk_client.py claude_model_catalog.py claude_goals.py claude_background_reconciliation.py codex_app_server.py codex_auth.py codex_provider.py provider_connections.py cursor_api_key.py side_questions.py title_generation.py codex_side_question.py claude_side_question.py cursor_agent_client.py cursor_provider_mcp.py opencode_agent_client.py gemini_acp_client.py gemini_history.py gemini_content.py gemini_import.py gemini_runtime.py gemini_runner.py gemini_permissions.py gemini_api.py cursor_process_guard.py transcript_reader.py claude_history_repair.py claude_history_provenance.py codex_history_repair.py public_chat_shares.py public_chat_transcript.py public_chat_share_routes.py interactive_chat_shares.py interactive_chat_share_routes.py interactive_chat_share_web.py interactive_chat_projection.py interactive_chat_runtime.py interactive_chat_native.py shared_chat_videos.py shared_chat_analytics_web.py shared_chat_video_stream.py interactive_chat_controls.py install.sh uninstall.sh instances.sh server_instances.py update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem LICENSE NOTICE)
+RELEASE_FILES=(activation_transaction.py execution_activation.py execution_legacy_runner.py execution_preparation.py update_preparation.py update_handoff.py update_recovery.py execution_update_status.py execution_uninstall.py execution_recovery.py execution_recovery_status.py execution_http.py execution_durability.py execution_control.py execution_install.py execution_maintenance.py execution_manage.py execution_ownership.py execution_service.py execution_transport.py agent_server.py local_session_ownership.py cursor_history.py workspace_git.py team_hub_host.py secure_peer_runtime.py team_mail_runtime.py team_mail_websocket.py team_mail_grants.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py chat_mailbox.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py provider_commands.py provider_usage.py claude_sdk_client.py claude_model_catalog.py claude_goals.py claude_background_reconciliation.py codex_app_server.py codex_auth.py codex_provider.py provider_connections.py cursor_api_key.py side_questions.py title_generation.py codex_side_question.py claude_side_question.py cursor_agent_client.py cursor_provider_mcp.py opencode_agent_client.py gemini_acp_client.py gemini_history.py gemini_content.py gemini_import.py gemini_runtime.py gemini_runner.py gemini_permissions.py gemini_api.py cursor_process_guard.py transcript_reader.py claude_history_repair.py claude_history_provenance.py codex_history_repair.py public_chat_shares.py public_chat_transcript.py public_chat_share_routes.py interactive_chat_shares.py interactive_chat_share_routes.py interactive_chat_share_web.py interactive_chat_projection.py interactive_chat_runtime.py interactive_chat_native.py shared_chat_videos.py shared_chat_analytics_web.py shared_chat_video_stream.py interactive_chat_controls.py install.sh uninstall.sh instances.sh server_instances.py npm/agentsdock/pair.cjs npm/agentsdock/qr-renderer.cjs npm/agentsdock/QR-NOTICES.txt update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem LICENSE NOTICE)
 RELEASE_DIRECTORIES=(agentsdock_team_hub)
 TEAM_HUB_RELEASE_FILES=(
   __init__.py
@@ -1880,6 +1887,12 @@ TEAM_HUB_RELEASE_FILES=(
   migrations/0023_team_message_search.sql
 )
 
+for directory in npm npm/agentsdock; do
+  if [[ ! -d "$SOURCE_DIR/$directory" || -L "$SOURCE_DIR/$directory" ]]; then
+    echo "$directory is missing beside install.sh or is not a real directory." >&2
+    exit 1
+  fi
+done
 for name in "${RELEASE_FILES[@]}"; do
   if [[ ! -f "$SOURCE_DIR/$name" || -L "$SOURCE_DIR/$name" ]]; then
     echo "$name is missing beside install.sh or is not a regular release file." >&2
@@ -3996,6 +4009,7 @@ if [[ "$stage_identity" != *$'\n'* \
   exit 1
 fi
 for name in "${RELEASE_FILES[@]}"; do
+  mkdir -p "$(dirname -- "$STAGE_DIR/$name")"
   install -m 644 "$SOURCE_DIR/$name" "$STAGE_DIR/$name"
 done
 mkdir -p "$STAGE_DIR/agentsdock_team_hub/migrations"

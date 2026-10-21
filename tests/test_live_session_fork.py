@@ -77,6 +77,87 @@ class CompletedPrefixForkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fork.await_args.kwargs["completed_snapshot"], self.events()[:3])
         self.assertEqual(active["parent"]["run_id"], "live")
 
+    def claude_timestamp_fixture(self):
+        events = self.events()[:3]
+        events[1] = {**events[1], "type": "assistant_text", "provider_message_id": "completed-uuid"}
+        events[-1]["provider_session_id"] = "claude-parent"
+        native = {
+            "type": "assistant", "uuid": "completed-uuid", "timestamp": "2026-09-08T10:01:00.161Z",
+            "message": {"stop_reason": "end_turn", "content": [{"type": "text", "text": "Completed answer"}]},
+        }
+        return events, native
+
+    def test_claude_exact_uuid_accepts_fractional_time_in_completed_second(self):
+        events, native = self.claude_timestamp_fixture()
+        for fraction in ("000", "001", "161", "999"):
+            with self.subTest(fraction=fraction), patch.object(
+                server, "claude_resume_file_for_cwd", return_value=Mock(is_file=Mock(return_value=True)),
+            ), patch.object(server, "bounded_jsonl_events", return_value=[
+                {**native, "timestamp": f"2026-09-08T10:01:00.{fraction}Z"},
+                {**native, "uuid": "live-uuid", "timestamp": "2026-09-08T10:01:00.999Z"},
+            ]):
+                self.assertEqual(server.claude_completed_fork_boundary({"cwd": "/tmp"}, "claude-parent", events), "completed-uuid")
+
+    def test_claude_fractional_time_does_not_relax_other_snapshot_guards(self):
+        for invalid in ("next-second", "precise-terminal", "legacy-no-uuid", "wrong-uuid", "wrong-text", "tool-use", "sidechain", "wrong-provider", "missing-time"):
+            with self.subTest(invalid=invalid):
+                events, native = self.claude_timestamp_fixture()
+                if invalid == "next-second":
+                    native["timestamp"] = "2026-09-08T10:01:01.000Z"
+                elif invalid == "precise-terminal":
+                    events[-1]["ts"] = "2026-09-08T10:01:00.160Z"
+                elif invalid == "legacy-no-uuid":
+                    events[1].pop("provider_message_id")
+                elif invalid == "wrong-uuid":
+                    native["uuid"] = "live-uuid"
+                elif invalid == "wrong-text":
+                    native["message"]["content"][0]["text"] = "Other answer"
+                elif invalid == "tool-use":
+                    native["message"]["content"].append({"type": "tool_use"})
+                elif invalid == "sidechain":
+                    native["isSidechain"] = True
+                elif invalid == "wrong-provider":
+                    events[-1]["provider_session_id"] = "other-provider"
+                elif invalid == "missing-time":
+                    events[-1].pop("ts")
+                with patch.object(server, "claude_resume_file_for_cwd", return_value=Mock(is_file=Mock(return_value=True))), patch.object(
+                    server, "bounded_jsonl_events", return_value=[native],
+                ), self.assertRaises(server.HTTPException) as raised:
+                    server.claude_completed_fork_boundary({"cwd": "/tmp"}, "claude-parent", events)
+                self.assertEqual(raised.exception.status_code, 409)
+
+    async def test_running_claude_fork_saves_exact_fractional_cutoff_on_child_only(self):
+        completed, native = self.claude_timestamp_fixture()
+        parent = {"id": "parent", "backend": "claude", "cwd": "/tmp", "claude_session_id": "claude-parent", "latest_event_seq": 5}
+        child = {"id": "child", "backend": "claude", "cwd": "/tmp", "_fork_initializing": True}
+        sessions = {"parent": parent}
+        active = {"parent": {"run_id": "live"}}
+
+        async def create_child(*args, **kwargs):
+            sessions["child"] = child
+            return child
+
+        with patch.object(server.STORE, "sessions", sessions), patch.object(server, "ACTIVE", active), patch.object(
+            server, "iter_session_events", return_value=iter(completed + self.events()[3:]),
+        ), patch.object(server, "validated_claude_fork_provider_id", return_value="claude-parent"), patch.object(
+            server, "claude_resume_file_for_cwd", return_value=Mock(is_file=Mock(return_value=True)),
+        ), patch.object(server, "bounded_jsonl_events", return_value=[native]), patch.object(
+            server.STORE, "_lock", asyncio.Lock(),
+        ), patch.object(server.STORE, "create", new_callable=AsyncMock, side_effect=create_child), patch.object(
+            server.STORE, "reorder", new_callable=AsyncMock,
+        ), patch.object(server.STORE, "update", new_callable=AsyncMock, return_value=child), patch.object(
+            server.STORE, "save", new_callable=AsyncMock,
+        ), patch.object(server, "copy_fork_history", new_callable=AsyncMock, return_value=3) as copy, patch.object(
+            server, "append_event", new_callable=AsyncMock,
+        ):
+            result = await server.fork_session("parent", server.ForkSessionRequest())
+        self.assertEqual(result["session"]["id"], "child")
+        self.assertEqual(child["fork_from"], "claude-parent")
+        self.assertEqual(child["fork_resume_session_at"], "completed-uuid")
+        copy.assert_awaited_once_with("parent", "child", source_events=completed)
+        self.assertEqual(active, {"parent": {"run_id": "live"}})
+        self.assertNotIn("fork_resume_session_at", parent)
+
     async def test_running_codex_fork_uses_native_boundary_before_replay_and_stopped_turns(self):
         parent = {"id": "parent", "backend": "codex", "cwd": "/tmp", "codex_thread_id": "parent-thread", "latest_event_seq": 10}
         events = self.events()[:3] + [

@@ -91702,7 +91702,15 @@ def claude_completed_fork_boundary(
     # final projected message can identify the inclusive native cutoff.
     expected_text = projected_text if projected_text and final_text.endswith(projected_text) else final_text
     recorded_uuid = str(final_projection.get("provider_message_id") or "") if expected_text == projected_text else ""
-    cutoff_time = parse_job_timestamp(str(terminal.get("ts") or ""))
+    cutoff_ts = str(terminal.get("ts") or "")
+    cutoff_time = parse_job_timestamp(cutoff_ts)
+    # now_iso() truncates server events to whole seconds; native Claude
+    # records retain milliseconds. Only an exact completed-message UUID can
+    # disambiguate another turn in that same second. Keep legacy text-only
+    # matching and explicitly fractional timestamps on the strict cutoff.
+    cutoff_second_is_truncated = bool(recorded_uuid and re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", cutoff_ts,
+    ))
     started = next((
         event for event in reversed(events[:-1])
         if event.get("type") == "turn_started" and str(event.get("run_id") or "") == run_id
@@ -91723,7 +91731,11 @@ def claude_completed_fork_boundary(
             if not record_uuid or (recorded_uuid and record_uuid != recorded_uuid):
                 continue
             record_time = parse_job_timestamp(str(record.get("timestamp") or ""))
-            if cutoff_time is None or record_time is None or record_time > cutoff_time:
+            if cutoff_time is None or record_time is None:
+                continue
+            if record_time > cutoff_time and not (
+                cutoff_second_is_truncated and record_time < cutoff_time + 1
+            ):
                 continue
             if not recorded_uuid and (start_time is None or record_time < start_time):
                 continue

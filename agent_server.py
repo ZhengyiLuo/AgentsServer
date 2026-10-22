@@ -84,6 +84,7 @@ import server_instances
 import local_session_ownership
 import cursor_history
 import provider_usage
+import session_unread
 
 from codex_app_server import (
     CodexAppServerDisconnected,
@@ -17551,6 +17552,11 @@ async def update_session_event_metadata(session_id: str, event: dict[str, Any]) 
         return
     event_type = str(event.get("type") or "")
     run_id = str(event.get("run_id") or "").strip()
+    # Read run provenance before terminal events retire active_run.
+    session_unread.project_event(
+        sess, event, visible=is_agent_visible_event(event_type, event),
+        run_metadata=run_event_metadata(run_id) if run_id else {},
+    )
     active_run_changed = False
     compaction_state_changed = False
     imported_event = event.get("imported") is True or run_id.startswith("import_")
@@ -17680,6 +17686,68 @@ async def update_session_event_metadata(session_id: str, event: dict[str, Any]) 
         # Called under the per-chat event delivery lock for nearly every
         # event; coalesce instead of rewriting sessions.json per event.
         await STORE.save(flush=False)
+
+
+NON_JOB_AGENT_RECOVERY_PENDING: set[str] = set()
+
+
+def prepare_non_job_agent_recovery() -> list[tuple[str, dict[str, Any], dict[str, Any]]]:
+    """Capture durable checkpoints before startup recovery can append events."""
+    NON_JOB_AGENT_RECOVERY_PENDING.clear()
+    items = []
+    for session_id, session in STORE.sessions.items():
+        snapshot = {key: copy.deepcopy(session[key]) for key in (
+            session_unread.COUNTER, session_unread.CHECKPOINT,
+            session_unread.LAST_RUN, session_unread.JOURNAL, "latest_event_seq",
+        ) if key in session}
+        items.append((session_id, session, snapshot))
+        NON_JOB_AGENT_RECOVERY_PENDING.add(session_id)
+    return items
+
+
+async def recover_non_job_agent_metadata(items: list[tuple[str, dict[str, Any], dict[str, Any]]]) -> None:
+    """One background reader migrates old chats and repairs crash tails once."""
+    cancelled = threading.Event()
+    try:
+        for session_id, owner, snapshot in items:
+            if STORE.sessions.get(session_id) is not owner:
+                NON_JOB_AGENT_RECOVERY_PENDING.discard(session_id)
+                continue
+            try:
+                path = events_path(session_id)
+                result = await asyncio.to_thread(
+                    session_unread.recover_projection, path, snapshot,
+                    visible=is_agent_visible_event,
+                    resume_offset=event_index_resume_offset,
+                    prior_events=lambda path=path: reversed_jsonl_events(path, retained_fields={
+                        "seq", "type", "run_id", "purpose", "job_id", "job",
+                    }),
+                    cancelled=cancelled.is_set,
+                )
+                if STORE.sessions.get(session_id) is not owner:
+                    NON_JOB_AGENT_RECOVERY_PENDING.discard(session_id)
+                    continue
+                through = int(result[session_unread.CHECKPOINT])
+                live_counter = max(int(owner.get(session_unread.COUNTER) or 0), int(owner.get(session_unread.PENDING_COUNTER) or 0))
+                owner[session_unread.COUNTER] = max(
+                    int(result[session_unread.COUNTER]), live_counter if live_counter > through else 0,
+                )
+                owner.pop(session_unread.PENDING_COUNTER, None)
+                owner[session_unread.CHECKPOINT] = max(through, int(owner.get(session_unread.CHECKPOINT) or 0))
+                if int(owner.get("latest_event_seq") or 0) <= through:
+                    owner[session_unread.LAST_RUN] = result[session_unread.LAST_RUN]
+                if session_unread.JOURNAL in result:
+                    owner[session_unread.JOURNAL] = result[session_unread.JOURNAL]
+                await STORE.save(flush=False)
+                NON_JOB_AGENT_RECOVERY_PENDING.discard(session_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Leave the field unknown. A later restart can retry the
+                # journal; never publish a guessed zero or start provider work.
+                logger.exception("unread provenance recovery failed session=%s", session_id)
+    finally:
+        cancelled.set()
 
 
 def queue_recovery_readiness() -> dict[str, Any]:
@@ -52148,6 +52216,11 @@ def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, 
             "last_read_agent_event_seq", "last_read_agent_event_at", "manual_unread",
         )
     }
+    public[session_unread.COUNTER] = (
+        sess.get(session_unread.COUNTER)
+        if str(sess.get("id") or "") not in NON_JOB_AGENT_RECOVERY_PENDING
+        and session_unread.CHECKPOINT in sess else None
+    )
     notification_fields = (
         "unread_notification_level", "unread_notification_seq",
         "latest_notification_level", "latest_notification_message",
@@ -79211,6 +79284,7 @@ async def lifespan(app: FastAPI):
         SERVER_STATE_PROCESS_LOCK = server_instances.acquire_state_lock(STATE_DIR)
     SERVER_SHUTTING_DOWN = False
     await STORE.load()
+    non_job_agent_recovery_items = prepare_non_job_agent_recovery()
     # Prime the managed-service ownership proof once, off the loop, so the
     # restart controls never depend on a fresh launchctl/cgroup probe later.
     with suppress(Exception):
@@ -79334,6 +79408,10 @@ async def lifespan(app: FastAPI):
         name="queued-turn-startup-recovery",
     )
     QUEUE_RECOVERY_TASK = queue_recovery_task
+    non_job_agent_recovery_task = asyncio.create_task(
+        recover_non_job_agent_metadata(non_job_agent_recovery_items),
+        name="unread-provenance-recovery",
+    )
     server_update_pending_waiter_task = asyncio.create_task(
         server_update_pending_waiter_loop(),
         name="server-update-pending-waiter",
@@ -79502,6 +79580,7 @@ async def lifespan(app: FastAPI):
         cross_chat_expiry_task.cancel()
         digest_recovery_task.cancel()
         queue_recovery_task.cancel()
+        non_job_agent_recovery_task.cancel()
         queue_checkpoint_task.cancel()
         history_tasks = (*HISTORY_MAINTENANCE_TASKS.values(), *(item[1] for item in TURN_RECEIPT_TASKS.values()))
         for task in history_tasks:
@@ -79514,6 +79593,7 @@ async def lifespan(app: FastAPI):
                 cross_chat_expiry_task,
                 digest_recovery_task,
                 queue_recovery_task,
+                non_job_agent_recovery_task,
                 queue_checkpoint_task,
                 *history_tasks,
                 server_update_pending_waiter_task,

@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 from pydantic import BaseModel, Field
 import codex_provider
 import local_session_ownership
+import session_unread
 from tests import test_codex_subagent_config_isolated as config_fixture
 
 SOURCE = (Path(__file__).resolve().parents[1] / "agent_server.py")
@@ -51,6 +52,7 @@ def make_namespace(root: Path):
     registry = local_session_ownership.Registry(root)
     ns = {"Any": Any, "Literal": Literal, "BaseModel": BaseModel, "Field": Field,
         "HISTORY_MAINTENANCE_STATE": {},
+        "session_unread": session_unread, "NON_JOB_AGENT_RECOVERY_PENDING": set(),
         "cancel_generated_session_title": Mock(),
         "local_session_ownership": local_session_ownership,
         "local_history_import_guard": lambda: local_session_ownership.history_import_lock(registry=registry),

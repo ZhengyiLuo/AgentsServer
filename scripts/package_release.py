@@ -54,6 +54,7 @@ FILES = (
     "agentsdock_team.py",
     "provider_commands.py",
     "provider_usage.py",
+    "session_unread.py",
     "claude_sdk_client.py",
     "claude_model_catalog.py",
     "claude_goals.py",

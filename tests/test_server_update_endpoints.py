@@ -3152,7 +3152,8 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
             return agent_server.JSONResponse({"saved": True})
 
         with patch.object(agent_server, "AGENT_TOKEN", ""), \
-             patch.object(agent_server, "UNSAFE_HTTP_MUTATION_TASKS", {}):
+             patch.object(agent_server, "UNSAFE_HTTP_MUTATION_TASKS", {}), \
+             patch.object(agent_server, "unsafe_http_mutation_blocked_response", return_value=None):
             mutation = asyncio.create_task(
                 agent_server.require_agent_token(request, slow_mutation)
             )

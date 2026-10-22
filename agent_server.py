@@ -25093,6 +25093,17 @@ async def pause_queued_turns_after_explicit_stop(session_id: str) -> int:
                     item["_paused_after_stop"] = True
                     if not durable:
                         item["_durable"] = False
+            if run_now is not None and str(run_now.get("queued_id") or "").strip() in queued_ids:
+                # Stop has withdrawn this promotion before provider admission.
+                # Return it to the held queue in the same transition: the Stop
+                # fence may prevent the scheduler from doing so for some time.
+                RUN_NOW_TURNS.pop(session_id, None)
+                queue = QUEUED_TURNS.setdefault(session_id, deque())
+                if not any(
+                    str(candidate.get("queued_id") or "") == str(run_now.get("queued_id") or "")
+                    for candidate in queue
+                ):
+                    queue.appendleft(run_now)
             for queued_id in queued_ids:
                 RUN_NOW_COMPLETED_RESULTS.pop((session_id, queued_id), None)
             if hidden_delivery_at_head:

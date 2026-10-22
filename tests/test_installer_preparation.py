@@ -30,7 +30,7 @@ class InstallerPreparationTests(unittest.TestCase):
         (self.source/'VERSION').write_text('2.0.0\n')
         (self.source/'agent_server.py').write_text('API_CONTRACT_VERSION = 28\n')
         # The actual branch copies these mandatory executable helpers.
-        for name in ('agentsdock_jobs.py','agentsdock_chats.py','agentsdock_emergency.py','agentsdock_publish.py',
+        for name in ('agentsdock_jobs.py','agentsdock_chats.py','agentsdock_emergency.py','agentsdock_notify.py','agentsdock_publish.py',
                      'agentsdock_mail.py','agentsdock_team.py','install.sh','uninstall.sh','instances.sh','update_runner.py'):
             self.names.append(name); (self.source/name).write_text('# fixture\n')
         (self.source/"agentsdock_team_hub").mkdir()

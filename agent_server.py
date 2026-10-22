@@ -751,6 +751,7 @@ PROVIDER_CROSS_CHAT_ROUTE_ACTIONS = ("instruction", "request_reply")
 PROVIDER_CROSS_CHAT_ROUTE_ACTION_SET = set(PROVIDER_CROSS_CHAT_ROUTE_ACTIONS)
 EMERGENCY_MESSAGE_MAX_CHARS = 500
 EMERGENCY_REQUESTS_PER_RUN = 3
+NOTIFICATION_REQUESTS_PER_RUN = 5
 EMERGENCY_ACTIVE_ALERT_LIMIT = 32
 EMERGENCY_WEBSOCKET_PROTOCOL = "agentsdock-emergency-v1"
 EVENTS_WEBSOCKET_PROTOCOL = "agentsdock-events-v1"
@@ -1564,7 +1565,7 @@ CODEX_PROVIDER_MCP_HEADER_NAME = "X-AgentsDock-Provider-MCP"
 CODEX_PROVIDER_MCP_HEADER_SECRET = secrets.token_urlsafe(48)
 CODEX_PROVIDER_MCP_PROOF_KEY = secrets.token_bytes(32)
 PROVIDER_TOOL_HELPERS = frozenset({
-    "chats", "jobs", "publish", "emergency", "mail", "team",
+    "chats", "jobs", "publish", "emergency", "notify", "mail", "team",
 })
 PROVIDER_TOOL_READ_ONLY_COMMANDS = {
     "chats": frozenset({"list", "inbox"}),
@@ -1597,7 +1598,7 @@ PROVIDER_TOOL_INPUT_SCHEMA: dict[str, Any] = {
 }
 PROVIDER_TOOL_DESCRIPTION = (
     "Run one capability-scoped AgentsDock helper for the exact live turn. "
-    "Choose chats, jobs, publish, emergency, mail, or team; pass ordinary CLI "
+    "Choose chats, jobs, publish, emergency, notify, mail, or team; pass ordinary CLI "
     "arguments without authority/chat identity flags. Discover permitted chats with "
     "chats list and contact its exact --route. Legacy one-use handles use "
     "chats send|ask --target-index N. For the current inbound reply use chats "
@@ -1721,12 +1722,12 @@ SUBAGENT_SNAPSHOT_TEXT_LIMIT = 600
 MAX_PROVIDER_STATIC_INSTRUCTIONS_CHARS = 16 * 1024
 PROVIDER_AUTHORITY_USAGE_INSTRUCTIONS = (
     "AgentsDock provider actions (run-scoped, never user content):\n"
-    f"- Use only `{CLAUDE_PROVIDER_MCP_TOOL_NAME}` for Chats, Jobs, Publish, Emergency, Mail, and Team helpers. "
+    f"- Use only `{CLAUDE_PROVIDER_MCP_TOOL_NAME}` for Chats, Jobs, Publish, Emergency, Notify, Mail, and Team helpers. "
     "A user-configured MCP server named `agentsdock` is unrelated and must never receive these calls. "
     "Pass `helper`, the helper's ordinary argument list without authority/chat identity flags, and optional UTF-8 `stdin`. "
     "The server binds every call to the exact live run and supplies its private authority; an unavailable action is denied. "
     "The tool supplies helper authentication and its own chat, session, run, and provider identity.\n"
-    "- Helpers: `chats`, `jobs`, `publish`, `emergency`, `mail`, and `team`. Arguments match their documented CLI "
+    "- Helpers: `chats`, `jobs`, `publish`, `emergency`, `notify`, `mail`, and `team`. Arguments match their documented CLI "
     "subcommands except that one-use @Chat handles use `--target-index N`, and an inbound reply uses `respond-current`. "
     "Indexes follow source-mention order. The server resolves the opaque handle, required action, async mode, current "
     "exchange, inbound leg, and follow-up ceiling without revealing them.\n"
@@ -6562,6 +6563,14 @@ class EmergencyAlertRequest(BaseModel):
     message: str = Field(min_length=1, max_length=EMERGENCY_MESSAGE_MAX_CHARS)
 
 
+class AgentNotificationRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    request_id: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
+    level: Literal["normal", "important", "emergency"]
+    message: str = Field(min_length=1, max_length=EMERGENCY_MESSAGE_MAX_CHARS)
+
+
 class AcknowledgeEmergencyRequest(BaseModel):
     model_config = {"extra": "forbid"}
 
@@ -9734,6 +9743,73 @@ EMERGENCY_EVENT_FIELDS = frozenset({
     "id", "seq", "type", "ts", "session_id", "run_id",
     "emergency_alert", "emergency_alert_id", "emergency_request_id", "emergency_request_digest",
 })
+NOTIFICATION_EVENT_FIELDS = frozenset({
+    "id", "seq", "type", "ts", "session_id", "run_id", "message",
+    "notification_level", "notification_request_id", "notification_request_digest",
+})
+
+
+def notification_events_after(
+    session_id: str,
+    after_seq: int,
+) -> tuple[list[dict[str, Any]], int]:
+    newest_seq = max(0, int(after_seq or 0))
+    events: list[dict[str, Any]] = []
+    for event in reversed_jsonl_events(events_path(session_id), retained_fields=NOTIFICATION_EVENT_FIELDS):
+        seq = int(event.get("seq") or 0)
+        newest_seq = max(newest_seq, seq)
+        if seq <= after_seq:
+            break
+        if event.get("type") == "agent_notification":
+            events.append(event)
+    events.reverse()
+    return events, newest_seq
+
+
+def reconcile_session_agent_notifications(session_id: str, sess: dict[str, Any]) -> bool:
+    through = max(0, int(sess.get("_notification_reconciled_through_seq") or 0))
+    checkpoint = through or max(0, int(sess.get("latest_event_seq") or 0))
+    events, newest_seq = notification_events_after(session_id, checkpoint)
+    if not events and not through:
+        return False
+    before = (
+        sess.get("latest_notification_level"), sess.get("latest_notification_message"),
+        sess.get("unread_notification_level"), sess.get("unread_notification_seq"), through,
+    )
+    if not through and events:
+        sess.pop("unread_notification_level", None)
+        sess.pop("unread_notification_seq", None)
+    read_seq = int(sess.get("last_read_agent_event_seq") or 0)
+    ranks = {"normal": 1, "important": 2, "emergency": 3}
+    for event in events:
+        level = event.get("notification_level")
+        seq = int(event.get("seq") or 0)
+        if level not in ranks or seq <= 0:
+            continue
+        sess["latest_notification_level"] = level
+        sess["latest_notification_message"] = event.get("message")
+        if seq > int(sess.get("latest_agent_event_seq") or 0):
+            sess["latest_agent_event_seq"] = seq
+            sess["latest_agent_event_at"] = event.get("ts")
+            sess["latest_agent_event_type"] = "agent_notification"
+        if seq > int(sess.get("latest_event_seq") or 0):
+            sess["latest_event_seq"] = seq
+            sess["latest_event_at"] = event.get("ts")
+            sess["latest_event_type"] = "agent_notification"
+        if seq > read_seq and ranks[level] >= ranks.get(sess.get("unread_notification_level"), 0):
+            sess["unread_notification_level"] = level
+            sess["unread_notification_seq"] = seq
+    if int(sess.get("unread_notification_seq") or 0) <= read_seq:
+        sess.pop("unread_notification_level", None)
+        sess.pop("unread_notification_seq", None)
+    if newest_seq:
+        sess["_notification_reconciled_through_seq"] = newest_seq
+    after = (
+        sess.get("latest_notification_level"), sess.get("latest_notification_message"),
+        sess.get("unread_notification_level"), sess.get("unread_notification_seq"),
+        int(sess.get("_notification_reconciled_through_seq") or 0),
+    )
+    return before != after
 
 
 def emergency_lifecycle_events_after(
@@ -10235,6 +10311,8 @@ class SessionStore:
                 runtime_changed = True
                 durable_route_reconciliation = True
             if reconcile_session_emergency_alerts(session_id, sess):
+                runtime_changed = True
+            if reconcile_session_agent_notifications(session_id, sess):
                 runtime_changed = True
             backend = str(sess.get("backend") or DEFAULT_BACKEND).strip().lower()
             if not sess.get("gemini_permission_mode"):
@@ -11262,6 +11340,9 @@ class SessionStore:
             sess["last_read_agent_event_seq"] = max(current, requested)
             sess["last_read_agent_event_at"] = now_iso()
             sess["manual_unread"] = False
+            if sess["last_read_agent_event_seq"] >= int(sess.get("unread_notification_seq") or 0):
+                sess.pop("unread_notification_level", None)
+                sess.pop("unread_notification_seq", None)
             await self.save()
             return sess
 
@@ -17364,14 +17445,20 @@ def is_agent_visible_event(event_type: str, event: dict[str, Any]) -> bool:
         return bool(str(event.get("text") or "").strip())
     if event_type == "turn_finished":
         return bool(str(event.get("result_text") or "").strip())
+    if event_type == "codex_goal_updated":
+        goal = event.get("goal")
+        return isinstance(goal, dict) and goal.get("status") == "complete"
     return event_type in {
         "error",
         "emergency_alert_raised",
+        "agent_notification",
         "artifact_created",
         "job_ran",
+        "job_finished",
         "job_error",
         "handoff_digest_received",
         "codex_interaction_requested",
+        "claude_interaction_requested",
     }
 
 
@@ -17577,6 +17664,15 @@ async def update_session_event_metadata(session_id: str, event: dict[str, Any]) 
         sess["latest_agent_event_seq"] = int(event.get("seq") or 0)
         sess["latest_agent_event_at"] = event.get("ts")
         sess["latest_agent_event_type"] = event_type
+    if event_type == "agent_notification":
+        level = event.get("notification_level")
+        ranks = {"normal": 1, "important": 2, "emergency": 3}
+        sess["latest_notification_level"] = level
+        sess["latest_notification_message"] = event.get("message")
+        sess["_notification_reconciled_through_seq"] = int(event.get("seq") or 0)
+        if level in ranks and ranks[level] >= ranks.get(sess.get("unread_notification_level"), 0):
+            sess["unread_notification_level"] = level
+            sess["unread_notification_seq"] = int(event.get("seq") or 0)
     bump_updated_at = should_bump_session_updated_at(event_type, event)
     if bump_updated_at:
         sess["updated_at"] = event.get("ts") or now_iso()
@@ -20284,7 +20380,7 @@ async def issue_cross_chat_capability(
         STORE.sessions.get(source_session_id)
     )
     effective_actions = set(actions or {
-        "jobs", "publish", "emergency", "cross_chat_instruction",
+        "jobs", "publish", "emergency", "notify", "cross_chat_instruction",
         "cross_chat_request_reply", "agent_cross_chat_routes",
         "team_mail",
     })
@@ -21131,11 +21227,12 @@ async def execute_provider_tool(
         "jobs": SERVER_ROOT / "agentsdock_jobs.py",
         "publish": SERVER_ROOT / "agentsdock_publish.py",
         "emergency": SERVER_ROOT / "agentsdock_emergency.py",
+        "notify": SERVER_ROOT / "agentsdock_notify.py",
         "mail": SERVER_ROOT / "agentsdock_mail.py",
         "team": SERVER_ROOT / "agentsdock_team.py",
     }
     command = [sys.executable, str(scripts[helper]), "--authority-file", str(authority_path)]
-    if helper in {"jobs", "publish", "emergency"}:
+    if helper in {"jobs", "publish", "emergency", "notify"}:
         command.extend(["--chat-id", session_id])
     command.extend(resolved)
     proc: asyncio.subprocess.Process | None = None
@@ -21511,7 +21608,7 @@ def native_steer_provider_actions(
     )
     actions = {"publish"}
     if provider_turn_may_raise_emergency(selected.get("purpose")):
-        actions.add("emergency")
+        actions.update({"emergency", "notify"})
     if jobs_access != "blocked" and AGENT_TOKEN:
         actions.add("jobs")
     if AGENT_TOKEN and provider_turn_may_read_team(selected.get("purpose")):
@@ -21874,6 +21971,10 @@ def cross_chat_provider_authority_block(
             "- Emergency contact is reserved for an urgent risk of data loss, security compromise, irreversible external harm, or a sustained production outage. Do not use it for ordinary failures, uncertainty, or clarification.",
             f"- Emergency contact: `\"$AGENTSDOCK_EMERGENCY_CLI\" --authority-file {shlex.quote(str(authority_path))} --chat-id {shlex.quote(source_session_id)} alert --message TEXT`",
         ))
+    if "notify" in actions:
+        helper_lines.append(
+            f"- Agent notification: `\"$AGENTSDOCK_NOTIFY_CLI\" --authority-file {shlex.quote(str(authority_path))} --chat-id {shlex.quote(source_session_id)} send --level normal|important|emergency --message TEXT`. Choose the level from the actual user impact: normal for ordinary updates, important when input or a significant result needs attention, emergency only for urgent harm or outage. Do not notify for every routine message."
+        )
     if "team_mail" in actions:
         helper_lines.extend((
             "- The user explicitly opened this turn for server-authored Team Network mail with `/mail`.",
@@ -30104,6 +30205,13 @@ def client_safe_event(event: dict[str, Any]) -> dict[str, Any]:
             safe = dict(event)
         safe.pop("emergency_request_id", None)
         safe.pop("emergency_request_digest", None)
+    if event.get("type") == "agent_notification" and (
+        "notification_request_id" in event or "notification_request_digest" in event
+    ):
+        if safe is event:
+            safe = dict(event)
+        safe.pop("notification_request_id", None)
+        safe.pop("notification_request_digest", None)
     output = event.get("output")
     if output is not None and not isinstance(output, str):
         if safe is event:
@@ -44088,6 +44196,7 @@ async def authorize_provider_action(
         "jobs",
         "publish",
         "emergency",
+        "notify",
         "agent_cross_chat_routes",
         "team_mail",
         "team_read",
@@ -44474,6 +44583,25 @@ def find_emergency_request_event(
         if (
             event.get("type") == "emergency_alert_raised"
             and event.get("emergency_request_id") == request_id
+            and event.get("run_id") == source_run_id
+        ):
+            return event
+    return None
+
+
+def find_agent_notification_event(
+    session_id: str,
+    request_id: str,
+    source_run_id: str,
+) -> dict[str, Any] | None:
+    retained = frozenset({
+        "type", "id", "seq", "run_id", "notification_request_id",
+        "notification_request_digest", "notification_level",
+    })
+    for event in reversed_jsonl_events(events_path(session_id), retained_fields=retained):
+        if (
+            event.get("type") == "agent_notification"
+            and event.get("notification_request_id") == request_id
             and event.get("run_id") == source_run_id
         ):
             return event
@@ -47481,6 +47609,7 @@ LEGACY_PROVIDER_AUTHORITY_LABELS = frozenset({
     "cross_chat_routes=durable",
     "cross_chat_routes=job_grants",
     "emergency",
+    "notify",
     "jobs=blocked",
     "jobs=full",
     "jobs=read_only",
@@ -52019,6 +52148,16 @@ def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, 
             "last_read_agent_event_seq", "last_read_agent_event_at", "manual_unread",
         )
     }
+    notification_fields = (
+        "unread_notification_level", "unread_notification_seq",
+        "latest_notification_level", "latest_notification_message",
+    )
+    for field in notification_fields:
+        if not summary or field in sess:
+            public[field] = sess.get(field)
+    if summary and "latest_notification_level" in sess:
+        public.setdefault("unread_notification_level", None)
+        public.setdefault("unread_notification_seq", None)
     maintenance = HISTORY_MAINTENANCE_STATE.get(str(sess.get("id") or ""), {})
     # Never-started maintenance adds no useful information to high-volume lists.
     # Once observed, retain idle/cleared fields so caches can retire old errors.
@@ -52917,6 +53056,7 @@ def agent_runner_env(
     env["AGENTSDOCK_CHATS_CLI"] = str(SERVER_ROOT / "agentsdock_chats.py")
     env["AGENTSDOCK_PUBLISH_CLI"] = str(SERVER_ROOT / "agentsdock_publish.py")
     env["AGENTSDOCK_EMERGENCY_CLI"] = str(SERVER_ROOT / "agentsdock_emergency.py")
+    env["AGENTSDOCK_NOTIFY_CLI"] = str(SERVER_ROOT / "agentsdock_notify.py")
     env["AGENTSDOCK_MAIL_CLI"] = str(SERVER_ROOT / "agentsdock_mail.py")
     env["AGENTSDOCK_TEAM_CLI"] = str(SERVER_ROOT / "agentsdock_team.py")
     env.update(validate_provider_runtime_env(provider_runtime_env))
@@ -52939,6 +53079,7 @@ def codex_app_server_env(selected: dict | None = None) -> dict[str, str]:
     env["AGENTSDOCK_CHATS_CLI"] = str(SERVER_ROOT / "agentsdock_chats.py")
     env["AGENTSDOCK_PUBLISH_CLI"] = str(SERVER_ROOT / "agentsdock_publish.py")
     env["AGENTSDOCK_EMERGENCY_CLI"] = str(SERVER_ROOT / "agentsdock_emergency.py")
+    env["AGENTSDOCK_NOTIFY_CLI"] = str(SERVER_ROOT / "agentsdock_notify.py")
     env["AGENTSDOCK_MAIL_CLI"] = str(SERVER_ROOT / "agentsdock_mail.py")
     env["AGENTSDOCK_TEAM_CLI"] = str(SERVER_ROOT / "agentsdock_team.py")
     scrub_provider_runtime_environment(env)
@@ -74515,7 +74656,7 @@ async def _start_turn_locked(
         )
         provider_actions = {"publish"}
         if provider_turn_may_raise_emergency(req.purpose):
-            provider_actions.add("emergency")
+            provider_actions.update({"emergency", "notify"})
         if req.purpose == "cross_chat_handoff_delivery":
             if exchange_response_grant is not None:
                 provider_actions.add("cross_chat_response")
@@ -79620,6 +79761,7 @@ AGENT_HELPER_ROUTE_RULES: tuple[tuple[str, re.Pattern[str], int], ...] = (
         16 * 1024 * 1024,
     ),
     ("POST", re.compile(r"^/api/agent/sessions/[^/]+/emergency-alerts$"), 8 * 1024),
+    ("POST", re.compile(r"^/api/agent/sessions/[^/]+/notifications$"), 8 * 1024),
     ("GET", re.compile(r"^/api/agent/team-mail/routes$"), 0),
     (
         "POST",
@@ -83098,6 +83240,16 @@ async def health() -> dict[str, Any]:
                 "stream_path": "/api/emergency-alerts/events",
                 "stream_protocol": EMERGENCY_WEBSOCKET_PROTOCOL,
                 "acknowledge_through_alert_id": True,
+            },
+            "agent_notification_levels_v1": {
+                "available": bool(AGENT_TOKEN),
+                "required": False,
+                "message": "Agents can choose durable normal, important, or emergency notification levels.",
+                "action": None if AGENT_TOKEN else "Configure an AgentsServer client token.",
+                "version": 1,
+                "levels": ["normal", "important", "emergency"],
+                "max_message_chars": EMERGENCY_MESSAGE_MAX_CHARS,
+                "max_requests_per_run": NOTIFICATION_REQUESTS_PER_RUN,
             },
             "cross_chat_handoffs_v1": cross_chat_handoffs_capability(),
             "codex_controls": {
@@ -98511,6 +98663,72 @@ async def raise_agent_emergency_alert(
             sess,
             duplicate=False,
         )
+
+
+@app.post("/api/agent/sessions/{session_id}/notifications")
+async def raise_agent_notification(
+    request: Request,
+    session_id: str,
+    req: AgentNotificationRequest,
+) -> dict[str, Any]:
+    capability = await authorize_provider_action(request, action="notify", session_id=session_id)
+    message = clean_emergency_message(req.message)
+    if not message:
+        raise HTTPException(status_code=422, detail="notification message is empty")
+    if req.level == "emergency":
+        receipt = await raise_agent_emergency_alert(
+            request,
+            session_id,
+            EmergencyAlertRequest(request_id=req.request_id, message=message),
+        )
+        return {
+            "ok": True, "chat_id": session_id, "level": req.level,
+            "event_id": receipt["event_id"], "event_seq": receipt["event_seq"],
+            "duplicate": receipt["duplicate"],
+        }
+
+    request_digest = hashlib.sha256(
+        json.dumps({"level": req.level, "message": message}, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    async with session_lifecycle_lock(session_id):
+        sess = STORE.sessions.get(session_id)
+        if not sess:
+            raise HTTPException(status_code=404, detail="session not found")
+        ensure_session_not_deleting(session_id)
+        if sess.get("archived"):
+            raise HTTPException(status_code=409, detail="an archived chat cannot send a notification")
+        token = provider_capability_header(request)
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        async with CROSS_CHAT_CAPABILITY_LOCK:
+            live = CROSS_CHAT_CAPABILITIES.get(token_hash)
+            if live is None or live.get("source_run_id") != capability.get("source_run_id"):
+                raise HTTPException(status_code=403, detail="provider capability is no longer attached to this turn")
+            reservations = live.setdefault("notification_requests", {})
+            previous_digest = reservations.get(req.request_id)
+            if previous_digest is not None and previous_digest != request_digest:
+                raise HTTPException(status_code=409, detail="notification request ID was already used with different content")
+            if previous_digest is None:
+                if len(reservations) >= NOTIFICATION_REQUESTS_PER_RUN:
+                    raise HTTPException(status_code=429, detail="this turn already used its notification limit")
+                reservations[req.request_id] = request_digest
+        source_run_id = str(capability.get("source_run_id") or "")
+        existing = await asyncio.to_thread(
+            find_agent_notification_event, session_id, req.request_id, source_run_id,
+        )
+        if existing is not None:
+            if existing.get("notification_request_digest") != request_digest:
+                raise HTTPException(status_code=409, detail="notification receipt does not match this live turn")
+            return {"ok": True, "chat_id": session_id, "level": req.level,
+                    "event_id": existing["id"], "event_seq": existing["seq"], "duplicate": True}
+        event = await append_durable_event(session_id, "agent_notification", {
+            "run_id": source_run_id,
+            "message": message,
+            "notification_level": req.level,
+            "notification_request_id": req.request_id,
+            "notification_request_digest": request_digest,
+        })
+        return {"ok": True, "chat_id": session_id, "level": req.level,
+                "event_id": event["id"], "event_seq": event["seq"], "duplicate": False}
 
 
 def stage_upload_file_sync(source: Any, destination: Path) -> int:

@@ -1044,6 +1044,86 @@ class EmergencyAlertServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["unacknowledged_emergency_count"], 0)
         self.assertIsNone(summary["emergency_alert"])
 
+    async def test_agent_chosen_notification_is_durable_unread_and_idempotent(self) -> None:
+        _, token = await self.issue_authority("source", "run_active", actions={"notify", "emergency"})
+        request = provider_request(token)
+        important = agent_server.AgentNotificationRequest(
+            request_id="notice.important.1", level="important", message="Review the completed result"
+        )
+        first = await agent_server.raise_agent_notification(request, "source", important)
+        repeated = await agent_server.raise_agent_notification(request, "source", important)
+        self.assertEqual(first["event_id"], repeated["event_id"])
+        self.assertTrue(repeated["duplicate"])
+        summary = agent_server.public_session(agent_server.STORE.sessions["source"], summary=True)
+        self.assertEqual(summary["latest_agent_event_type"], "agent_notification")
+        self.assertEqual(summary["unread_notification_level"], "important")
+        self.assertEqual(summary["latest_notification_message"], important.message)
+        self.assertEqual(summary["latest_agent_event_seq"], first["event_seq"])
+        self.assertNotIn("notification_request_id", agent_server.client_safe_event(self.event_records()[0]))
+
+        normal = await agent_server.raise_agent_notification(request, "source", agent_server.AgentNotificationRequest(
+            request_id="notice.normal.1", level="normal", message="Routine update"
+        ))
+        self.assertEqual(normal["event_seq"], first["event_seq"] + 1)
+        summary = agent_server.public_session(agent_server.STORE.sessions["source"], summary=True)
+        self.assertEqual(summary["unread_notification_level"], "important")
+        self.assertEqual(summary["latest_notification_level"], "normal")
+        await agent_server.STORE.mark_read("source", normal["event_seq"])
+        summary = agent_server.public_session(agent_server.STORE.sessions["source"], summary=True)
+        self.assertIsNone(summary["unread_notification_level"])
+        with self.assertRaises(HTTPException) as conflict:
+            await agent_server.raise_agent_notification(request, "source", agent_server.AgentNotificationRequest(
+                request_id="notice.normal.1", level="important", message="Changed content"
+            ))
+        self.assertEqual(conflict.exception.status_code, 409)
+
+    async def test_notification_authority_and_emergency_semantics(self) -> None:
+        notice = agent_server.AgentNotificationRequest(
+            request_id="notice.emergency.1", level="emergency", message="Urgent incident"
+        )
+        with self.assertRaises(HTTPException) as denied:
+            await agent_server.raise_agent_notification(provider_request(self.token), "source", notice)
+        self.assertEqual(denied.exception.status_code, 403)
+        _, token = await self.issue_authority("source", "run_active", actions={"notify", "emergency"})
+        response = await agent_server.raise_agent_notification(provider_request(token), "source", notice)
+        self.assertEqual(response["level"], "emergency")
+        self.assertEqual(self.event_records()[0]["type"], "emergency_alert_raised")
+        self.assertEqual(agent_server.public_session(agent_server.STORE.sessions["source"])["unacknowledged_emergency_count"], 1)
+
+    async def test_notification_recovers_unread_summary_after_interrupted_save(self) -> None:
+        _, token = await self.issue_authority("source", "run_active", actions={"notify"})
+        receipt = await agent_server.raise_agent_notification(
+            provider_request(token), "source",
+            agent_server.AgentNotificationRequest(
+                request_id="notice.restart.1", level="important", message="Needs review",
+            ),
+        )
+        agent_server.SESSIONS_FILE.write_text(json.dumps({
+            "source": dict(self.base_source), "other": dict(self.other),
+        }), encoding="utf-8")
+        restored = agent_server.SessionStore()
+        with patch.object(agent_server, "STORE", restored):
+            await restored.load()
+        summary = agent_server.public_session(restored.sessions["source"], summary=True)
+        self.assertEqual(summary["unread_notification_level"], "important")
+        self.assertEqual(summary["latest_agent_event_seq"], receipt["event_seq"])
+        self.assertEqual(summary["latest_notification_message"], "Needs review")
+        with patch.object(agent_server, "STORE", restored):
+            await restored.mark_read("source", receipt["event_seq"])
+        self.assertIsNone(agent_server.public_session(restored.sessions["source"], summary=True)["unread_notification_level"])
+
+    def test_notifiable_events_always_advance_unread_cursor(self) -> None:
+        for event_type, payload in (
+            ("agent_notification", {}),
+            ("job_finished", {}),
+            ("artifact_created", {}),
+            ("claude_interaction_requested", {}),
+            ("codex_goal_updated", {"goal": {"status": "complete"}}),
+        ):
+            self.assertTrue(agent_server.is_agent_visible_event(event_type, payload), event_type)
+        self.assertFalse(agent_server.is_agent_visible_event("codex_goal_updated", {"goal": {"status": "active"}}))
+        self.assertFalse(agent_server.is_agent_visible_event("file_uploaded", {}))
+
 
 if __name__ == "__main__":
     unittest.main()

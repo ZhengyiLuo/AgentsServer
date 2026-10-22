@@ -1466,6 +1466,21 @@ The endpoint uses the same bearer-token authentication as the rest of the API.
 Binary changes remain compact Git binary markers rather than being copied into
 the event log.
 
+## Agent notification levels
+
+An authorized live provider turn can call the `notify` helper with
+`send --level normal|important|emergency --message TEXT`. The helper binds the
+request to that exact server, chat, and run. The agent chooses the level;
+clients do not infer it from message wording. Normal and important notices
+become durable `agent_notification` timeline events. Emergency uses the
+existing acknowledged emergency-alert lifecycle. All three advance the
+session's unread cursor, and `unread_notification_level` in session summaries
+retains the highest level until the chat is marked read. The contract is
+advertised as `capabilities.agent_notification_levels_v1`.
+
+System notifications are still scheduled by connected clients. This helper
+does not provide APNs or FCM delivery to a terminated mobile app.
+
 ## Dismissing emergency alerts
 
 `POST /api/sessions/{session_id}/emergency/acknowledge` accepts exactly one
@@ -1609,7 +1624,7 @@ FIFO order.
 Before publishing:
 
 ```bash
-python3 -m py_compile agent_server.py agentsdock_jobs.py agentsdock_chats.py agentsdock_emergency.py agentsdock_publish.py provider_commands.py claude_sdk_client.py codex_app_server.py cursor_agent_client.py update_runner.py
+python3 -m py_compile agent_server.py agentsdock_jobs.py agentsdock_chats.py agentsdock_emergency.py agentsdock_notify.py agentsdock_publish.py provider_commands.py claude_sdk_client.py codex_app_server.py cursor_agent_client.py update_runner.py
 rg -n 'private-host|/home/<name>|/Users/<name>|token-value' .
 ```
 

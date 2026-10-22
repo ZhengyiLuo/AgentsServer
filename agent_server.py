@@ -52135,10 +52135,18 @@ def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, 
             "latest_event_seq", "latest_event_at", "latest_event_type",
             "latest_agent_event_seq", "latest_agent_event_at", "latest_agent_event_type",
             "last_read_agent_event_seq", "last_read_agent_event_at", "manual_unread",
-            "unread_notification_level", "unread_notification_seq",
-            "latest_notification_level", "latest_notification_message",
         )
     }
+    notification_fields = (
+        "unread_notification_level", "unread_notification_seq",
+        "latest_notification_level", "latest_notification_message",
+    )
+    for field in notification_fields:
+        if not summary or field in sess:
+            public[field] = sess.get(field)
+    if summary and "latest_notification_level" in sess:
+        public.setdefault("unread_notification_level", None)
+        public.setdefault("unread_notification_seq", None)
     maintenance = HISTORY_MAINTENANCE_STATE.get(str(sess.get("id") or ""), {})
     # Never-started maintenance adds no useful information to high-volume lists.
     # Once observed, retain idle/cleared fields so caches can retire old errors.

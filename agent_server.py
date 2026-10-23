@@ -52216,11 +52216,15 @@ def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, 
             "last_read_agent_event_seq", "last_read_agent_event_at", "manual_unread",
         )
     }
-    public[session_unread.COUNTER] = (
-        sess.get(session_unread.COUNTER)
-        if str(sess.get("id") or "") not in NON_JOB_AGENT_RECOVERY_PENDING
-        and session_unread.CHECKPOINT in sess else None
-    )
+    unread_recovery_pending = str(sess.get("id") or "") in NON_JOB_AGENT_RECOVERY_PENDING
+    # Keep metadata-free summaries sparse, but retire any cached projection
+    # explicitly while recovery is pending or its checkpoint is unavailable.
+    if (not summary or unread_recovery_pending
+            or session_unread.COUNTER in sess or session_unread.CHECKPOINT in sess):
+        public[session_unread.COUNTER] = (
+            sess.get(session_unread.COUNTER)
+            if not unread_recovery_pending and session_unread.CHECKPOINT in sess else None
+        )
     notification_fields = (
         "unread_notification_level", "unread_notification_seq",
         "latest_notification_level", "latest_notification_message",

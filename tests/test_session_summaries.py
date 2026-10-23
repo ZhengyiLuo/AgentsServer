@@ -3,7 +3,12 @@ from unittest.mock import patch
 
 from fastapi.responses import JSONResponse
 
-from agent_server import HISTORY_MAINTENANCE_STATE, public_session, session_provider_id
+from agent_server import (
+    HISTORY_MAINTENANCE_STATE,
+    public_session,
+    session_provider_id,
+    session_unread,
+)
 
 
 class SessionSummaryTests(unittest.TestCase):
@@ -76,6 +81,32 @@ class SessionSummaryTests(unittest.TestCase):
         }, summary=True)
         self.assertIsNone(read["unread_notification_level"])
         self.assertIsNone(read["unread_notification_seq"])
+
+    def test_non_job_unread_projection_is_sparse_until_known_or_recovering(self):
+        session = {"id": "unread-summary"}
+        counter = session_unread.COUNTER
+        with patch("agent_server.NON_JOB_AGENT_RECOVERY_PENDING", set()) as pending:
+            self.assertNotIn(counter, public_session(session, summary=True))
+            self.assertIsNone(public_session(session)[counter])
+
+            pending.add(session["id"])
+            self.assertIsNone(public_session(session, summary=True)[counter])
+            pending.clear()
+
+            session.update({counter: 0, session_unread.CHECKPOINT: 3})
+            self.assertEqual(public_session(session, summary=True)[counter], 0)
+            session[counter] = 2
+            self.assertEqual(public_session(session, summary=True)[counter], 2)
+
+            pending.add(session["id"])
+            self.assertIsNone(public_session(session, summary=True)[counter])
+            pending.clear()
+            del session[session_unread.CHECKPOINT]
+            self.assertIsNone(public_session(session, summary=True)[counter])
+
+            del session[counter]
+            session[session_unread.CHECKPOINT] = 3
+            self.assertIsNone(public_session(session, summary=True)[counter])
 
     def test_summary_keeps_compact_goal_status_and_clear_tombstone(self):
         goal = {"status": "complete", "updatedAt": 123, "objective": "x" * 2000}

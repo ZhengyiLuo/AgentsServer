@@ -25,7 +25,7 @@ MANIFEST_NAME = "agents-server-npm-manifest.json"
 VERSION_PATTERN = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-beta\.([1-9][0-9]*))?$")
 EXECUTABLE_FILES = {
     "install.sh", "uninstall.sh", "agentsdock_jobs.py", "agentsdock_chats.py",
-    "agentsdock_emergency.py", "agentsdock_publish.py", "agentsdock_mail.py",
+    "agentsdock_emergency.py", "agentsdock_notify.py", "agentsdock_publish.py", "agentsdock_mail.py",
     "agentsdock_team.py", "update_runner.py",
 }
 

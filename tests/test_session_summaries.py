@@ -61,6 +61,22 @@ class SessionSummaryTests(unittest.TestCase):
         summary = public_session({"id": "changed-chat", "backend": "cursor", "provider_connection": "default"}, summary=True)
         self.assertEqual(summary["provider_connection"], "default")
 
+    def test_notification_fields_are_sparse_but_read_clears_are_explicit(self):
+        self.assertNotIn("unread_notification_level", public_session({"id": "ordinary-chat"}, summary=True))
+        notified = public_session({
+            "id": "notified-chat", "latest_notification_level": "important",
+            "latest_notification_message": "Review this", "unread_notification_level": "important",
+            "unread_notification_seq": 12,
+        }, summary=True)
+        self.assertEqual(notified["unread_notification_level"], "important")
+        self.assertEqual(notified["unread_notification_seq"], 12)
+        read = public_session({
+            "id": "notified-chat", "latest_notification_level": "important",
+            "latest_notification_message": "Review this",
+        }, summary=True)
+        self.assertIsNone(read["unread_notification_level"])
+        self.assertIsNone(read["unread_notification_seq"])
+
     def test_summary_keeps_compact_goal_status_and_clear_tombstone(self):
         goal = {"status": "complete", "updatedAt": 123, "objective": "x" * 2000}
         summary = public_session({"id": "goal-chat", "backend": "codex", "codex_goal": goal}, summary=True)

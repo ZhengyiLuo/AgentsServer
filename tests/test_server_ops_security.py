@@ -84,6 +84,19 @@ class FakeProviderProcess:
 
 
 class ServerOpsSecurityTests(unittest.IsolatedAsyncioTestCase):
+    def test_agent_notification_route_has_bounded_helper_access(self):
+        self.assertEqual(
+            agent_server.agent_helper_route_body_limit(
+                "POST", "/api/agent/sessions/chat/notifications"
+            ),
+            8 * 1024,
+        )
+        self.assertIsNone(
+            agent_server.agent_helper_route_body_limit(
+                "GET", "/api/agent/sessions/chat/notifications"
+            )
+        )
+
     async def test_user_authored_authority_lookalike_is_never_stripped(self):
         lookalike = (
             "Keep this literal text.\n\n"

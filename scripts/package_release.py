@@ -48,6 +48,7 @@ FILES = (
     "agentsdock_chats.py",
     "chat_mailbox.py",
     "agentsdock_emergency.py",
+    "agentsdock_notify.py",
     "agentsdock_publish.py",
     "agentsdock_mail.py",
     "agentsdock_team.py",
@@ -259,6 +260,7 @@ def main() -> int:
         (package_root / "agentsdock_jobs.py").chmod(0o755)
         (package_root / "agentsdock_chats.py").chmod(0o755)
         (package_root / "agentsdock_emergency.py").chmod(0o755)
+        (package_root / "agentsdock_notify.py").chmod(0o755)
         (package_root / "agentsdock_publish.py").chmod(0o755)
         (package_root / "agentsdock_mail.py").chmod(0o755)
         (package_root / "agentsdock_team.py").chmod(0o755)

@@ -1445,7 +1445,7 @@ exit 0
         self.assertIsNotNone(release_files_match)
         release_files = release_files_match.group(1).split()
         for filename in (
-            "activation_transaction.py agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py chat_mailbox.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py provider_commands.py claude_sdk_client.py claude_background_reconciliation.py codex_app_server.py cursor_agent_client.py cursor_provider_mcp.py opencode_agent_client.py cursor_process_guard.py"
+            "activation_transaction.py agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py chat_mailbox.py agentsdock_emergency.py agentsdock_notify.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py provider_commands.py claude_sdk_client.py claude_background_reconciliation.py codex_app_server.py cursor_agent_client.py cursor_provider_mcp.py opencode_agent_client.py cursor_process_guard.py"
         ).split():
             self.assertIn(filename, release_files)
         self.assertIn('"$STAGE_DIR/activation_transaction.py"', installer_source)
@@ -1453,6 +1453,7 @@ exit 0
         self.assertIn("RELEASE_DIRECTORIES=(agentsdock_team_hub)", installer_source)
         self.assertIn('"$STAGE_DIR/agentsdock_chats.py"', installer_source)
         self.assertIn('"$STAGE_DIR/agentsdock_emergency.py"', installer_source)
+        self.assertIn('"$STAGE_DIR/agentsdock_notify.py"', installer_source)
         self.assertIn('"$STAGE_DIR/agentsdock_publish.py"', installer_source)
         self.assertIn('"$STAGE_DIR/provider_commands.py"', installer_source)
         self.assertIn('"$STAGE_DIR/provider_usage.py"', installer_source)
@@ -1476,6 +1477,7 @@ exit 0
         self.assertIn('"activation_transaction.py"', packager_source)
         self.assertIn('"agentsdock_chats.py"', packager_source)
         self.assertIn('"agentsdock_emergency.py"', packager_source)
+        self.assertIn('"agentsdock_notify.py"', packager_source)
         self.assertIn('"agentsdock_mail.py"', packager_source)
         self.assertIn('"agentsdock_team.py"', packager_source)
         self.assertIn('"provider_commands.py"', packager_source)
@@ -1514,6 +1516,9 @@ exit 0
                 emergency = archive.getmember(
                     f"agents-server-{version}/agentsdock_emergency.py"
                 )
+                notification = archive.getmember(
+                    f"agents-server-{version}/agentsdock_notify.py"
+                )
                 mail = archive.getmember(
                     f"agents-server-{version}/agentsdock_mail.py"
                 )
@@ -1528,6 +1533,7 @@ exit 0
                 f"agents-server-{version}/agentsdock_emergency.py",
                 members,
             )
+            self.assertIn(f"agents-server-{version}/agentsdock_notify.py", members)
             self.assertIn(
                 f"agents-server-{version}/agentsdock_mail.py",
                 members,
@@ -1633,6 +1639,7 @@ exit 0
             )
             self.assertNotEqual(publisher.mode & 0o111, 0)
             self.assertNotEqual(emergency.mode & 0o111, 0)
+            self.assertNotEqual(notification.mode & 0o111, 0)
             self.assertNotEqual(mail.mode & 0o111, 0)
             self.assertNotEqual(uninstaller.mode & 0o111, 0)
             self.assertEqual(

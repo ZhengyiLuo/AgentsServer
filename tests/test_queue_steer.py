@@ -2600,6 +2600,63 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         )
         start.assert_not_awaited()
 
+    async def test_stop_demotes_promotion_before_scheduler_or_snapshot_can_resume(
+        self,
+    ) -> None:
+        promoted = agent_server.QUEUED_TURNS["chat-1"].popleft()
+        promoted["_durable"] = True
+        successor = {**promoted, "queued_id": "queued-next", "prompt": "Next request"}
+        agent_server.QUEUED_TURNS["chat-1"].append(successor)
+        agent_server.RUN_NOW_TURNS["chat-1"] = promoted
+        agent_server.RUN_NOW_COMPLETED_RESULTS[("chat-1", "queued-steer")] = {
+            "expires_at": time.monotonic() + 30,
+            "result": {"ok": True, "queued_id": "queued-steer"},
+        }
+        write_started = asyncio.Event()
+        finish_write = asyncio.Event()
+
+        async def persist_pause(*_args: object, **_kwargs: object) -> dict:
+            write_started.set()
+            await finish_write.wait()
+            return {}
+
+        with patch.object(agent_server, "append_durable_event", side_effect=persist_pause), \
+                patch.object(agent_server, "_start_turn_locked", new_callable=AsyncMock) as start:
+            pause = asyncio.create_task(agent_server.pause_queued_turns_after_explicit_stop("chat-1"))
+            await asyncio.wait_for(write_started.wait(), 0.5)
+            snapshot = asyncio.create_task(agent_server.queued_turns_snapshot("chat-1"))
+            await asyncio.sleep(0)
+            self.assertFalse(snapshot.done())
+            finish_write.set()
+            self.assertEqual(await pause, 2)
+            rows = await snapshot
+
+            # Stop owns the held state immediately, even while its cleanup
+            # fence prevents the ordinary queue scheduler from running.
+            self.assertEqual([row["queued_id"] for row in rows], ["queued-steer", "queued-next"])
+            self.assertTrue(all(row["paused"] and not row["promoted"] for row in rows))
+            self.assertNotIn("chat-1", agent_server.RUN_NOW_TURNS)
+            self.assertNotIn(("chat-1", "queued-steer"), agent_server.RUN_NOW_COMPLETED_RESULTS)
+            agent_server.reject_promoted_queue_mutation("chat-1", "queued-steer")
+            await agent_server.start_next_queued_turn("chat-1")
+            start.assert_not_awaited()
+
+    async def test_failed_stop_pause_write_demotes_and_holds_without_replaying(
+        self,
+    ) -> None:
+        promoted = agent_server.QUEUED_TURNS.pop("chat-1")[0]
+        promoted["_durable"] = True
+        agent_server.RUN_NOW_TURNS["chat-1"] = promoted
+        with patch.object(agent_server, "append_durable_event", side_effect=OSError("fixture storage failure")), \
+                patch.object(agent_server, "_start_turn_locked", new_callable=AsyncMock) as start:
+            self.assertEqual(await agent_server.pause_queued_turns_after_explicit_stop("chat-1"), 1)
+            rows = await agent_server.queued_turns_snapshot("chat-1")
+            self.assertFalse(rows[0]["promoted"])
+            self.assertTrue(rows[0]["paused"])
+            self.assertFalse(agent_server.QUEUED_TURNS["chat-1"][0]["_durable"])
+            await agent_server.start_next_queued_turn("chat-1")
+            start.assert_not_awaited()
+
     async def test_force_send_does_not_cache_success_after_stop_pauses_item(
         self,
     ) -> None:

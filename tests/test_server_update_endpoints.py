@@ -4120,11 +4120,22 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                                 },
                             )
                         )
-                        entered = await asyncio.wait_for(
-                            asyncio.to_thread(message_outbox_entered.wait, 2),
-                            timeout=3,
-                        )
-                        self.assertTrue(entered)
+                        # A loaded CI runner can delay the real TestClient
+                        # request. Poll the event without occupying another
+                        # worker, and report an early HTTP response instead of
+                        # masking it as an event timeout.
+                        for _ in range(300):
+                            if message_outbox_entered.is_set():
+                                break
+                            if message_task.done():
+                                response = await message_task
+                                self.fail(
+                                    "message returned before reaching the outbox: "
+                                    f"{response.status_code} {response.text[:300]}"
+                                )
+                            await asyncio.sleep(0.05)
+                        else:
+                            self.fail("message did not reach the outbox within 15 seconds")
                         self.assertEqual(
                             agent_server.unsafe_http_mutation_count_locked(),
                             1,

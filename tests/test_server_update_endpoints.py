@@ -3928,6 +3928,12 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
             message_task: asyncio.Task | None = None
             try:
                 with ExitStack() as stack:
+                    # Exercise admission against the in-flight message mutation;
+                    # package preparation is covered separately and depends on
+                    # whether the test host has a managed install configured.
+                    stack.enter_context(
+                        patch.dict(os.environ, {"AGENTS_SERVER_INSTALL_DIR": ""})
+                    )
                     stack.enter_context(
                         patch.object(agent_server, "TEAM_HUB_RUNTIME", runtime)
                     )

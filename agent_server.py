@@ -24701,6 +24701,12 @@ async def _run_queued_turn_now_once(
                     if goal_followup and active_turn.get("codex_native_operation_kind") != "goal_resume"
                     else "native_steer_queue"
                 )
+                claude_followup = bool(
+                    active_turn.get("transport") == CLAUDE_TRANSPORT_AGENT_SDK
+                    and "claude_followup_queue" in active_turn
+                )
+                if claude_followup:
+                    native_steer_queue_key = "claude_followup_queue"
                 native_steer_queue = active_turn.get(native_steer_queue_key)
                 native_steer = bool(
                     (
@@ -24774,6 +24780,43 @@ async def _run_queued_turn_now_once(
                         )
                     )
                 )
+                if claude_followup:
+                    # Additional user input belongs to this existing native
+                    # run. Keep its process, child tasks, approvals, tool owner
+                    # and original authorization intact. Picker changes apply
+                    # on the next turn, as they do for native goal steering.
+                    native_steer = bool(
+                        selected_backend == BACKEND_CLAUDE
+                        and active_turn.get("provider_turn_ready")
+                        and not active_turn.get("stop_requested")
+                        and native_steer_queue is not None
+                        and codex_goal_steer_selection_is_plain(selected)
+                    )
+                    if not native_steer and codex_goal_steer_selection_is_plain(selected):
+                        if not selected.get("_turn_deferred_notified"):
+                            selected["_turn_deferred_notified"] = True
+                            await append_event(session_id, "turn_deferred", {
+                                "queued_id": queued_id, "remaining": len(items),
+                                "message": "Claude is starting or finishing. Your message remains queued; running subagents have been kept alive.",
+                            })
+                        return {
+                            "ok": False, "queued_id": queued_id, "interrupted": False,
+                            "deferred": True, "replays_interrupted_message": False,
+                            "remaining": len(items), "superseded_queued_ids": [],
+                            "message": "Claude is starting or finishing. Your message remains queued; running subagents have been kept alive.",
+                        }
+                    if not native_steer:
+                        raise HTTPException(status_code=409, detail=force_send_conflict_detail(
+                            session_id, queued_id, guard="claude_followup_not_ready",
+                            message=(
+                                "This action needs a new Claude turn and remains queued. Running subagents have been kept alive."
+                                if not codex_goal_steer_selection_is_plain(selected) else
+                                "Claude is finishing or starting its turn. Your message remains queued."
+                            ),
+                            action="Send text or files now, or let this action run next.",
+                            retryable=codex_goal_steer_selection_is_plain(selected),
+                            owner_queued_id=queued_id,
+                        ))
                 if goal_followup and not native_steer:
                     unsupported_input = not codex_goal_steer_selection_is_plain(selected)
                     raise HTTPException(
@@ -24854,6 +24897,7 @@ async def _run_queued_turn_now_once(
                 "remaining": remaining,
                 "future": future,
                 "phase": "queued",
+                "preserve_claude_run": claude_followup,
                 "accepted_event": asyncio.Event(),
                 "owner_task": owner_task,
                 "expected_provider_turn_id": (
@@ -26381,7 +26425,7 @@ def scan_queued_turns_from_events(
                     order.append(queued_id)
             elif event_type in {"turn_queue_updated", "turn_queue_run_now"} and queued_id in pending:
                 pending[queued_id].update(async_route_queue_fields({**pending[queued_id], **event}))
-                if event_type == "turn_queue_run_now" and event.get("native_goal_steer") is not True:
+                if event_type == "turn_queue_run_now" and event.get("native_goal_steer") is not True and event.get("native_followup") is not True:
                     pending[queued_id]["_paused_after_stop"] = False
                     pending[queued_id].pop("_native_delivery_fenced", None)
                 # A goal follow-up continues an existing provider turn. Its
@@ -33608,7 +33652,7 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
     turn_record_keys_by_run: dict[str, list[str]] = {}
     for existing in records:
         existing_key = str(existing.get("key") or "")
-        if existing_key.startswith("turn:"):
+        if existing_key.startswith("turn:") and not existing.get("_native_user_followup"):
             existing_run = existing_key[5:].split(":start-", 1)[0]
             turn_record_keys_by_run.setdefault(existing_run, []).append(existing_key)
     dirty_record_keys: set[str] = set()
@@ -33931,7 +33975,7 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
             }
             by_key[key] = record
             records.append(record)
-            if key.startswith("turn:"):
+            if key.startswith("turn:") and not is_native_goal_steer_event(event):
                 turn_record_keys_by_run.setdefault(key[5:].split(":start-", 1)[0], []).append(key)
             if advance_timeline:
                 latest_timeline_landmark_key = key
@@ -34386,7 +34430,7 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                 or event.get("purpose") == "scheduled_job"
                 or event.get("job_id")
                 or (run_id and run_id in job_by_run)
-            ):
+            ) and not is_native_goal_steer_event(event):
                 job = event.get("job") if isinstance(event.get("job"), dict) else {}
                 job_id = str(
                     event.get("job_id")
@@ -34398,6 +34442,10 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                 if run_id:
                     job_by_run[run_id] = job_id
                 prior_key = current_turn_by_run.pop(run_id, None) if run_id else None
+                if (by_key.get(prior_key or "") or {}).get("_native_user_followup"):
+                    if active_turn_key == prior_key:
+                        active_turn_key = None
+                    prior_key = None
                 if not prior_key and run_id:
                     prior_keys = turn_record_keys_by_run.get(run_id, [])
                     while prior_keys and prior_keys[-1] not in by_key:
@@ -34541,9 +34589,10 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                     # ``:start-{seq}`` disambiguated key as the index.
                     safe_start_offset = int(base_record.get("start_offset") or 0)
                     key = f"turn:{run_key}:start-{seq}"
-                active_turn_key = key
-                if run_id:
-                    current_turn_by_run[run_id] = key
+                if not resolved_job_id:
+                    active_turn_key = key
+                    if run_id:
+                        current_turn_by_run[run_id] = key
                 if hidden_imported_prompt:
                     # Preserve routing for a following provider answer without
                     # exposing the generated input. The placeholder retains
@@ -34574,6 +34623,11 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                 )
                 record["has_turn_start"] = True
                 record["has_user"] = True
+                # A human input in a scheduled owner is its own presentation
+                # boundary; later job output must not absorb it as a legacy
+                # provisional job start.
+                if is_native_goal_steer_event(event):
+                    record["_native_user_followup"] = True
                 prompt = compact_timeline_index_text(event.get("prompt"))
                 if prompt:
                     record["title"] = compact_timeline_index_text(prompt, 72)
@@ -35417,11 +35471,19 @@ def is_native_goal_steer_event(event: dict[str, Any]) -> bool:
     """An accepted human follow-up, not a new run or provider goal prompt."""
     return bool(
         event.get("type") == "turn_steered"
-        and event.get("native_goal_steer") is True
         and event.get("native_steer") is True
         and event.get("provider_user_authored") is True
-        and event.get("backend") == BACKEND_CODEX
-        and event.get("purpose") == "codex_goal_resume"
+        and (
+            (event.get("native_goal_steer") is True
+             and event.get("backend") == BACKEND_CODEX
+             and event.get("purpose") == "codex_goal_resume")
+            or (event.get("native_followup") is True
+                and event.get("backend") == BACKEND_CLAUDE
+                and event.get("purpose") is None
+                and event.get("provider_generated") is not True
+                and isinstance(event.get("provider_message_id"), str)
+                and event["provider_message_id"].strip())
+        )
         and str(event.get("run_id") or "").strip()
     )
 
@@ -35721,7 +35783,7 @@ def collect_semantic_timeline_events(
                     job_id = explicit_job_id or run_id or f"job-{seq}"
                 if codex_lifecycle_key:
                     key = codex_lifecycle_key
-                elif job_id:
+                elif job_id and not is_native_goal_steer_event(event):
                     occurrence = scheduled_job_occurrence_key(event)
                     occurrence_map_key = (
                         f"{job_id}\0{occurrence}"
@@ -35773,9 +35835,10 @@ def collect_semantic_timeline_events(
                     if is_native_goal_steer_event(event) or key in seen_user_turn_keys:
                         key = f"turn:{run_key}:start-{seq}"
                     seen_user_turn_keys.add(key)
-                    active_turn_key = key
-                    if run_id:
-                        current_turn_by_run[run_id] = key
+                    if not job_id:
+                        active_turn_key = key
+                        if run_id:
+                            current_turn_by_run[run_id] = key
                 else:
                     key = current_turn_by_run.get(run_id) if run_id else active_turn_key
                     if run_id and not key:
@@ -65208,6 +65271,103 @@ async def acknowledge_claude_background_reconciliation(
     return []
 
 
+async def send_claude_followup(
+    session_id: str, run_id: str, manager: Any, handle: Any,
+    ownership_token: str, provider_id: str,
+    steer_queue: asyncio.Queue[dict[str, Any]], request: dict[str, Any],
+) -> dict[str, Any]:
+    """Send native input without replacing the process, run or child authority."""
+    selected = request["selected"]
+    attempted = False
+    acknowledged = False
+
+    async def before_send(actual_owner: str) -> None:
+        async with ACTIVE_LOCK:
+            active = ACTIVE.get(session_id) or {}
+            current = CURRENT_TURNS.get(session_id) or {}
+            valid = bool(
+                actual_owner == ownership_token
+                and active.get("claude_sdk_owner_token") == ownership_token
+                and active.get("claude_sdk_run") is handle
+                and active.get("claude_followup_queue") is steer_queue
+                and active.get("run_id") == run_id
+                and current.get("run_id") == run_id
+                and active.get("provider_turn_ready")
+                and not active.get("stop_requested")
+                and session_id in BUSY_SESSIONS
+                and session_id not in STOP_REQUESTS
+                and session_id not in DELETING_SESSIONS
+                and run_id not in STOPPED_RUNS
+                and codex_goal_steer_selection_is_plain(selected)
+            )
+        if not valid:
+            raise NativeSteerHandoffError(
+                "Claude finished or stopped before this message could be sent",
+                safe_to_requeue=True,
+            )
+
+    try:
+        await before_send(ownership_token)
+        prompt = build_user_provider_prompt(
+            session_id, str(selected.get("prompt") or ""), list(selected.get("file_ids") or []),
+        )
+        await fence_native_steer_delivery(session_id, selected, backend=BACKEND_CLAUDE)
+        attempted = True
+        request["_claude_followup_query_started"] = True
+        message_id = await manager.steer_run(
+            session_id, prompt, run_id=run_id, ownership_token=ownership_token,
+            query_session_id=provider_id or None, on_before_send=before_send,
+        )
+        acknowledged = True
+        display_prompt = str(selected.get("display_prompt") if selected.get("display_prompt") is not None else selected.get("prompt") or "")
+        display_files = list(selected.get("display_file_ids") if selected.get("display_file_ids") is not None else selected.get("file_ids") or [])
+        # One accepted user message, one retained logical run. In particular,
+        # do not terminalize the predecessor, clear its task ledger, rotate its
+        # MCP authority, cancel approvals or recreate its manifest watcher.
+        await append_durable_event_batch(session_id, [
+            ("turn_queue_run_now", {
+                "queued_id": selected.get("queued_id"), "run_id": run_id,
+                "backend": BACKEND_CLAUDE, "prompt": display_prompt,
+                "file_ids": display_files, "native_steer": True,
+                "native_followup": True, "interrupted": False,
+                "replays_interrupted_message": False,
+                "remaining": request.get("remaining", 0), "superseded_queued_ids": [],
+                "message": "Follow-up sent to Claude; running subagents remain active.",
+            }),
+            ("turn_steered", {
+                "run_id": run_id, "backend": BACKEND_CLAUDE,
+                "queued_id": selected.get("queued_id"), "prompt": display_prompt,
+                "file_ids": display_files, "native_steer": True,
+                "native_followup": True, "provider_user_authored": True,
+                "provider_message_id": message_id,
+                **queued_turn_run_metadata(selected),
+            }),
+        ])
+        async with ACTIVE_LOCK:
+            current = CURRENT_TURNS.get(session_id)
+            if current and current.get("run_id") == run_id:
+                lineage = turn_steering_lineage(current)
+                lineage.append({"prompt": str(selected.get("prompt") or ""), "file_ids": list(selected.get("file_ids") or [])})
+                current["steering_lineage"] = lineage
+        return {
+            "ok": True, "queued_id": selected.get("queued_id"), "run_id": run_id,
+            "interrupted": False, "native_steer": True, "native_followup": True,
+            "replays_interrupted_message": False, "superseded_queued_ids": [],
+        }
+    except NativeSteerHandoffError:
+        raise
+    except BaseException as exc:
+        # SDK pre-write failures explicitly report delivery_uncertain=False;
+        # cancellation or a post-ACK local failure can never authorize replay.
+        safe = not acknowledged and (
+            not attempted or getattr(exc, "delivery_uncertain", None) is False
+        )
+        raise NativeSteerHandoffError(
+            concise_error_message(exc) or "Claude follow-up delivery was interrupted",
+            safe_to_requeue=safe, delivery_uncertain=not safe,
+        ) from exc
+
+
 async def run_claude_sdk(
     session_id: str,
     run_id: str,
@@ -65280,14 +65440,15 @@ async def run_claude_sdk(
         "backend": BACKEND_CLAUDE,
         "transport": CLAUDE_TRANSPORT_AGENT_SDK,
         "claude_sdk_run": None,
-        # Authority-bearing runs receive a fresh provider-tool owner binding.
-        # Force Send therefore follows Stop -> queued start for those runs;
-        # retain the legacy native path only for callers without authority.
+        # Legacy logical-run transitions are kept separate from the native
+        # follow-up lane below. Real Force Send preserves this exact owner;
+        # it never tears down the connection or rebinds surviving children.
         "native_steer_queue": (
             None
             if provider_runtime_env or provider_command is not None
             else native_steer_queue
         ),
+        "claude_followup_queue": native_steer_queue,
         "interactive_agent_sdk": True,
         "provider_model": str(sess.get("model") or ""),
         "provider_effort": str(sess.get("effort") or ""),
@@ -65516,6 +65677,8 @@ async def run_claude_sdk(
     cancelled_error: asyncio.CancelledError | None = None
     retire_supervisor = False
     pending_steer: dict[str, Any] | None = None
+    followup_task: asyncio.Task[Any] | None = None
+    followup_request: dict[str, Any] | None = None
     message_task: asyncio.Task[Any] | None = None
     steer_task: asyncio.Task[Any] | None = None
     first_activity_task: asyncio.Task[bool] | None = None
@@ -65796,13 +65959,15 @@ async def run_claude_sdk(
                 break
             if message_task is None:
                 message_task = asyncio.create_task(current_handle.__anext__())
-            if pending_steer is None and steer_task is None:
+            if pending_steer is None and followup_task is None and steer_task is None:
                 steer_task = asyncio.create_task(native_steer_queue.get())
             waiters = {message_task}
             if steer_task is not None:
                 waiters.add(steer_task)
             if first_activity_task is not None:
                 waiters.add(first_activity_task)
+            if followup_task is not None:
+                waiters.add(followup_task)
             elapsed = now_monotonic - logical_started_monotonic
             idle = now_monotonic - last_activity_monotonic
             timeout_candidates = [5.0]
@@ -65866,6 +66031,30 @@ async def run_claude_sdk(
                         current_run_id,
                     )
                     break
+
+            if followup_task is not None and followup_task in done:
+                request = followup_request or {}
+                future = request.get("future")
+                try:
+                    result = followup_task.result()
+                    if isinstance(future, asyncio.Future) and not future.done():
+                        future.set_result(result)
+                except Exception as exc:
+                    if isinstance(future, asyncio.Future) and not future.done():
+                        future.set_exception(exc)
+                followup_task = None
+                followup_request = None
+
+            if steer_task is not None and steer_task in done:
+                request = steer_task.result()
+                if request.get("preserve_claude_run"):
+                    steer_task = None
+                    mark_native_steer_accepted(request)
+                    followup_request = request
+                    followup_task = asyncio.create_task(send_claude_followup(
+                        session_id, current_run_id, manager, current_handle,
+                        sdk_ownership_token, provider_id, native_steer_queue, request,
+                    ))
 
             if steer_task is not None and steer_task in done:
                 request = steer_task.result()
@@ -66034,6 +66223,22 @@ async def run_claude_sdk(
                     continue
                 result_details = projected_result
 
+            if result_details is not None and followup_task is not None:
+                # The provider may finish in the same batch as its replay ACK.
+                # Persist the accepted human input before projecting completion;
+                # cancelling here would strand an already delivered queue row.
+                request = followup_request or {}
+                future = request.get("future")
+                try:
+                    result = await asyncio.shield(followup_task)
+                    if isinstance(future, asyncio.Future) and not future.done():
+                        future.set_result(result)
+                except Exception as exc:
+                    if isinstance(future, asyncio.Future) and not future.done():
+                        future.set_exception(exc)
+                followup_task = None
+                followup_request = None
+
             if result_details and result_details.get("session_id"):
                 provider_id = str(result_details["session_id"])
             if provider_id and provider_id != provider_persisted_id:
@@ -66068,6 +66273,7 @@ async def run_claude_sdk(
                     ):
                         active["provider_turn_ready"] = False
                         active["native_steer_queue"] = None
+                        active["claude_followup_queue"] = None
                         active["claude_permissions_open"] = False
                 break
 
@@ -66644,6 +66850,22 @@ async def run_claude_sdk(
     async def cleanup_live_sdk_state() -> None:
         nonlocal retire_supervisor, stream_error
         unhandled_steer: dict[str, Any] | None = None
+        if followup_task is not None:
+            if not followup_task.done():
+                followup_task.cancel()
+            outcome = (await asyncio.gather(followup_task, return_exceptions=True))[0]
+            future = (followup_request or {}).get("future")
+            if isinstance(future, asyncio.Future) and not future.done():
+                if isinstance(outcome, dict):
+                    future.set_result(outcome)
+                elif isinstance(outcome, NativeSteerHandoffError):
+                    future.set_exception(outcome)
+                else:
+                    attempted = bool((followup_request or {}).get("_claude_followup_query_started"))
+                    future.set_exception(NativeSteerHandoffError(
+                        "Claude follow-up delivery ended before acknowledgement; it was not replayed",
+                        safe_to_requeue=not attempted, delivery_uncertain=attempted,
+                    ))
         readiness_tasks = tuple(provider_ready_tasks)
         for task in readiness_tasks:
             if not task.done():
@@ -83389,11 +83611,9 @@ async def health() -> dict[str, Any]:
                 ),
                 "permission_modes": list(CLAUDE_PERMISSION_MODE_OPTIONS),
                 "features": {
-                    # Every real turn now carries run-scoped out-of-band
-                    # authority. In-place provider steering cannot prove that
-                    # a delayed pre-steer tool call belongs to the successor
-                    # run, so Force Send deliberately uses Stop -> fresh turn.
-                    "native_steer": False,
+                    # Native input keeps the current run and tool owner, so
+                    # delayed child callbacks never acquire a successor owner.
+                    "native_steer": True,
                     "force_send": True,
                     "interrupt": True,
                     "approvals": True,

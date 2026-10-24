@@ -216,6 +216,8 @@ class ClaudeSDKClientProtocol(Protocol):
 
     async def interrupt(self) -> None: ...
 
+    async def send_now(self, message_uuid: str) -> dict[str, Any]: ...
+
     async def get_context_usage(self) -> dict[str, Any]: ...
 
     async def get_mcp_status(self) -> dict[str, Any]: ...
@@ -553,6 +555,8 @@ async def _query_message_stream(
     prompt: str,
     correlation_id: str,
     validated_provider_command_name: str | None = None,
+    *,
+    priority: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Yield the single UUID-bearing SDK stdin frame for one logical turn."""
 
@@ -573,6 +577,8 @@ async def _query_message_stream(
         # Apply it per message so explicit commands and ordinary @file input
         # retain their native behavior without modifying the prompt text.
         message["client_composed"] = True
+    if priority is not None:
+        message["priority"] = priority
     yield message
 
 
@@ -586,6 +592,17 @@ def default_claude_sdk_client_factory(options: Any) -> ClaudeSDKClientProtocol:
             "claude-agent-sdk is not installed; use the claude -p fallback"
         ) from exc
     class GoalAwareClaudeSDKClient(ClaudeSDKClient):
+        async def send_now(self, message_uuid: str) -> dict[str, Any]:
+            # SDK 0.2.130 has no public wrapper for this newer native control.
+            # The supervisor must first see interrupt_send_now_v1 on init:
+            # older CLIs interpret these extra fields as an ordinary Stop.
+            if self._query is None:
+                raise ClaudeSDKSupervisorClosed("Claude SDK client is not connected")
+            return await self._query._send_control_request({
+                "subtype": "interrupt", "send_now": True,
+                "message_uuid": message_uuid,
+            })
+
         async def connect(self, prompt=None) -> None:
             from claude_model_catalog import native_catalog_key, remember_native_models
 
@@ -625,11 +642,11 @@ def default_claude_sdk_client_factory(options: Any) -> ClaudeSDKClientProtocol:
 def _parse_claude_sdk_message(data: dict[str, Any]) -> Any:
     from claude_agent_sdk._internal.message_parser import parse_message
 
-    if data.get("type") == "active_goal":
+    if data.get("type") in {"active_goal", "command_lifecycle"}:
         return data
     message = parse_message(data)
     if message is not None:
-        for field in ("local_command", "local_command_run"):
+        for field in ("local_command", "local_command_run", "user_message_uuid"):
             if field in data:
                 setattr(message, field, data[field])
     return message
@@ -1281,6 +1298,20 @@ class _Interrupt:
 
 
 @dataclass
+class _SteerRun:
+    prompt: str
+    run_id: str
+    ownership_token: str
+    query_session_id: str | None
+    on_before_send: SupervisorReadyCallback | None
+    response: asyncio.Future[str]
+    correlation_id: str
+    cancelled: bool = False
+    delivery_attempted: bool = False
+    send_now_requested: bool = False
+
+
+@dataclass
 class _ClearGoal:
     run_id: str
     expected_generation: str | None
@@ -1409,6 +1440,10 @@ class ClaudeSDKSupervisor:
         self._receiver_task: asyncio.Task[None] | None = None
         self._ack_timeout_task: asyncio.Task[None] | None = None
         self._active_run: ClaudeSDKRunHandle | None = None
+        self._pending_steer: _SteerRun | None = None
+        self._superseded_query_ids: set[str] = set()
+        self._current_query_id: str | None = None
+        self._supports_send_now = False
         self._pending_goal_clear: _ClearGoal | None = None
         self._inflight_tasks: set[str] = set()
         self._background_reconciliation_hook: _BackgroundReconciliationHook | None = None
@@ -1550,6 +1585,51 @@ class ClaudeSDKSupervisor:
         assert self._commands is not None
         await self._commands.put(_Interrupt(run_id=run_id, response=response))
         return await asyncio.shield(response)
+
+    async def steer_run(
+        self,
+        prompt: str,
+        *,
+        run_id: str,
+        ownership_token: str,
+        query_session_id: str | None = None,
+        on_before_send: SupervisorReadyCallback | None = None,
+    ) -> str:
+        """Send native follow-up input without stopping the owning run/tasks.
+
+        Return only after the CLI replays this input's exact UUID. Cancellation
+        after a write attempt is delivery-uncertain and never retries or stops
+        the live connection. Its ACK still settles the actor's pending lane.
+        """
+
+        loop = self._ensure_actor()
+        response: asyncio.Future[str] = loop.create_future()
+        command = _SteerRun(
+            str(prompt), str(run_id), str(ownership_token), query_session_id,
+            on_before_send, response, str(uuid.uuid4()),
+        )
+        # An HTTP waiter may leave after delivery. Still consume any eventual
+        # failure while preserving it for callers that remain attached.
+        response.add_done_callback(
+            lambda future: None if future.cancelled() else future.exception()
+        )
+        assert self._commands is not None
+        await self._commands.put(command)
+        try:
+            return await asyncio.shield(response)
+        except asyncio.CancelledError as exc:
+            if not command.delivery_attempted:
+                command.cancelled = True
+                response.cancel()
+                # Preserve asyncio cancellation while letting the queue owner
+                # distinguish proven non-delivery from an uncertain write.
+                exc.delivery_uncertain = False
+                exc.safe_to_requeue = True
+                raise
+            raise ClaudeSDKQueryError(
+                "Claude Force Send was cancelled after delivery was attempted; "
+                "the message must not be replayed"
+            ) from exc
 
     async def clear_goal(
         self, *, run_id: str, expected_generation: str | None = None,
@@ -1918,6 +1998,8 @@ class ClaudeSDKSupervisor:
                 )
 
     async def _disconnect_current_client(self) -> None:
+        self._supports_send_now = False
+        self._fail_pending_steer("Claude disconnected before confirming Force Send")
         pending = self._pending_goal_clear
         self._pending_goal_clear = None
         if pending is not None and not pending.response.done():
@@ -1944,17 +2026,26 @@ class ClaudeSDKSupervisor:
             await self._cancel_task_bounded(receiver)
 
     def _fail_active(self, error: BaseException) -> None:
+        self._fail_pending_steer("Claude ended before confirming Force Send")
         self._cancel_ack_timeout()
         active = self._active_run
         self._active_run = None
         bind_provider_tool_owner(self.options, "", "")
         self._inflight_tasks.clear()
+        self._superseded_query_ids.clear()
+        self._current_query_id = None
         if self._background_reconciliation_hook is not None:
             self._background_reconciliation_hook.retire()
         if self._pending_mail_hint_hook is not None:
             self._pending_mail_hint_hook.retire()
         if active is not None:
             active._fail(error)
+
+    def _fail_pending_steer(self, message: str) -> None:
+        pending = self._pending_steer
+        self._pending_steer = None
+        if pending is not None and not pending.response.done():
+            pending.response.set_exception(ClaudeSDKQueryError(message))
 
     def _cancel_ack_timeout(self) -> None:
         task = self._ack_timeout_task
@@ -1986,10 +2077,10 @@ class ClaudeSDKSupervisor:
 
     async def _deliver_query_bounded(
         self,
-        query: Awaitable[None],
+        query: Awaitable[Any],
         *,
         run_id: str,
-    ) -> None:
+    ) -> Any:
         """Bound stdin delivery without awaiting cancellation-hostile SDK code."""
 
         task = asyncio.create_task(
@@ -2018,7 +2109,7 @@ class ClaudeSDKSupervisor:
                 f"Claude SDK query delivery timed out for chat {self.chat_id}; "
                 "delivery is uncertain"
             )
-        await task
+        return await task
 
     async def _handle_start(self, command: _StartRun) -> None:
         if self._pending_goal_clear is not None:
@@ -2093,6 +2184,8 @@ class ClaudeSDKSupervisor:
         )
         handle._background_task_reconciliation = command.background_task_reconciliation
         self._active_run = handle
+        self._superseded_query_ids.clear()
+        self._current_query_id = correlation_id
         self._last_used_at = time.monotonic()
         if command.on_supervisor_ready is not None:
             try:
@@ -2209,6 +2302,95 @@ class ClaudeSDKSupervisor:
         if not command.response.done():
             command.response.set_result(handle)
 
+    async def _handle_steer(self, command: _SteerRun) -> None:
+        if command.cancelled:
+            return
+        active = self._active_run
+        client = self._client
+        if (active is None or active.done or active.run_id != command.run_id
+                or self.ownership_token != command.ownership_token
+                or client is None or not self._connected):
+            command.response.set_exception(ClaudeSDKGenerationChanged(
+                "The Claude run changed before Force Send"
+            ))
+            return
+        if (not active.acknowledged or self._pending_steer is not None
+                or self._pending_goal_clear is not None):
+            command.response.set_exception(ClaudeSDKRunActive(
+                "Claude is still confirming its previous input"
+            ))
+            return
+        send_now = getattr(client, "send_now", None)
+        if not self._supports_send_now or not callable(send_now):
+            command.response.set_exception(ClaudeSDKConfigurationConflict(
+                "This Claude CLI cannot Force Send while preserving background work; "
+                "update Claude Code or leave the message queued"
+            ))
+            return
+        try:
+            if command.on_before_send is not None:
+                await command.on_before_send(self.ownership_token)
+            if command.cancelled:
+                return
+            if self._closed:
+                raise ClaudeSDKSupervisorClosed("Claude closed before Force Send")
+        except Exception as exc:
+            if not command.response.done():
+                command.response.set_exception(exc)
+            return
+
+        # Keep the same run and MCP owner. Rebinding would let a delayed call
+        # from the preceding model response borrow a successor's authority.
+        # Install the receipt lane before writing: the receiver can enqueue
+        # an interrupted predecessor Result or a child completion immediately.
+        self._pending_steer = command
+        command.delivery_attempted = True
+        try:
+            kwargs = ({"session_id": command.query_session_id}
+                      if command.query_session_id is not None else {})
+            await self._deliver_query_bounded(
+                client.query(_query_message_stream(
+                    command.prompt, command.correlation_id, priority="next",
+                ), **kwargs),
+                run_id=command.run_id,
+            )
+        except Exception as exc:
+            error = ClaudeSDKQueryError(
+                f"Claude Force Send delivery is uncertain: {exc}"
+            )
+            if not command.response.done():
+                command.response.set_exception(error)
+            # The transport may have accepted the frame before reporting a
+            # write failure. Keep its receipt lane and the existing tasks;
+            # only an actual receiver failure or explicit Stop retires them.
+            return
+        self._last_used_at = time.monotonic()
+
+    async def _send_pending_input_now(self, command: _SteerRun) -> None:
+        if command.send_now_requested:
+            return
+        command.send_now_requested = True
+        try:
+            # Wait for the exact queued receipt: a control sent while native
+            # admission is pending intentionally does nothing. Once queued,
+            # Send now releases the foreground tool wait while sparing native
+            # background tasks. Plain interrupt remains the hard Stop path.
+            assert self._client is not None
+            receipt = await self._deliver_query_bounded(
+                self._client.send_now(command.correlation_id), run_id=command.run_id,
+            )
+            if not isinstance(receipt, dict) or receipt.get("send_now") not in {
+                "stopped", "delivering", "nothing_waiting",
+            }:
+                raise ClaudeSDKSupervisorError("Claude returned no Send now receipt")
+        except Exception as exc:
+            if not command.response.done():
+                command.response.set_exception(ClaudeSDKQueryError(
+                    f"Claude Force Send delivery is uncertain: {exc}"
+                ))
+            # The user frame was already written. Preserve its ACK lane and
+            # live tasks; retrying or disconnecting would compound uncertainty.
+
     async def _handle_clear_goal(self, command: _ClearGoal) -> None:
         if command.cancelled or command.response.done():
             return
@@ -2222,6 +2404,11 @@ class ClaudeSDKSupervisor:
         if self._pending_goal_clear is not None:
             command.response.set_exception(ClaudeSDKRunActive(
                 "Claude is already clearing its goal"
+            ))
+            return
+        if self._pending_steer is not None:
+            command.response.set_exception(ClaudeSDKRunActive(
+                "Claude is still confirming Force Send"
             ))
             return
         generation = self.control_generation
@@ -2280,6 +2467,7 @@ class ClaudeSDKSupervisor:
                 )
             return
         active._background_reconciliation_aborted = True
+        self._fail_pending_steer("Claude was stopped before confirming Force Send")
         try:
             await client.interrupt()
         except Exception as exc:
@@ -2714,6 +2902,15 @@ class ClaudeSDKSupervisor:
     async def _handle_received(self, command: _ReceivedMessage) -> None:
         if command.generation != self._generation:
             return
+        data = _message_field(command.message, "data", {})
+        if _message_field(command.message, "subtype") == "init":
+            capabilities = _message_field(command.message, "capabilities")
+            if capabilities is None and isinstance(data, dict):
+                capabilities = data.get("capabilities")
+            self._supports_send_now = isinstance(capabilities, list) and all(
+                capability in capabilities
+                for capability in ("interrupt_send_now_v1", "msg_lifecycle_v1")
+            )
         if _message_type(command.message) in {"ratelimitevent", "rate_limit_event"} and self._usage_observer is not None:
             generation = self.control_generation
             if generation is not None:
@@ -2743,6 +2940,32 @@ class ClaudeSDKSupervisor:
         if active is None or active.done:
             return
         self._last_used_at = time.monotonic()
+        steer = self._pending_steer
+        if _message_type(command.message) == "command_lifecycle":
+            if (steer is not None
+                    and _message_field(command.message, "command_uuid") == steer.correlation_id):
+                state = _message_field(command.message, "state")
+                if state == "queued":
+                    await self._send_pending_input_now(steer)
+                elif state == "cancelled":
+                    self._fail_pending_steer("Claude cancelled the Force Send input before confirming it")
+            return
+        if steer is not None and _is_matching_replay_ack(
+            command.message, steer.correlation_id,
+        ):
+            if self._current_query_id is not None:
+                self._superseded_query_ids.add(self._current_query_id)
+            self._current_query_id = steer.correlation_id
+            self._pending_steer = None
+            if not steer.response.done():
+                steer.response.set_result(steer.correlation_id)
+            return
+        message_uuid = str(_message_field(command.message, "uuid") or "")
+        if (active.acknowledged and (message_uuid == self._current_query_id
+                or message_uuid in self._superseded_query_ids)
+                and _is_matching_replay_ack(command.message, message_uuid)):
+            # Duplicate receipts are protocol metadata, never user bubbles.
+            return
         if not active.acknowledged:
             if (pending is not None and self._is_result_message(command.message)
                     and _result_forces_run_end(command.message)):
@@ -2760,18 +2983,20 @@ class ClaudeSDKSupervisor:
             # before this query. Nothing owns the new run until its exact UUID
             # is replayed by the CLI.
             return
-        elif _is_matching_replay_ack(
-            command.message,
-            active.correlation_id,
-        ):
-            # A duplicate acknowledgment is protocol metadata, never a second
-            # user bubble.
-            return
 
         active._observe_reconciliation_progress(command.message)
         if self._pending_mail_hint_hook is not None:
             self._pending_mail_hint_hook.observe(command.message)
         if self._is_result_message(command.message):
+            result_query_id = str(_message_field(command.message, "user_message_uuid") or "")
+            if steer is not None or result_query_id in self._superseded_query_ids:
+                # A Send now input preempts one model response while its
+                # native Agent/workflow tasks remain alive. Before its exact
+                # ACK, Results still belong to the preceding response. Newer
+                # CLIs also identify that input explicitly, fencing delayed
+                # predecessor Results after the ACK without discarding task
+                # notification turns (which may have their own UUID).
+                return
             # A Claude Result ends one model turn, not necessarily the logical
             # run. Delegated local agents/workflows can outlive that Result;
             # their completion wakes Claude for a follow-up model turn and a
@@ -2790,6 +3015,8 @@ class ClaudeSDKSupervisor:
             self._active_run = None
             bind_provider_tool_owner(self.options, "", "")
             self._inflight_tasks.clear()
+            self._superseded_query_ids.clear()
+            self._current_query_id = None
             if had_inflight_tasks and forced_run_end:
                 # An interrupted/error response can strand provider-side task
                 # frames after this logical run has ended. Retire only this
@@ -2883,6 +3110,8 @@ class ClaudeSDKSupervisor:
                 )
                 if isinstance(command, _StartRun):
                     await self._handle_start(command)
+                elif isinstance(command, _SteerRun):
+                    await self._handle_steer(command)
                 elif isinstance(command, _Interrupt):
                     await self._handle_interrupt(command)
                 elif isinstance(command, _GetContextUsage):
@@ -3214,6 +3443,33 @@ class ClaudeSDKSupervisorManager:
         if supervisor is None:
             return False
         return await supervisor.interrupt(run_id=run_id)
+
+    async def steer_run(
+        self,
+        chat_id: str,
+        prompt: str,
+        *,
+        run_id: str,
+        ownership_token: str,
+        query_session_id: str | None = None,
+        on_before_send: SupervisorReadyCallback | None = None,
+    ) -> str:
+        """Steer only the exact existing live owner, without a new authority."""
+
+        self._bind_loop()
+        assert self._lock is not None
+        async with self._lock:
+            supervisor = self._supervisors.get(str(chat_id))
+            if (supervisor is None or supervisor.closed
+                    or supervisor.ownership_token != str(ownership_token)
+                    or supervisor.active_run_id != str(run_id)):
+                raise ClaudeSDKGenerationChanged(
+                    "The Claude run changed before Force Send"
+                )
+        return await supervisor.steer_run(
+            prompt, run_id=run_id, ownership_token=ownership_token,
+            query_session_id=query_session_id, on_before_send=on_before_send,
+        )
 
     async def clear_goal(
         self, chat_id: str, *, run_id: str,

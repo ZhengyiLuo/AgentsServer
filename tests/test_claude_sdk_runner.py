@@ -5852,6 +5852,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         first = FakeClaudeRun()
         manager = SafeFailingCandidateStartManager([first])
+        manager.steer_run = AsyncMock(side_effect=ClaudeSDKUnavailable("pre-write rejection"))
         predecessor_run_id = "run_claude"
         agent_server.CURRENT_TURNS["chat-claude"]["run_id"] = predecessor_run_id
         predecessor_path = await agent_server.issue_cross_chat_capability(
@@ -6001,25 +6002,17 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                         "queued-safe-rejection",
                     )
                 )
-                for _ in range(100):
-                    if first.interrupt_calls:
-                        break
-                    await asyncio.sleep(0)
-                await first.messages.put({
-                    "type": "result",
-                    "result": "interrupted",
-                    "session_id": "provider",
-                    "terminal_reason": "aborted_streaming",
-                })
                 result = await asyncio.wait_for(force_send, 0.5)
-                await asyncio.wait_for(cleanup_entered.wait(), 0.5)
+                self.assertEqual(first.interrupt_calls, 0)
+                self.assertFalse(cleanup_entered.is_set())
+                self.assertFalse(runner.done())
 
                 self.assertFalse(result["ok"])
                 self.assertTrue(result["deferred"])
                 self.assertTrue(result["retryable"])
                 self.assertFalse(result["delivery_uncertain"])
-                self.assertIsNotNone(manager.candidate_authority_path)
-                self.assertFalse(manager.candidate_authority_path.exists())
+                self.assertIsNone(manager.candidate_authority_path)
+                self.assertEqual(len(manager.start_calls), 1)
                 self.assertTrue(predecessor_path.exists())
                 self.assertEqual(
                     {
@@ -6062,6 +6055,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                 )
             finally:
                 release_cleanup.set()
+                await first.messages.put({"type": "result", "result": "done", "session_id": "provider"})
                 await asyncio.wait_for(runner, 0.5)
 
         self.assertTrue(predecessor_path.exists())
@@ -7065,6 +7059,232 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(result, FakePermissionResultDeny)
         self.assertFalse(getattr(result, "interrupt", True))
         self.assertIn("skipped", str(getattr(result, "message", "")).lower())
+
+    def followup_fixture(self):
+        handle = FakeClaudeRun()
+        queue = asyncio.Queue()
+        selected = {"queued_id": "queued-followup", "prompt": "Change course", "file_ids": [], "backend": "claude", "_durable": True}
+        active = {
+            "run_id": "run-claude", "backend": "claude",
+            "transport": agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+            "claude_sdk_owner_token": "owner", "claude_sdk_run": handle,
+            "claude_followup_queue": queue, "provider_turn_ready": True,
+            "claude_permissions_open": True,
+        }
+        agent_server.ACTIVE["chat-claude"] = active
+        request = {"selected": selected, "remaining": 2}
+        manager = types.SimpleNamespace()
+        async def deliver(*args, **kwargs):
+            await kwargs["on_before_send"]("owner")
+            return "native-message-uuid"
+        manager.steer_run = AsyncMock(side_effect=deliver)
+        return handle, queue, request, manager
+
+    async def test_followup_retains_owner_authority_and_emits_one_accepted_user_message(self):
+        handle, queue, request, manager = self.followup_fixture()
+        current = agent_server.CURRENT_TURNS["chat-claude"]
+        current.update({"purpose": "scheduled_job", "chat_references": [{"session_id": "peer"}]})
+        with patch.object(agent_server, "build_user_provider_prompt", return_value="exact input with files"), patch.object(agent_server, "stop_turn", AsyncMock()) as stop:
+            result = await agent_server.send_claude_followup("chat-claude", "run-claude", manager, handle, "owner", "provider", queue, request)
+        self.assertTrue(result["native_followup"])
+        self.assertFalse(result["interrupted"])
+        self.assertEqual(result["run_id"], "run-claude")
+        self.assertEqual(handle.interrupt_calls, 0)
+        stop.assert_not_called()
+        self.assertEqual(current["prompt"], "Prompt")
+        self.assertEqual(current["purpose"], "scheduled_job")
+        self.assertEqual(current["steering_lineage"][-1]["prompt"], "Change course")
+        self.assertTrue(agent_server.ACTIVE["chat-claude"]["claude_permissions_open"])
+        manager.steer_run.assert_awaited_once()
+        self.assertEqual(manager.steer_run.await_args.args[1], "exact input with files")
+        events = self.append_durable_event_batch.await_args.args[1]
+        self.assertEqual([kind for kind, _ in events], ["turn_queue_run_now", "turn_steered"])
+        accepted = {"type": events[1][0], **events[1][1]}
+        self.assertTrue(agent_server.is_native_goal_steer_event(accepted))
+        self.assertNotIn("purpose", accepted)
+        self.assertEqual(accepted["provider_message_id"], "native-message-uuid")
+        for key in ("native_followup", "provider_user_authored", "provider_message_id"):
+            invalid = {**accepted, key: None}
+            self.assertFalse(agent_server.is_native_goal_steer_event(invalid))
+
+    async def test_followup_stop_winner_before_write_restores_queue_without_interrupt(self):
+        handle, queue, request, manager = self.followup_fixture()
+        async def race(*args, **kwargs):
+            agent_server.ACTIVE["chat-claude"]["stop_requested"] = True
+            await kwargs["on_before_send"]("owner")
+            self.fail("must not write after Stop")
+        manager.steer_run.side_effect = race
+        with self.assertRaises(agent_server.NativeSteerHandoffError) as raised:
+            await agent_server.send_claude_followup("chat-claude", "run-claude", manager, handle, "owner", "provider", queue, request)
+        self.assertTrue(raised.exception.safe_to_requeue)
+        self.assertEqual(handle.interrupt_calls, 0)
+        self.assertFalse(any(kind == "turn_steered" for call in self.append_durable_event_batch.await_args_list for kind, _ in call.args[1]))
+
+    async def test_followup_post_ack_persistence_failure_never_replays(self):
+        handle, queue, request, manager = self.followup_fixture()
+        async def persist(_session, events):
+            if any(kind == "turn_steered" for kind, _ in events):
+                raise OSError("disk unavailable")
+            return []
+        self.append_durable_event_batch.side_effect = persist
+        with self.assertRaises(agent_server.NativeSteerHandoffError) as raised:
+            await agent_server.send_claude_followup("chat-claude", "run-claude", manager, handle, "owner", "provider", queue, request)
+        self.assertFalse(raised.exception.safe_to_requeue)
+        self.assertTrue(raised.exception.delivery_uncertain)
+        self.assertEqual(handle.interrupt_calls, 0)
+
+    async def test_followup_sdk_prewrite_cancellation_is_safe_to_requeue(self):
+        handle, queue, request, manager = self.followup_fixture()
+        error = asyncio.CancelledError()
+        error.delivery_uncertain = False
+        manager.steer_run.side_effect = error
+        with self.assertRaises(agent_server.NativeSteerHandoffError) as raised:
+            await agent_server.send_claude_followup("chat-claude", "run-claude", manager, handle, "owner", "provider", queue, request)
+        self.assertTrue(request["_claude_followup_query_started"])
+        self.assertTrue(raised.exception.safe_to_requeue)
+        self.assertFalse(raised.exception.delivery_uncertain)
+        self.assertEqual(handle.interrupt_calls, 0)
+
+    async def test_followup_sdk_uncertain_failure_keeps_replay_fenced(self):
+        handle, queue, request, manager = self.followup_fixture()
+        manager.steer_run.side_effect = ClaudeSDKQueryError("unknown write")
+        with self.assertRaises(agent_server.NativeSteerHandoffError) as raised:
+            await agent_server.send_claude_followup("chat-claude", "run-claude", manager, handle, "owner", "provider", queue, request)
+        self.assertFalse(raised.exception.safe_to_requeue)
+        self.assertTrue(raised.exception.delivery_uncertain)
+        self.assertEqual(handle.interrupt_calls, 0)
+
+    async def test_followup_selection_preserves_referenced_running_owner_and_future_picker(self):
+        handle, queue, request, manager = self.followup_fixture()
+        selected = request["selected"]
+        selected["model"] = "different-next-model"
+        selected["effort"] = "low"
+        agent_server.CURRENT_TURNS["chat-claude"].update({"purpose": "scheduled_job", "chat_references": [{"session_id": "peer"}], "skill_selection": {"name": "original"}})
+        agent_server.QUEUED_TURNS["chat-claude"] = deque([selected])
+        with patch.object(agent_server, "stop_turn", AsyncMock()) as stop:
+            delivery = asyncio.create_task(agent_server._run_queued_turn_now_once("chat-claude", selected["queued_id"]))
+            actual = await asyncio.wait_for(queue.get(), .5)
+            self.assertTrue(actual["preserve_claude_run"])
+            agent_server.mark_native_steer_accepted(actual)
+            actual["future"].set_result({"ok": True, "native_followup": True})
+            result = await asyncio.wait_for(delivery, .5)
+        self.assertTrue(result["ok"])
+        stop.assert_not_called()
+        self.assertEqual(handle.interrupt_calls, 0)
+
+    async def test_followup_new_route_never_falls_back_to_destructive_stop(self):
+        handle, queue, request, manager = self.followup_fixture()
+        request["selected"]["chat_references"] = [{"session_id": "new-peer"}]
+        agent_server.QUEUED_TURNS["chat-claude"] = deque([request["selected"]])
+        with patch.object(agent_server, "stop_turn", AsyncMock()) as stop:
+            with self.assertRaises(HTTPException):
+                await agent_server._run_queued_turn_now_once("chat-claude", "queued-followup")
+        self.assertEqual(len(agent_server.QUEUED_TURNS["chat-claude"]), 1)
+        stop.assert_not_called()
+        self.assertEqual(handle.interrupt_calls, 0)
+
+    async def test_followup_runner_streams_children_during_ack_and_commits_before_terminal(self):
+        await self.followup_runner_scenario(cancel_before_delivery=False)
+
+    async def test_followup_runner_stop_before_delivery_restores_unsent_queue_row(self):
+        await self.followup_runner_scenario(cancel_before_delivery=True)
+
+    async def followup_runner_scenario(self, *, cancel_before_delivery):
+        handle = FakeClaudeRun()
+        manager = FakeClaudeManager(handle)
+        acknowledgement = asyncio.Event()
+        delivered = asyncio.Event()
+        async def steer(*args, **kwargs):
+            await kwargs["on_before_send"](manager.owner_token)
+            delivered.set()
+            await acknowledgement.wait()
+            return "real-ack-id"
+        manager.steer_run = AsyncMock(side_effect=steer)
+        events = []
+        async def record(_session, kind, data):
+            events.append((kind, data))
+            return {}
+        async def project(_session, run, message, **kwargs):
+            events.append((message["type"], {"run_id": run}))
+            return {"result_text": "done", "session_id": "provider"} if message["type"] == "result" else None
+        with ExitStack() as stack:
+            for name, value in {
+                "resolve_claude_resume_provider": Mock(return_value=("provider", None)),
+                "capture_git_baseline": AsyncMock(return_value={}),
+                "build_claude_sdk_options": Mock(return_value=(object(), "config", "/usr/bin/claude")),
+                "claude_sdk_manager": AsyncMock(return_value=manager),
+                "watch_manifest_artifacts": wait_forever,
+                "append_event": record,
+                "append_turn_finished_event": AsyncMock(return_value={}),
+                "project_claude_sdk_message": project,
+                "persist_run_provider_session": AsyncMock(),
+                "refresh_claude_goal": AsyncMock(),
+                "sample_claude_context_usage": AsyncMock(),
+                "cancel_claude_interactions": AsyncMock(),
+                "collect_manifest": AsyncMock(),
+                "collect_recent_leftover_manifests": AsyncMock(),
+                "publish_turn_code_diff": AsyncMock(),
+                "release_turn_slot": AsyncMock(return_value=True),
+                "record_runtime_success": Mock(),
+                "should_schedule_queue_after_finish": Mock(return_value=False),
+            }.items():
+                stack.enter_context(patch.object(agent_server, name, value))
+            if cancel_before_delivery:
+                real_create_task = asyncio.create_task
+                def stop_before_start(coro, *args, **kwargs):
+                    task = real_create_task(coro, *args, **kwargs)
+                    if getattr(getattr(coro, "cr_code", None), "co_name", "") == "send_claude_followup":
+                        # Stop/cancellation wins after queue acceptance but
+                        # before the follow-up coroutine can attempt delivery.
+                        task.cancel()
+                        asyncio.current_task().cancel()
+                    return task
+                stack.enter_context(patch.object(asyncio, "create_task", side_effect=stop_before_start))
+            runner = asyncio.create_task(agent_server.run_claude_sdk("chat-claude", "run-claude", "Prompt", dict(self.session), Path(self.cwd) / ".manifest.json", provider_runtime_env={"test": "authority-present"}))
+            try:
+                for _ in range(100):
+                    if (agent_server.ACTIVE.get("chat-claude") or {}).get("provider_turn_ready"):
+                        break
+                    await asyncio.sleep(0)
+                selected = {"queued_id": "followup", "backend": "claude", "prompt": "Change course", "file_ids": [], "_durable": True}
+                agent_server.QUEUED_TURNS["chat-claude"] = deque([selected])
+                send = asyncio.create_task(agent_server._run_queued_turn_now_once("chat-claude", "followup"))
+                if cancel_before_delivery:
+                    with self.assertRaises(agent_server.NativeSteerHandoffError) as raised:
+                        await asyncio.wait_for(send, .5)
+                    self.assertTrue(raised.exception.safe_to_requeue)
+                    self.assertFalse(raised.exception.delivery_uncertain)
+                    self.assertEqual(agent_server.QUEUED_TURNS["chat-claude"][0]["queued_id"], "followup")
+                    self.assertNotIn("_native_delivery_fenced", selected)
+                    manager.steer_run.assert_not_called()
+                    await asyncio.gather(runner, return_exceptions=True)
+                    return
+                await asyncio.wait_for(delivered.wait(), .5)
+                await handle.messages.put({"type": "child_progress"})
+                for _ in range(100):
+                    if any(kind == "child_progress" for kind, _ in events):
+                        break
+                    await asyncio.sleep(0)
+                self.assertTrue(any(kind == "child_progress" for kind, _ in events))
+                self.assertFalse(send.done())
+                self.assertEqual(handle.interrupt_calls, 0)
+                acknowledgement.set()
+                await handle.messages.put({"type": "result"})
+                result = await asyncio.wait_for(send, .5)
+                await asyncio.wait_for(runner, .5)
+                self.assertTrue(result["native_followup"])
+                self.assertEqual(result["run_id"], "run-claude")
+                self.assertEqual(len(manager.start_calls), 1)
+                self.assertEqual(handle.interrupt_calls, 0)
+                self.assertEqual(manager.evict_calls, [])
+                accepted = [payload for call in self.append_durable_event_batch.await_args_list for kind, payload in call.args[1] if kind == "turn_steered"]
+                self.assertEqual(len(accepted), 1)
+                self.assertEqual(accepted[0]["provider_message_id"], "real-ack-id")
+            finally:
+                acknowledgement.set()
+                if not runner.done():
+                    runner.cancel()
+                await asyncio.gather(runner, return_exceptions=True)
 
 
 if __name__ == "__main__":

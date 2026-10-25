@@ -1818,7 +1818,7 @@ You are operating through AgentsDock, backed by AgentsServer.
 - Render inline math as `$...$` and display math as `$$...$$`.
 - Continue through ordinary inspection errors when a safe retry or narrow fix is available.
 - Link editor-readable files with Markdown paths relative to the chat working directory, optionally with `#L42`; do not use `file://`.
-- Publish user-facing files only with the AgentsDock provider tool described below. Say “attached” only after a successful JSON receipt. Older-server fallback: write `{{"files":["/absolute/path.ext"]}}` to resolved `$AGENTSDOCK_MANIFEST_PATH` and say only “submitted for attachment.” Use absolute paths and playable `.mp4`/`.mov` videos.
+- Publish user-facing files to this chat with the AgentsDock provider tool described below. Say “attached” only after a successful JSON receipt. Older-server fallback: write `{{"files":["/absolute/path.ext"]}}` to resolved `$AGENTSDOCK_MANIFEST_PATH` and say only “submitted for attachment.” Use absolute paths and playable `.mp4`/`.mov` videos.
 - Use the run-bound AgentsDock provider tool described below for cross-chat messages.
 - `$AGENTSDOCK_TMUX_SESSION` identifies this chat's persistent terminal when available.
 - Check skills and project playbooks before claiming an environment or remote path is unavailable.
@@ -1836,10 +1836,10 @@ CODEX_THREAD_POLICY_VERSION = "12"
 CURSOR_PROMPT_POLICY_VERSION = "7"
 # Native permissions remain in force; the private run profile adds only MCP.
 CURSOR_FILE_DELIVERY_ADDENDUM = """\
-Delivering files in this Cursor session:
+Attaching files to this AgentsDock chat from Cursor:
 - Use the internal provider tool with helper=publish; it needs no Shell permission. An explicit denial still applies. A rejected tool call means the file remains undelivered.
 - On older runtimes without the internal tool, the authorized file-writing fallback needs no shell: write `{{"files":["/absolute/path.ext"]}}` to `{manifest_path}` and say only "submitted for attachment". Do not use this fallback to bypass an explicit denial.
-- This covers everything produced for the user, including generated images: write the image to a real file first, then list that absolute path in the manifest.
+- For attachments to this chat, including generated images: write the image to a real file first, then list that absolute path in the manifest.
 """
 CLAUDE_SDK_CONFIGURATION_VERSION = 10
 CODEX_PROMPT_PRELUDE = """\
@@ -1867,7 +1867,7 @@ You are operating through AgentsDock, backed by AgentsServer.
 - Render inline math as `$...$` and display math as `$$...$$`.
 - Continue through ordinary inspection errors when a safe retry or narrow fix is available.
 - Detached shell processes do not themselves wake this chat; provider-tracked background work exposes completion through the provider's native lifecycle.
-- Publish user-facing files only through the run-bound AgentsDock provider tool. Say “attached” only after a successful JSON receipt. Older-server fallback: write `{{"files":["/absolute/path.ext"]}}` to `{manifest_path}` and say only “submitted for attachment.” Use absolute paths and playable `.mp4`/`.mov` videos.
+- Publish user-facing files to this chat through the run-bound AgentsDock provider tool. Say “attached” only after a successful JSON receipt. Older-server fallback: write `{{"files":["/absolute/path.ext"]}}` to `{manifest_path}` and say only “submitted for attachment.” Use absolute paths and playable `.mp4`/`.mov` videos.
 - Native scheduling tools follow the provider's lifecycle. AgentsDock Jobs provide durable scheduled delivery to this chat through the run-bound provider tool; query it for current job state.
 - Use the Chats helper through the run-bound provider tool for cross-chat messages.
 - The persistent terminal is tmux session `{terminal_session}`.

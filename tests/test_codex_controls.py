@@ -1714,6 +1714,18 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
         try:
             with patch.object(
                 agent_server,
+                "prepare_codex_login_turn",
+                AsyncMock(),
+            ), patch.object(
+                agent_server,
+                "codex_app_server_manager",
+                AsyncMock(return_value=manager),
+            ), patch.object(
+                agent_server,
+                "existing_codex_app_server_manager",
+                return_value=manager,
+            ), patch.object(
+                agent_server,
                 "ensure_codex_app_server_thread",
                 ensure_thread,
             ), patch.object(
@@ -2680,6 +2692,20 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     },
                 },
                 {
+                    "method": "item/started",
+                    "params": {"threadId": "thread", "turnId": "turn-shell", "item": {
+                        "id": "shell-item", "type": "commandExecution", "source": "userShell",
+                        "command": "git status --short", "status": "inProgress",
+                    }},
+                },
+                {
+                    "method": "item/completed",
+                    "params": {"threadId": "thread", "turnId": "turn-shell", "item": {
+                        "id": "shell-item", "type": "commandExecution", "source": "userShell",
+                        "command": "git status --short", "status": "completed", "exitCode": 0,
+                    }},
+                },
+                {
                     "method": "turn/completed",
                     "params": {
                         "threadId": "thread",
@@ -2782,11 +2808,19 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
                         "provider_turn_id": None,
                         "provider_turn_ready": False,
                         "codex_native_operation_kind": None,
+                        "codex_shell_handoff_closed": False,
                     }
                 )
                 turn_id = f"turn-{operation}"
                 subscription = GatedNativeSubscription(
                     [
+                        *([{
+                            "method": method,
+                            "params": {"threadId": "thread", "turnId": turn_id, "item": {
+                                "id": "shell-item", "type": "commandExecution", "source": "userShell",
+                                "command": "git status --short", "status": "completed", "exitCode": 0,
+                            }},
+                        } for method in ("item/started", "item/completed")] if operation == "shell" else []),
                         {
                             "method": "turn/completed",
                             "params": {
@@ -3822,6 +3856,57 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 )
         self.assertEqual(raised.exception.status_code, 400)
         acquire.assert_not_awaited()
+
+
+class CodexActiveBackgroundTerminalReadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_lists_during_active_turn_without_replacing_its_owner(self):
+        active = {"backend": agent_server.BACKEND_CODEX, "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
+                  "provider_thread_id": "thread", "provider_turn_id": "turn", "run_id": "run"}
+        manager = AsyncMock()
+        manager.is_thread_loaded = Mock(return_value=True)
+        manager.list_background_terminals.return_value = [{"processId": "process"}]
+        sessions = {"chat": {"id": "chat", "backend": agent_server.BACKEND_CODEX, "codex_thread_id": "thread"}}
+        with (
+            patch.object(agent_server.STORE, "sessions", sessions),
+            patch.object(agent_server, "ACTIVE", {"chat": active}),
+            patch.object(agent_server, "BUSY_SESSIONS", {"chat"}),
+            patch.object(agent_server, "SERVER_MAINTENANCE_SESSIONS", set()),
+            patch.object(agent_server, "CODEX_GOALS_RECONFIGURING", False),
+            patch.object(agent_server, "CODEX_TRANSPORT", agent_server.CODEX_TRANSPORT_APP_SERVER),
+            patch.object(agent_server, "managed_server_update_blocker", return_value=None),
+            patch.object(agent_server, "existing_codex_app_server_manager", return_value=manager),
+            patch.object(agent_server, "pin_codex_app_server_thread", AsyncMock()),
+            patch.object(agent_server, "unpin_codex_app_server_thread", AsyncMock()),
+            patch.object(agent_server, "acquire_codex_interactive_control_lease"),
+            patch.object(agent_server, "release_codex_interactive_control_lease"),
+            patch.object(agent_server, "schedule_next_queued_turn") as schedule,
+        ):
+            result = await agent_server._get_codex_background_terminals_locked("chat")
+            self.assertEqual(result, {"supported": True, "terminals": [{"processId": "process"}]})
+            self.assertIs(agent_server.ACTIVE["chat"], active)
+            self.assertEqual(active["provider_turn_id"], "turn")
+            self.assertEqual(active["run_id"], "run")
+            self.assertIn("chat", agent_server.BUSY_SESSIONS)
+            self.assertNotIn("chat", agent_server.SERVER_MAINTENANCE_SESSIONS)
+            manager.start.assert_not_awaited()
+            manager.list_background_terminals.assert_awaited_once_with("thread")
+            manager.terminate_background_terminal.return_value = True
+            terminated = await agent_server._post_codex_background_terminal_terminate_locked(
+                "chat", agent_server.CodexBackgroundTerminalRequest(process_id="process", confirmed=True))
+            self.assertEqual(terminated, {"terminated": True})
+            cleaned = await agent_server._post_codex_background_terminals_clean_locked(
+                "chat", agent_server.CodexBackgroundTerminalsCleanRequest(confirmed=True))
+            self.assertEqual(cleaned, {"cleaned": True})
+            manager.terminate_background_terminal.assert_awaited_once_with("thread", "process")
+            manager.clean_background_terminals.assert_awaited_once_with("thread")
+            self.assertIs(agent_server.ACTIVE["chat"], active)
+            self.assertEqual(active["run_id"], "run")
+            schedule.assert_not_called()
+            sessions["chat"]["codex_thread_id"] = "replacement"
+            with self.assertRaises(HTTPException) as caught:
+                await agent_server._get_codex_background_terminals_locked("chat")
+            self.assertEqual(caught.exception.status_code, 409)
+            self.assertIs(agent_server.ACTIVE["chat"], active)
 
 
 if __name__ == "__main__":

@@ -97,7 +97,6 @@ from codex_app_server import (
     decline_server_request,
 )
 from claude_sdk_client import (
-    CLAUDE_NON_DURABLE_SCHEDULER_TOOLS,
     CLAUDE_PROVIDER_MCP_SERVER_NAME,
     CLAUDE_PROVIDER_MCP_TOOL_NAME,
     CLAUDE_SDK_MCP_STATUS_TRUNCATED_KEY,
@@ -114,7 +113,6 @@ from claude_sdk_client import (
     ClaudeSDKUnavailable,
     canonical_claude_mcp_identifier,
     claude_background_tracking_hooks,
-    claude_nondurable_scheduler_reason,
     create_claude_agent_options,
     create_claude_sdk_mcp_server,
 )
@@ -884,23 +882,23 @@ if CLAUDE_TRANSPORT not in {
 }:
     CLAUDE_TRANSPORT = CLAUDE_TRANSPORT_AUTO
 CLAUDE_SDK_MAX_LOADED_CHATS = max(
-    1,
-    int(agentsdock_setting("CLAUDE_SDK_MAX_LOADED_CHATS", "4")),
+    0,
+    int(agentsdock_setting("CLAUDE_SDK_MAX_LOADED_CHATS", "0")),
 )
 CLAUDE_SDK_CONNECT_TIMEOUT_SECONDS = max(
     5.0,
     float(agentsdock_setting("CLAUDE_SDK_CONNECT_TIMEOUT_SECONDS", "30")),
 )
 CLAUDE_SDK_IDLE_TTL_SECONDS = max(
-    30,
-    int(agentsdock_setting("CLAUDE_SDK_IDLE_TTL_SECONDS", "300")),
+    0,
+    int(agentsdock_setting("CLAUDE_SDK_IDLE_TTL_SECONDS", "0")),
 )
 CLAUDE_SDK_POST_ACK_FIRST_ACTIVITY_TIMEOUT_SECONDS = max(
-    1.0,
+    0.0,
     float(
         agentsdock_setting(
             "CLAUDE_SDK_POST_ACK_FIRST_ACTIVITY_TIMEOUT_SECONDS",
-            "180",
+            "0",
         )
     ),
 )
@@ -913,10 +911,10 @@ CLAUDE_MCP_MAX_SERVERS = 100
 CLAUDE_MCP_STATUS_SCAN_LIMIT = 500
 CLAUDE_MCP_MAX_TOOL_COUNT = 100_000
 CODEX_APP_SERVER_MAX_LOADED_THREADS = max(
-    1,
-    int(agentsdock_setting("CODEX_APP_SERVER_MAX_LOADED_THREADS", "12")),
+    0,
+    int(agentsdock_setting("CODEX_APP_SERVER_MAX_LOADED_THREADS", "0")),
 )
-CODEX_RESUME_ACTIVITY_TIMEOUT_SECONDS = int(agentsdock_setting("CODEX_RESUME_ACTIVITY_TIMEOUT_SECONDS", "120"))
+CODEX_RESUME_ACTIVITY_TIMEOUT_SECONDS = int(agentsdock_setting("CODEX_RESUME_ACTIVITY_TIMEOUT_SECONDS", "0"))
 RUNTIME_CATALOG_TIMEOUT_SECONDS = float(agentsdock_setting("RUNTIME_CATALOG_TIMEOUT_SECONDS", "6"))
 # Leave room for HTTP/JSON overhead before desktop and mobile's 30s deadline.
 RUNTIME_CATALOG_BUDGET_SECONDS = 25.0
@@ -961,7 +959,7 @@ JOB_BUSY_RETRY_SECONDS = int(agentsdock_setting("JOB_BUSY_RETRY_SECONDS", "60"))
 # Zero means scheduled jobs have no scheduler-specific concurrency ceiling.
 # The optional global cap and low-memory check still apply.
 JOB_MAX_ACTIVE_RUNS = int(agentsdock_setting("JOB_MAX_ACTIVE_RUNS", "0"))
-JOB_MIN_AVAILABLE_MEM_MB = int(agentsdock_setting("JOB_MIN_AVAILABLE_MEM_MB", "4096"))
+JOB_MIN_AVAILABLE_MEM_MB = int(agentsdock_setting("JOB_MIN_AVAILABLE_MEM_MB", "0"))
 JOB_DEFER_EVENT_MIN_SECONDS = int(agentsdock_setting("JOB_DEFER_EVENT_MIN_SECONDS", "300"))
 # A missing or logged-out provider runtime may recover without operator action,
 # but an occurrence must not be parked forever.  Keep the small retry budget on
@@ -970,14 +968,14 @@ JOB_RUNTIME_UNAVAILABLE_MAX_DEFERS = 3
 # No server-wide chat-run ceiling by default. Operators can explicitly set a
 # positive cap; launch memory and managed-update guards remain independent.
 MAX_ACTIVE_AGENT_RUNS = int(agentsdock_setting("MAX_ACTIVE_AGENT_RUNS", "0"))
-MIN_START_AVAILABLE_MEM_MB = int(agentsdock_setting("MIN_START_AVAILABLE_MEM_MB", "2048"))
+MIN_START_AVAILABLE_MEM_MB = int(agentsdock_setting("MIN_START_AVAILABLE_MEM_MB", "0"))
 HOST_MONITOR_INTERVAL_SECONDS = float(agentsdock_setting("HOST_MONITOR_INTERVAL_SECONDS", "15"))
 HOST_HEALTH_MAX_BYTES = int(agentsdock_setting("HOST_HEALTH_MAX_BYTES", str(20 * 1024 * 1024)))
 IDLE_WARN_SECONDS = int(agentsdock_setting("IDLE_WARN_SECONDS", "1800"))
-IDLE_KILL_SECONDS = int(agentsdock_setting("IDLE_KILL_SECONDS", "21600"))
+IDLE_KILL_SECONDS = int(agentsdock_setting("IDLE_KILL_SECONDS", "0"))
 CLAUDE_SDK_PRE_ACK_TIMEOUT_SECONDS = max(
-    30.0,
-    float(agentsdock_setting("CLAUDE_SDK_PRE_ACK_TIMEOUT_SECONDS", "600")),
+    0.0,
+    float(agentsdock_setting("CLAUDE_SDK_PRE_ACK_TIMEOUT_SECONDS", "0")),
 )
 # An active Claude turn has no useful wall-clock lifetime limit. Long-running
 # tool work and user approvals can legitimately span hours; cancel remains the
@@ -988,7 +986,7 @@ CLAUDE_SDK_TURN_TIMEOUT_SECONDS = max(
     float(agentsdock_setting("CLAUDE_SDK_TURN_TIMEOUT_SECONDS", "0")),
 )
 CLAUDE_SDK_IDLE_TIMEOUT_SECONDS = max(
-    30.0,
+    0.0,
     float(
         agentsdock_setting(
             "CLAUDE_SDK_IDLE_TIMEOUT_SECONDS",
@@ -998,26 +996,20 @@ CLAUDE_SDK_IDLE_TIMEOUT_SECONDS = max(
 )
 CLAUDE_SDK_IDLE_WARN_SECONDS = max(
     1.0,
-    min(float(IDLE_WARN_SECONDS), CLAUDE_SDK_IDLE_TIMEOUT_SECONDS / 2),
+    min(float(IDLE_WARN_SECONDS), CLAUDE_SDK_IDLE_TIMEOUT_SECONDS / 2)
+    if CLAUDE_SDK_IDLE_TIMEOUT_SECONDS > 0 else float(IDLE_WARN_SECONDS),
 )
-# A Codex app-server notification can be silently dropped if it arrives for a
-# subscription that already closed (see _route_notification in
-# codex_app_server.py) - the turn then waits forever with zero visible
-# activity, but IDLE_WARN/IDLE_KILL_SECONDS above are sized for legitimate
-# gaps *between* activity on an already-productive turn, not "nothing has
-# happened since the turn started." This bounds only that first-activity
-# wait, far tighter, so a stalled turn fails fast and (if resuming an
-# existing thread) is picked up by the existing rollover-retry path instead
-# of hanging with no error for up to IDLE_KILL_SECONDS.
+# Accepted native work can legitimately be silent. Operators may opt into an
+# inactivity cutoff, but absence of output alone does not fail a turn by default.
 CODEX_APP_SERVER_FIRST_ACTIVITY_TIMEOUT_SECONDS = int(
-    agentsdock_setting("CODEX_APP_SERVER_FIRST_ACTIVITY_TIMEOUT_SECONDS", "180")
+    agentsdock_setting("CODEX_APP_SERVER_FIRST_ACTIVITY_TIMEOUT_SECONDS", "0")
 )
 CURSOR_STARTUP_TIMEOUT_SECONDS = max(
-    5.0,
-    float(agentsdock_setting("CURSOR_STARTUP_TIMEOUT_SECONDS", "120")),
+    0.0,
+    float(agentsdock_setting("CURSOR_STARTUP_TIMEOUT_SECONDS", "0")),
 )
 CURSOR_TURN_TIMEOUT_SECONDS = max(
-    CURSOR_STARTUP_TIMEOUT_SECONDS,
+    0.0,
     float(
         agentsdock_setting(
             "CURSOR_TURN_TIMEOUT_SECONDS",
@@ -1026,10 +1018,13 @@ CURSOR_TURN_TIMEOUT_SECONDS = max(
     ),
 )
 CURSOR_IDLE_TIMEOUT_SECONDS = max(
-    30.0,
-    float(agentsdock_setting("CURSOR_IDLE_TIMEOUT_SECONDS", "900")),
+    0.0,
+    float(agentsdock_setting("CURSOR_IDLE_TIMEOUT_SECONDS", "0")),
 )
-CURSOR_IDLE_WARN_SECONDS = min(300.0, CURSOR_IDLE_TIMEOUT_SECONDS / 2)
+CURSOR_IDLE_WARN_SECONDS = (
+    min(300.0, CURSOR_IDLE_TIMEOUT_SECONDS / 2)
+    if CURSOR_IDLE_TIMEOUT_SECONDS > 0 else 300.0
+)
 CURSOR_POST_TERMINAL_EXIT_SECONDS = max(
     0.1,
     float(agentsdock_setting("CURSOR_POST_TERMINAL_EXIT_SECONDS", "30")),
@@ -1069,11 +1064,11 @@ CURSOR_MAX_TOOL_CALLS = max(
     int(agentsdock_setting("CURSOR_MAX_TOOL_CALLS", "4096")),
 )
 OPENCODE_STARTUP_TIMEOUT_SECONDS = max(
-    5.0,
-    float(agentsdock_setting("OPENCODE_STARTUP_TIMEOUT_SECONDS", "120")),
+    0.0,
+    float(agentsdock_setting("OPENCODE_STARTUP_TIMEOUT_SECONDS", "0")),
 )
 OPENCODE_TURN_TIMEOUT_SECONDS = max(
-    OPENCODE_STARTUP_TIMEOUT_SECONDS,
+    0.0,
     float(
         agentsdock_setting(
             "OPENCODE_TURN_TIMEOUT_SECONDS",
@@ -1081,15 +1076,17 @@ OPENCODE_TURN_TIMEOUT_SECONDS = max(
         )
     ),
 )
-# Sized deliberately, not copied: a turn whose tools are all denied was
-# measured retrying for more than ten minutes without finishing or failing.
-# Nothing inside OpenCode bounds that, so this ceiling is the only thing that
-# ends such a turn.
+# Execution deadlines are opt-in; native retries and silent tools may remain
+# active without producing stream events. Stop and transport failure still end
+# the owned process normally.
 OPENCODE_IDLE_TIMEOUT_SECONDS = max(
-    30.0,
-    float(agentsdock_setting("OPENCODE_IDLE_TIMEOUT_SECONDS", "900")),
+    0.0,
+    float(agentsdock_setting("OPENCODE_IDLE_TIMEOUT_SECONDS", "0")),
 )
-OPENCODE_IDLE_WARN_SECONDS = min(300.0, OPENCODE_IDLE_TIMEOUT_SECONDS / 2)
+OPENCODE_IDLE_WARN_SECONDS = (
+    min(300.0, OPENCODE_IDLE_TIMEOUT_SECONDS / 2)
+    if OPENCODE_IDLE_TIMEOUT_SECONDS > 0 else 300.0
+)
 OPENCODE_POST_TERMINAL_EXIT_SECONDS = max(
     0.1,
     float(agentsdock_setting("OPENCODE_POST_TERMINAL_EXIT_SECONDS", "30")),
@@ -1583,7 +1580,6 @@ PROVIDER_TOOL_MAX_STDIN_CHARS = CROSS_CHAT_HANDOFF_BODY_MAX_CHARS
 PROVIDER_TOOL_MAX_STDIN_BYTES = 400 * 1024
 PROVIDER_TOOL_MAX_OUTPUT_BYTES = 128 * 1024
 PROVIDER_TOOL_TIMEOUT_SECONDS = 90.0
-PROVIDER_TOOL_MAX_CONCURRENT_PER_CLAUDE_CHAT = 2
 PROVIDER_TOOL_INPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -1821,14 +1817,10 @@ You are operating through AgentsDock, backed by AgentsServer.
 - Keep final answers concise; the UI separates tools, output, reasoning, and artifacts.
 - Render inline math as `$...$` and display math as `$$...$$`.
 - Continue through ordinary inspection errors when a safe retry or narrow fix is available.
-- Treat milestone completion as progress, not completion of the user's whole request. Before finishing, join child tasks you started and wait for every requested milestone and acceptance check; automate only when explicitly asked.
-- Never detach required work with `nohup`, `disown`, `setsid`, shell `&`, or Bash `run_in_background`. Keep work needed for the current reply in foreground. Async completion that must wake chat requires a tracked Agent/workflow; background Bash does not guarantee a completion wake-up.
-- This is AgentsDock, not Slack; never use Slack file helpers.
 - Link editor-readable files with Markdown paths relative to the chat working directory, optionally with `#L42`; do not use `file://`.
 - Publish user-facing files only with the AgentsDock provider tool described below. Say “attached” only after a successful JSON receipt. Older-server fallback: write `{{"files":["/absolute/path.ext"]}}` to resolved `$AGENTSDOCK_MANIFEST_PATH` and say only “submitted for attachment.” Use absolute paths and playable `.mp4`/`.mov` videos.
-- Never use Claude's `Monitor`, `ScheduleWakeup`, `/loop`, or `CronCreate`; under AgentsDock they cannot durably deliver a later chat update. Only when explicitly asked, use the Jobs helper through the provider tool.
 - Use the run-bound AgentsDock provider tool described below for cross-chat messages.
-- Inspect `$AGENTSDOCK_TMUX_SESSION` read-only unless explicitly asked to operate it.
+- `$AGENTSDOCK_TMUX_SESSION` identifies this chat's persistent terminal when available.
 - Check skills and project playbooks before claiming an environment or remote path is unavailable.
 - If optional cleanup makes a compound command fail, immediately retry the still-safe requested operation without it.
 - Keep chat focused; delegate bounded noisy exploration and return summaries.
@@ -1840,8 +1832,8 @@ SYSTEM_PROMPT = CLAUDE_PROMPT_PRELUDE
 
 # v8: static provider-authority usage and cross-chat delivery provenance moved
 # from every per-turn prompt into these thread instructions (context diet).
-CODEX_THREAD_POLICY_VERSION = "11"
-CURSOR_PROMPT_POLICY_VERSION = "6"
+CODEX_THREAD_POLICY_VERSION = "12"
+CURSOR_PROMPT_POLICY_VERSION = "7"
 # Native permissions remain in force; the private run profile adds only MCP.
 CURSOR_FILE_DELIVERY_ADDENDUM = """\
 Delivering files in this Cursor session:
@@ -1855,17 +1847,15 @@ You are operating through AgentsDock, backed by AgentsServer.
 - Keep the final answer concise; the UI renders tool calls, command output, reasoning, and artifacts separately.
 - Render inline math as `$...$` and display math as `$$...$$`.
 - Continue through ordinary inspection errors when a safe retry or narrow fix is available.
-- Never detach required work with `nohup`, `disown`, `setsid`, or shell `&`. Keep work needed for the current reply in foreground. Async completion that must wake chat requires a provider-tracked exec, Agent, or workflow; an explicitly requested durable service must use an observable service manager.
-- This is AgentsDock, not Slack; create files locally and never call Slack file helpers.
+- Detached shell processes do not themselves wake this chat; provider-tracked background work exposes completion through the provider's native lifecycle.
 - Link editor-readable files with Markdown paths relative to the chat working directory, optionally with `#L42`; do not use `file://`.
-- Publish user-facing files only with the AgentsDock provider tool described below. Say “attached” only after a successful JSON receipt. Older-server fallback: write `{{"files":["/absolute/path.ext"]}}` to `{manifest_path}` and say only “submitted for attachment.” Use absolute paths and playable `.mp4`/`.mov` videos.
-- Never rely on provider-local timers, loops, or detached processes to wake this AgentsDock chat or deliver a later reply. Manage durable scheduled jobs only when explicitly asked through the run-bound provider tool; query it instead of relying on a prompt snapshot.
+- Publish user-facing files to this chat with the AgentsDock provider tool described below. Say “attached” only after a successful JSON receipt. Older-server fallback: write `{{"files":["/absolute/path.ext"]}}` to `{manifest_path}` and say only “submitted for attachment.” Use absolute paths and playable `.mp4`/`.mov` videos.
+- Native scheduling tools follow the provider's lifecycle. AgentsDock Jobs provide durable scheduled delivery to this chat through the run-bound provider tool; query it for current job state.
 - Use the run-bound AgentsDock provider tool described below for cross-chat messages.
-- The persistent terminal is tmux session `{terminal_session}`; inspect it read-only unless the user explicitly asks you to operate it.
+- The persistent terminal is tmux session `{terminal_session}`.
 - Check installed skills and project playbooks before claiming a specialized environment or remote path is unavailable.
 - If an incidental cleanup or optional clause makes a compound command fail, immediately retry the still-safe requested operation without that clause.
 - Keep the main chat focused; delegate bounded noisy exploration and return summaries instead of dumping large logs or tool output into the thread.
-- When you call `spawn_agent`, pass `fork_turns` as a small number written as a string (for example `"3"`) or `"none"`, never `"all"`: a full-history fork copies the entire compacted parent transcript (hundreds of MB per child) and exhausts the server.
 - Preserve user work; avoid destructive actions without authorization; continue until complete or blocked.
 """ + PROVIDER_THREAD_INSTRUCTION_ADDENDUM
 
@@ -1876,12 +1866,11 @@ You are operating through AgentsDock, backed by AgentsServer.
 - Keep the final answer concise; the UI renders tool calls, command output, reasoning, and artifacts separately.
 - Render inline math as `$...$` and display math as `$$...$$`.
 - Continue through ordinary inspection errors when a safe retry or narrow fix is available.
-- Never detach required work with `nohup`, `disown`, `setsid`, or shell `&`. Keep work needed for the current reply in foreground. Async completion that must wake chat requires a provider-tracked Agent/workflow; an explicitly requested durable service must use an observable service manager.
-- This is AgentsDock, not Slack; create files locally and never call Slack file helpers.
+- Detached shell processes do not themselves wake this chat; provider-tracked background work exposes completion through the provider's native lifecycle.
 - Publish user-facing files only through the run-bound AgentsDock provider tool. Say “attached” only after a successful JSON receipt. Older-server fallback: write `{{"files":["/absolute/path.ext"]}}` to `{manifest_path}` and say only “submitted for attachment.” Use absolute paths and playable `.mp4`/`.mov` videos.
-- Never rely on provider-local timers, loops, or detached processes to wake this AgentsDock chat or deliver a later reply. Manage durable scheduled jobs only when explicitly asked and only through the Jobs helper in the run-bound provider tool.
+- Native scheduling tools follow the provider's lifecycle. AgentsDock Jobs provide durable scheduled delivery to this chat through the run-bound provider tool; query it for current job state.
 - Use the Chats helper through the run-bound provider tool for cross-chat messages.
-- The persistent terminal is tmux session `{terminal_session}`; inspect it read-only unless the user explicitly asks you to operate it.
+- The persistent terminal is tmux session `{terminal_session}`.
 - Check installed skills and project playbooks before claiming a specialized environment or remote path is unavailable.
 - If an incidental cleanup or optional clause makes a compound command fail, immediately retry the still-safe requested operation without that clause.
 - Keep the main chat focused; delegate bounded noisy exploration and return summaries instead of dumping large logs or tool output into the thread.
@@ -53563,41 +53552,6 @@ def claude_context_usage_snapshot(
     return {key: value for key, value in snapshot.items() if value is not None}
 
 
-async def evict_failed_idle_claude_context_sample(
-    session_id: str,
-    manager: Any,
-) -> None:
-    """Retire the sampled idle actor before releasing its lifecycle lock.
-
-    A canceled context-usage request can leave the SDK actor waiting on a
-    provider response. Remove only the manager instance that issued this
-    sample. The caller owns the session lifecycle lock, so this helper must
-    never leave a late eviction task that could race a replacement turn.
-    """
-
-    if globals().get("CLAUDE_SDK_MANAGER") is not manager:
-        return
-    evict = getattr(manager, "evict", None)
-    if not callable(evict):
-        return
-    try:
-        task = asyncio.create_task(evict(session_id, force=True))
-    except Exception:
-        return
-    try:
-        await asyncio.shield(task)
-    except asyncio.CancelledError:
-        # The caller still owns session_lifecycle_lock. Finish retirement
-        # before propagating cancellation so a queued start cannot bind a new
-        # actor and then be killed by this stale cleanup.
-        with suppress(BaseException):
-            await join_task_despite_caller_cancellation(task)
-        raise
-    except Exception:
-        # Cleanup is best-effort, but it is never detached.
-        return
-
-
 async def refresh_idle_claude_context_usage(session_id: str) -> bool:
     """Ask an already-loaded, idle Claude SDK client for fresh usage.
 
@@ -53717,11 +53671,6 @@ async def refresh_idle_claude_context_usage(session_id: str) -> bool:
                     None if completed.cancelled() else completed.exception()
                 )
             )
-            cleanup_task = asyncio.create_task(
-                evict_failed_idle_claude_context_sample(session_id, manager)
-            )
-            with suppress(BaseException):
-                await join_task_despite_caller_cancellation(cleanup_task)
             raise
         if sample_task not in done:
             sample_task.cancel()
@@ -53730,13 +53679,11 @@ async def refresh_idle_claude_context_usage(session_id: str) -> bool:
                     None if completed.cancelled() else completed.exception()
                 )
             )
-            await evict_failed_idle_claude_context_sample(session_id, manager)
             raise HTTPException(
                 status_code=504,
-                detail="Claude context sampling timed out; the idle SDK client was reset",
+                detail="Claude context sampling timed out; the provider remains connected",
             )
         if sample_task.cancelled():
-            await evict_failed_idle_claude_context_sample(session_id, manager)
             raise HTTPException(
                 status_code=502,
                 detail="Claude context sampling was canceled",
@@ -53744,7 +53691,6 @@ async def refresh_idle_claude_context_usage(session_id: str) -> bool:
         try:
             sampled = sample_task.result()
         except Exception as exc:
-            await evict_failed_idle_claude_context_sample(session_id, manager)
             raise HTTPException(
                 status_code=502,
                 detail=f"Claude context sampling failed: {concise_error_message(exc)}",
@@ -53755,7 +53701,6 @@ async def refresh_idle_claude_context_usage(session_id: str) -> bool:
             # Compatibility for early manager adapters.
             usage, provider_generation = sampled, 0
         else:
-            await evict_failed_idle_claude_context_sample(session_id, manager)
             raise HTTPException(
                 status_code=502,
                 detail="Claude did not return context usage",
@@ -53770,7 +53715,6 @@ async def refresh_idle_claude_context_usage(session_id: str) -> bool:
         except (TypeError, ValueError, OverflowError):
             snapshot = None
         if snapshot is None:
-            await evict_failed_idle_claude_context_sample(session_id, manager)
             raise HTTPException(
                 status_code=502,
                 detail="Claude returned invalid context usage",
@@ -54986,13 +54930,6 @@ async def handle_claude_tool_permission(
 ) -> Any:
     """Bridge one Agent SDK permission callback to its opted-in desktop chat."""
     from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
-
-    scheduler_reason = claude_nondurable_scheduler_reason(tool_name)
-    if scheduler_reason is not None:
-        return PermissionResultDeny(
-            message=scheduler_reason,
-            interrupt=False,
-        )
 
     completion_event: asyncio.Event | None = None
     completion_task: asyncio.Task[Any] | None = None
@@ -56629,7 +56566,7 @@ async def codex_app_server_manager(sess: dict[str, Any] | None = None, *, allow_
 
 
 async def claude_sdk_manager() -> ClaudeSDKSupervisorManager:
-    """Return the bounded registry of independent per-chat Claude clients."""
+    """Return independent per-chat clients with optional operator retention limits."""
 
     global CLAUDE_SDK_MANAGER
     ensure_provider_manager_factory_admission()
@@ -56642,7 +56579,7 @@ async def claude_sdk_manager() -> ClaudeSDKSupervisorManager:
         if manager is None:
             manager = ClaudeSDKSupervisorManager(
                 max_clients=CLAUDE_SDK_MAX_LOADED_CHATS,
-                idle_ttl_seconds=CLAUDE_SDK_IDLE_TTL_SECONDS,
+                idle_ttl_seconds=CLAUDE_SDK_IDLE_TTL_SECONDS or None,
                 connect_timeout_seconds=CLAUDE_SDK_CONNECT_TIMEOUT_SECONDS,
                 control_timeout_seconds=CLAUDE_MCP_CONTROL_TIMEOUT_SECONDS,
                 usage_observer=observe_claude_provider_usage,
@@ -57193,6 +57130,7 @@ async def acquire_codex_control_thread(
     *,
     reserve_session: bool = False,
     allow_active_goal_mutation: bool = False,
+    allow_active_control: bool = False,
 ) -> tuple[CodexAppServerManager, str, dict[str, Any]]:
     """Load and pin a Codex thread for an explicit desktop control."""
     reservation_task = asyncio.current_task() if reserve_session else None
@@ -57230,7 +57168,7 @@ async def acquire_codex_control_thread(
             managed_server_update_blocker()
             if (
                 session_id in BUSY_SESSIONS
-                and allow_active_goal_mutation
+                and (allow_active_goal_mutation or allow_active_control)
                 and not reserve_session
             )
             else managed_server_update_admission_blocker()
@@ -57253,7 +57191,7 @@ async def acquire_codex_control_thread(
             # to render approvals, not whether this loaded thread can accept a
             # goal mutation from another compatible client.
             if (
-                not allow_active_goal_mutation
+                not (allow_active_goal_mutation or (allow_active_control and not reserve_session))
                 or not active
                 or active.get("backend") != BACKEND_CODEX
                 or active.get("transport") != CODEX_TRANSPORT_APP_SERVER
@@ -57871,6 +57809,89 @@ async def commit_codex_goal_steer(
     }
 
 
+def codex_shell_intents_pending(active: dict[str, Any] | None) -> bool:
+    return bool(active and active.get("codex_shell_intents"))
+
+
+async def observe_codex_shell_notification(
+    session_id: str,
+    active: dict[str, Any] | None,
+    notification: dict[str, Any],
+    sequence: int,
+) -> None:
+    """Correlate admitted user shells without projecting their tools twice.
+
+    shellCommand acknowledges with {}, rather than an item/turn id. Its native
+    userShell items arrive on the already-owned, ordered thread subscription.
+    Only notifications after admission can bind an intent; model tools and old
+    shell items cannot extend this run. Keep it through both item and turn
+    completion, including a new shell turn after the parent completed.
+    """
+    if not active or ACTIVE.get(session_id) is not active:
+        return
+    intents = active.get("codex_shell_intents") or []
+    if not intents:
+        return
+    params = notification.get("params") or {}
+    if params.get("threadId") != active.get("provider_thread_id"):
+        return
+    method = notification.get("method")
+    native_turn = params.get("turn") or {}
+    turn_id = str(params.get("turnId") or native_turn.get("id") or "")
+    item = params.get("item") or {}
+    item_id = str(item.get("id") or "")
+    if method in {"item/started", "item/completed"} and (
+        item.get("type") == "commandExecution" and item.get("source") == "userShell"
+        and item_id and turn_id
+    ):
+        intent = next((entry for entry in intents if entry.get("item_id") == item_id), None)
+        if intent is None and method == "item/started":
+            intent = next((entry for entry in intents if (
+                not entry.get("item_id") and sequence > entry["after_sequence"]
+            )), None)
+            if intent is not None:
+                intent["item_id"] = item_id
+                intent["turn_id"] = turn_id
+                try:
+                    await append_event(session_id, "codex_shell_started", {
+                        "run_id": active.get("run_id"), "operation_id": intent["operation_id"],
+                        "provider_turn_id": turn_id, "item_id": item_id,
+                        "command": intent["command"], "unsandboxed": True,
+                        "message": "Codex started the confirmed unsandboxed shell command.",
+                    })
+                except Exception as exc:
+                    logger.warning("failed to persist Codex shell start session=%s: %s",
+                                   session_id, concise_error_message(exc))
+        if intent is not None and intent.get("turn_id") == turn_id and method == "item/completed":
+            intent["item_completed"] = True
+            intent["exit_code"] = item.get("exitCode")
+    elif method == "turn/completed" and turn_id:
+        for intent in intents:
+            if intent.get("turn_id") == turn_id:
+                intent["turn_completed"] = True
+                intent["status"] = native_turn.get("status") or "failed"
+    await publish_codex_shell_completions(session_id, active)
+
+
+async def publish_codex_shell_completions(session_id: str, active: dict[str, Any]) -> None:
+    if ACTIVE.get(session_id) is not active:
+        return
+    intents = active.get("codex_shell_intents") or []
+    finished = [entry for entry in intents if (
+        entry.get("item_completed") and entry.get("turn_completed")
+    )]
+    for intent in finished:
+        intents.remove(intent)
+        if intent.get("owner_operation"):
+            # The idle shell consumer publishes this operation's terminal.
+            continue
+        await append_event(session_id, "codex_shell_finished", {
+            "run_id": active.get("run_id"), "operation_id": intent["operation_id"],
+            "provider_turn_id": intent["turn_id"], "item_id": intent["item_id"],
+            "status": intent["status"], "exit_code": intent.get("exit_code"),
+        })
+
+
 async def consume_codex_native_turn(
     session_id: str,
     operation_id: str,
@@ -57895,6 +57916,13 @@ async def consume_codex_native_turn(
     terminal_error: str | None = None
     schedule_queue = True
     goal_resume = operation == "goal_resume"
+    shell_resume = operation == "shell_resume"
+    waiting_for_shell = False
+    shell_owner = ACTIVE.get(session_id)
+    if shell_owner is not None and shell_owner.get("run_id") == operation_id:
+        shell_owner["codex_shell_subscription"] = subscription
+    else:
+        shell_owner = None
     last_turn_id = turn_id
     result_text = ""
     goal_turn_running = bool(turn_id)
@@ -57904,7 +57932,7 @@ async def consume_codex_native_turn(
     seen_goal_turn_ids: set[str] = set()
     goal_activity_deadline = time.monotonic() + max(
         CODEX_APP_SERVER_LIFECYCLE_TIMEOUT_SECONDS, IDLE_KILL_SECONDS,
-    )
+    ) if IDLE_KILL_SECONDS > 0 else None
     goal_steer_queue = (ACTIVE.get(session_id) or {}).get("native_steer_queue") if goal_resume else None
     steer_task: asyncio.Task[Any] | None = None
     notification_task: asyncio.Task[Any] | None = None
@@ -57915,12 +57943,37 @@ async def consume_codex_native_turn(
     handled_sequence = initial_sequence
     synthetic_sequence = initial_sequence
 
-    async def next_goal_notification() -> tuple[int, dict[str, Any]]:
+    def adopt_shell_goal_locked() -> bool:
+        nonlocal goal_resume, goal_steer_queue
+        if not shell_resume or goal_resume or not CODEX_GOALS_ENABLED:
+            return False
+        active = ACTIVE.get(session_id)
+        goal = (STORE.sessions.get(session_id) or {}).get("codex_goal")
+        if not (
+            active is shell_owner and active is not None
+            and active.get("run_id") == operation_id
+            and active.get("provider_thread_id") == thread_id
+            and (not reservation_id or active.get("codex_control_reservation_id") == reservation_id)
+            and not active.get("stop_requested") and operation_id not in STOPPED_RUNS
+            and isinstance(goal, dict) and goal.get("status") == "active"
+        ):
+            return False
+        # A goal can be set while a manual shell retains the ordinary owner.
+        # Adopt its native continuation on this same subscription and queue;
+        # do not restart the goal or create another local/model turn.
+        goal_resume = True
+        active["codex_native_operation_kind"] = "goal_resume"
+        goal_steer_queue = active.get("native_steer_queue")
+        if goal_steer_queue is None:
+            goal_steer_queue = active["native_steer_queue"] = asyncio.Queue(maxsize=1)
+        return True
+
+    async def next_goal_notification(timeout: float | None = 0.5) -> tuple[int, dict[str, Any]]:
         nonlocal synthetic_sequence
         reader = getattr(subscription, "next_notification_with_sequence", None)
         if callable(reader):
-            return await reader(timeout=0.5)
-        notification = await subscription.next_notification(timeout=0.5)
+            return await reader(timeout=timeout)
+        notification = await subscription.next_notification(timeout=timeout)
         synthetic_sequence += 1
         return synthetic_sequence, notification
 
@@ -57938,7 +57991,11 @@ async def consume_codex_native_turn(
         if interrupted_before_start:
             raise asyncio.CancelledError
         while True:
-            if goal_resume:
+            if shell_resume and not goal_resume:
+                async with session_lifecycle_lock(session_id):
+                    async with ACTIVE_LOCK:
+                        adopt_shell_goal_locked()
+            if goal_resume or shell_resume or waiting_for_shell:
                 if pending_steer is None and steer_request is not None:
                     if not steer_request.get("expected_provider_turn_id"):
                         # Send now may arrive in the gap between native goal
@@ -57984,12 +58041,12 @@ async def consume_codex_native_turn(
                         pending_steer = None
                         steer_request = None
                 latest = STORE.sessions.get(session_id) or {}
-                goal = latest.get("codex_goal")
+                goal = latest.get("codex_goal") if goal_resume else None
                 goal_status = str(goal.get("status") or "") if isinstance(goal, dict) else ""
                 async with ACTIVE_LOCK:
                     active = ACTIVE.get(session_id)
                     stopped = bool(active and active.get("stop_requested"))
-                remaining = codex_goal_time_budget_remaining(latest)
+                remaining = codex_goal_time_budget_remaining(latest) if goal_resume else None
                 used = goal.get("timeUsedSeconds") if isinstance(goal, dict) else 0
                 used = float(used) if isinstance(used, (int, float)) and not isinstance(used, bool) else 0.0
                 identity = str(goal.get("id") or goal.get("objective") or "") if isinstance(goal, dict) else ""
@@ -58057,6 +58114,7 @@ async def consume_codex_native_turn(
                         # after this stream's consumer has exited.
                         async with session_lifecycle_lock(session_id):
                             async with ACTIVE_LOCK:
+                                adopt_shell_goal_locked()
                                 active = ACTIVE.get(session_id)
                                 latest_goal = (STORE.sessions.get(session_id) or {}).get("codex_goal")
                                 stopped = bool(
@@ -58065,27 +58123,36 @@ async def consume_codex_native_turn(
                                 )
                                 enqueued = getattr(subscription, "_last_enqueued_sequence", 0)
                                 pending_output = isinstance(enqueued, int) and enqueued > handled_sequence
+                                if (active is shell_owner
+                                        and codex_shell_intents_pending(active)):
+                                    continue
                                 if not stopped and (
                                     pending_output
-                                    or (isinstance(latest_goal, dict) and latest_goal.get("status") == "active")
+                                    or (goal_resume and isinstance(latest_goal, dict) and latest_goal.get("status") == "active")
                                 ):
                                     continue
                                 if active and active.get("run_id") == operation_id:
-                                    active["codex_goal_handoff_closed"] = True
+                                    active["codex_shell_handoff_closed"] = True
+                                    if goal_resume:
+                                        active["codex_goal_handoff_closed"] = True
                         terminal_status = "interrupted" if stopped else "completed"
                         break
-                    if time.monotonic() >= goal_activity_deadline:
+                    if goal_activity_deadline is not None and time.monotonic() >= goal_activity_deadline:
                         raise
                     continue
                 goal_activity_deadline = time.monotonic() + max(
                     CODEX_APP_SERVER_LIFECYCLE_TIMEOUT_SECONDS, IDLE_KILL_SECONDS,
-                )
+                ) if IDLE_KILL_SECONDS > 0 else None
             else:
-                notification = await subscription.next_notification(
+                handled_sequence, notification = await next_goal_notification(
                     timeout=max(
                         CODEX_APP_SERVER_LIFECYCLE_TIMEOUT_SECONDS,
                         IDLE_KILL_SECONDS,
-                    )
+                    ) if IDLE_KILL_SECONDS > 0 else None
+                )
+            if shell_owner is not None:
+                await observe_codex_shell_notification(
+                    session_id, shell_owner, notification, handled_sequence,
                 )
             method = str(notification.get("method") or "")
             params = (
@@ -58102,7 +58169,7 @@ async def consume_codex_native_turn(
                 )
                 or ""
             )
-            if goal_resume and method == "turn/started" and notification_turn_id:
+            if (goal_resume or shell_resume or waiting_for_shell) and method == "turn/started" and notification_turn_id:
                 if notification_turn_id in seen_goal_turn_ids:
                     continue
                 seen_goal_turn_ids.add(notification_turn_id)
@@ -58135,6 +58202,8 @@ async def consume_codex_native_turn(
                             # before RPC completion. A backlogged consumer must
                             # not replace that id with an earlier goal turn.
                             if not goal_resume:
+                                if active.get("provider_turn_id") != notification_turn_id:
+                                    active["native_interrupt_sent"] = False
                                 active["provider_turn_id"] = notification_turn_id
                                 active["provider_turn_ready"] = True
                             else:
@@ -58359,14 +58428,19 @@ async def consume_codex_native_turn(
                     # The provider's successful terminal packet supersedes
                     # transient error notices from this exact native turn.
                     terminal_error = None
-                if goal_resume:
+                pending_shell = (
+                    ACTIVE.get(session_id) is shell_owner
+                    and codex_shell_intents_pending(shell_owner)
+                )
+                if goal_resume or shell_resume or waiting_for_shell or pending_shell:
+                    waiting_for_shell = bool(pending_shell)
                     goal_turn_running = False
                     goal_clock_started = None
                     async with ACTIVE_LOCK:
                         active = ACTIVE.get(session_id)
                         if (
                             active and active.get("run_id") == operation_id
-                            and active.get("codex_control_reservation_id") == reservation_id
+                            and (not reservation_id or active.get("codex_control_reservation_id") == reservation_id)
                             and active.get("provider_turn_id") == notification_turn_id
                         ):
                             active["provider_turn_id"] = None
@@ -58376,9 +58450,30 @@ async def consume_codex_native_turn(
                     await manager.wait_for_notification_handler(
                         project_codex_notification, thread_id,
                     )
-                    if terminal_status == "completed" and not terminal_error:
+                    if pending_shell or ((goal_resume or shell_resume)
+                                         and terminal_status == "completed" and not terminal_error):
                         turn_id = None
                         continue
+                # The endpoint registers intents under this same lifecycle
+                # lock. Seal only after the final await above so an accepted
+                # shell cannot lose its receiver during terminal projection.
+                async with session_lifecycle_lock(session_id):
+                    async with ACTIVE_LOCK:
+                        if adopt_shell_goal_locked():
+                            goal_turn_running = False
+                            turn_id = None
+                            continue
+                        active = ACTIVE.get(session_id)
+                        if active is shell_owner:
+                            if codex_shell_intents_pending(active):
+                                waiting_for_shell = True
+                                goal_turn_running = False
+                                turn_id = None
+                                continue
+                            if active is not None:
+                                active["codex_shell_handoff_closed"] = True
+                                if goal_resume:
+                                    active["codex_goal_handoff_closed"] = True
                 break
     except (asyncio.TimeoutError, CodexAppServerSubscriptionClosed) as exc:
         terminal_status = "failed"
@@ -58391,6 +58486,10 @@ async def consume_codex_native_turn(
         terminal_status = "failed"
         terminal_error = concise_error_message(exc)
     finally:
+        if (shell_owner is not None and ACTIVE.get(session_id) is shell_owner
+                and shell_owner.get("codex_shell_subscription") is subscription):
+            shell_owner.pop("codex_shell_subscription", None)
+            shell_owner["codex_shell_handoff_closed"] = True
         summary_cleanup = asyncio.create_task(finish_reasoning_summary_stream(
             session_id, operation_id, completed_reasoning_items))
         try:
@@ -58757,6 +58856,8 @@ async def touch_codex_app_server_thread(
             return
         CODEX_APP_SERVER_THREAD_LRU.pop(thread_id, None)
         CODEX_APP_SERVER_THREAD_LRU[thread_id] = time.monotonic()
+        if CODEX_APP_SERVER_MAX_LOADED_THREADS <= 0:
+            return
         managers = (manager, *(
             current for current in codex_app_server_managers() if current is not manager
         ))
@@ -61557,7 +61658,6 @@ def build_claude_cmd(
         "AskUserQuestion",
         "EnterPlanMode",
         "ExitPlanMode",
-        *CLAUDE_NON_DURABLE_SCHEDULER_TOOLS,
         *(["Agent", "Task"] if disable_provider_subagents else []),
     ]
     if sess.get("model"):
@@ -61625,10 +61725,9 @@ def claude_sdk_configuration_key(
         "system_prompt": system_prompt,
         "permission_mode": effective_claude_permission_mode(sess),
         "setting_sources": ["user", "project", "local"],
-        "background_tracking_hooks": 2,
+        "background_tracking_hooks": 3,
         "allow_dangerously_skip_permissions": True,
         "replay_user_messages": True,
-        "disallowed_tools": list(CLAUDE_NON_DURABLE_SCHEDULER_TOOLS),
         "allowed_tools": [CLAUDE_PROVIDER_MCP_TOOL_NAME],
         "thinking": {"type": "adaptive", "display": "summarized"},
         "agentsdock_provider_tool": 1,
@@ -61691,9 +61790,6 @@ def build_claude_sdk_options(
         raise ValueError("The completed Claude fork snapshot is unavailable; refusing an empty resume.")
     permission_owner = {"token": ""}
     provider_tool_owner = {"ownership_token": "", "run_id": ""}
-    provider_tool_slots = asyncio.Semaphore(
-        PROVIDER_TOOL_MAX_CONCURRENT_PER_CLAUDE_CHAT
-    )
 
     async def can_use_tool(
         tool_name: str,
@@ -61723,45 +61819,34 @@ def build_claude_sdk_options(
                 "arguments": arguments,
                 **({"stdin": stdin} if stdin else {}),
             }
-            # Claude's SDK dispatches MCP calls concurrently. Fail fast above
-            # a small per-chat ceiling instead of allowing one adversarial or
-            # confused model response to spawn unbounded helper processes.
-            if provider_tool_slots.locked():
-                raise ProviderToolError(
-                    "too many AgentsDock provider actions are already running"
+            if provider_tool_call_is_read_only(helper, arguments):
+                # The in-process Claude MCP SDK does not expose a transport
+                # call ID. Identical reads must remain live rather than being
+                # mistaken for retries and replaying a stale mailbox/listing.
+                text, is_error = await execute_provider_tool(
+                    session_id,
+                    owner_run_id,
+                    bounded_input,
+                    backend=BACKEND_CLAUDE,
+                    claude_owner_token=ownership_token,
                 )
-            await provider_tool_slots.acquire()
-            try:
-                if provider_tool_call_is_read_only(helper, arguments):
-                    # The in-process Claude MCP SDK does not expose a transport
-                    # call ID. Identical reads must remain live rather than being
-                    # mistaken for retries and replaying a stale mailbox/listing.
-                    text, is_error = await execute_provider_tool(
-                        session_id,
-                        owner_run_id,
+            else:
+                replay_digest = hashlib.sha256(
+                    json.dumps(
                         bounded_input,
-                        backend=BACKEND_CLAUDE,
-                        claude_owner_token=ownership_token,
-                    )
-                else:
-                    replay_digest = hashlib.sha256(
-                        json.dumps(
-                            bounded_input,
-                            sort_keys=True,
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        ).encode("utf-8")
-                    ).hexdigest()
-                    text, is_error = await execute_provider_tool_once(
-                        session_id,
-                        owner_run_id,
-                        bounded_input,
-                        replay_key="claude:" + replay_digest,
-                        backend=BACKEND_CLAUDE,
-                        claude_owner_token=ownership_token,
-                    )
-            finally:
-                provider_tool_slots.release()
+                        sort_keys=True,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                text, is_error = await execute_provider_tool_once(
+                    session_id,
+                    owner_run_id,
+                    bounded_input,
+                    replay_key="claude:" + replay_digest,
+                    backend=BACKEND_CLAUDE,
+                    claude_owner_token=ownership_token,
+                )
         except ProviderToolError as exc:
             text, is_error = str(exc), True
         return {
@@ -61796,7 +61881,6 @@ def build_claude_sdk_options(
         permission_mode=effective_claude_permission_mode(sess),
         can_use_tool=can_use_tool,
         hooks=claude_background_tracking_hooks(),
-        disallowed_tools=list(CLAUDE_NON_DURABLE_SCHEDULER_TOOLS),
         # This internal tool performs its own exact live-run authorization.
         # Do not make the desktop ask the user to approve the transport
         # wrapper in normal Claude permission modes.
@@ -64547,7 +64631,7 @@ async def run_claude_print(
                 idle = time.time() - last_event
                 if idle >= IDLE_WARN_SECONDS:
                     await append_event(session_id, "idle_warning", {"run_id": run_id, "idle_seconds": int(idle)})
-                if idle >= IDLE_KILL_SECONDS:
+                if IDLE_KILL_SECONDS > 0 and idle >= IDLE_KILL_SECONDS:
                     idle_killed = True
                     await terminate_process_tree(proc)
                     break
@@ -65778,6 +65862,8 @@ async def run_claude_sdk(
         nonlocal first_activity_task
 
         await cancel_first_activity_watchdog()
+        if CLAUDE_SDK_POST_ACK_FIRST_ACTIVITY_TIMEOUT_SECONDS <= 0:
+            return
         first_activity_task = asyncio.create_task(
             first_activity_timeout_after_ack(logical_handle)
         )
@@ -65890,6 +65976,7 @@ async def run_claude_sdk(
         idle = observed_at - last_activity_monotonic
         if (
             not provider_acknowledged
+            and CLAUDE_SDK_PRE_ACK_TIMEOUT_SECONDS > 0
             and elapsed >= CLAUDE_SDK_PRE_ACK_TIMEOUT_SECONDS
         ):
             stream_error = (
@@ -65917,6 +66004,7 @@ async def run_claude_sdk(
             idle_warning_emitted = True
         if (
             provider_acknowledged
+            and CLAUDE_SDK_IDLE_TIMEOUT_SECONDS > 0
             and idle >= CLAUDE_SDK_IDLE_TIMEOUT_SECONDS
         ):
             stream_error = (
@@ -65987,8 +66075,9 @@ async def run_claude_sdk(
                     if idle_warning_emitted
                     else CLAUDE_SDK_IDLE_WARN_SECONDS
                 )
-                timeout_candidates.append(max(0.01, idle_deadline - idle))
-            else:
+                if idle_deadline > 0:
+                    timeout_candidates.append(max(0.01, idle_deadline - idle))
+            elif CLAUDE_SDK_PRE_ACK_TIMEOUT_SECONDS > 0:
                 timeout_candidates.append(
                     max(0.01, CLAUDE_SDK_PRE_ACK_TIMEOUT_SECONDS - elapsed)
                 )
@@ -67763,7 +67852,7 @@ async def run_codex_exec(
                 idle = time.time() - last_event
                 if idle >= IDLE_WARN_SECONDS:
                     await append_event(session_id, "idle_warning", {"run_id": run_id, "idle_seconds": int(idle)})
-                if idle >= IDLE_KILL_SECONDS:
+                if IDLE_KILL_SECONDS > 0 and idle >= IDLE_KILL_SECONDS:
                     idle_killed = True
                     await terminate_process_tree(proc)
                     break
@@ -68081,7 +68170,7 @@ async def write_cursor_process_stdin(
         writer.write(prompt.encode("utf-8"))
         await asyncio.wait_for(
             writer.drain(),
-            timeout=CURSOR_STARTUP_TIMEOUT_SECONDS,
+            timeout=CURSOR_STARTUP_TIMEOUT_SECONDS or 120.0,
         )
     except (BrokenPipeError, ConnectionResetError) as exc:
         raise RuntimeError("Cursor closed stdin before accepting the prompt") from exc
@@ -68446,6 +68535,7 @@ async def run_cursor_process(
             if (
                 not pending_live_wait
                 and not provider_started
+                and CURSOR_STARTUP_TIMEOUT_SECONDS > 0
                 and elapsed >= CURSOR_STARTUP_TIMEOUT_SECONDS
             ):
                 timeout_error = (
@@ -68456,6 +68546,7 @@ async def run_cursor_process(
                 break
             if (
                 not pending_live_wait
+                and CURSOR_TURN_TIMEOUT_SECONDS > 0
                 and elapsed >= CURSOR_TURN_TIMEOUT_SECONDS
             ):
                 timeout_error = (
@@ -68464,32 +68555,21 @@ async def run_cursor_process(
                 )
                 await terminate_process_tree(proc)
                 break
-            startup_remaining = (
-                CURSOR_STARTUP_TIMEOUT_SECONDS - elapsed
-                if not provider_started and not pending_live_wait
-                else CURSOR_TURN_TIMEOUT_SECONDS
-            )
-            turn_remaining = (
-                CURSOR_TURN_TIMEOUT_SECONDS
-                if pending_live_wait
-                else CURSOR_TURN_TIMEOUT_SECONDS - elapsed
-            )
             idle_elapsed = now_monotonic - last_event_monotonic
             idle_deadline = (
                 CURSOR_IDLE_TIMEOUT_SECONDS
                 if idle_warning_emitted
                 else CURSOR_IDLE_WARN_SECONDS
             )
-            idle_remaining = max(0.01, idle_deadline - idle_elapsed)
-            wait_seconds = max(
-                0.01,
-                min(
-                    5.0,
-                    startup_remaining,
-                    turn_remaining,
-                    idle_remaining,
-                ),
-            )
+            remaining_deadlines = [5.0]
+            if not pending_live_wait:
+                if CURSOR_TURN_TIMEOUT_SECONDS > 0:
+                    remaining_deadlines.append(CURSOR_TURN_TIMEOUT_SECONDS - elapsed)
+                if not provider_started and CURSOR_STARTUP_TIMEOUT_SECONDS > 0:
+                    remaining_deadlines.append(CURSOR_STARTUP_TIMEOUT_SECONDS - elapsed)
+                if idle_deadline > 0:
+                    remaining_deadlines.append(idle_deadline - idle_elapsed)
+            wait_seconds = max(0.01, min(remaining_deadlines))
             try:
                 raw = await asyncio.wait_for(
                     proc.stdout.readline(),  # type: ignore[union-attr]
@@ -68518,6 +68598,7 @@ async def run_cursor_process(
                 idle = now_monotonic - last_event_monotonic
                 if (
                     not provider_started
+                    and CURSOR_STARTUP_TIMEOUT_SECONDS > 0
                     and elapsed >= CURSOR_STARTUP_TIMEOUT_SECONDS
                 ):
                     timeout_error = (
@@ -68526,7 +68607,10 @@ async def run_cursor_process(
                     )
                     await terminate_process_tree(proc)
                     break
-                if elapsed >= CURSOR_TURN_TIMEOUT_SECONDS:
+                if (
+                    CURSOR_TURN_TIMEOUT_SECONDS > 0
+                    and elapsed >= CURSOR_TURN_TIMEOUT_SECONDS
+                ):
                     timeout_error = (
                         "Cursor exceeded the absolute turn timeout of "
                         f"{CURSOR_TURN_TIMEOUT_SECONDS:g} seconds."
@@ -68536,7 +68620,10 @@ async def run_cursor_process(
                 if idle >= CURSOR_IDLE_WARN_SECONDS and not idle_warning_emitted:
                     await append_event(session_id, "idle_warning", {"run_id": run_id, "idle_seconds": int(idle)})
                     idle_warning_emitted = True
-                if idle >= CURSOR_IDLE_TIMEOUT_SECONDS:
+                if (
+                    CURSOR_IDLE_TIMEOUT_SECONDS > 0
+                    and idle >= CURSOR_IDLE_TIMEOUT_SECONDS
+                ):
                     timeout_error = (
                         "Cursor produced no output for "
                         f"{CURSOR_IDLE_TIMEOUT_SECONDS:g} seconds."
@@ -69095,7 +69182,7 @@ async def write_opencode_process_stdin(
         writer.write(prompt.encode("utf-8"))
         await asyncio.wait_for(
             writer.drain(),
-            timeout=OPENCODE_STARTUP_TIMEOUT_SECONDS,
+            timeout=OPENCODE_STARTUP_TIMEOUT_SECONDS or 120.0,
         )
     except (BrokenPipeError, ConnectionResetError) as exc:
         raise RuntimeError(
@@ -70112,6 +70199,7 @@ async def run_opencode_process(
             if (
                 not pending_live_wait
                 and not provider_started
+                and OPENCODE_STARTUP_TIMEOUT_SECONDS > 0
                 and elapsed >= OPENCODE_STARTUP_TIMEOUT_SECONDS
             ):
                 timeout_error = (
@@ -70127,7 +70215,11 @@ async def run_opencode_process(
                 )
                 await terminate_process_tree(proc)
                 break
-            if not pending_live_wait and elapsed >= OPENCODE_TURN_TIMEOUT_SECONDS:
+            if (
+                not pending_live_wait
+                and OPENCODE_TURN_TIMEOUT_SECONDS > 0
+                and elapsed >= OPENCODE_TURN_TIMEOUT_SECONDS
+            ):
                 timeout_error = (
                     "OpenCode exceeded the absolute turn timeout of "
                     f"{OPENCODE_TURN_TIMEOUT_SECONDS:g} seconds."
@@ -70140,10 +70232,13 @@ async def run_opencode_process(
                 if idle_warning_emitted
                 else OPENCODE_IDLE_WARN_SECONDS
             )
-            remaining_deadlines = [5.0, idle_deadline - idle_elapsed]
+            remaining_deadlines = [5.0]
             if not pending_live_wait:
-                remaining_deadlines.append(OPENCODE_TURN_TIMEOUT_SECONDS - elapsed)
-                if not provider_started:
+                if idle_deadline > 0:
+                    remaining_deadlines.append(idle_deadline - idle_elapsed)
+                if OPENCODE_TURN_TIMEOUT_SECONDS > 0:
+                    remaining_deadlines.append(OPENCODE_TURN_TIMEOUT_SECONDS - elapsed)
+                if not provider_started and OPENCODE_STARTUP_TIMEOUT_SECONDS > 0:
                     remaining_deadlines.append(OPENCODE_STARTUP_TIMEOUT_SECONDS - elapsed)
             wait_seconds = max(
                 0.01,
@@ -70165,8 +70260,15 @@ async def run_opencode_process(
                     continue
                 elapsed = now_monotonic - started_monotonic
                 if (
-                    (not provider_started and elapsed >= OPENCODE_STARTUP_TIMEOUT_SECONDS)
-                    or elapsed >= OPENCODE_TURN_TIMEOUT_SECONDS
+                    (
+                        not provider_started
+                        and OPENCODE_STARTUP_TIMEOUT_SECONDS > 0
+                        and elapsed >= OPENCODE_STARTUP_TIMEOUT_SECONDS
+                    )
+                    or (
+                        OPENCODE_TURN_TIMEOUT_SECONDS > 0
+                        and elapsed >= OPENCODE_TURN_TIMEOUT_SECONDS
+                    )
                 ):
                     # Apply the earliest startup/absolute deadline at the top
                     # of the loop instead of misreporting it as idle expiry.
@@ -70178,7 +70280,10 @@ async def run_opencode_process(
                         "idle_seconds": int(idle),
                     })
                     idle_warning_emitted = True
-                if idle >= OPENCODE_IDLE_TIMEOUT_SECONDS:
+                if (
+                    OPENCODE_IDLE_TIMEOUT_SECONDS > 0
+                    and idle >= OPENCODE_IDLE_TIMEOUT_SECONDS
+                ):
                     timeout_error = (
                         "OpenCode produced no output for "
                         f"{OPENCODE_IDLE_TIMEOUT_SECONDS:g} seconds."
@@ -70901,6 +71006,7 @@ async def retain_codex_goal_run_owner(
     session_id: str, run_id: str, manager: CodexAppServerManager,
     thread_id: str,
     *, subscription: Any = None, handled_sequence: int = 0,
+    allow_goal_continuation: bool = True,
 ) -> bool:
     """Keep an ordinary runner supervised when its native goal continues.
 
@@ -70924,27 +71030,31 @@ async def retain_codex_goal_run_owner(
             goal = (STORE.sessions.get(session_id) or {}).get("codex_goal")
             enqueued = getattr(subscription, "_last_enqueued_sequence", 0)
             pending_output = isinstance(enqueued, int) and enqueued > handled_sequence
-            retain = bool(
-                CODEX_GOALS_ENABLED
+            retain_goal = bool(
+                allow_goal_continuation and CODEX_GOALS_ENABLED
                 and isinstance(goal, dict)
                 and (goal.get("status") == "active" or pending_output)
                 and not active.get("stop_requested")
                 and run_id not in STOPPED_RUNS
             )
+            retain_shell = codex_shell_intents_pending(active)
+            retain = retain_goal or retain_shell
             active["codex_goal_handoff_closed"] = not retain
+            active["codex_shell_handoff_closed"] = not retain
             if not retain:
                 return False
             # Same supervised task, authority, runtime lease and thread pin.
             # Do not create a synthetic user message or a detached successor.
             active["codex_native_operation"] = True
-            active["codex_native_operation_kind"] = "goal_resume"
+            active["codex_native_operation_kind"] = "goal_resume" if retain_goal else "shell_resume"
             active["codex_control_reservation_id"] = run_id
             active["codex_app_server_turn"] = None
             active["provider_turn_id"] = None
             active["provider_turn_ready"] = False
             active["native_interrupt_sent"] = False
             active["native_steer_queue"] = asyncio.Queue(maxsize=1)
-            CURRENT_TURNS[session_id]["purpose"] = "codex_goal_resume"
+            if retain_goal:
+                CURRENT_TURNS[session_id]["purpose"] = "codex_goal_resume"
             CURRENT_TURNS[session_id]["codex_control_reservation_id"] = run_id
             # Register the existing supervisor, not a new task, so Delete and
             # server drain see the same native owner as Stop and Force Send.
@@ -72441,6 +72551,9 @@ async def run_codex_app_server(
         nonlocal ambiguous_turn_start, error_emitted
         nonlocal native_answer_turn_id, waiting_for_child_continuation
         nonlocal compaction_failed, compaction_execution_seen
+        await observe_codex_shell_notification(
+            session_id, ACTIVE.get(session_id), notification, handled_notification_sequence,
+        )
         method = str(notification.get("method") or "")
         params = (
             notification.get("params")
@@ -73040,6 +73153,7 @@ async def run_codex_app_server(
                     )
                     if active_owned:
                         active["codex_app_server_turn"] = turn
+                        active["codex_shell_subscription"] = turn._subscription
                         if not native_answer_turn_id:
                             native_answer_turn_id = str(turn.turn_id or "")
                         active["provider_thread_id"] = provider_id
@@ -73125,6 +73239,7 @@ async def run_codex_app_server(
                             idle = time.monotonic() - last_activity
                             if (
                                 not first_activity_seen
+                                and CODEX_APP_SERVER_FIRST_ACTIVITY_TIMEOUT_SECONDS > 0
                                 and idle >= CODEX_APP_SERVER_FIRST_ACTIVITY_TIMEOUT_SECONDS
                             ):
                                 # turn/start was accepted but nothing at all
@@ -73162,7 +73277,7 @@ async def run_codex_app_server(
                                     "run_id": current_run_id,
                                     "idle_seconds": int(idle),
                                 })
-                            if idle >= IDLE_KILL_SECONDS:
+                            if IDLE_KILL_SECONDS > 0 and idle >= IDLE_KILL_SECONDS:
                                 terminal_error = "Codex app-server turn exceeded the idle timeout."
                                 if turn.turn_id:
                                     with suppress(CodexAppServerError):
@@ -73353,12 +73468,13 @@ async def run_codex_app_server(
                             )
 
                 if (
-                    turn_completed and terminal_status == "completed"
+                    turn_completed
                     and not standalone_provider_context
                     and await retain_codex_goal_run_owner(
                         session_id, current_run_id, manager, provider_id,
                         subscription=turn._subscription,
                         handled_sequence=handled_notification_sequence,
+                        allow_goal_continuation=terminal_status == "completed",
                     )
                 ):
                     # Complete the initial answer, but not the supervised run.
@@ -73372,8 +73488,10 @@ async def run_codex_app_server(
                         goal_time_budget_task.cancel()
                         await asyncio.gather(goal_time_budget_task, return_exceptions=True)
                         goal_time_budget_task = None
+                    continuation_kind = str((ACTIVE.get(session_id) or {}).get(
+                        "codex_native_operation_kind") or "goal_resume")
                     goal_continuation_result = await consume_codex_native_turn(
-                        session_id, current_run_id, "goal_resume", manager,
+                        session_id, current_run_id, continuation_kind, manager,
                         provider_id, current_run_id, turn._subscription,
                         finalize_operation=False,
                         initial_sequence=handled_notification_sequence,
@@ -73383,7 +73501,8 @@ async def run_codex_app_server(
                     terminal_error = goal_continuation_result["error"]
                     # Never overwrite a later goal answer with the first reply
                     # in the terminal payload when the goal eventually ends.
-                    text_parts[:] = [goal_continuation_result["result_text"]]
+                    if continuation_kind != "shell_resume" or goal_continuation_result["result_text"]:
+                        text_parts[:] = [goal_continuation_result["result_text"]]
 
         stopped = (
             terminal_status in {"interrupted", "cancelled", "canceled"}
@@ -76229,10 +76348,8 @@ def macos_launchd_owns_current_process() -> bool | None:
 
 
 def detect_managed_server_service_kind() -> str | None:
-    """Prove that an official user service will relaunch this process."""
+    """Prove that a user service will relaunch this process."""
 
-    if not official_server_release_tree():
-        return None
     if sys.platform.startswith("linux"):
         return "systemd-user" if agents_server_systemd_cgroup() else None
     if sys.platform == "darwin":
@@ -84144,6 +84261,16 @@ def claude_event_file_fingerprints(
     return tuple(fingerprints)
 
 
+def claude_native_background_work_state(manager: Any) -> tuple:
+    inspect = getattr(manager, "background_work_snapshot", None)
+    value = inspect() if callable(inspect) else ()
+    return value if isinstance(value, tuple) else ()
+
+
+def claude_native_background_work_labels(state: tuple) -> list[str]:
+    return [f"Claude background command in {row[0]}" for row in state if row[4]]
+
+
 def active_provider_background_work_labels() -> list[str]:
     """Return bounded provider-owned work that survives its parent turn.
 
@@ -84157,6 +84284,7 @@ def active_provider_background_work_labels() -> list[str]:
 
     labels = sorted(set(
         active_codex_work_labels() + active_generated_title_work_labels()
+        + claude_native_background_work_labels(claude_native_background_work_state(CLAUDE_SDK_MANAGER))
         + SIDE_QUESTIONS.active_work_labels()
     ))[:SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT]
     remaining = SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT - len(labels)
@@ -84232,6 +84360,10 @@ async def prepare_provider_background_work_snapshot(
     global CLAUDE_BACKGROUND_WORK_CACHE_KEY
     global CLAUDE_BACKGROUND_WORK_CACHE_LABELS
 
+    side_snapshot = await SIDE_QUESTIONS.prepare_background_work_snapshot(
+        timeout_seconds=5.0 if timeout_seconds is None else max(0.0, timeout_seconds),
+    )
+    native_work_before = claude_native_background_work_state(CLAUDE_SDK_MANAGER)
     codex_snapshot = await prepare_codex_subagent_terminal_snapshot(
         timeout_seconds=timeout_seconds,
     )
@@ -84266,7 +84398,7 @@ async def prepare_provider_background_work_snapshot(
                 )
             )
             return {
-                "codex": codex_snapshot,
+                "codex": codex_snapshot, "side": side_snapshot, "claude_native_work": native_work_before,
                 "manager": manager,
                 "session_ids": session_ids,
                 "unknown_labels": unknown_labels,
@@ -84277,7 +84409,7 @@ async def prepare_provider_background_work_snapshot(
             }
         except Exception:
             return {
-                "codex": codex_snapshot,
+                "codex": codex_snapshot, "side": side_snapshot, "claude_native_work": native_work_before,
                 "manager": manager,
                 "session_ids": session_ids,
                 "unknown_labels": unknown_labels,
@@ -84291,12 +84423,13 @@ async def prepare_provider_background_work_snapshot(
         claude_event_file_fingerprints,
         session_ids,
     )
-    consistent = fingerprints_before == fingerprints_after
+    consistent = (fingerprints_before == fingerprints_after
+                  and native_work_before == claude_native_background_work_state(CLAUDE_SDK_MANAGER))
     if consistent:
         CLAUDE_BACKGROUND_WORK_CACHE_KEY = cache_key
         CLAUDE_BACKGROUND_WORK_CACHE_LABELS = tuple(claude_labels)
     return {
-        "codex": codex_snapshot,
+        "codex": codex_snapshot, "side": side_snapshot, "claude_native_work": native_work_before,
         "manager": manager,
         "session_ids": session_ids,
         "unknown_labels": unknown_labels,
@@ -84334,6 +84467,8 @@ def provider_background_work_labels_from_snapshot(
             labels = [label for label in labels if label not in terminal_labels]
     labels = sorted(set(
         labels + active_generated_title_work_labels() + SIDE_QUESTIONS.active_work_labels()
+        + SIDE_QUESTIONS.background_work_labels_from_snapshot(snapshot.get("side") or {})
+        + claude_native_background_work_labels(claude_native_background_work_state(CLAUDE_SDK_MANAGER))
     ))[:SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT]
     remaining = SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT - len(labels)
     if remaining <= 0:
@@ -84345,6 +84480,7 @@ def provider_background_work_labels_from_snapshot(
     snapshot_is_current = (
         snapshot.get("consistent") is True
         and manager is snapshot.get("manager")
+        and claude_native_background_work_state(manager) == snapshot.get("claude_native_work", ())
         and session_ids == tuple(snapshot.get("session_ids") or ())
         and unknown_labels == tuple(snapshot.get("unknown_labels") or ())
         and fingerprints == tuple(snapshot.get("fingerprints") or ())
@@ -84788,8 +84924,7 @@ async def create_native_side_chat(session_id: str, *, persisted_state=None, pers
                             except side_questions.SideQuestionError:
                                 return False
                             return bool(self.codex is not None and not self.codex.closed
-                                        and self.codex.thread_id
-                                        and str(params.get("threadId") or "") == self.codex.thread_id)
+                                        and self.codex.owns_thread(str(params.get("threadId") or "")))
                         return await handle_codex_server_request(request_id, method, params,
                             side_session_id=session_id, side_owner_is_current=is_current,
                             side_approval_policy=approval_policy)
@@ -84815,6 +84950,12 @@ async def create_native_side_chat(session_id: str, *, persisted_state=None, pers
                           "context_note": "Native Codex context from when Side chat started, including tool results. Clear Side chat to use the latest main context."}
             self.current()
             return {"backend": backend, **result}
+
+        def background_work_scope(self):
+            return self.codex.background_work_scope() if self.codex is not None else None
+
+        async def has_background_work(self):
+            return await self.codex.has_background_work() if self.codex is not None else False
 
         async def close(self):
             if self.codex is not None:
@@ -86100,33 +86241,6 @@ async def _restart_server_endpoint_impl(
                     retryable=True,
                 ),
             )
-        terminal_restart = str(restart_status.get("phase") or "") in {
-            "complete",
-            "failed",
-        }
-        cooldown_remaining = (
-            max(
-                0,
-                math.ceil(
-                    SERVER_RESTART_COOLDOWN_SECONDS
-                    - server_restart_status_age_seconds(restart_status)
-                ),
-            )
-            if terminal_restart
-            else 0
-        )
-        if terminal_restart and cooldown_remaining > 0:
-            raise HTTPException(
-                status_code=409,
-                detail=server_restart_error_detail(
-                    "server_restart_cooldown",
-                    "AgentsServer was restarted recently.",
-                    action="Wait briefly before requesting another restart.",
-                    retryable=True,
-                    retry_after_seconds=cooldown_remaining,
-                ),
-            )
-
         current_server_identity = server_identity()
         if (
             body.expected_server_identity != current_server_identity
@@ -91451,6 +91565,9 @@ async def _post_codex_shell_command_locked(
                 "confirmed=true"
             ),
         )
+    if (session_id in BUSY_SESSIONS
+            and (ACTIVE.get(session_id) or {}).get("codex_shell_subscription") is not None):
+        return await post_codex_active_shell_command(session_id, req)
     manager, thread_id, control_session = await acquire_codex_control_thread(
         session_id,
         reserve_session=True,
@@ -91468,6 +91585,14 @@ async def _post_codex_shell_command_locked(
                 active["codex_native_operation_kind"] = "shell"
                 active["provider_turn_id"] = None
                 active["provider_turn_ready"] = False
+                watermark = getattr(subscription, "_last_enqueued_sequence", 0)
+                active.setdefault("codex_shell_intents", []).append({
+                    "operation_id": operation_id, "owner_operation": True,
+                    "command": req.command,
+                    "after_sequence": watermark if isinstance(watermark, int) else 0,
+                    "item_id": "", "turn_id": "",
+                    "item_completed": False, "turn_completed": False,
+                })
         await manager.run_thread_shell_command(thread_id, req.command)
         task = asyncio.create_task(
             consume_codex_native_turn(
@@ -91481,25 +91606,6 @@ async def _post_codex_shell_command_locked(
             )
         )
         register_codex_native_action(session_id, operation_id, task)
-        try:
-            await append_event(
-                session_id,
-                "codex_shell_started",
-                {
-                    "operation_id": operation_id,
-                    "command": req.command,
-                    "unsandboxed": True,
-                    "message": (
-                        "Codex started the confirmed unsandboxed shell command."
-                    ),
-                },
-            )
-        except Exception as exc:
-            logger.warning(
-                "failed to persist Codex shell start session=%s: %s",
-                session_id,
-                concise_error_message(exc),
-            )
         return {"accepted": True, "operation_id": operation_id}
     except Exception as exc:
         subscription.close()
@@ -91513,6 +91619,88 @@ async def _post_codex_shell_command_locked(
         raise codex_control_http_error(exc) from exc
 
 
+async def post_codex_active_shell_command(
+    session_id: str, req: CodexShellCommandRequest,
+) -> dict[str, Any]:
+    """Submit into the existing owner; its stream supervises any late shell turn.
+
+    The route's lifecycle lock orders registration/RPC with the consumer's
+    terminal decision. Never replace ACTIVE or add a second tool consumer.
+    """
+    manager, thread_id, _session = await acquire_codex_control_thread(
+        session_id, allow_active_control=True,
+    )
+    intent: dict[str, Any] | None = None
+    active: dict[str, Any] | None = None
+    try:
+        async with ACTIVE_LOCK:
+            active = ACTIVE.get(session_id)
+            subscription = (active or {}).get("codex_shell_subscription")
+            if not (
+                active and session_id in BUSY_SESSIONS
+                and active.get("provider_thread_id") == thread_id
+                and (active.get("run_id") == (CURRENT_TURNS.get(session_id) or {}).get("run_id")
+                    or (active.get("codex_native_operation")
+                        and active.get("codex_control_reservation_id")
+                        == (CURRENT_TURNS.get(session_id) or {}).get("codex_control_reservation_id")))
+                and subscription is not None
+                and not active.get("codex_shell_handoff_closed")
+                and not active.get("codex_goal_handoff_closed")
+                and not active.get("stop_requested")
+                and active.get("run_id") not in STOPPED_RUNS
+            ):
+                raise HTTPException(status_code=409, detail="The Codex owner is starting or finishing; retry the command.")
+            watermark = getattr(subscription, "_last_enqueued_sequence", 0)
+            intent = {
+                "operation_id": f"codexop_{uuid.uuid4().hex[:16]}",
+                "command": req.command,
+                "after_sequence": watermark if isinstance(watermark, int) else 0,
+                "item_id": "", "turn_id": "",
+                "item_completed": False, "turn_completed": False,
+            }
+            active.setdefault("codex_shell_intents", []).append(intent)
+        generation = manager.generation
+        delivery_attempted = False
+
+        def before_send() -> bool:
+            nonlocal delivery_attempted
+            if not (ACTIVE.get(session_id) is active
+                    and active.get("codex_shell_subscription") is subscription
+                    and active.get("provider_thread_id") == thread_id
+                    and manager.generation == generation
+                    and not active.get("codex_shell_handoff_closed")
+                    and not active.get("stop_requested")):
+                return False
+            # Exclude older buffered items at the actual stdin boundary. The
+            # transport calls this synchronously immediately before writing.
+            watermark = getattr(subscription, "_last_enqueued_sequence", 0)
+            if isinstance(watermark, int):
+                intent["after_sequence"] = watermark
+            delivery_attempted = True
+            return True
+
+        try:
+            await manager.run_thread_shell_command(thread_id, req.command, before_send=before_send)
+        except BaseException as exc:
+            # An explicit native rejection or proven pre-write failure cannot
+            # create work. Unknown delivery remains on the original receiver;
+            # neither this endpoint nor its caller replays it automatically.
+            if not intent.get("item_id") and (
+                not delivery_attempted or isinstance(exc, CodexAppServerRequestError)
+                or not getattr(exc, "request_sent", True)
+            ):
+                if intent in active.get("codex_shell_intents", []):
+                    active["codex_shell_intents"].remove(intent)
+            raise
+        return {"accepted": True, "operation_id": intent["operation_id"]}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise codex_control_http_error(exc) from exc
+    finally:
+        await release_codex_control_thread(session_id, manager, thread_id)
+
+
 @app.get("/api/sessions/{session_id}/codex/background-terminals")
 async def get_codex_background_terminals(session_id: str) -> dict[str, Any]:
     async with session_lifecycle_lock(session_id):
@@ -91524,7 +91712,9 @@ async def _get_codex_background_terminals_locked(
     session_id: str,
 ) -> dict[str, Any]:
     global CODEX_BACKGROUND_TERMINALS_SUPPORTED
-    manager, thread_id, _session = await acquire_codex_control_thread(session_id)
+    manager, thread_id, _session = await acquire_codex_control_thread(
+        session_id, allow_active_control=True,
+    )
     try:
         terminals = await manager.list_background_terminals(thread_id)
         CODEX_BACKGROUND_TERMINALS_SUPPORTED = True
@@ -91568,7 +91758,7 @@ async def _post_codex_background_terminal_terminate_locked(
                 "and requires explicit confirmed=true"
             ),
         )
-    manager, thread_id, _session = await acquire_codex_control_thread(session_id)
+    manager, thread_id, _session = await acquire_codex_control_thread(session_id, allow_active_control=True)
     try:
         terminated = await manager.terminate_background_terminal(
             thread_id,
@@ -91606,7 +91796,7 @@ async def _post_codex_background_terminals_clean_locked(
                 "background terminal and requires explicit confirmed=true"
             ),
         )
-    manager, thread_id, _session = await acquire_codex_control_thread(session_id)
+    manager, thread_id, _session = await acquire_codex_control_thread(session_id, allow_active_control=True)
     try:
         await manager.clean_background_terminals(thread_id)
         return {"cleaned": True}

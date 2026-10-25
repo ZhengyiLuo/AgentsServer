@@ -406,7 +406,7 @@ class CodexThreadParamsConfigTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CodexForkTurnsInstructionTests(unittest.TestCase):
-    def test_developer_instructions_forbid_full_history_forks(self) -> None:
+    def test_developer_instructions_preserve_native_fork_choices(self) -> None:
         with patch.object(
             agent_server,
             "codex_user_developer_instructions",
@@ -417,10 +417,9 @@ class CodexForkTurnsInstructionTests(unittest.TestCase):
                 {"id": "chat-1", "backend": agent_server.BACKEND_CODEX, "cwd": "/repo"},
             )
 
-        self.assertIn("spawn_agent", instructions)
-        self.assertIn("fork_turns", instructions)
-        self.assertIn('"none"', instructions)
-        self.assertIn('never `"all"`', instructions)
+        self.assertNotIn("fork_turns", instructions)
+        self.assertNotIn('never `"all"`', instructions)
+        self.assertIn("delegate bounded noisy exploration", instructions)
         # The core prelude stays compact; the static provider-authority
         # addendum (moved out of every per-turn prompt) follows it.
         core = instructions.split(
@@ -430,7 +429,7 @@ class CodexForkTurnsInstructionTests(unittest.TestCase):
         self.assertLessEqual(len(core.strip().splitlines()), 18)
 
     def test_policy_version_bumped_so_existing_threads_migrate(self) -> None:
-        self.assertEqual(agent_server.CODEX_THREAD_POLICY_VERSION, "11")
+        self.assertEqual(agent_server.CODEX_THREAD_POLICY_VERSION, "12")
 
 
 class FakeFinalizationManager:

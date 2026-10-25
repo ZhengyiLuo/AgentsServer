@@ -22,6 +22,8 @@ SOURCE = (Path(__file__).resolve().parents[1] / "agent_server.py")
 NAMES = {
     "NativeSteerHandoffError", "send_codex_goal_steer", "commit_codex_goal_steer",
     "consume_codex_native_turn", "codex_goal_steer_selection_is_plain",
+    "codex_shell_intents_pending", "observe_codex_shell_notification",
+    "publish_codex_shell_completions",
     "mark_native_steer_accepted", "fence_native_steer_delivery",
     "requeue_native_steer_after_safe_rejection", "native_steer_requeue_event_payload",
     "join_task_despite_caller_cancellation", "concise_error_message",

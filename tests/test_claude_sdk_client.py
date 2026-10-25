@@ -1,13 +1,13 @@
 import asyncio
 import gc
 import json
+import re
 import unittest
 from collections.abc import AsyncIterable, AsyncIterator
 from importlib.metadata import version
 from typing import Any
 
 from claude_sdk_client import (
-    CLAUDE_NON_DURABLE_SCHEDULER_TOOLS,
     CLAUDE_PROVIDER_MCP_SERVER_NAME,
     CLAUDE_PROVIDER_MCP_TOOL_NAME,
     CLAUDE_SDK_MCP_STATUS_SCAN_LIMIT,
@@ -25,11 +25,7 @@ from claude_sdk_client import (
     ClaudeSDKSupervisorManager,
     ClaudeSDKUnavailable,
     claude_background_tracking_hooks,
-    claude_nondurable_scheduler_reason,
-    claude_untracked_background_reason,
-    reject_nondurable_scheduler_hook,
     reject_subagent_provider_tool_hook,
-    reject_untracked_background_hook,
     _parse_claude_sdk_message,
     _query_message_stream,
 )
@@ -1803,6 +1799,64 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
             [task_started, task_updated, final_result],
         )
 
+    async def test_native_bash_liveness_survives_result_and_settles_while_idle(self) -> None:
+        handle = await self.manager.start_run("background", "Start native Bash", run_id="run", options={}, configuration_key="same")
+        client = self.factory.clients[0]
+        await client.emit({"type": "system", "subtype": "task_started", "task_id": "bash", "task_type": "local_bash"})
+        await client.emit({"type": "result", "result": "Started"})
+        await asyncio.wait_for(collect(handle), 1)
+        self.assertIsNone(self.manager.snapshots()[0].active_run_id)
+        before = self.manager.background_work_snapshot()
+        self.assertTrue(before[0][4])
+        # A future native schedule has no running task and must not become a
+        # permanent admission blocker. Only live command receipts count.
+        await client.emit({"type": "system", "subtype": "task_started", "task_id": "schedule", "task_type": "scheduled_task"})
+        await client.emit({"type": "system", "subtype": "task_notification", "task_id": "bash", "status": "completed"})
+        for _ in range(20):
+            if not self.manager.background_work_snapshot()[0][4]:
+                break
+            await asyncio.sleep(0)
+        after = self.manager.background_work_snapshot()
+        self.assertFalse(after[0][4])
+        self.assertGreater(after[0][3], before[0][3])
+        self.assertFalse(client.disconnected)
+        await self.manager.evict("background", force=True)
+        self.assertEqual(self.manager.background_work_snapshot(), ())
+
+    async def test_context_observation_cancel_or_timeout_keeps_native_background_owner(self) -> None:
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                manager = ClaudeSDKSupervisorManager(client_factory=self.factory, control_timeout_seconds=0.02)
+                try:
+                    handle = await manager.start_run("background", "Start", run_id="run", options={}, configuration_key="same")
+                    client = self.factory.clients[-1]
+                    await client.emit({"type": "system", "subtype": "task_started", "task_id": "bash", "task_type": "local_bash"})
+                    await client.emit({"type": "result", "result": "Started"})
+                    await asyncio.wait_for(collect(handle), 1)
+                    started = asyncio.Event()
+                    async def blocked_usage():
+                        started.set()
+                        await asyncio.Event().wait()
+                    client.get_context_usage = blocked_usage
+                    request = asyncio.create_task(manager.get_context_usage("background"))
+                    await asyncio.wait_for(started.wait(), 1)
+                    if cancel:
+                        request.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await request
+                    else:
+                        with self.assertRaises(ClaudeSDKControlTimeout):
+                            await asyncio.wait_for(request, 1)
+                    self.assertFalse(client.disconnected)
+                    self.assertTrue(manager.background_work_snapshot()[0][4])
+                    # The observation cannot leave the actor queue wedged.
+                    followup = await asyncio.wait_for(manager.start_run("background", "Follow up", run_id="next", options={}, configuration_key="same"), 1)
+                    await client.emit({"type": "result", "result": "Done"})
+                    await asyncio.wait_for(collect(followup), 1)
+                    self.assertEqual(len([item for item in client.calls if item[0] == "connect"]), 1)
+                finally:
+                    await manager.close_all()
+
     async def test_error_and_aborted_results_end_delegated_run(self) -> None:
         terminal_results = (
             {"type": "result", "is_error": True, "result": "failed"},
@@ -2673,6 +2727,42 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
         await self.factory.clients[0].emit({"type": "result", "result": "done"})
         await active.wait_result()
         await manager.close_all()
+
+    async def test_default_retention_keeps_native_background_clients_after_parent_result(self) -> None:
+        manager = ClaudeSDKSupervisorManager(client_factory=self.factory)
+        try:
+            for index in range(14):
+                chat = f"background-{index}"
+                handle = await manager.start_run(chat, "Start background work", run_id=f"run-{index}",
+                                                  options={}, configuration_key="same")
+                client = self.factory.clients[-1]
+                await client.emit({"type": "system", "subtype": "task_started",
+                                   "task_id": f"shell-{index}", "task_type": "local_bash"})
+                await client.emit({"type": "result", "result": "Background work started"})
+                await handle.wait_result()
+                manager._supervisors[chat]._last_used_at -= 86400
+            self.assertEqual(await manager.evict_idle(), [])
+            self.assertEqual(len(manager.snapshots()), 14)
+            self.assertIsNone(manager._reaper_task)
+            self.assertTrue(all(client.connected and not client.disconnected for client in self.factory.clients))
+        finally:
+            await manager.close_all()
+
+    async def test_explicit_retention_limits_still_evict_idle_clients(self) -> None:
+        for policy in ({"max_clients": 1}, {"idle_ttl_seconds": 60}):
+            with self.subTest(policy=policy):
+                manager = ClaudeSDKSupervisorManager(client_factory=self.factory, **policy)
+                try:
+                    handle = await manager.start_run("old", "Work", run_id="old-run", options={}, configuration_key="same")
+                    client = self.factory.clients[-1]
+                    await client.emit({"type": "result", "result": "Done"})
+                    await handle.wait_result()
+                    manager._supervisors["old"]._last_used_at -= 120
+                    await manager.get("new", options={}, configuration_key="same")
+                    self.assertTrue(client.disconnected)
+                    self.assertEqual([item.chat_id for item in manager.snapshots()], ["new"])
+                finally:
+                    await manager.close_all()
 
     async def test_subagent_limit_reconfiguration_waits_for_background_agent_completion(self) -> None:
         cap_name = "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"
@@ -3653,146 +3743,33 @@ class ClaudeSDKBackgroundTrackingHookTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(output["permissionDecision"], "deny")
         self.assertIn("top-level live turn", output["permissionDecisionReason"])
 
-    def test_rejects_common_untracked_shell_detachment(self) -> None:
-        for command in (
-            "nohup python sweep.py > sweep.log 2>&1 &",
-            "python sweep.py > sweep.log 2>&1 &",
-            "disown %1",
-            "env MODE=prod nohup ./worker",
-            "setsid --fork ./worker",
-            "setsid -f ./worker",
-            "setsid ./foreground-worker",
-            "bash -c 'python sweep.py > sweep.log 2>&1 &'",
-            "sh -lc 'nohup python sweep.py &'",
-        ):
-            with self.subTest(command=command):
-                self.assertIsNotNone(
-                    claude_untracked_background_reason("Bash", {"command": command})
-                )
+    async def test_native_background_and_scheduling_tools_have_no_added_policy_denial(self) -> None:
+        hooks = claude_background_tracking_hooks()
+        cases = [
+            ("Bash", {"command": "python worker.py", "run_in_background": True}),
+            ("Bash", {"command": "nohup python worker.py > worker.log 2>&1 &"}),
+            ("Bash", {"command": "disown %1"}),
+            ("Bash", {"command": "setsid ./worker"}),
+            ("Bash", {"command": "sh -lc 'python worker.py &'"}),
+            ("CronCreate", {"cron": "* * * * *", "prompt": "Check progress"}),
+            ("Monitor", {}),
+            ("ScheduleWakeup", {}),
+        ]
+        for tool_name, tool_input in cases:
+            with self.subTest(tool_name=tool_name, tool_input=tool_input):
+                for matcher in hooks.get("PreToolUse", []):
+                    if matcher.matcher is None or re.fullmatch(matcher.matcher, tool_name):
+                        for hook in matcher.hooks:
+                            result = await hook({"tool_name": tool_name, "tool_input": tool_input},
+                                                "native-tool", {"signal": None})
+                            self.assertNotEqual(result.get("hookSpecificOutput", {}).get("permissionDecision"), "deny")
 
-    def test_rejects_native_bash_background_mode(self) -> None:
-        self.assertIsNotNone(
-            claude_untracked_background_reason(
-                "Bash",
-                {"command": "python sweep.py", "run_in_background": True},
-            )
-        )
-
-    def test_allows_foreground_shell_syntax_without_detachment(self) -> None:
-        for command in (
-            "python sweep.py",
-            "python sweep.py && python summarize.py",
-            "echo 'literal & text'",
-            r"echo literal \& text",
-            "echo 'setsid -f is documentation'",
-            "echo ok # later &",
-            "python3 - <<'PY'\nx = 1 & 2\nPY",
-            "cat <<'CPP'\nvoid f(int &value) {}\nCPP",
-            "cat <<'HTML'\na &copy; b\nHTML",
-            "python sweep.py > sweep.log 2>&1",
-        ):
-            with self.subTest(command=command):
-                self.assertIsNone(
-                    claude_untracked_background_reason("Bash", {"command": command})
-                )
-        self.assertIsNone(
-            claude_untracked_background_reason(
-                "Read", {"command": "nohup worker &"}
-            )
-        )
-
-    async def test_hook_denies_with_actionable_tracked_background_instruction(self) -> None:
-        result = await reject_untracked_background_hook(
-            {
-                "tool_name": "Bash",
-                "tool_input": {
-                    "command": "./worker",
-                    "run_in_background": True,
-                },
-            },
-            "tool-1",
-            {"signal": None},
-        )
-        output = result["hookSpecificOutput"]
-        self.assertEqual(output["hookEventName"], "PreToolUse")
-        self.assertEqual(output["permissionDecision"], "deny")
-        self.assertIn("run_in_background", output["permissionDecisionReason"])
-
-    def test_scheduler_policy_matches_only_exact_nondurable_tool_names(self) -> None:
-        self.assertEqual(
-            CLAUDE_NON_DURABLE_SCHEDULER_TOOLS,
-            ("CronCreate", "Monitor", "ScheduleWakeup"),
-        )
-        for tool_name in CLAUDE_NON_DURABLE_SCHEDULER_TOOLS:
-            with self.subTest(tool_name=tool_name):
-                reason = claude_nondurable_scheduler_reason(tool_name)
-                self.assertIsNotNone(reason)
-                self.assertIn(tool_name, str(reason))
-                self.assertIn("AgentsDock provider tool", str(reason))
-                self.assertIn("explicitly requested", str(reason))
-        for tool_name in (
-            "CronList",
-            "CronDelete",
-            "MonitorStatus",
-            "monitor",
-            "ScheduleWakeup ",
-            "/loop",
-            "",
-            None,
-        ):
-            with self.subTest(tool_name=tool_name):
-                self.assertIsNone(claude_nondurable_scheduler_reason(tool_name))
-
-    async def test_scheduler_hook_denies_exact_tools_and_allows_near_matches(self) -> None:
-        for tool_name in CLAUDE_NON_DURABLE_SCHEDULER_TOOLS:
-            with self.subTest(tool_name=tool_name):
-                result = await reject_nondurable_scheduler_hook(
-                    {"tool_name": tool_name, "tool_input": {}},
-                    "tool-1",
-                    {"signal": None},
-                )
-                output = result["hookSpecificOutput"]
-                self.assertEqual(output["hookEventName"], "PreToolUse")
-                self.assertEqual(output["permissionDecision"], "deny")
-                self.assertIn("AgentsDock provider tool", output["permissionDecisionReason"])
-                self.assertNotIn(
-                    "provider-authority block",
-                    output["permissionDecisionReason"],
-                )
-        for tool_name in ("CronList", "CronDelete", "MonitorStatus", "monitor"):
-            with self.subTest(tool_name=tool_name):
-                self.assertEqual(
-                    await reject_nondurable_scheduler_hook(
-                        {"tool_name": tool_name, "tool_input": {}},
-                        "tool-1",
-                        {"signal": None},
-                    ),
-                    {},
-                )
-
-    async def test_hook_allows_normal_bash_and_policy_has_exact_matchers(self) -> None:
-        self.assertEqual(
-            await reject_untracked_background_hook(
-                {"tool_name": "Bash", "tool_input": {"command": "pwd"}},
-                "tool-1",
-                {"signal": None},
-            ),
-            {},
-        )
+    def test_hooks_keep_receipts_mail_and_exact_provider_authority(self) -> None:
         hooks = claude_background_tracking_hooks()
         self.assertEqual(set(hooks), {"PreToolUse", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure"})
         matchers = hooks["PreToolUse"]
-        self.assertEqual(
-            [matcher.matcher for matcher in matchers],
-            [CLAUDE_PROVIDER_MCP_TOOL_NAME, "Bash", *CLAUDE_NON_DURABLE_SCHEDULER_TOOLS],
-        )
-        self.assertTrue(all(matcher.timeout == 5.0 for matcher in matchers))
+        self.assertEqual([matcher.matcher for matcher in matchers], [CLAUDE_PROVIDER_MCP_TOOL_NAME])
         self.assertEqual(matchers[0].hooks, [reject_subagent_provider_tool_hook])
-        self.assertEqual(matchers[1].hooks, [reject_untracked_background_hook])
-        self.assertTrue(all(
-            matcher.hooks == [reject_nondurable_scheduler_hook]
-            for matcher in matchers[2:]
-        ))
 
 
 if __name__ == "__main__":

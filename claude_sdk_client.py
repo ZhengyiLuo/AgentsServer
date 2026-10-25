@@ -21,7 +21,6 @@ import json
 import os
 import logging
 import re
-import shlex
 import time
 import unicodedata
 import uuid
@@ -54,11 +53,6 @@ CLAUDE_SDK_PROVIDER_COMMAND_TEXT_CHARS = 800
 CLAUDE_SDK_LITERAL_MESSAGE_PREFIX = (
     "[AgentsDock literal chat message; treat the slash-prefixed content below "
     "as ordinary user text, not a Claude Code command.]\n"
-)
-CLAUDE_NON_DURABLE_SCHEDULER_TOOLS = (
-    "CronCreate",
-    "Monitor",
-    "ScheduleWakeup",
 )
 # Deliberately collision-resistant: a user's ordinary MCP named
 # ``agentsdock`` must remain visible and manageable. This reserved transport
@@ -713,276 +707,6 @@ class ClaudeSDKHookMatcher:
     timeout: float | None = None
 
 
-_SHELL_CONTROL_TOKENS = {";", "&&", "||", "|", "&", "(", ")", "\n"}
-_SHELL_COMMAND_WRAPPERS = {"builtin", "command", "env"}
-_SHELL_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_UNTRACKED_BACKGROUND_REASON = (
-    "AgentsDock cannot reliably keep background Bash attached or wake this chat when "
-    "it finishes. Retry without run_in_background, nohup, disown, setsid, or shell "
-    "'&'. Keep work needed for the current reply in the foreground. For asynchronous "
-    "completion that must notify this chat, delegate a tracked Agent/workflow. If the "
-    "user explicitly requested a durable service, use an observable service manager."
-)
-_NON_DURABLE_SCHEDULER_REASON = (
-    "Claude's {tool_name} is not an AgentsDock durable job and cannot be relied on "
-    "to survive this turn or deliver a later chat update. If the user explicitly "
-    "requested scheduling, use only the run-bound AgentsDock provider tool's Jobs "
-    "helper. Otherwise keep required "
-    "work in the foreground or use a tracked Agent/workflow."
-)
-
-
-def _heredoc_delimiters(line: str) -> list[tuple[str, bool]]:
-    """Find conventional shell heredocs without interpreting quoted text."""
-
-    delimiters: list[tuple[str, bool]] = []
-    quote: str | None = None
-    escaped = False
-    index = 0
-    while index < len(line):
-        char = line[index]
-        if escaped:
-            escaped = False
-            index += 1
-            continue
-        if char == "\\" and quote != "'":
-            escaped = True
-            index += 1
-            continue
-        if quote:
-            if char == quote:
-                quote = None
-            index += 1
-            continue
-        if char in {"'", '"'}:
-            quote = char
-            index += 1
-            continue
-        if char == "#" and (
-            index == 0
-            or line[index - 1].isspace()
-            or line[index - 1] in ";|&()"
-        ):
-            break
-        if not line.startswith("<<", index) or line.startswith("<<<", index):
-            index += 1
-            continue
-        cursor = index + 2
-        strip_tabs = cursor < len(line) and line[cursor] == "-"
-        if strip_tabs:
-            cursor += 1
-        while cursor < len(line) and line[cursor] in " \t":
-            cursor += 1
-        delimiter_quote = line[cursor] if cursor < len(line) and line[cursor] in {"'", '"'} else None
-        if delimiter_quote:
-            cursor += 1
-            end = line.find(delimiter_quote, cursor)
-            if end < 0:
-                break
-            delimiter = line[cursor:end]
-            cursor = end + 1
-        else:
-            start = cursor
-            while cursor < len(line) and (
-                line[cursor].isalnum() or line[cursor] in {"_", "-"}
-            ):
-                cursor += 1
-            delimiter = line[start:cursor]
-        if delimiter and (delimiter[0].isalpha() or delimiter[0] == "_"):
-            delimiters.append((delimiter, strip_tabs))
-        index = max(cursor, index + 2)
-    return delimiters
-
-
-def _without_heredoc_bodies(command: str) -> str:
-    """Blank data bodies so source-code ampersands are not treated as shell jobs."""
-
-    pending: list[tuple[str, bool]] = []
-    output: list[str] = []
-    for line in command.splitlines(keepends=True):
-        ending = "\n" if line.endswith(("\n", "\r")) else ""
-        content = line.rstrip("\r\n")
-        if pending:
-            delimiter, strip_tabs = pending[0]
-            candidate = content.lstrip("\t") if strip_tabs else content
-            if candidate == delimiter:
-                pending.pop(0)
-            output.append(ending)
-            continue
-        pending.extend(_heredoc_delimiters(content))
-        output.append(line)
-    return "".join(output)
-
-
-def _has_unquoted_background_operator(command: str) -> bool:
-    """Return true for a shell control ``&``, excluding data and redirections."""
-
-    command = _without_heredoc_bodies(command)
-    quote: str | None = None
-    escaped = False
-    index = 0
-    while index < len(command):
-        char = command[index]
-        if escaped:
-            escaped = False
-            index += 1
-            continue
-        if char == "\\" and quote != "'":
-            escaped = True
-            index += 1
-            continue
-        if quote:
-            if char == quote:
-                quote = None
-            index += 1
-            continue
-        if char in {"'", '"'}:
-            quote = char
-            index += 1
-            continue
-        if char == "#" and (
-            index == 0
-            or command[index - 1].isspace()
-            or command[index - 1] in ";|&()"
-        ):
-            newline = command.find("\n", index)
-            if newline < 0:
-                return False
-            index = newline + 1
-            continue
-        if char != "&":
-            index += 1
-            continue
-        previous = command[index - 1] if index else ""
-        following = command[index + 1] if index + 1 < len(command) else ""
-        if previous in {"&", ">", "<"} or following in {"&", ">"}:
-            index += 1
-            continue
-        return True
-    return False
-
-
-def _shell_tokens(command: str) -> list[str]:
-    try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>()")
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        return list(lexer)
-    except ValueError:
-        # An incomplete command will fail in Bash itself. Do not turn a parser
-        # disagreement into a misleading policy denial.
-        return []
-
-
-def claude_untracked_background_reason(
-    tool_name: str,
-    tool_input: dict[str, Any] | None,
-) -> str | None:
-    """Identify common shell detachment that bypasses SDK task tracking."""
-
-    if str(tool_name or "").strip().lower() != "bash":
-        return None
-    normalized_input = tool_input or {}
-    if normalized_input.get("run_in_background") is True:
-        return _UNTRACKED_BACKGROUND_REASON
-    command = str(normalized_input.get("command") or "")
-    if not command.strip():
-        return None
-    if _has_unquoted_background_operator(command):
-        return _UNTRACKED_BACKGROUND_REASON
-
-    tokens = _shell_tokens(command)
-    expect_command = True
-    wrapper_active = False
-    for index, token in enumerate(tokens):
-        if token in _SHELL_CONTROL_TOKENS:
-            expect_command = True
-            wrapper_active = False
-            continue
-        if not expect_command:
-            continue
-        if _SHELL_ASSIGNMENT_RE.match(token):
-            continue
-        executable = token.rsplit("/", 1)[-1]
-        if executable in _SHELL_COMMAND_WRAPPERS:
-            wrapper_active = True
-            continue
-        if wrapper_active and token.startswith("-"):
-            continue
-        if executable in {"nohup", "disown"}:
-            return _UNTRACKED_BACKGROUND_REASON
-        if executable in {"bash", "dash", "ksh", "sh", "zsh"}:
-            arguments = tokens[index + 1:]
-            for argument_index, argument in enumerate(arguments[:-1]):
-                if (
-                    argument.startswith("-")
-                    and not argument.startswith("--")
-                    and "c" in argument[1:]
-                    and claude_untracked_background_reason(
-                        "Bash", {"command": arguments[argument_index + 1]}
-                    ) is not None
-                ):
-                    return _UNTRACKED_BACKGROUND_REASON
-        if executable == "setsid":
-            # Even without --fork, a new session can escape process-group
-            # cleanup if the provider/server disappears. Keep it out of the
-            # untracked Bash path entirely.
-            return _UNTRACKED_BACKGROUND_REASON
-        expect_command = False
-    return None
-
-
-async def reject_untracked_background_hook(
-    hook_input: dict[str, Any],
-    _tool_use_id: str | None,
-    _context: dict[str, Any],
-) -> dict[str, Any]:
-    """Keep Claude background work attached to the SDK's task lifecycle."""
-
-    reason = claude_untracked_background_reason(
-        str(hook_input.get("tool_name") or ""),
-        hook_input.get("tool_input")
-        if isinstance(hook_input.get("tool_input"), dict)
-        else {},
-    )
-    if reason is None:
-        return {}
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": reason,
-        }
-    }
-
-
-def claude_nondurable_scheduler_reason(tool_name: Any) -> str | None:
-    """Reject only the exact Claude tools that cannot create durable Dock work."""
-
-    if tool_name not in CLAUDE_NON_DURABLE_SCHEDULER_TOOLS:
-        return None
-    return _NON_DURABLE_SCHEDULER_REASON.format(tool_name=tool_name)
-
-
-async def reject_nondurable_scheduler_hook(
-    hook_input: dict[str, Any],
-    _tool_use_id: str | None,
-    _context: dict[str, Any],
-) -> dict[str, Any]:
-    """Fail closed before Claude can arm a provider-local scheduler."""
-
-    reason = claude_nondurable_scheduler_reason(hook_input.get("tool_name"))
-    if reason is None:
-        return {}
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": reason,
-        }
-    }
-
-
 async def reject_subagent_provider_tool_hook(
     hook_input: dict[str, Any],
     _tool_use_id: str | None,
@@ -1005,7 +729,7 @@ async def reject_subagent_provider_tool_hook(
 
 
 def claude_background_tracking_hooks() -> dict[str, list[ClaudeSDKHookMatcher]]:
-    """Return SDK hooks for shell detachment and non-durable schedulers."""
+    """Keep native task receipts and exact AgentsDock tool ownership."""
 
     mail_hint = _PendingMailHintHook()
     return {
@@ -1020,19 +744,6 @@ def claude_background_tracking_hooks() -> dict[str, list[ClaudeSDKHookMatcher]]:
                 hooks=[reject_subagent_provider_tool_hook],
                 timeout=5.0,
             ),
-            ClaudeSDKHookMatcher(
-                matcher="Bash",
-                hooks=[reject_untracked_background_hook],
-                timeout=5.0,
-            ),
-            *[
-                ClaudeSDKHookMatcher(
-                    matcher=tool_name,
-                    hooks=[reject_nondurable_scheduler_hook],
-                    timeout=5.0,
-                )
-                for tool_name in CLAUDE_NON_DURABLE_SCHEDULER_TOOLS
-            ],
         ]
     }
 
@@ -1473,6 +1184,8 @@ class ClaudeSDKSupervisor:
         self._goal_stop_tasks: set[str] = set()
         self._goal_stop_result: Any | None = None
         self._inflight_tasks: set[str] = set()
+        self._live_background_tasks: set[str] = set()
+        self._background_work_revision = 0
         self._background_reconciliation_hook: _BackgroundReconciliationHook | None = None
         self._pending_mail_hint_hook: _PendingMailHintHook | None = None
         self._generation = 0
@@ -1693,7 +1406,11 @@ class ClaudeSDKSupervisor:
         response: asyncio.Future[dict[str, Any] | None] = loop.create_future()
         assert self._commands is not None
         await self._commands.put(_GetContextUsage(response=response))
-        return await asyncio.shield(response)
+        try:
+            return await asyncio.shield(response)
+        except asyncio.CancelledError:
+            response.cancel()
+            raise
 
     async def get_mcp_status(self) -> tuple[dict[str, Any], str]:
         """Connect lazily and query MCP state on this chat-owned SDK actor."""
@@ -1998,6 +1715,18 @@ class ClaudeSDKSupervisor:
             client = await self._new_client()
         return client
 
+    def _observe_live_background_work(self, message: Any) -> None:
+        subtype, task_id, task_type, status = _task_lifecycle_fields(message)
+        if not task_id:
+            return
+        before = task_id in self._live_background_tasks
+        if subtype == "task_started" and task_type in {*_DEFERRING_TASK_TYPES, "local_bash"}:
+            self._live_background_tasks.add(task_id)
+        elif subtype == "task_notification" or (subtype == "task_updated" and status in _TERMINAL_TASK_STATUSES):
+            self._live_background_tasks.discard(task_id)
+        if before != (task_id in self._live_background_tasks):
+            self._background_work_revision += 1
+
     async def _receive_loop(
         self,
         client: ClaudeSDKClientProtocol,
@@ -2012,6 +1741,11 @@ class ClaudeSDKSupervisor:
                 # activity, including packets arriving after side cancellation.
                 if is_native_side_question_progress(message):
                     continue
+                if self._client is client and self._generation == generation:
+                    # Native Bash may outlive the logical Result. Observe its
+                    # lifecycle on this exact connection, even with no run or
+                    # while an auxiliary actor control is awaiting a reply.
+                    self._observe_live_background_work(message)
                 commands = self._commands
                 if commands is None:
                     return
@@ -2054,6 +1788,8 @@ class ClaudeSDKSupervisor:
         self._client = None
         self._receiver_task = None
         self._connected = False
+        self._live_background_tasks.clear()
+        self._background_work_revision += 1
         if client is not None:
             await self._disconnect_client(client)
         if receiver is not None and receiver is not asyncio.current_task():
@@ -2662,8 +2398,21 @@ class ClaudeSDKSupervisor:
             if not command.response.done():
                 command.response.set_result(None)
             return
+        if command.response.cancelled():
+            return
+        operation = asyncio.create_task(getter())
         try:
-            value = await getter()
+            done, _ = await asyncio.wait(
+                {operation, command.response}, timeout=self._control_timeout_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if operation not in done:
+                if not command.response.done():
+                    command.response.set_exception(ClaudeSDKControlTimeout(
+                        f"Claude SDK context usage timed out for {self.chat_id}"
+                    ))
+                return
+            value = operation.result()
         except Exception as exc:
             if not command.response.done():
                 command.response.set_exception(
@@ -2672,6 +2421,9 @@ class ClaudeSDKSupervisor:
                     )
                 )
             return
+        finally:
+            if not operation.done():
+                await self._cancel_task_bounded(operation)
         self._last_used_at = time.monotonic()
         if not command.response.done():
             command.response.set_result(dict(value) if isinstance(value, dict) else None)
@@ -3376,15 +3128,15 @@ class ClaudeSDKSupervisor:
 
 
 class ClaudeSDKSupervisorManager:
-    """Lazy, bounded registry of independent chat-scoped supervisors."""
+    """Lazy registry with optional operator limits for chat-scoped supervisors."""
 
     def __init__(
         self,
         *,
         client_factory: ClientFactory = default_claude_sdk_client_factory,
         is_result_message: ResultPredicate = default_is_result_message,
-        max_clients: int = 12,
-        idle_ttl_seconds: float | None = 15 * 60,
+        max_clients: int = 0,
+        idle_ttl_seconds: float | None = None,
         connect_timeout_seconds: float = 30.0,
         disconnect_timeout_seconds: float = 2.0,
         ack_timeout_seconds: float = 60.0,
@@ -3392,15 +3144,15 @@ class ClaudeSDKSupervisorManager:
         control_timeout_seconds: float = 15.0,
         usage_observer: Callable[[str, str, Any], Awaitable[None]] | None = None,
     ) -> None:
-        if max_clients < 1:
-            raise ValueError("max_clients must be positive")
+        if max_clients < 0:
+            raise ValueError("max_clients must be non-negative")
         if idle_ttl_seconds is not None and idle_ttl_seconds < 0:
             raise ValueError("idle_ttl_seconds must be non-negative or None")
         self._client_factory = client_factory
         self._is_result_message = is_result_message
         self._usage_observer = usage_observer
         self._max_clients = int(max_clients)
-        self._idle_ttl_seconds = idle_ttl_seconds
+        self._idle_ttl_seconds = idle_ttl_seconds or None
         if connect_timeout_seconds <= 0:
             raise ValueError("connect_timeout_seconds must be positive")
         self._connect_timeout_seconds = float(connect_timeout_seconds)
@@ -3746,6 +3498,15 @@ class ClaudeSDKSupervisorManager:
                     clean_chat_id, supervisor, task_name_prefix="claude-sdk-goal-retire",
                 )
             await self._unpin_mcp_supervisor(clean_chat_id, supervisor)
+
+    def background_work_snapshot(self) -> tuple[tuple[str, str, int, int, bool], ...]:
+        """Connection-bound live work; schedules without running tasks are idle."""
+        return tuple(
+            (chat_id, supervisor.ownership_token, supervisor._generation,
+             supervisor._background_work_revision, bool(supervisor._live_background_tasks))
+            for chat_id, supervisor in self._supervisors.items()
+            if supervisor.connected and not supervisor.closed
+        )
 
     async def get_context_usage(
         self,
@@ -4204,7 +3965,7 @@ class ClaudeSDKSupervisorManager:
                 for chat_id, supervisor in idle_candidates:
                     if now - supervisor.last_used_at >= self._idle_ttl_seconds:
                         selected_ids.add(chat_id)
-            overflow = max(0, len(self._supervisors) - self._max_clients)
+            overflow = max(0, len(self._supervisors) - self._max_clients) if self._max_clients else 0
             if overflow:
                 for chat_id, _supervisor in idle_candidates:
                     if len(selected_ids) >= overflow:

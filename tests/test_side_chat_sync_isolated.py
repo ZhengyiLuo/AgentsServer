@@ -112,6 +112,16 @@ class SyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.send("request2", "outdated follow up", initial)).status_code, 409)
         self.assertEqual(len(self.calls), 1)
 
+    async def test_idle_native_handle_has_no_expiry_and_large_question_is_accepted(self):
+        self.assertEqual((await self.send(question="x" * 8001)).status_code, 202)
+        await self.settle()
+        self.assertEqual(self.runtime.synced.timers, {})
+        self.assertEqual(len(self.runtime.synced.handles), 1)
+        self.assertEqual((await self.send("follow-up", "continue")).status_code, 202)
+        await self.settle()
+        self.assertEqual(len(self.factories), 1)
+        self.assertFalse(self.closed)
+
     async def test_simultaneous_devices_do_not_overwrite_each_others_questions(self):
         initial = await self.snapshot()
         results = await asyncio.gather(self.send("device1", "first", initial), self.send("device2", "second", initial))

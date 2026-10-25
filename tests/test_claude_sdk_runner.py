@@ -1197,6 +1197,48 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             agent_server.CLAUDE_EMPTY_TURN_ERROR,
         )
 
+    async def test_print_disabled_idle_ceiling_waits_for_native_result(self) -> None:
+        process = FakeClaudePrintProcess([])
+        process.stdout.readline = AsyncMock(side_effect=[
+            asyncio.TimeoutError(),
+            b'{"type":"result","result":"done","session_id":"provider"}\n',
+            b"",
+        ])
+        append_event = AsyncMock(return_value={})
+        finished = AsyncMock(return_value={})
+        with patch.multiple(
+            agent_server,
+            IDLE_KILL_SECONDS=0,
+            resolve_claude_resume_provider=Mock(return_value=(None, None)),
+            capture_git_baseline=AsyncMock(return_value={}),
+            build_claude_cmd=Mock(return_value=["claude", "-p"]),
+            process_group_for_pid=Mock(return_value=4242),
+            watch_manifest_artifacts=wait_forever,
+            append_event=append_event,
+            append_turn_finished_event=finished,
+            append_active_stdout=AsyncMock(),
+            mark_provider_turn_ready=AsyncMock(),
+            persist_run_provider_session=AsyncMock(),
+            terminate_process_tree=AsyncMock(),
+            clear_active_process=AsyncMock(),
+            collect_manifest=AsyncMock(),
+            collect_recent_leftover_manifests=AsyncMock(),
+            publish_turn_code_diff=AsyncMock(),
+            release_turn_slot=AsyncMock(return_value=True),
+            record_runtime_success=Mock(),
+            record_runtime_failure=Mock(),
+            should_schedule_queue_after_finish=Mock(return_value=False),
+        ), patch.object(agent_server.asyncio, "create_subprocess_exec",
+                        AsyncMock(return_value=process)):
+            await agent_server.run_claude_print(
+                "chat-claude", "run-claude", "Prompt", dict(self.session),
+                Path(self.cwd) / ".manifest.json",
+            )
+        self.assertEqual(process.stdout.readline.await_count, 3)
+        self.assertEqual(finished.await_args.args[1]["exit_code"], 0)
+        self.assertEqual(finished.await_args.args[1]["result_text"], "done")
+        self.assertFalse(any(call.args[1] == "error" for call in append_event.await_args_list))
+
     async def test_interactive_auto_never_downgrades_to_unattended_print(self) -> None:
         sdk = AsyncMock(side_effect=ClaudeSDKUnavailable("missing SDK"))
         print_runner = AsyncMock()
@@ -1436,7 +1478,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(changed.exception.status_code, 409)
         self.assertIs(self.session["context_usage_snapshot"], newer_snapshot)
 
-    async def test_manual_context_timeout_preserves_snapshot_and_resets_idle_client(self) -> None:
+    async def test_manual_context_timeout_preserves_snapshot_and_connected_client(self) -> None:
         manager = FakeClaudeManager()
         manager.get_context_usage = AsyncMock(  # type: ignore[method-assign]
             side_effect=wait_forever
@@ -1479,11 +1521,11 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertEqual(timed_out.exception.status_code, 504)
-        self.assertEqual(manager.evict_calls, [("chat-claude", True)])
+        self.assertEqual(manager.evict_calls, [])
         self.assertIs(self.session["context_usage_snapshot"], stale_snapshot)
         self.assertEqual(self.session["context_usage_state"], "available")
 
-    async def test_cancelled_manual_context_refresh_retires_only_idle_client(self) -> None:
+    async def test_cancelled_manual_context_refresh_preserves_connected_client(self) -> None:
         manager = FakeClaudeManager()
         sampling_started = asyncio.Event()
 
@@ -1534,7 +1576,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                     break
                 await asyncio.sleep(0)
 
-        self.assertEqual(manager.evict_calls, [("chat-claude", True)])
+        self.assertEqual(manager.evict_calls, [])
         self.assertIs(self.session["context_usage_snapshot"], stale_snapshot)
 
     async def test_cancelled_context_refresh_cannot_late_evict_replacement_turn(
@@ -1542,8 +1584,6 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         manager = FakeClaudeManager()
         sampling_started = asyncio.Event()
-        eviction_started = asyncio.Event()
-        release_eviction = asyncio.Event()
         replacement_running = asyncio.Event()
 
         async def blocked_sample(
@@ -1552,18 +1592,6 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         ) -> None:
             sampling_started.set()
             await asyncio.Event().wait()
-
-        async def delayed_evict(
-            chat_id: str,
-            *,
-            force: bool = False,
-        ) -> bool:
-            manager.evict_calls.append((chat_id, force))
-            eviction_started.set()
-            await release_eviction.wait()
-            manager.active_run_id = None
-            manager.loaded = False
-            return True
 
         async def replacement_runner(
             _session_id: str,
@@ -1579,9 +1607,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         manager.get_context_usage = AsyncMock(  # type: ignore[method-assign]
             side_effect=blocked_sample
         )
-        manager.evict = AsyncMock(  # type: ignore[method-assign]
-            side_effect=delayed_evict
-        )
+        manager.evict = AsyncMock(side_effect=AssertionError("Read-only context sampling must not retire its provider"))
         self.session["claude_session_id"] = "provider-manual"
         agent_server.CLAUDE_SDK_MANAGER = manager
         agent_server.ACTIVE = {}
@@ -1626,7 +1652,8 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             )
             await asyncio.wait_for(sampling_started.wait(), 0.2)
             refresh.cancel()
-            await asyncio.wait_for(eviction_started.wait(), 0.2)
+            with self.assertRaises(asyncio.CancelledError):
+                await refresh
 
             replacement = asyncio.create_task(
                 agent_server.start_turn(
@@ -1634,12 +1661,6 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                     agent_server.TurnRequest(prompt="Replacement turn"),
                 )
             )
-            await asyncio.sleep(0)
-            self.assertFalse(replacement_running.is_set())
-
-            release_eviction.set()
-            with self.assertRaises(asyncio.CancelledError):
-                await refresh
             # Provider admission now scrubs a pre-existing tmux daemon's
             # global and per-session environments before launch. Keep this
             # lifecycle assertion bounded without assuming that external
@@ -1647,7 +1668,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             started = await asyncio.wait_for(replacement, 1.0)
             await asyncio.wait_for(replacement_running.wait(), 0.2)
 
-        self.assertEqual(manager.evict_calls, [("chat-claude", True)])
+        self.assertEqual(manager.evict_calls, [])
         self.assertTrue(manager.loaded)
         self.assertEqual(manager.active_run_id, started["run_id"])
 
@@ -2277,10 +2298,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(captured_options["permission_mode"], "plan")
         self.assertEqual(agent_server.CLAUDE_SDK_CONFIGURATION_VERSION, 10)
-        self.assertEqual(
-            captured_options["disallowed_tools"],
-            ["CronCreate", "Monitor", "ScheduleWakeup"],
-        )
+        self.assertNotIn("disallowed_tools", captured_options)
         self.assertEqual(
             captured_options["allowed_tools"],
             [agent_server.CLAUDE_PROVIDER_MCP_TOOL_NAME],
@@ -2310,13 +2328,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         hooks = captured_options["hooks"]
         self.assertEqual(
             [matcher.matcher for matcher in hooks["PreToolUse"]],
-            [
-                agent_server.CLAUDE_PROVIDER_MCP_TOOL_NAME,
-                "Bash",
-                "CronCreate",
-                "Monitor",
-                "ScheduleWakeup",
-            ],
+            [agent_server.CLAUDE_PROVIDER_MCP_TOOL_NAME],
         )
         self.assertEqual(result, {"behavior": "allow"})
         permission.assert_awaited_once_with(
@@ -2350,19 +2362,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                 "/usr/bin/claude",
                 system_prompt,
             )
-        with patch.object(
-            agent_server,
-            "CLAUDE_NON_DURABLE_SCHEDULER_TOOLS",
-            ("CronCreate",),
-        ):
-            previous_tools_key = agent_server.claude_sdk_configuration_key(
-                session,
-                self.cwd,
-                "/usr/bin/claude",
-                system_prompt,
-            )
         self.assertNotEqual(config_key, previous_version_key)
-        self.assertNotEqual(config_key, previous_tools_key)
 
     async def test_provider_tool_repeats_live_reads_but_replays_identical_mutations(self) -> None:
         captured_mcp: dict[str, object] = {}
@@ -2437,7 +2437,12 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             }
             first_mutation = await handler(mutation)
             second_mutation = await handler(mutation)
+            with patch.object(agent_server, "provider_tool_capability_snapshot",
+                              AsyncMock(side_effect=agent_server.ProviderToolError("owner retired"))):
+                stale_mutation = await handler(mutation)
 
+        self.assertTrue(stale_mutation["is_error"])
+        self.assertEqual(stale_mutation["content"][0]["text"], "owner retired")
         self.assertEqual(first_read["content"][0]["text"], "read-1")
         self.assertEqual(second_read["content"][0]["text"], "read-2")
         self.assertEqual(first_mutation, second_mutation)
@@ -2445,73 +2450,36 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(executor.await_count, 3)
 
         entered = 0
-        both_entered = asyncio.Event()
+        all_entered = asyncio.Event()
         release = asyncio.Event()
 
         async def gated_executor(*_args: object, **_kwargs: object):
             nonlocal entered
             entered += 1
-            if entered == agent_server.PROVIDER_TOOL_MAX_CONCURRENT_PER_CLAUDE_CHAT:
-                both_entered.set()
+            if entered == 3:
+                all_entered.set()
             await release.wait()
             return "fresh", False
 
-        with patch.object(
-            agent_server,
-            "execute_provider_tool",
-            AsyncMock(side_effect=gated_executor),
-        ):
+        concurrent_executor = AsyncMock(side_effect=gated_executor)
+        with patch.object(agent_server, "execute_provider_tool", concurrent_executor):
             running = [
-                asyncio.create_task(handler({
-                    "helper": "jobs",
-                    "arguments": ["list"],
-                }))
-                for _ in range(
-                    agent_server.PROVIDER_TOOL_MAX_CONCURRENT_PER_CLAUDE_CHAT
-                )
+                asyncio.create_task(handler({"helper": "jobs", "arguments": ["list"]}))
+                for _ in range(3)
             ]
-            await asyncio.wait_for(both_entered.wait(), 1)
-            rejected = await handler({
-                "helper": "jobs",
-                "arguments": ["list"],
-            })
-            release.set()
-            await asyncio.gather(*running)
+            try:
+                await asyncio.wait_for(all_entered.wait(), 1)
+                self.assertTrue(all(not call.done() for call in running))
+            finally:
+                release.set()
+                results = await asyncio.gather(*running)
 
-        self.assertTrue(rejected["is_error"])
-        self.assertIn(
-            "too many AgentsDock provider actions",
-            rejected["content"][0]["text"],
-        )
-
-    async def test_nondurable_scheduler_permission_never_creates_interaction(self) -> None:
-        append_event = AsyncMock(return_value={})
-        update_metadata = AsyncMock()
-        with patch.dict(sys.modules, fake_claude_sdk_modules()), patch.object(
-            agent_server,
-            "append_event",
-            append_event,
-        ), patch.object(
-            agent_server,
-            "update_claude_pending_session_metadata",
-            update_metadata,
-        ):
-            for tool_name in ("CronCreate", "Monitor", "ScheduleWakeup"):
-                with self.subTest(tool_name=tool_name):
-                    result = await agent_server.handle_claude_tool_permission(
-                        "chat-claude",
-                        tool_name,
-                        {},
-                        {"tool_use_id": f"tool-{tool_name}"},
-                    )
-                    self.assertIsInstance(result, FakePermissionResultDeny)
-                    self.assertFalse(getattr(result, "interrupt", True))
-                    self.assertIn("AgentsDock provider tool", result.message)
-                    self.assertNotIn("provider-authority block", result.message)
-
-        self.assertFalse(agent_server.CLAUDE_PENDING_INTERACTIONS)
-        append_event.assert_not_awaited()
-        update_metadata.assert_not_awaited()
+        self.assertEqual(concurrent_executor.await_count, 3)
+        self.assertTrue(all(not result["is_error"] for result in results))
+        self.assertEqual([result["content"][0]["text"] for result in results], ["fresh"] * 3)
+        for call in concurrent_executor.await_args_list:
+            self.assertEqual(call.args[:2], ("chat-claude", "run-claude"))
+            self.assertEqual(call.kwargs["claude_owner_token"], "owner")
 
     async def test_bypass_permission_mode_never_creates_approval_interaction(self) -> None:
         self.session["claude_permission_mode"] = "bypassPermissions"
@@ -2548,6 +2516,11 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             for tool_name, input_data in (
                 ("Read", {"file_path": "/tmp/read-only.txt"}),
                 ("Bash", {"command": "pwd"}),
+                ("Bash", {"command": "python worker.py", "run_in_background": True}),
+                ("Bash", {"command": "nohup ./worker > worker.log 2>&1 &"}),
+                ("CronCreate", {"cron": "* * * * *", "prompt": "Check progress"}),
+                ("Monitor", {}),
+                ("ScheduleWakeup", {}),
             ):
                 with self.subTest(tool_name=tool_name):
                     result = await agent_server.handle_claude_tool_permission(
@@ -2689,16 +2662,15 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("--permission-mode", command)
         disallowed_index = command.index("--disallowedTools")
         self.assertEqual(
-            command[disallowed_index + 1:disallowed_index + 7],
+            command[disallowed_index + 1:disallowed_index + 4],
             [
                 "AskUserQuestion",
                 "EnterPlanMode",
                 "ExitPlanMode",
-                "CronCreate",
-                "Monitor",
-                "ScheduleWakeup",
             ],
         )
+        for native_tool in ("CronCreate", "Monitor", "ScheduleWakeup"):
+            self.assertNotIn(native_tool, command)
         self.assertNotIn("CronList", command)
         self.assertNotIn("CronDelete", command)
 
@@ -4935,6 +4907,28 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             for call in append_event.await_args_list
         ))
         runtime_failure.assert_not_called()
+
+    async def test_disabled_execution_watchdogs_wait_for_native_result(self) -> None:
+        class DelayedTerminalClaudeRun(FakeClaudeRun):
+            async def __anext__(self) -> object:
+                await asyncio.sleep(0.06)
+                return {"type": "result", "result": "Native work completed", "session_id": "provider"}
+
+        for acknowledged in (False, True):
+            with self.subTest(acknowledged=acknowledged):
+                handle = DelayedTerminalClaudeRun(acknowledged=acknowledged)
+                manager, events, finished, failure = await self._run_sdk_timeout_case(
+                    handle, pre_ack_timeout=0, post_ack_timeout=0, turn_timeout=0,
+                    idle_warn=0.01, idle_timeout=0,
+                    project_result={"session_id": "provider", "result_text": "Native work completed",
+                                    "is_error": False, "error": "", "subtype": "success",
+                                    "terminal_reason": "end_turn", "aborted": False},
+                )
+                self.assertEqual(handle.interrupt_calls, 0)
+                self.assertEqual(manager.evict_calls, [])
+                self.assertEqual(finished.await_args.args[1]["exit_code"], 0)
+                self.assertFalse(any(call.args[1] == "error" for call in events.await_args_list))
+                failure.assert_not_called()
 
     async def test_pending_approval_pauses_idle_and_absolute_watchdogs(self) -> None:
         interaction_id = "claudereq_waiting"

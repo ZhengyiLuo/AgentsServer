@@ -1404,6 +1404,27 @@ time.sleep(10)
         self.assertEqual(terminal["result_text"], "")
         self.assertNotIn(self.session_id, agent_server.BUSY_SESSIONS)
 
+    async def test_disabled_deadlines_allow_silence_before_and_after_init(self) -> None:
+        agent_server.CURSOR_STARTUP_TIMEOUT_SECONDS = 0
+        agent_server.CURSOR_TURN_TIMEOUT_SECONDS = 0
+        agent_server.CURSOR_IDLE_TIMEOUT_SECONDS = 0
+        agent_server.CURSOR_IDLE_WARN_SECONDS = 0.02
+        events = await self._run_script(
+            """#!/usr/bin/env python3
+import json, sys, time
+sys.stdin.read()
+time.sleep(0.12)
+print(json.dumps({"type":"system","subtype":"init","session_id":"cursor-sess-test","cwd":".","model":"Auto"}), flush=True)
+time.sleep(0.12)
+print(json.dumps({"type":"result","subtype":"success","is_error":False,"result":"Finished after quiet work","session_id":"cursor-sess-test"}), flush=True)
+"""
+        )
+        terminal = next(event for event in events if event["type"] == "turn_finished")
+        self.assertFalse(terminal["is_error"])
+        self.assertEqual(terminal["result_text"], "Finished after quiet work")
+        self.assertTrue(any(event["type"] == "idle_warning" for event in events))
+        self.assertFalse(any(event["type"] == "error" for event in events))
+
     async def test_absolute_timeout_applies_despite_continuous_output(self) -> None:
         agent_server.CURSOR_STARTUP_TIMEOUT_SECONDS = 0.2
         agent_server.CURSOR_TURN_TIMEOUT_SECONDS = 0.15
@@ -1456,10 +1477,7 @@ print(json.dumps({"type":"result","subtype":"success","is_error":False,"result":
         # Process/guard startup is a separate idle period. Arm the short
         # thresholds only after init so slow CI startup cannot add a warning
         # before the single post-init idle period this test exercises.
-        startup_idle_deadline = (
-            agent_server.CURSOR_STARTUP_TIMEOUT_SECONDS
-            + agent_server.CURSOR_TURN_TIMEOUT_SECONDS
-        )
+        startup_idle_deadline = 10.0
         agent_server.CURSOR_IDLE_WARN_SECONDS = startup_idle_deadline
         agent_server.CURSOR_IDLE_TIMEOUT_SECONDS = startup_idle_deadline
         mark_ready = agent_server.mark_provider_turn_ready
@@ -2025,7 +2043,7 @@ class CursorFileDeliveryInstructionTests(unittest.TestCase):
             )
         current = agent_server.cursor_instruction_hash("chat-x", {}, manifest)
 
-        self.assertEqual(agent_server.CURSOR_PROMPT_POLICY_VERSION, "6")
+        self.assertEqual(agent_server.CURSOR_PROMPT_POLICY_VERSION, "7")
         self.assertNotEqual(previous, current)
 
 

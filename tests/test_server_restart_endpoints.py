@@ -109,6 +109,16 @@ def restart_body(
 @contextmanager
 def restart_environment(root: Path):
     with ExitStack() as stack:
+        # This route fixture does not run the app startup that opens HubStore.
+        # Dedicated snapshot tests override these defaults explicitly.
+        stack.enter_context(patch.object(
+            agent_server.TEAM_HUB_RUNTIME, "prepare_maintenance",
+            new=AsyncMock(return_value=None),
+        ))
+        stack.enter_context(patch.object(
+            agent_server.TEAM_HUB_RUNTIME, "reopen_admission",
+            new=AsyncMock(),
+        ))
         stack.enter_context(patch.object(
             agent_server,
             "SERVER_RESTART_STATUS_FILE",
@@ -688,7 +698,7 @@ class ManagedServerProofTests(unittest.TestCase):
         unmanaged_cgroup.assert_not_called()
         unmanaged_probe.assert_not_called()
 
-    def test_linux_requires_current_release_tree_and_exact_service_cgroup(self):
+    def test_linux_requires_exact_service_cgroup(self):
         with tempfile.TemporaryDirectory() as temporary:
             install_root = Path(temporary)
             release = install_root / "releases" / "0.1.25-beta.1"
@@ -720,6 +730,15 @@ class ManagedServerProofTests(unittest.TestCase):
                     self.assertIsNone(
                         agent_server.detect_managed_server_service_kind()
                     )
+
+    def test_owned_source_checkout_can_restart_without_installer_layout(self):
+        with patch.object(agent_server, "official_server_release_tree", return_value=False):
+            with patch.object(agent_server.sys, "platform", "darwin"), \
+                 patch.object(agent_server, "macos_launchd_owns_current_process", return_value=True):
+                self.assertEqual(agent_server.detect_managed_server_service_kind(), "launch-agent")
+            with patch.object(agent_server.sys, "platform", "linux"), \
+                 patch.object(agent_server, "agents_server_systemd_cgroup", return_value="/user.slice/agents-server.service"):
+                self.assertEqual(agent_server.detect_managed_server_service_kind(), "systemd-user")
 
     def test_release_tree_must_resolve_through_installer_current_link(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1303,7 +1322,7 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["phase"], "accepted")
         self.assertEqual(len(tasks.tasks), 1)
 
-    async def test_recent_terminal_restart_enforces_cooldown(self):
+    async def test_recent_completed_or_failed_restart_does_not_block_new_request(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             with restart_environment(root), \
@@ -1312,21 +1331,20 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
                      "server_restart_status_age_seconds",
                      return_value=2,
                  ):
-                agent_server.write_server_restart_status(
-                    phase="complete",
-                    request_id=str(uuid.uuid4()),
-                    requested_at="2026-08-19T00:00:00Z",
-                )
-                with self.assertRaises(HTTPException) as raised:
-                    await agent_server.restart_server_endpoint(
+                for phase in ("complete", "failed"):
+                    agent_server.write_server_restart_status(
+                        phase=phase,
+                        request_id=str(uuid.uuid4()),
+                        requested_at="2026-08-19T00:00:00Z",
+                    )
+                    tasks = BackgroundTasks()
+                    result = await agent_server.restart_server_endpoint(
                         restart_body(),
                         http_request(method="POST"),
-                        BackgroundTasks(),
+                        tasks,
                     )
-
-        self.assertEqual(raised.exception.status_code, 409)
-        self.assertEqual(raised.exception.detail["code"], "server_restart_cooldown")
-        self.assertGreater(raised.exception.detail["retry_after_seconds"], 0)
+                    self.assertEqual(result["phase"], "accepted")
+                    self.assertEqual(len(tasks.tasks), 1)
 
     async def test_expected_identity_and_instance_are_both_authoritative(self):
         for force in (False, True):

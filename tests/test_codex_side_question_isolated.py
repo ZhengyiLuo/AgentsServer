@@ -74,7 +74,8 @@ class ConfigurationTests(unittest.TestCase):
 
     def test_side_chat_keeps_native_tools_and_excludes_only_parent_run_authority(self):
         name = CLAUDE_PROVIDER_MCP_SERVER_NAME
-        parent = {"features.shell_tool": True, "web_search": "live",
+        parent = {"features.shell_tool": True, "web_search": "live", "agents.enabled": True,
+                  "features.multi_agent": True, "features.multi_agent_v2": True,
                   "mcp_servers": {"ordinary": {"enabled": True}, name: {"http_headers": {"secret": "parent"}}},
                   f"mcp_servers.{name}.http_headers": {"secret": "parent"},
                   "shell_environment_policy.exclude": ["PRIVATE_KEY"]}
@@ -88,7 +89,9 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(config[f"mcp_servers.{name}.url"], "http://127.0.0.1:0")
         self.assertNotIn(f"mcp_servers.{name}.http_headers", config)
         self.assertEqual(config["shell_environment_policy.exclude"], ["PRIVATE_KEY"])
-        self.assertFalse(config["agents.enabled"])
+        for key in ("agents.enabled", "features.multi_agent", "features.multi_agent_v2"):
+            self.assertTrue(config[key])
+            self.assertNotIn(key, adapter.side_chat_config())
         self.assertEqual(json.dumps(parent, sort_keys=True), before)
 
 
@@ -97,6 +100,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.turn = SimpleNamespace(next_notification=AsyncMock(side_effect=[message(), completed()]), close=AsyncMock())
         self.client = SimpleNamespace(
             start=AsyncMock(), close=AsyncMock(),
+            add_notification_handler=Mock(),
             request=AsyncMock(return_value={"config": {"mcp_servers": {"ordinary": {}, "dotted.name": {}}}}),
             start_thread=AsyncMock(return_value="temporary-thread"),
             fork_thread=AsyncMock(return_value="temporary-thread"),
@@ -125,6 +129,45 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             cwd="/synthetic/workspace", fork_overrides={"runtimeWorkspaceRoots": ["/synthetic/workspace"],
                 "approvalPolicy": "on-request", "sandbox": "workspace-write"},
             turn_overrides={"approvalPolicy": "on-request", "sandboxPolicy": {"type": "workspaceWrite"}})
+
+    async def test_retained_child_liveness_uses_native_descendants_after_parent_result(self):
+        self.client.ready = True
+        self.client.generation = 7
+        self.client.list_descendant_threads = AsyncMock(return_value=[{
+            "id": "child-with-no-start-notification", "status": {"type": "active"},
+            "parentThreadId": "temporary-thread",
+        }])
+        chat = adapter.NativeCodexSideChat("parent-thread", executable="synthetic", model=None, env={})
+        try:
+            self.assertEqual(await chat.ask("Launch authorized side work"), "Answer")
+            self.assertIsNone(chat._active)
+            self.assertTrue(await chat.has_background_work())
+            self.client.list_descendant_threads.assert_awaited_with("temporary-thread")
+            self.client.list_descendant_threads.return_value[0]["status"] = {"type": "idle"}
+            self.assertFalse(await chat.has_background_work())
+            self.client.list_descendant_threads.return_value = []
+            self.assertFalse(await chat.has_background_work())
+            before = chat.background_work_scope()
+            chat._remember_notification({"method": "turn/started", "params": {"threadId": "child"}})
+            self.assertNotEqual(before, chat.background_work_scope())
+        finally:
+            await chat.close()
+        self.assertIsNone(chat.background_work_scope())
+
+    async def test_background_probe_rejects_replaced_native_generation(self):
+        self.client.ready = True
+        self.client.generation = 7
+        chat = adapter.NativeCodexSideChat("parent-thread", executable="synthetic", model=None, env={})
+        async def changed(_thread_id):
+            self.client.generation += 1
+            return []
+        self.client.list_descendant_threads = AsyncMock(side_effect=changed)
+        try:
+            await chat.ask("Question")
+            with self.assertRaises(SideQuestionError):
+                await chat.has_background_work()
+        finally:
+            await chat.close()
 
     async def test_synced_chat_saves_native_fork_then_resumes_exact_child_after_restart(self):
         self.client.read_thread.return_value = {"id": "temporary-thread", "ephemeral": False, "path": "/private/native-side.jsonl"}
@@ -407,6 +450,62 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         callback.assert_awaited_once_with(2, "item/commandExecution/requestApproval", {"threadId": "temporary-thread"})
         self.assertEqual(await chat._handle_server_request(3, "item/commandExecution/requestApproval",
             {"threadId": "temporary-thread"}), {"decision": "decline"})
+        await chat.close()
+
+    async def test_descendant_approvals_require_provider_lineage_to_side_fork(self):
+        callback = AsyncMock(return_value={"decision": "accept"})
+        chat = adapter.NativeCodexSideChat("parent-thread", executable="synthetic-codex",
+            model=None, env={}, server_request_handler=callback)
+        chat.thread_id = "side-thread"
+        chat._client = self.client
+        chat._active = asyncio.current_task()
+        def metadata(thread_id, **_kwargs):
+            parent = {"child": "side-thread", "grandchild": "child", "inherited": "parent-thread",
+                      "unrelated": "other-root", "cycle-a": "cycle-b", "cycle-b": "cycle-a"}.get(thread_id)
+            return {"id": thread_id, "source": {"subAgent": {"thread_spawn": {
+                "parent_thread_id": parent, "depth": 1}}}} if parent else {"id": thread_id, "source": "cli"}
+        self.client.read_thread.side_effect = metadata
+        method = "item/commandExecution/requestApproval"
+        for thread_id in ("grandchild", "child", "side-thread"):
+            self.assertEqual(await chat._handle_server_request(1, method, {"threadId": thread_id}), {"decision": "accept"})
+            self.assertTrue(chat.owns_thread(thread_id))
+        for thread_id in ("parent-thread", "inherited", "unrelated", "cycle-a"):
+            self.assertEqual(await chat._handle_server_request(2, method, {"threadId": thread_id}), {"decision": "decline"})
+            self.assertFalse(chat.owns_thread(thread_id))
+        self.assertEqual(callback.await_count, 3)
+        chat._active = None
+        self.assertEqual(await chat._handle_server_request(3, method, {"threadId": "child"}), {"decision": "accept"})
+        self.assertEqual(await chat._handle_server_request(4, method, {"threadId": "side-thread"}), {"decision": "decline"})
+        self.assertEqual(callback.await_count, 4)
+        await chat.close()
+        self.assertFalse(chat.owns_thread("child"))
+
+    async def test_started_lineage_is_available_before_immediate_approval(self):
+        chat = adapter.NativeCodexSideChat("parent-thread", executable="synthetic-codex", model=None, env={})
+        chat.thread_id = "side-thread"
+        chat._client = self.client
+        chat._remember_notification({"method": "thread/started", "params": {"thread": {
+            "id": "child", "source": {"subAgent": {"thread_spawn": {"parent_thread_id": "side-thread"}}},
+        }}})
+        self.assertTrue(await chat._verify_owned_thread("child"))
+        self.client.read_thread.assert_not_awaited()
+        await chat.close()
+
+    async def test_close_during_lineage_read_never_routes_approval(self):
+        callback = AsyncMock()
+        chat = adapter.NativeCodexSideChat("parent-thread", executable="synthetic-codex", model=None,
+            env={}, server_request_handler=callback)
+        chat.thread_id = "side-thread"
+        chat._client = self.client
+        chat._active = asyncio.current_task()
+        async def read(*_args, **_kwargs):
+            chat._closed = True
+            return {"id": "child", "source": {"subAgent": {"thread_spawn": {"parent_thread_id": "side-thread"}}}}
+        self.client.read_thread.side_effect = read
+        self.assertEqual(await chat._handle_server_request(1, "item/commandExecution/requestApproval",
+            {"threadId": "child"}), {"decision": "decline"})
+        callback.assert_not_awaited()
+        chat._active = None
         await chat.close()
 
     async def test_final_answer_ignores_commentary_and_duplicate_completion(self):

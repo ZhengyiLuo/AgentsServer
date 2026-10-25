@@ -96,13 +96,15 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(agent_server.terminal_session_name("chat-1"), instructions)
         self.assertIn("immediately retry the still-safe requested operation", instructions)
         self.assertIn("delegate bounded noisy exploration", instructions)
-        self.assertIn("Never detach required work", instructions)
-        self.assertIn("`nohup`, `disown`, `setsid`, or shell `&`", instructions)
-        self.assertIn("provider-tracked exec, Agent, or workflow", instructions)
-        self.assertIn("observable service manager", instructions)
-        self.assertIn("Never rely on provider-local timers, loops, or detached processes", instructions)
-        self.assertIn("wake this AgentsDock chat or deliver a later reply", instructions)
-        self.assertIn("Manage durable scheduled jobs only when explicitly asked", instructions)
+        for restriction in (
+            "Never detach", "never call Slack", 'never `"all"`',
+            "inspect it read-only", "Never rely on provider-local timers",
+            "Manage durable scheduled jobs only",
+        ):
+            self.assertNotIn(restriction, instructions)
+        self.assertIn("Detached shell processes do not themselves wake this chat", instructions)
+        self.assertIn("Native scheduling tools follow the provider's lifecycle", instructions)
+        self.assertIn("AgentsDock Jobs provide durable scheduled delivery", instructions)
         # Context diet: the static provider-authority usage and delivery
         # provenance rules moved from every per-turn prompt into these thread
         # instructions, so the line budget applies to the core policy and the
@@ -131,23 +133,17 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
                     session,
                 )
 
-        # v11 scopes messaging guidance to the out-of-band provider tool.
-        self.assertEqual(agent_server.CODEX_THREAD_POLICY_VERSION, "11")
+        # v12 removes app-added restrictions from existing thread instructions.
+        self.assertEqual(agent_server.CODEX_THREAD_POLICY_VERSION, "12")
         self.assertNotEqual(current_hash, previous_hash)
 
     def test_claude_policy_has_the_same_retry_and_context_hygiene_rules(self) -> None:
         instructions = agent_server.CLAUDE_PROMPT_PRELUDE.format()
         self.assertIn("immediately retry the still-safe requested operation", instructions)
         self.assertIn("delegate bounded noisy exploration", instructions)
-        self.assertIn("Keep work needed for the current reply in foreground", instructions)
-        self.assertIn("tracked Agent/workflow", instructions)
-        self.assertIn("does not guarantee a completion wake-up", instructions)
-        self.assertIn(
-            "Never use Claude's `Monitor`, `ScheduleWakeup`, `/loop`, or `CronCreate`",
-            instructions,
-        )
-        self.assertIn("cannot durably deliver a later chat update", instructions)
-        self.assertIn("Jobs helper through the provider tool", instructions)
+        for restriction in ("Never detach", "Never use Claude's", "never use Slack", "join child tasks", "read-only unless explicitly asked"):
+            self.assertNotIn(restriction, instructions)
+        self.assertIn("persistent terminal when available", instructions)
         self.assertNotIn("--authority-file", instructions)
         # Context diet: the static addendum is appended once; the core policy
         # keeps its line budget.
@@ -401,6 +397,14 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
             agent_server.BACKEND_CODEX,
             codex_instruction_hash=instruction_hash,
         )
+
+    async def test_unset_loaded_thread_cap_preserves_idle_native_owners(self) -> None:
+        manager = FakeCodexAppServerManager(loaded={f"thread-{i}" for i in range(20)})
+        with patch.object(agent_server, "CODEX_APP_SERVER_MAX_LOADED_THREADS", 0):
+            for thread in sorted(manager.loaded):
+                await agent_server.touch_codex_app_server_thread(manager, thread)
+        self.assertEqual(len(manager.loaded), 20)
+        self.assertEqual(manager.unsubscribe_calls, [])
 
     async def test_slow_lru_eviction_does_not_hold_the_global_lock(self) -> None:
         class SlowManager:

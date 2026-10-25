@@ -791,23 +791,45 @@ without losing chat state:
 | `AGENTSDOCK_BACKEND` | Default backend, `claude` or `codex` | `claude` |
 | `CLAUDE_BIN` | Claude Code executable name/path | `claude` |
 | `AGENTSDOCK_CLAUDE_TRANSPORT` | Interactive Claude transport: `auto`, `agent-sdk`, or `print` | `auto` |
-| `AGENTSDOCK_CLAUDE_SDK_IDLE_TTL_SECONDS` | Idle per-chat SDK client retention | `300` |
-| `AGENTSDOCK_CLAUDE_SDK_MAX_LOADED_CHATS` | Maximum retained per-chat SDK clients | `4` |
+| `AGENTSDOCK_CLAUDE_SDK_IDLE_TTL_SECONDS` | Optional idle SDK connection eviction; `0` retains until explicit cleanup | `0` |
+| `AGENTSDOCK_CLAUDE_SDK_MAX_LOADED_CHATS` | Optional retained SDK connection cap; `0` disables count eviction | `0` |
 | `CODEX_BIN` | Codex executable name/path | `codex` |
+| `AGENTSDOCK_CODEX_APP_SERVER_MAX_LOADED_THREADS` | Optional retained native thread cap; `0` disables count eviction | `0` |
 | `AGENTSDOCK_RUNTIME_CATALOG_TIMEOUT_SECONDS` | Per-command CLI version/help/model probe timeout | `6` |
 | `AGENTSDOCK_RUNTIME_DIAGNOSTIC_TTL_SECONDS` | Cache lifetime for safe CLI version/auth probes | `60` |
 | `CLAUDE_PROJECTS_ROOT` | Claude history search root | `~/.claude/projects` |
 | `CODEX_SESSIONS_ROOT` | Codex history search root | `~/.codex/sessions` |
 | `AGENTSDOCK_JOB_MAX_ACTIVE_RUNS` | Scheduled-job concurrency cap (`0` disables this dedicated cap) | `0` |
 | `AGENTSDOCK_MAX_ACTIVE_AGENT_RUNS` | Optional server-wide concurrency cap for chat, cron and goal runs (`0` means no count limit) | `0` |
-| `AGENTSDOCK_JOB_MIN_AVAILABLE_MEM_MB` | Job launch memory guardrail | `4096` |
-| `AGENTSDOCK_MIN_START_AVAILABLE_MEM_MB` | Interactive launch memory guardrail | `2048` |
+| `AGENTSDOCK_JOB_MIN_AVAILABLE_MEM_MB` | Optional job launch memory floor; `0` disables | `0` |
+| `AGENTSDOCK_MIN_START_AVAILABLE_MEM_MB` | Optional interactive launch memory floor; `0` disables | `0` |
 | `AGENTSDOCK_HANDOFF_DIGEST_BACKEND` | LLM backend for context digests, `claude` or `codex` | `claude` |
 | `AGENTSDOCK_HANDOFF_DIGEST_MODEL` | LLM model for context digests | `sonnet` |
 | `AGENTSDOCK_HANDOFF_DIGEST_EFFORT` | Optional digest reasoning/effort setting | unset |
 | `AGENTSDOCK_HANDOFF_DIGEST_TIMEOUT_SECONDS` | Digest summarizer timeout | `180` |
 | `AGENTSDOCK_HANDOFF_DIGEST_CHARS` | Final digest character cap | `56000` |
 | `AGENTSDOCK_CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS` | Maximum time for each isolated Git worktree snapshot | `120` |
+
+Provider execution deadlines are opt-in. Zero disables the execution deadline
+for `AGENTSDOCK_IDLE_KILL_SECONDS`,
+`AGENTSDOCK_CODEX_APP_SERVER_FIRST_ACTIVITY_TIMEOUT_SECONDS`,
+`AGENTSDOCK_CODEX_RESUME_ACTIVITY_TIMEOUT_SECONDS`,
+`AGENTSDOCK_CLAUDE_SDK_PRE_ACK_TIMEOUT_SECONDS`,
+`AGENTSDOCK_CLAUDE_SDK_POST_ACK_FIRST_ACTIVITY_TIMEOUT_SECONDS`,
+`AGENTSDOCK_CLAUDE_SDK_IDLE_TIMEOUT_SECONDS`, and
+`AGENTSDOCK_CLAUDE_SDK_TURN_TIMEOUT_SECONDS`. Cursor and OpenCode likewise accept
+zero for their `STARTUP_TIMEOUT_SECONDS`, `TURN_TIMEOUT_SECONDS` and
+`IDLE_TIMEOUT_SECONDS` settings. These default to zero; positive operator
+settings remain enforced. Informational idle warnings, explicit Stop, transport
+errors, connection establishment and control-request deadlines remain active.
+
+Claude connections and loaded Codex threads are retained by default so native
+background work and provider schedules are not ended by automatic eviction.
+This retains more processes and memory. Operators can opt into a positive
+retained-client/thread cap or Claude idle TTL; explicit closure and server
+shutdown still release owned connections. Native
+background work and timers follow the provider lifecycle; AgentsDock Jobs are
+available for schedules that must outlive a provider connection.
 
 Runtime catalog refreshes share a 25-second CLI/network-probe budget so they
 can finish before the desktop and mobile clients' 30-second request timeout.

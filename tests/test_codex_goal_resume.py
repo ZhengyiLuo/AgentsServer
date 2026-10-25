@@ -209,6 +209,8 @@ class CodexGoalResumeTests(unittest.IsolatedAsyncioTestCase):
             "CODEX_GOAL_CONTROL_TIMEOUT_SECONDS": 1,
             "STOP_CONFIRM_TIMEOUT_SECONDS": 1,
             "codex_app_server_manager": AsyncMock(return_value=self.manager),
+            "existing_codex_app_server_manager": Mock(return_value=self.manager),
+            "prepare_codex_login_turn": AsyncMock(),
             "ensure_codex_app_server_thread": AsyncMock(
                 return_value=("thread-goal", "instructions")
             ),

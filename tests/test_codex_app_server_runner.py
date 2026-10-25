@@ -2001,6 +2001,227 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             "Observed the accepted turn.",
         )
 
+    async def exercise_active_shell(self, *, parent_finishes_during_dispatch: bool) -> None:
+        turn = FakeTurn()
+        manager = FakeManager(turn)
+        stack, events, finished, fallback = self.runner_patches(manager)
+        command = "printf shell-proof"
+        parent_drained = asyncio.Event()
+        allow_ack = asyncio.Event()
+
+        async def barrier(*_args: object) -> None:
+            parent_drained.set()
+
+        manager.wait_for_notification_handler = barrier
+
+        async def shell(_thread: str, _command: str, *, before_send: object) -> None:
+            self.assertTrue(before_send())
+            self.assertEqual((_thread, _command), ("thread-native", command))
+            self.assertIs(agent_server.ACTIVE["chat-native"], owner)
+            self.assertEqual(owner["run_id"], "run-original")
+            self.assertEqual(len(owner["codex_shell_intents"]), 1)
+            if parent_finishes_during_dispatch:
+                turn.feed(completed_notification())
+                await allow_ack.wait()
+
+        manager.run_thread_shell_command = AsyncMock(side_effect=shell)
+        with stack, patch.object(agent_server, "CODEX_GOALS_ENABLED", False), patch.object(
+            agent_server, "acquire_codex_control_thread", AsyncMock(return_value=(manager, "thread-native", self.session)),
+        ) as acquire, patch.object(agent_server, "release_codex_control_thread", AsyncMock()) as release:
+            runner = asyncio.create_task(agent_server.run_codex_app_server(
+                "chat-native", "run-original", "Original request", dict(self.session),
+                Path(self.cwd) / ".runner-test-manifest.json", allow_exec_fallback=False,
+            ))
+            request = None
+            try:
+                await self.wait_for_native_provider_ready(runner)
+                owner = agent_server.ACTIVE["chat-native"]
+                request = asyncio.create_task(agent_server.post_codex_shell_command(
+                    "chat-native", agent_server.CodexShellCommandRequest(command=command, confirmed=True),
+                ))
+                if parent_finishes_during_dispatch:
+                    await asyncio.wait_for(parent_drained.wait(), timeout=2)
+                    self.assertFalse(runner.done())
+                    self.assertEqual(turn.close_calls, 0)
+                    finished.assert_not_awaited()
+                    allow_ack.set()
+                response = await asyncio.wait_for(request, timeout=2)
+                self.assertTrue(response["accepted"])
+                self.assertEqual(owner["run_id"], "run-original")
+                native_id = "turn-shell-late" if parent_finishes_during_dispatch else "turn-native"
+                if parent_finishes_during_dispatch:
+                    turn.feed({"method": "turn/started", "params": {
+                        "threadId": "thread-native", "turn": {"id": native_id},
+                    }})
+                for method in ("item/started", "item/completed"):
+                    turn.feed({"method": method, "params": {
+                        "threadId": "thread-native", "turnId": native_id,
+                        "item": {"id": "shell-item", "type": "commandExecution", "source": "userShell",
+                                 "command": "/bin/zsh -lc 'printf shell-proof'",
+                                 "commandActions": [{"type": "unknown", "command": command}],
+                                 "aggregatedOutput": "shell-proof", "exitCode": 0},
+                    }})
+                terminal = completed_notification()
+                terminal["params"]["turnId"] = native_id
+                terminal["params"]["turn"]["id"] = native_id
+                turn.feed(terminal)
+                await asyncio.wait_for(runner, timeout=3)
+            finally:
+                pending = [task for task in (runner, request) if task is not None and not task.done()]
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+        acquire.assert_awaited_once_with("chat-native", allow_active_control=True)
+        release.assert_awaited_once_with("chat-native", manager, "thread-native")
+        manager.run_thread_shell_command.assert_awaited_once()
+        self.assertEqual(len(manager.turn_calls), 1, "Shell continuation must not send another turn/start")
+        self.assertEqual(turn.close_calls, 1)
+        self.assertFalse(owner["codex_shell_intents"])
+        shell_finished = [call for call in events.await_args_list if call.args[1] == "codex_shell_finished"]
+        self.assertEqual(len(shell_finished), 1)
+        self.assertEqual(shell_finished[0].args[2]["operation_id"], response["operation_id"])
+        self.assertEqual(shell_finished[0].args[2]["provider_turn_id"], native_id)
+        for event_type in ("tool_started", "tool_finished"):
+            self.assertEqual(len([call for call in events.await_args_list if call.args[1] == event_type]), 1)
+        finished.assert_awaited_once()
+        fallback.assert_not_awaited()
+
+    async def test_active_shell_uses_original_run_and_single_tool_projection(self) -> None:
+        await self.exercise_active_shell(parent_finishes_during_dispatch=False)
+
+    async def test_active_shell_retains_receiver_when_parent_finishes_before_rpc_ack(self) -> None:
+        await self.exercise_active_shell(parent_finishes_during_dispatch=True)
+
+    async def test_shell_intent_ignores_buffered_old_items_and_model_commands(self) -> None:
+        _manager, _turn = self.prepare_goal_handoff()
+        owner = agent_server.ACTIVE["chat-native"]
+        intent = {"operation_id": "manual-shell", "command": "same command", "after_sequence": 10}
+        owner["codex_shell_intents"] = [intent]
+
+        def item(method: str, item_id: str, source: str = "userShell") -> dict[str, object]:
+            return {"method": method, "params": {
+                "threadId": "thread-native", "turnId": "turn-native",
+                "item": {"type": "commandExecution", "id": item_id, "source": source,
+                         "command": "same command", "exitCode": 0},
+            }}
+
+        with patch.object(agent_server, "append_event", AsyncMock()) as events:
+            await agent_server.observe_codex_shell_notification("chat-native", owner, item("item/started", "old"), 10)
+            await agent_server.observe_codex_shell_notification("chat-native", owner, item("item/completed", "old"), 11)
+            await agent_server.observe_codex_shell_notification("chat-native", owner, item("item/started", "model", "agent"), 12)
+            self.assertNotIn("item_id", intent)
+            await agent_server.observe_codex_shell_notification("chat-native", owner, item("item/started", "new"), 13)
+            self.assertEqual(intent["item_id"], "new")
+            await agent_server.observe_codex_shell_notification("chat-native", owner, item("item/completed", "new"), 14)
+            self.assertTrue(agent_server.codex_shell_intents_pending(owner))
+            self.assertEqual([call.args[1] for call in events.await_args_list], ["codex_shell_started"])
+            await agent_server.observe_codex_shell_notification("chat-native", owner, completed_notification(), 15)
+            self.assertFalse(agent_server.codex_shell_intents_pending(owner))
+            self.assertEqual([call.args[1] for call in events.await_args_list], ["codex_shell_started", "codex_shell_finished"])
+
+    async def test_active_shell_lifecycle_remains_ordered_when_native_finishes_before_rpc_ack(self) -> None:
+        manager, turn = self.prepare_goal_handoff()
+        owner = agent_server.ACTIVE["chat-native"]
+        owner["codex_shell_subscription"] = turn._subscription
+        turn._subscription._last_enqueued_sequence = 0
+
+        async def shell(*_args: object, before_send: object) -> None:
+            self.assertTrue(before_send())
+            for sequence, method in enumerate(("item/started", "item/completed"), 1):
+                await agent_server.observe_codex_shell_notification("chat-native", owner, {
+                    "method": method, "params": {
+                        "threadId": "thread-native", "turnId": "turn-native",
+                        "item": {"id": "early-shell", "type": "commandExecution", "source": "userShell", "exitCode": 0},
+                    },
+                }, sequence)
+            await agent_server.observe_codex_shell_notification("chat-native", owner, completed_notification(), 3)
+            self.assertEqual([call.args[1] for call in events.await_args_list], ["codex_shell_started", "codex_shell_finished"])
+
+        manager.run_thread_shell_command = AsyncMock(side_effect=shell)
+        with patch.object(agent_server, "acquire_codex_control_thread", AsyncMock(
+            return_value=(manager, "thread-native", self.session),
+        )), patch.object(agent_server, "release_codex_control_thread", AsyncMock()), patch.object(
+            agent_server, "append_event", AsyncMock(),
+        ) as events:
+            response = await agent_server.post_codex_shell_command("chat-native", agent_server.CodexShellCommandRequest(
+                command="printf early", confirmed=True,
+            ))
+        self.assertEqual([call.args[1] for call in events.await_args_list], ["codex_shell_started", "codex_shell_finished"])
+        self.assertTrue(all(call.args[2]["operation_id"] == response["operation_id"] for call in events.await_args_list))
+
+    async def test_overlapping_identical_shells_keep_distinct_native_items(self) -> None:
+        _manager, _turn = self.prepare_goal_handoff()
+        owner = agent_server.ACTIVE["chat-native"]
+        first = {"operation_id": "shell-first", "command": "same", "after_sequence": 0}
+        second = {"operation_id": "shell-second", "command": "same", "after_sequence": 1}
+        owner["codex_shell_intents"] = [first]
+
+        async def observe(sequence: int, method: str, item_id: str) -> None:
+            await agent_server.observe_codex_shell_notification("chat-native", owner, {
+                "method": method, "params": {"threadId": "thread-native", "turnId": "turn-native",
+                    "item": {"id": item_id, "type": "commandExecution", "source": "userShell", "exitCode": 0}},
+            }, sequence)
+
+        with patch.object(agent_server, "append_event", AsyncMock()) as events:
+            await observe(1, "item/started", "item-first")
+            owner["codex_shell_intents"].append(second)
+            await observe(2, "item/completed", "item-first")
+            self.assertNotIn("item_id", second)
+            await observe(3, "item/started", "item-second")
+            await observe(4, "item/completed", "item-second")
+            await agent_server.observe_codex_shell_notification("chat-native", owner, completed_notification(), 5)
+        completions = [call.args[2] for call in events.await_args_list if call.args[1] == "codex_shell_finished"]
+        self.assertEqual([(row["operation_id"], row["item_id"]) for row in completions], [
+            ("shell-first", "item-first"), ("shell-second", "item-second"),
+        ])
+        self.assertFalse(agent_server.codex_shell_intents_pending(owner))
+
+    async def test_rejected_active_shell_withdraws_only_its_intent(self) -> None:
+        manager, turn = self.prepare_goal_handoff()
+        owner = agent_server.ACTIVE["chat-native"]
+        owner["codex_shell_subscription"] = turn._subscription
+        previous = {"operation_id": "earlier-shell"}
+        owner["codex_shell_intents"] = [previous]
+        manager.run_thread_shell_command = AsyncMock(side_effect=CodexAppServerRequestError(
+            "thread/shellCommand", {"code": -32602, "message": "native rejection"},
+        ))
+        with patch.object(agent_server, "acquire_codex_control_thread", AsyncMock(
+            return_value=(manager, "thread-native", self.session),
+        )), patch.object(agent_server, "release_codex_control_thread", AsyncMock()) as release:
+            with self.assertRaises(HTTPException) as caught:
+                await agent_server.post_codex_shell_command("chat-native", agent_server.CodexShellCommandRequest(
+                    command="rejected", confirmed=True,
+                ))
+        self.assertEqual(caught.exception.status_code, 502)
+        self.assertEqual(owner["codex_shell_intents"], [previous])
+        self.assertIs(agent_server.ACTIVE["chat-native"], owner)
+        self.assertEqual(owner["run_id"], "run-original")
+        release.assert_awaited_once_with("chat-native", manager, "thread-native")
+
+    async def test_cancelled_shell_keeps_intent_only_after_native_write_boundary(self) -> None:
+        for written in (False, True):
+            with self.subTest(written=written):
+                manager, turn = self.prepare_goal_handoff()
+                owner = agent_server.ACTIVE["chat-native"]
+                owner["codex_shell_subscription"] = turn._subscription
+
+                async def shell(*_args: object, before_send: object) -> None:
+                    if written:
+                        self.assertTrue(before_send())
+                    raise asyncio.CancelledError
+
+                manager.run_thread_shell_command = AsyncMock(side_effect=shell)
+                with patch.object(agent_server, "acquire_codex_control_thread", AsyncMock(
+                    return_value=(manager, "thread-native", self.session),
+                )), patch.object(agent_server, "release_codex_control_thread", AsyncMock()) as release:
+                    with self.assertRaises(asyncio.CancelledError):
+                        await agent_server.post_codex_shell_command("chat-native", agent_server.CodexShellCommandRequest(
+                            command="printf cancellation", confirmed=True,
+                        ))
+                self.assertEqual(agent_server.codex_shell_intents_pending(owner), written)
+                self.assertIs(agent_server.ACTIVE["chat-native"], owner)
+                release.assert_awaited_once_with("chat-native", manager, "thread-native")
+
     async def exercise_goal_handoff(self, *, stop: bool) -> None:
         turn = FakeTurn()
         manager = FakeManager(turn)
@@ -2197,6 +2418,27 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             agent_server.ACTIVE["chat-native"]["codex_control_reservation_id"],
             agent_server.CURRENT_TURNS["chat-native"]["codex_control_reservation_id"],
         )
+
+    async def test_failed_native_terminal_seals_shell_admission_without_resuming_goal(self) -> None:
+        manager, turn = self.prepare_goal_handoff(status="active")
+        owner = agent_server.ACTIVE["chat-native"]
+        owner["codex_shell_subscription"] = turn._subscription
+        with patch.object(agent_server, "CODEX_GOALS_ENABLED", True):
+            self.assertFalse(await agent_server.retain_codex_goal_run_owner(
+                "chat-native", "run-original", manager, "thread-native",
+                subscription=turn._subscription, allow_goal_continuation=False,
+            ))
+        self.assertTrue(owner["codex_shell_handoff_closed"])
+        manager.run_thread_shell_command = AsyncMock()
+        with patch.object(agent_server, "acquire_codex_control_thread", AsyncMock(
+            return_value=(manager, "thread-native", self.session),
+        )), patch.object(agent_server, "release_codex_control_thread", AsyncMock()):
+            with self.assertRaises(HTTPException) as raised:
+                await agent_server.post_codex_shell_command("chat-native", agent_server.CodexShellCommandRequest(
+                    command="printf too-late", confirmed=True,
+                ))
+        self.assertEqual(raised.exception.status_code, 409)
+        manager.run_thread_shell_command.assert_not_awaited()
 
     async def test_completed_goal_with_unread_native_turn_retains_and_drains_stream(self) -> None:
         manager, turn = self.prepare_goal_handoff(status="complete")
@@ -4402,6 +4644,76 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(len(finals), 1)
         self.assertEqual(finals[0]["run_id"], run_now["run_id"])
+
+    async def test_disabled_idle_limits_preserve_silent_accepted_turn(self) -> None:
+        turn = FakeTurn()
+        manager = FakeManager(turn)
+        real_wait = asyncio.wait
+
+        async def fast_poll(
+            futures: set[asyncio.Future[object] | asyncio.Task[object]],
+            *,
+            timeout: float | None = None,
+            return_when: str = asyncio.ALL_COMPLETED,
+        ) -> tuple[
+            set[asyncio.Future[object] | asyncio.Task[object]],
+            set[asyncio.Future[object] | asyncio.Task[object]],
+        ]:
+            return await real_wait(
+                futures,
+                timeout=min(0.01, timeout) if timeout is not None else 0.01,
+                return_when=return_when,
+            )
+
+        stack, events, finished, _exec_fallback = self.runner_patches(manager)
+        with stack, patch.object(
+            agent_server.asyncio,
+            "wait",
+            fast_poll,
+        ), patch.object(
+            agent_server,
+            "CODEX_APP_SERVER_FIRST_ACTIVITY_TIMEOUT_SECONDS",
+            0,
+        ), patch.object(
+            agent_server,
+            "IDLE_WARN_SECONDS",
+            1800,
+        ), patch.object(
+            agent_server,
+            "IDLE_KILL_SECONDS",
+            0,
+        ), patch.object(
+            agent_server,
+            "provider_run_owns_pending_cross_chat_live_wait",
+            return_value=False,
+        ):
+            runner = asyncio.create_task(
+                agent_server.run_codex_app_server(
+                    "chat-native",
+                    "run-original",
+                    "Wait for a peer",
+                    dict(self.session),
+                    Path(self.cwd) / ".runner-test-manifest.json",
+                    allow_exec_fallback=True,
+                    allow_resume_rollover=False,
+                )
+            )
+            await asyncio.sleep(0.08)
+            self.assertFalse(runner.done())
+            turn.feed(agent_message(
+                "final-after-peer",
+                "Peer answered after the idle window.",
+                "final_answer",
+            ))
+            turn.feed(completed_notification())
+            await asyncio.wait_for(runner, timeout=2)
+
+        self.assertEqual(finished.await_args.args[1]["exit_code"], 0)
+        self.assertFalse(any(
+            call.args[1] in {"error", "idle_warning"}
+            for call in events.await_args_list
+        ))
+        self.assertEqual(turn.interrupt_calls, 0)
 
     async def test_pending_live_cross_chat_wait_pauses_codex_idle_watchdog(self) -> None:
         turn = FakeTurn()

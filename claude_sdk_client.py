@@ -1330,6 +1330,7 @@ class ClaudeSDKGoalReceipt:
 
     command_id: str
     error: str | None = None
+    cancelled_by_user: bool = False
 
 
 @dataclass
@@ -2084,12 +2085,14 @@ class ClaudeSDKSupervisor:
         if pending is not None and not pending.response.done():
             pending.response.set_exception(ClaudeSDKQueryError(message))
 
-    def _fail_pending_goal(self, message: str) -> None:
+    def _fail_pending_goal(self, message: str, *, cancelled_by_user: bool = False) -> None:
         pending = self._pending_goal
         self._pending_goal = None
         if pending is not None:
             if self._active_run is not None:
-                self._active_run._deliver(ClaudeSDKGoalReceipt(pending.correlation_id, message))
+                self._active_run._deliver(ClaudeSDKGoalReceipt(
+                    pending.correlation_id, message, cancelled_by_user=cancelled_by_user,
+                ))
             if not pending.response.done():
                 pending.response.set_exception(ClaudeSDKQueryError(message))
 
@@ -2526,7 +2529,7 @@ class ClaudeSDKSupervisor:
             raise ClaudeSDKSupervisorError("Claude did not confirm queued-goal cancellation")
         # False means already dequeued: the following explicit interrupt owns
         # that running command. No queued copy remains to start afterwards.
-        self._fail_pending_goal("The queued goal was cancelled")
+        self._fail_pending_goal("The queued goal was cancelled", cancelled_by_user=True)
 
     async def _handle_interrupt(self, command: _Interrupt) -> None:
         active = self._active_run

@@ -178,6 +178,24 @@ class ClaudeGoalRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.ns["CLAUDE_GOAL_PENDING"], {})
         self.assertEqual(self.ns["CLAUDE_GOAL_ERRORS"], {})
 
+    async def test_user_cancelled_goal_settles_without_error_but_uncertain_withdrawal_is_visible(self):
+        pending = {"run_id": "running", "command_id": "queued", "condition": "Finish"}
+        settle = self.ns["settle_claude_goal_command"]
+        self.ns["CLAUDE_GOAL_PENDING"]["chat"] = dict(pending)
+        self.ns["CLAUDE_GOAL_ERRORS"]["chat"] = "Previous refusal"
+        await settle("chat", "running", ClaudeSDKGoalReceipt(
+            "queued", "The queued goal was cancelled", cancelled_by_user=True,
+        ))
+        self.assertEqual(self.ns["CLAUDE_GOAL_PENDING"], {})
+        self.assertEqual(self.ns["CLAUDE_GOAL_ERRORS"], {})
+        self.ns["CLAUDE_GOAL_PENDING"]["chat"] = dict(pending)
+        await settle("chat", "running", ClaudeSDKGoalReceipt(
+            "queued", "Stop could not confirm withdrawal of the queued goal",
+        ))
+        self.assertEqual(self.ns["CLAUDE_GOAL_PENDING"], {})
+        self.assertEqual(self.ns["CLAUDE_GOAL_ERRORS"]["chat"],
+                         "Stop could not confirm withdrawal of the queued goal")
+
     async def test_clear_with_pending_goal_waits_for_owned_stop_then_uses_native_idle_command(self):
         self.set_active()
         self.ns["CLAUDE_GOAL_PENDING"]["chat"] = {"run_id": "running", "command_id": "queued"}

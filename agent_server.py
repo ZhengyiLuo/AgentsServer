@@ -90355,7 +90355,7 @@ async def settle_claude_goal_command(
     if not pending or pending.get("run_id") != run_id or pending.get("command_id") != receipt.command_id:
         return
     CLAUDE_GOAL_PENDING.pop(session_id, None)
-    if receipt.error:
+    if receipt.error and not receipt.cancelled_by_user:
         CLAUDE_GOAL_ERRORS[session_id] = receipt.error
     else:
         CLAUDE_GOAL_ERRORS.pop(session_id, None)

@@ -959,6 +959,7 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
                     receipt = await handle.__anext__()
                 self.assertEqual(receipt.command_id, "goal-input")
                 self.assertIsNotNone(receipt.error)
+                self.assertEqual(receipt.cancelled_by_user, not disconnect)
                 if not disconnect:
                     self.assertTrue(supervisor.closed)
                     self.assertTrue(client.disconnected)

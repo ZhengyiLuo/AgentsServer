@@ -15,7 +15,7 @@ from fastapi import HTTPException
 from starlette.requests import Request
 
 import agent_server
-from claude_sdk_client import ClaudeSDKQueryError, ClaudeSDKUnavailable
+from claude_sdk_client import ClaudeSDKGoalReceipt, ClaudeSDKQueryError, ClaudeSDKUnavailable
 
 
 class FakeClaudeRun:
@@ -784,6 +784,23 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                 Path(self.cwd) / ".manifest.json",
             )
         return append_event, append_finished, runtime_success, runtime_failure
+
+    async def test_goal_receipt_settles_exact_operation_without_becoming_provider_output(self) -> None:
+        receipt = ClaudeSDKGoalReceipt("queued-goal", "Hooks are restricted")
+        terminal = {"type": "result", "result": "Original work completed", "session_id": "provider"}
+        settle = AsyncMock()
+        project = AsyncMock(return_value={
+            "result_text": "Original work completed", "is_error": False,
+            "session_id": "provider", "terminal_reason": "completed",
+        })
+        with patch.object(agent_server, "settle_claude_goal_command", settle), \
+                patch.object(agent_server, "project_claude_sdk_message", project):
+            _events, finished, _success, failure = await self._run_sdk_terminal_case([receipt, terminal])
+        self.assertEqual(settle.await_args.args, ("chat-claude", "run-claude", receipt))
+        self.assertEqual(project.await_count, 1)
+        self.assertIs(project.await_args.args[2], terminal)
+        self.assertEqual(finished.await_args.args[1]["result_text"], "Original work completed")
+        failure.assert_not_called()
 
     async def _run_sdk_timeout_case(
         self,

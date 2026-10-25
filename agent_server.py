@@ -104,6 +104,7 @@ from claude_sdk_client import (
     ClaudeSDKConfigurationConflict,
     ClaudeSDKControlTimeout,
     ClaudeSDKGenerationChanged,
+    ClaudeSDKGoalReceipt,
     ClaudeSDKMCPServerNotFound,
     ClaudeSDKQueryError,
     ClaudeSDKRunActive,
@@ -66179,6 +66180,11 @@ async def run_claude_sdk(
                 result_details = None
             else:
                 message_task = None
+                if isinstance(message, ClaudeSDKGoalReceipt):
+                    await settle_claude_goal_command(
+                        session_id, current_run_id, message, provider_id=provider_id,
+                    )
+                    continue
                 last_activity_monotonic = time.monotonic()
                 provider_acknowledged = bool(
                     getattr(current_handle, "acknowledged", False)
@@ -90338,6 +90344,23 @@ CLAUDE_GOAL_PROJECTIONS: dict[str, ClaudeGoalProjection] = {}
 CLAUDE_GOAL_PATHS: dict[str, Path] = {}
 CLAUDE_GOAL_LOCKS: dict[str, asyncio.Lock] = {}
 CLAUDE_GOAL_PENDING: dict[str, dict[str, Any]] = {}
+CLAUDE_GOAL_ERRORS: dict[str, str] = {}
+
+
+async def settle_claude_goal_command(
+    session_id: str, run_id: str, receipt: ClaudeSDKGoalReceipt,
+    *, provider_id: str | None = None,
+) -> None:
+    pending = CLAUDE_GOAL_PENDING.get(session_id)
+    if not pending or pending.get("run_id") != run_id or pending.get("command_id") != receipt.command_id:
+        return
+    CLAUDE_GOAL_PENDING.pop(session_id, None)
+    if receipt.error:
+        CLAUDE_GOAL_ERRORS[session_id] = receipt.error
+    else:
+        CLAUDE_GOAL_ERRORS.pop(session_id, None)
+    await refresh_claude_goal(session_id, provider_id=provider_id, notify=False)
+    await append_event(session_id, "claude_goal_changed", {})
 
 
 async def refresh_claude_goal(
@@ -90373,7 +90396,8 @@ async def refresh_claude_goal(
         changed = changed or not was_caught_up
         goal = projection.goal
         pending = CLAUDE_GOAL_PENDING.get(session_id)
-        if pending and goal and goal.get("set_at") != pending.get("previous_set_at"):
+        if (pending and not pending.get("command_id") and goal
+                and goal.get("set_at") != pending.get("previous_set_at")):
             CLAUDE_GOAL_PENDING.pop(session_id, None)
             changed = True
         if changed and notify:
@@ -90399,6 +90423,52 @@ async def start_claude_goal_command(session_id: str, argument: str) -> dict[str,
                     if record.public.get("invocation") == "/goal"), None)
     if snapshot["support"].get("available") is not True or command is None:
         raise HTTPException(status_code=409, detail="This Claude installation does not offer /goal. Update Claude Code to use Goals.")
+    if argument != "clear":
+        async with session_lifecycle_lock(session_id):
+            ensure_session_not_deleting(session_id)
+            async with ACTIVE_LOCK:
+                active = dict(ACTIVE.get(session_id) or {})
+                if session_id in CLAUDE_GOAL_PENDING:
+                    raise HTTPException(status_code=409, detail="Claude is already applying a goal")
+            if active.get("transport") == CLAUDE_TRANSPORT_AGENT_SDK:
+                run_id = str(active.get("run_id") or "")
+                owner = str(active.get("claude_sdk_owner_token") or "")
+                handle = active.get("claude_sdk_run")
+                command_id = str(uuid.uuid4())
+
+                async def before_send(actual_owner: str) -> None:
+                    async with ACTIVE_LOCK:
+                        current = ACTIVE.get(session_id) or {}
+                        if (not owner or actual_owner != owner or current.get("run_id") != run_id
+                                or current.get("claude_sdk_run") is not handle
+                                or current.get("claude_sdk_owner_token") != owner
+                                or current.get("stop_requested") or session_id in STOP_REQUESTS
+                                or session_id in DELETING_SESSIONS or run_id in STOPPED_RUNS):
+                            raise ClaudeSDKGenerationChanged("Claude finished or stopped before the goal could be queued")
+
+                operation = {"run_id": run_id, "command_id": command_id, "condition": argument}
+                CLAUDE_GOAL_PENDING[session_id] = operation
+                CLAUDE_GOAL_ERRORS.pop(session_id, None)
+                try:
+                    manager = await claude_sdk_manager()
+                    await manager.queue_goal(
+                        session_id, argument, run_id=run_id, ownership_token=owner,
+                        command_id=command_id,
+                        expected_generation=command.native.get("control_generation"),
+                        on_before_send=before_send,
+                    )
+                except BaseException as exc:
+                    if CLAUDE_GOAL_PENDING.get(session_id) is operation:
+                        if getattr(exc, "delivery_uncertain", False):
+                            operation["delivery_uncertain"] = True
+                            CLAUDE_GOAL_ERRORS[session_id] = str(exc)
+                        else:
+                            CLAUDE_GOAL_PENDING.pop(session_id, None)
+                    if isinstance(exc, ClaudeSDKSupervisorError):
+                        raise HTTPException(status_code=409, detail=str(exc)) from exc
+                    raise
+                await append_event(session_id, "claude_goal_changed", {})
+                return {"run_id": run_id, "native_queued": True}
     return await start_turn(session_id, TurnRequest(
         prompt=f"/goal {argument}",
         skill_selection=SkillSelection(id=command.public["id"], revision=inventory.revision),
@@ -90414,14 +90484,16 @@ class ClaudeGoalRequest(BaseModel):
 async def put_claude_goal(session_id: str, req: ClaudeGoalRequest) -> dict[str, Any]:
     require_claude_goal_session(session_id)
     condition = req.condition.strip()
-    if not condition or condition.lower() == "clear":
+    if not condition or condition.lower() in {"clear", "stop", "off", "reset", "none", "cancel"}:
         raise HTTPException(status_code=400, detail="Enter a completion condition for Claude")
     previous = await refresh_claude_goal(session_id, notify=False)
     accepted = await start_claude_goal_command(session_id, condition)
     # Bind pending display state only after actual admission. A competing
     # request or an older run's cleanup cannot clear the winner's operation.
     async with ACTIVE_LOCK:
-        if str((ACTIVE.get(session_id) or {}).get("run_id") or "") == accepted.get("run_id"):
+        if (not accepted.get("native_queued")
+                and str((ACTIVE.get(session_id) or {}).get("run_id") or "") == accepted.get("run_id")):
+            CLAUDE_GOAL_ERRORS.pop(session_id, None)
             CLAUDE_GOAL_PENDING[session_id] = {
                 "run_id": accepted["run_id"],
                 "previous_set_at": (previous or {}).get("set_at"),
@@ -90440,14 +90512,31 @@ async def delete_claude_goal(session_id: str) -> dict[str, Any]:
         async with ACTIVE_LOCK:
             active = dict(ACTIVE.get(session_id) or {})
         if active.get("transport") == CLAUDE_TRANSPORT_AGENT_SDK:
-            manager = await claude_sdk_manager()
-            try:
-                await manager.clear_goal(session_id, run_id=str(active.get("run_id") or ""))
-            except ClaudeSDKSupervisorError as exc:
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
-            cleared_live = True
+            pending_goal = CLAUDE_GOAL_PENDING.get(session_id)
+            if pending_goal and pending_goal.get("command_id"):
+                # A native priority-now goal yields after the current tool.
+                # Explicit Clear & stop must instead complete owned teardown,
+                # then clear through the ordinary native idle-command path.
+                stopped = await stop_turn(
+                    session_id, expected_run_id=str(active.get("run_id") or ""),
+                    schedule_queue=False,
+                )
+                if stopped.get("pending") or stopped.get("superseded") or not stopped.get("stopped"):
+                    raise HTTPException(status_code=409, detail="Claude is still stopping; retry clearing the goal shortly")
+            else:
+                manager = await claude_sdk_manager()
+                try:
+                    await manager.clear_goal(session_id, run_id=str(active.get("run_id") or ""))
+                except ClaudeSDKSupervisorError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                cleared_live = True
+            if CLAUDE_GOAL_PENDING.get(session_id) is pending_goal:
+                CLAUDE_GOAL_PENDING.pop(session_id, None)
+            CLAUDE_GOAL_ERRORS.pop(session_id, None)
     if not cleared_live:
         await start_claude_goal_command(session_id, "clear")
+        if session_id not in CLAUDE_GOAL_PENDING:
+            CLAUDE_GOAL_ERRORS.pop(session_id, None)
     await refresh_claude_goal(session_id)
     return await claude_runtime_snapshot(session_id)
 
@@ -90497,7 +90586,9 @@ async def claude_runtime_snapshot(session_id: str) -> dict[str, Any]:
         "persisted_session": bool(claude_provider_id_for_session(session)),
         "session_loaded": loaded,
         "goal": goal,
-        "goal_starting": session_id in CLAUDE_GOAL_PENDING,
+        "goal_starting": bool(session_id in CLAUDE_GOAL_PENDING
+                              and not CLAUDE_GOAL_PENDING[session_id].get("delivery_uncertain")),
+        "goal_error": CLAUDE_GOAL_ERRORS.get(session_id),
         "goal_loading": bool(is_claude and claude_provider_id_for_session(session)
                              and not getattr(CLAUDE_GOAL_PROJECTIONS.get(session_id), "caught_up", False)),
         "stop_fence_pending": session_id in CLAUDE_STOP_FENCE_SESSIONS,

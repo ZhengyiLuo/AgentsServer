@@ -15,6 +15,7 @@ from claude_sdk_client import (
     ClaudeSDKConfigurationConflict,
     ClaudeSDKControlTimeout,
     ClaudeSDKGenerationChanged,
+    ClaudeSDKGoalReceipt,
     ClaudeSDKLoopError,
     ClaudeSDKMCPServerNotFound,
     ClaudeSDKQueryError,
@@ -115,7 +116,7 @@ class FakeClaudeClient:
             raise self.query_error
         for message in self.query_prefix_messages:
             await self.messages.put(message)
-        if self.auto_queue and envelope and envelope[0].get("priority") == "next":
+        if self.auto_queue and envelope and envelope[0].get("priority") in {"next", "now"}:
             await self.messages.put({"type": "command_lifecycle", "state": "queued",
                                      "command_uuid": correlation_id})
         if self.auto_ack and correlation_id:
@@ -134,9 +135,16 @@ class FakeClaudeClient:
     async def interrupt(self) -> None:
         self._record("interrupt")
 
+    async def stop_task(self, task_id: str) -> None:
+        self._record("stop_task", task_id)
+
     async def send_now(self, message_uuid: str) -> dict[str, Any]:
         self._record("send_now", message_uuid)
         return {"send_now": "stopped", "still_queued": [message_uuid]}
+
+    async def cancel_queued_input(self, message_uuid: str) -> dict[str, Any]:
+        self._record("cancel_queued_input", message_uuid)
+        return {"cancelled": True}
 
     async def get_context_usage(self) -> dict[str, Any]:
         self._record("get_context_usage")
@@ -813,6 +821,266 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
         await supervisor.get_context_usage()
         self.assertTrue(client.disconnected)
         self.assertEqual(handle.background_task_receipts[0]["status"], "tracking_lost")
+
+    async def test_busy_goal_native_queue_preserves_run_children_and_waits_for_exact_ack(self) -> None:
+        handle, client, supervisor = await self._start_force_send_fixture()
+        client.auto_ack = False
+        await client.emit({"type": "system", "subtype": "task_started", "task_id": "child", "task_type": "local_agent"})
+        command_id = await self.manager.queue_goal(
+            "force-chat", "Finish safely", run_id=handle.run_id,
+            ownership_token=supervisor.ownership_token, command_id="goal-input",
+            expected_generation=supervisor.control_generation,
+        )
+        self.assertEqual(command_id, "goal-input")
+        frame = client.query_envelopes[-1][0]
+        self.assertEqual(frame["message"]["content"], "/goal Finish safely")
+        self.assertEqual(frame["priority"], "now")
+        self.assertNotIn("client_composed", frame)
+        old_result = {"type": "result", "result": "prior", "user_message_uuid": handle.correlation_id}
+        await client.emit(old_result)
+        await client.emit(replay_ack("unrelated"))
+        await supervisor.get_context_usage()
+        self.assertFalse(handle.done)
+        self.assertIsNotNone(supervisor._pending_goal)
+        await client.emit(replay_ack(command_id))
+        await client.emit(old_result)
+        await client.emit({"type": "result", "result": "goal parent response", "user_message_uuid": command_id})
+        await supervisor.get_context_usage()
+        self.assertFalse(handle.done)
+        self.assertIsNone(supervisor._pending_goal)
+        self.assertEqual(handle.background_task_receipts[0]["status"], "running")
+        await client.emit({"type": "system", "subtype": "task_notification", "task_id": "child", "status": "completed"})
+        final = {"type": "result", "result": "complete", "user_message_uuid": "child-wake"}
+        await client.emit(final)
+        self.assertEqual(await handle.wait_result(), final)
+        receipts = [row for row in await collect(handle) if isinstance(row, ClaudeSDKGoalReceipt)]
+        self.assertEqual(receipts, [ClaudeSDKGoalReceipt(command_id)])
+        self.assertFalse(any(call[0] in {"interrupt", "send_now"} for call in client.calls))
+        self.assertFalse(client.disconnected)
+
+    async def test_busy_goal_refusal_settles_without_finishing_running_children(self) -> None:
+        handle, client, supervisor = await self._start_force_send_fixture()
+        client.auto_ack = False
+        await client.emit({"type": "system", "subtype": "task_started", "task_id": "workflow", "task_type": "local_workflow"})
+        await self.manager.queue_goal("force-chat", "Finish", run_id=handle.run_id,
+                                      ownership_token=supervisor.ownership_token, command_id="goal-input")
+        await client.emit({"type": "result", "result": "prior", "user_message_uuid": handle.correlation_id})
+        await client.emit({"type": "result", "local_command": "goal", "is_error": False,
+                           "result": "Hooks are restricted", "user_message_uuid": "goal-input"})
+        await supervisor.get_context_usage()
+        self.assertIsNone(supervisor._pending_goal)
+        self.assertFalse(handle.done)
+        self.assertEqual(handle.background_task_receipts[0]["status"], "running")
+        await client.emit({"type": "system", "subtype": "task_notification", "task_id": "workflow", "status": "completed"})
+        await client.emit({"type": "result", "result": "workflow finished"})
+        receipts = [row for row in await collect(handle) if isinstance(row, ClaudeSDKGoalReceipt)]
+        self.assertEqual(receipts, [ClaudeSDKGoalReceipt("goal-input", "Hooks are restricted")])
+        self.assertFalse(client.disconnected)
+
+    async def test_pending_goal_does_not_block_force_send(self) -> None:
+        handle, client, supervisor = await self._start_force_send_fixture()
+        client.auto_ack = False
+        await self.manager.queue_goal("force-chat", "Finish", run_id=handle.run_id,
+                                      ownership_token=supervisor.ownership_token, command_id="goal-input")
+        force_send = asyncio.create_task(self.manager.steer_run(
+            "force-chat", "Follow up", run_id=handle.run_id, ownership_token=supervisor.ownership_token,
+        ))
+        while len(client.query_envelopes) < 3:
+            await asyncio.sleep(0)
+        followup_id = client.query_envelopes[-1][0]["uuid"]
+        await client.emit(replay_ack(followup_id))
+        self.assertEqual(await asyncio.wait_for(force_send, 1), followup_id)
+        self.assertIsNotNone(supervisor._pending_goal)
+        await client.emit({"type": "result", "user_message_uuid": followup_id})
+        await supervisor.get_context_usage()
+        self.assertFalse(handle.done)
+        await client.emit(replay_ack("goal-input"))
+        final = {"type": "result", "result": "finished", "user_message_uuid": "goal-input"}
+        await client.emit(final)
+        self.assertEqual(await handle.wait_result(), final)
+        self.assertEqual([call for call in client.calls if call[0] == "send_now"], [("send_now", followup_id)])
+
+    async def test_busy_goal_refused_or_discarded_before_dispatch_settles_receipt(self) -> None:
+        for state in ("refused", "discarded"):
+            with self.subTest(state=state):
+                handle, client, supervisor = await self._start_force_send_fixture(state)
+                client.auto_ack = False
+                await self.manager.queue_goal(state, "Finish", run_id=handle.run_id,
+                                              ownership_token=supervisor.ownership_token, command_id="goal-input")
+                await client.emit({"type": "command_lifecycle", "command_uuid": "goal-input", "state": state})
+                await supervisor.get_context_usage()
+                self.assertIsNone(supervisor._pending_goal)
+                self.assertFalse(handle.done)
+                receipt = await handle.__anext__()
+                while not isinstance(receipt, ClaudeSDKGoalReceipt):
+                    receipt = await handle.__anext__()
+                self.assertIn(state, receipt.error)
+
+    async def test_busy_goal_rejects_stale_owner_generation_and_clear_alias_without_writing(self) -> None:
+        handle, client, supervisor = await self._start_force_send_fixture()
+        cases = [dict(ownership_token="stale"), dict(run_id="stale"), dict(expected_generation="stale")]
+        for overrides in cases:
+            with self.assertRaises(ClaudeSDKGenerationChanged):
+                await self.manager.queue_goal("force-chat", "Finish", **{
+                    "run_id": handle.run_id, "ownership_token": supervisor.ownership_token,
+                    "command_id": "goal-input", **overrides,
+                })
+        for condition in ("clear", "Stop", "off", "reset", "none", "cancel"):
+            with self.assertRaises(ValueError):
+                await self.manager.queue_goal("force-chat", condition, run_id=handle.run_id,
+                                              ownership_token=supervisor.ownership_token, command_id="goal-input")
+        self.assertEqual(len(client.query_envelopes), 1)
+        self.assertFalse(handle.done)
+
+    async def test_busy_goal_explicit_stop_and_disconnect_settle_pending_receipt(self) -> None:
+        for disconnect in (False, True):
+            with self.subTest(disconnect=disconnect):
+                chat = f"goal-stop-{disconnect}"
+                handle, client, supervisor = await self._start_force_send_fixture(chat)
+                client.auto_ack = False
+                await self.manager.queue_goal(chat, "Finish", run_id=handle.run_id,
+                                              ownership_token=supervisor.ownership_token, command_id="goal-input")
+                if disconnect:
+                    await client.emit(OSError("transport closed"))
+                else:
+                    await handle.interrupt()
+                    self.assertLess(client.calls.index(("cancel_queued_input", "goal-input")),
+                                    client.calls.index(("interrupt",)))
+                    self.assertFalse(handle.done)
+                    self.assertFalse(client.disconnected)
+                    await client.emit({"type": "result", "terminal_reason": "aborted_tools", "is_error": True})
+                try:
+                    await handle.wait_result()
+                except ClaudeSDKSupervisorError:
+                    pass
+                self.assertIsNone(supervisor._pending_goal)
+                receipt = await handle.__anext__()
+                while not isinstance(receipt, ClaudeSDKGoalReceipt):
+                    receipt = await handle.__anext__()
+                self.assertEqual(receipt.command_id, "goal-input")
+                self.assertIsNotNone(receipt.error)
+                if not disconnect:
+                    self.assertTrue(supervisor.closed)
+                    self.assertTrue(client.disconnected)
+                    next_handle = await self.manager.start_run(
+                        chat, "Continue", run_id="next-run", options={}, configuration_key="native-force",
+                    )
+                    self.assertIsNot(self.factory.clients[-1], client)
+                    self.assertEqual(next_handle.run_id, "next-run")
+
+    async def test_goal_stop_stops_late_native_task_and_waits_for_its_terminal_receipt(self) -> None:
+        handle, client, supervisor = await self._start_force_send_fixture()
+        client.auto_ack = False
+        await self.manager.queue_goal("force-chat", "Finish", run_id=handle.run_id,
+                                      ownership_token=supervisor.ownership_token, command_id="goal-input")
+        await handle.interrupt()
+        await client.emit({"type": "system", "subtype": "task_started",
+                           "task_id": "late-foreground", "task_type": "local_bash"})
+        terminal = {"type": "result", "terminal_reason": "aborted_tools", "is_error": True}
+        await client.emit(terminal)
+        for _ in range(100):
+            if supervisor._goal_stop_result is not None:
+                break
+            await asyncio.sleep(0)
+        self.assertIn(("stop_task", "late-foreground"), client.calls)
+        self.assertFalse(handle.done)
+        self.assertFalse(client.disconnected)
+        with self.assertRaises(ClaudeSDKRunActive):
+            await self.manager.steer_run("force-chat", "Too late", run_id=handle.run_id,
+                                          ownership_token=supervisor.ownership_token)
+        await client.emit({"type": "system", "subtype": "task_notification",
+                           "task_id": "late-foreground", "status": "stopped"})
+        self.assertEqual(await asyncio.wait_for(handle.wait_result(), 1), terminal)
+        self.assertTrue(client.disconnected)
+        next_handle = await self.manager.start_run("force-chat", "Next", run_id="next-run",
+                                                    options={}, configuration_key="native-force")
+        next_client = self.factory.clients[-1]
+        await next_client.emit({"type": "system", "subtype": "task_started",
+                                "task_id": "next-foreground", "task_type": "local_bash"})
+        await asyncio.wait_for(next_handle.__anext__(), 1)
+        self.assertNotIn(("stop_task", "next-foreground"), next_client.calls)
+
+    async def test_goal_stop_withdraws_concurrent_force_send_before_draining_tasks(self) -> None:
+        handle, client, supervisor = await self._start_force_send_fixture()
+        client.auto_ack = False
+        await self.manager.queue_goal("force-chat", "Finish", run_id=handle.run_id,
+                                      ownership_token=supervisor.ownership_token, command_id="goal-input")
+        followup = asyncio.create_task(self.manager.steer_run("force-chat", "Follow up",
+            run_id=handle.run_id, ownership_token=supervisor.ownership_token))
+        while len(client.query_envelopes) < 3:
+            await asyncio.sleep(0)
+        followup_id = client.query_envelopes[-1][0]["uuid"]
+        await handle.interrupt()
+        with self.assertRaises(ClaudeSDKQueryError):
+            await followup
+        self.assertLess(client.calls.index(("cancel_queued_input", followup_id)),
+                        client.calls.index(("interrupt",)))
+        self.assertLess(client.calls.index(("cancel_queued_input", "goal-input")),
+                        client.calls.index(("interrupt",)))
+        await client.emit({"type": "result", "terminal_reason": "aborted_tools", "is_error": True})
+        await asyncio.wait_for(handle.wait_result(), 1)
+
+    async def test_goal_stop_ignores_delayed_result_from_superseded_force_send_input(self) -> None:
+        handle, client, supervisor = await self._start_force_send_fixture()
+        await self.manager.steer_run("force-chat", "Follow up", run_id=handle.run_id,
+                                    ownership_token=supervisor.ownership_token)
+        current_id = client.query_envelopes[-1][0]["uuid"]
+        client.auto_ack = False
+        await self.manager.queue_goal("force-chat", "Finish", run_id=handle.run_id,
+                                      ownership_token=supervisor.ownership_token, command_id="goal-input")
+        await handle.interrupt()
+        await client.emit({"type": "result", "user_message_uuid": handle.correlation_id})
+        await supervisor.get_context_usage()
+        self.assertIsNone(supervisor._goal_stop_result)
+        self.assertFalse(handle.done)
+        self.assertFalse(client.disconnected)
+        await client.emit({"type": "system", "subtype": "task_started",
+                           "task_id": "current-foreground", "task_type": "local_bash"})
+        await client.emit({"type": "system", "subtype": "task_notification",
+                           "task_id": "current-foreground", "status": "stopped"})
+        await client.emit({"type": "result", "user_message_uuid": current_id,
+                           "terminal_reason": "aborted_tools", "is_error": True})
+        await asyncio.wait_for(handle.wait_result(), 1)
+        self.assertIn(("stop_task", "current-foreground"), client.calls)
+
+    async def test_goal_stop_still_interrupts_and_drains_tasks_when_withdrawal_fails(self) -> None:
+        handle, client, supervisor = await self._start_force_send_fixture()
+        client.auto_ack = False
+        await self.manager.queue_goal("force-chat", "Finish", run_id=handle.run_id,
+                                      ownership_token=supervisor.ownership_token, command_id="goal-input")
+
+        async def failed_cancel(_message_id):
+            raise OSError("control write uncertain")
+
+        client.cancel_queued_input = failed_cancel
+        with self.assertRaisesRegex(ClaudeSDKQueryError, "withdrawal is uncertain"):
+            await handle.interrupt()
+        self.assertIn(("interrupt",), client.calls)
+        self.assertFalse(handle.done)
+        await client.emit({"type": "system", "subtype": "task_started",
+                           "task_id": "late-foreground", "task_type": "local_bash"})
+        await client.emit({"type": "system", "subtype": "task_notification",
+                           "task_id": "late-foreground", "status": "stopped"})
+        await client.emit({"type": "result", "terminal_reason": "aborted_tools", "is_error": True})
+        await asyncio.wait_for(handle.wait_result(), 1)
+        self.assertIn(("stop_task", "late-foreground"), client.calls)
+        self.assertTrue(client.disconnected)
+
+    async def test_busy_goal_clear_withdraws_queued_goal_before_native_clear(self) -> None:
+        handle, client, supervisor = await self._start_force_send_fixture()
+        client.auto_ack = False
+        await self.manager.queue_goal("force-chat", "Finish", run_id=handle.run_id,
+                                      ownership_token=supervisor.ownership_token, command_id="goal-input")
+        clear = asyncio.create_task(self.manager.clear_goal("force-chat", run_id=handle.run_id))
+        while len(client.query_envelopes) < 3:
+            await asyncio.sleep(0)
+        self.assertIsNone(supervisor._pending_goal)
+        self.assertLess(client.calls.index(("cancel_queued_input", "goal-input")), client.calls.index(("interrupt",)))
+        self.assertEqual(client.query_envelopes[-1][0]["message"]["content"], "/goal clear")
+        await client.emit({"type": "result", "terminal_reason": "aborted_tools", "is_error": True})
+        await client.emit({"type": "assistant", "local_command_run": {"command": "goal", "args": "clear"}})
+        await client.emit({"type": "result", "local_command": "goal", "result": "Goal cleared"})
+        await asyncio.wait_for(clear, 1)
 
     async def test_native_busy_goal_clear_reserves_receipt_after_aborted_run(self) -> None:
         for background in (False, True):

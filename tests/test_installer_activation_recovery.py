@@ -1134,3 +1134,112 @@ test "$(cat "$LOG")" = '{expected_log}'
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ActivationQuiesceBoundaryTests(unittest.TestCase):
+    """Split activation must name the quiesce boundary that actually failed."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.source = INSTALLER.read_text(encoding="utf-8")
+
+    def _quiesce_block(self) -> str:
+        # The split-mode guard line also appears inside helper functions, so
+        # anchor on the last occurrence before the takeover-linking comment.
+        source = self.source
+        end = source.index("# Materialize and link the new runtime")
+        begin = source.rindex(
+            'if [[ "${EXECUTION_MODE:-legacy}" == "split" ]]; then', 0, end
+        )
+        block = source[begin:end]
+        self.assertIn("ACTIVATION_QUIESCE_BOUNDARY", block)
+        return block
+
+    def _run(self, failing: str, handoff: str = "false"):
+        block = self._quiesce_block()
+        with tempfile.TemporaryDirectory() as temporary:
+            harness = Path(temporary) / "quiesce.sh"
+            harness.write_bytes((
+                "FAIL=\"${FAIL:-}\"\n"
+                "TRACE=\"${TRACE:-/dev/null}\"\n"
+                "execution_activation_command() {\n"
+                "  case \"$1 $FAIL\" in\n"
+                '    "durability durability") return 1 ;;\n'
+                '    "suppress suppress") return 1 ;;\n'
+                "  esac\n"
+                "  return 0\n"
+                "}\n"
+                "execution_recovery_arm() {\n"
+                '  [[ "$FAIL" == "recovery_arm" ]] && return 1\n'
+                "  return 0\n"
+                "}\n"
+                "record_activation_phase() {\n"
+                "  case \"$1 $FAIL\" in\n"
+                '    "quiescing quiescing") return 1 ;;\n'
+                '    "quiesced quiesced") return 1 ;;\n'
+                "  esac\n"
+                "  return 0\n"
+                "}\n"
+                "execution_stop_services() {\n"
+                "  case \"$2 $FAIL\" in\n"
+                '    "preflight preflight") return 1 ;;\n'
+                '    "stop stop") return 1 ;;\n'
+                "  esac\n"
+                "  return 0\n"
+                "}\n"
+                "resume_install_signals() { echo resumed >>\"$TRACE\"; }\n"
+                + block
+            ).encode("utf-8"))
+            environment = dict(os.environ)
+            environment.update(
+                {
+                    "EXECUTION_MODE": "split",
+                    "STAGE_DIR": temporary,
+                    "COLD_TEAM_HUB_HANDOFF": handoff,
+                    "FAIL": failing,
+                    "TRACE": str(Path(temporary) / "trace"),
+                }
+            )
+            return subprocess.run(
+                ["bash", str(harness)],
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=60,
+            )
+
+    def test_recovery_arm_failure_is_distinguished_from_service_stop(self) -> None:
+        result = self._run("recovery_arm")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("arming the activation recovery owner", result.stderr)
+        self.assertIn("could not be durably stopped", result.stderr)
+        self.assertNotIn("stopping the admitted execution service", result.stderr)
+
+    def test_service_stop_failure_is_distinguished_from_recovery_arm(self) -> None:
+        result = self._run("stop")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("stopping the admitted execution service", result.stderr)
+        self.assertNotIn("arming the activation recovery owner", result.stderr)
+
+    def test_every_other_boundary_is_named(self) -> None:
+        for failing, expected in (
+            ("durability", "recording activation durability evidence"),
+            ("quiescing", "journaling the quiescing phase"),
+            ("preflight", "preflighting the admitted execution service"),
+            ("suppress", "suppressing the admitted execution service"),
+            ("quiesced", "journaling the quiesced phase"),
+        ):
+            with self.subTest(failing=failing):
+                result = self._run(failing)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(expected, result.stderr)
+
+    def test_successful_quiesce_reports_nothing(self) -> None:
+        result = self._run("")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "")
+
+    def test_cold_handoff_resumes_signals_on_failure(self) -> None:
+        result = self._run("recovery_arm", handoff="true")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("arming the activation recovery owner", result.stderr)

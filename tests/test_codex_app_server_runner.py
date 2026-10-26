@@ -2596,6 +2596,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             return paused_goal
 
         manager.set_thread_goal = AsyncMock(side_effect=pause_goal)
+        manager.list_descendant_threads = AsyncMock(return_value=[])
         self.session["codex_goal"] = {
             **paused_goal,
             "status": "active",
@@ -2651,6 +2652,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("goal control unavailable")
 
         manager.set_thread_goal = AsyncMock(side_effect=fail_pause)
+        manager.list_descendant_threads = AsyncMock(return_value=[])
         active_goal = {
             "id": "goal-native",
             "threadId": "thread-native",

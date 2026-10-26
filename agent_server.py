@@ -31628,6 +31628,7 @@ async def _emit_codex_subagent_state_once(
         "subagent_started_at": started_at,
         "subagent_provider_ref": child_thread_id,
         "subagent_parent_thread_id": resolved_parent or None,
+        "subagent_root_thread_id": session_codex_thread_id(STORE.sessions.get(session_id) or {}) or None,
         "subagent_log": log,
     }
     if identity_only or terminal_identity_only:
@@ -31655,6 +31656,7 @@ async def _emit_codex_subagent_state_once(
         "subagent_activity",
         "subagent_summary",
         "subagent_parent_thread_id",
+        "subagent_root_thread_id",
         "subagent_log",
     )
     manager = existing_codex_app_server_manager(STORE.sessions.get(session_id))
@@ -32070,12 +32072,14 @@ async def stop_codex_descendant_subagents(
         or not callable(list_turns)
         or not callable(interrupt_turn)
     ):
+        known_active = [state for state in session_codex_subagent_states(session_id)
+                        if normalize_subagent_status(state.get("subagent_status")) in {"starting", "running"}]
         return {
             "descendants": 0,
             "requested": [],
             "interrupted": [],
             "pending": [],
-            "errors": [],
+            "errors": ["The native runtime is unavailable; child stopping could not be confirmed."] if known_active else [],
         }
     try:
         descendants = await list_descendants(root_thread_id)
@@ -32092,14 +32096,29 @@ async def stop_codex_descendant_subagents(
     interrupted: list[str] = []
     errors: list[str] = []
     pending: dict[str, dict[str, Any]] = {}
-    targets = {str(value) for value in target_thread_ids} if target_thread_ids else None
+    targets = {str(value) for value in target_thread_ids} if target_thread_ids is not None else None
+    requested_turns: set[tuple[str, str]] = set()
+
+    def still_owned(child_thread_id: str) -> bool:
+        # A child can be adopted as a separate chat while native reads await.
+        if child_thread_id == root_thread_id or CODEX_THREAD_SESSION_INDEX.get(child_thread_id):
+            return False
+        with CODEX_SUBAGENT_INDEX_LOCK:
+            return CODEX_SUBAGENT_SESSION_INDEX.get(child_thread_id) in {None, session_id}
+
     for thread in descendants if isinstance(descendants, list) else []:
         if not isinstance(thread, dict):
             continue
         child_thread_id = str(thread.get("id") or "").strip()
-        if not child_thread_id or (targets is not None and child_thread_id not in targets):
+        if (not child_thread_id or child_thread_id == root_thread_id
+                or CODEX_THREAD_SESSION_INDEX.get(child_thread_id)
+                or (targets is not None and child_thread_id not in targets)):
             continue
         with CODEX_SUBAGENT_INDEX_LOCK:
+            owner = CODEX_SUBAGENT_SESSION_INDEX.get(child_thread_id)
+            if owner and owner != session_id:
+                continue
+            previous = dict(CODEX_SUBAGENT_STATE.get(child_thread_id) or {})
             CODEX_SUBAGENT_SESSION_INDEX[child_thread_id] = session_id
         try:
             turns = await list_turns(
@@ -32108,6 +32127,8 @@ async def stop_codex_descendant_subagents(
                 items_view="summary",
                 sort_direction="desc",
             )
+            if not still_owned(child_thread_id):
+                continue
             active_turns = [
                 turn for turn in turns
                 if isinstance(turn, dict)
@@ -32115,7 +32136,12 @@ async def stop_codex_descendant_subagents(
                 and str(turn.get("id") or "").strip()
             ]
             for turn in active_turns:
+                if not still_owned(child_thread_id):
+                    break
                 await interrupt_turn(child_thread_id, str(turn["id"]))
+                requested_turns.add((child_thread_id, str(turn["id"])))
+            if not still_owned(child_thread_id):
+                continue
             if active_turns:
                 requested.append(child_thread_id)
                 pending[child_thread_id] = thread
@@ -32131,17 +32157,41 @@ async def stop_codex_descendant_subagents(
                     parent_thread_id=str(thread.get("parentThreadId") or root_thread_id),
                     name=thread.get("preview"),
                     activity="Stopping subagent…",
+                    reconcile_expected_state=previous,
                 )
+            else:
+                status = codex_child_status_from_turn(turns[0] if turns else None)
+                if status in {"completed", "stopped", "failed"}:
+                    # Stop must repair a stale live snapshot even when the
+                    # native child finished before we could interrupt it.
+                    reconciled = await emit_codex_subagent_state(
+                        session_id, child_thread_id, status,
+                        parent_thread_id=str(thread.get("parentThreadId") or root_thread_id),
+                        activity=f"Subagent {status}",
+                        persist_event=bool(previous),
+                        reconcile_expected_state=previous,
+                    )
+                    if normalize_subagent_status((reconciled or {}).get("subagent_status")) not in {"completed", "stopped", "failed"}:
+                        pending[child_thread_id] = thread
+                else:
+                    # A starting child may not have a turn ID yet. Keep it
+                    # pending and interrupt its exact turn once it appears.
+                    pending[child_thread_id] = thread
         except Exception as exc:
             errors.append(f"{child_thread_id}: {concise_error_message(exc)}")
 
     deadline = asyncio.get_running_loop().time() + STOP_CONFIRM_TIMEOUT_SECONDS
     while pending and asyncio.get_running_loop().time() < deadline:
         for child_thread_id, thread in list(pending.items()):
+            if not still_owned(child_thread_id):
+                pending.pop(child_thread_id, None)
+                continue
+            with CODEX_SUBAGENT_INDEX_LOCK:
+                previous = dict(CODEX_SUBAGENT_STATE.get(child_thread_id) or {})
             try:
                 turns = await list_turns(
                     child_thread_id,
-                    limit=1,
+                    limit=4,
                     items_view="summary",
                     sort_direction="desc",
                 )
@@ -32149,18 +32199,39 @@ async def stop_codex_descendant_subagents(
                 errors.append(f"{child_thread_id}: {concise_error_message(exc)}")
                 pending.pop(child_thread_id, None)
                 continue
+            if not still_owned(child_thread_id):
+                pending.pop(child_thread_id, None)
+                continue
             latest_turn = turns[0] if turns else None
             status = codex_child_status_from_turn(latest_turn)
             if status in {None, "running"}:
+                for turn in turns:
+                    if not isinstance(turn, dict) or not still_owned(child_thread_id):
+                        continue
+                    turn_id = str(turn.get("id") or "")
+                    key = (child_thread_id, turn_id)
+                    if turn_id and turn.get("status") == "inProgress" and key not in requested_turns:
+                        try:
+                            await interrupt_turn(child_thread_id, turn_id)
+                            requested_turns.add(key)
+                            if child_thread_id not in requested:
+                                requested.append(child_thread_id)
+                        except Exception as exc:
+                            errors.append(f"{child_thread_id}: {concise_error_message(exc)}")
+                            pending.pop(child_thread_id, None)
                 continue
-            await emit_codex_subagent_state(
+            reconciled = await emit_codex_subagent_state(
                 session_id,
                 child_thread_id,
                 status,
                 parent_thread_id=str(thread.get("parentThreadId") or root_thread_id),
                 name=thread.get("preview"),
                 activity=f"Subagent {status}",
+                reconcile_expected_state=previous,
             )
+            status = normalize_subagent_status((reconciled or {}).get("subagent_status"))
+            if status not in {"completed", "stopped", "failed"}:
+                continue
             if status == "stopped":
                 interrupted.append(child_thread_id)
             pending.pop(child_thread_id, None)
@@ -32172,6 +32243,17 @@ async def stop_codex_descendant_subagents(
         "interrupted": interrupted,
         "pending": list(pending),
         "errors": errors,
+    }
+
+
+def codex_subagent_stop_status(session: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    """A stopped parent is not proof that every native child has stopped."""
+    if session.get("backend") != BACKEND_CODEX or not (result.get("pending") or result.get("errors")):
+        return {}
+    return {
+        "stopped": False,
+        "pending": True,
+        "message": "Some Codex subagents have not confirmed stopping. Retry Stop; other chats are unaffected.",
     }
 
 
@@ -97198,7 +97280,6 @@ async def stop_turn(
         and not active
         and str(session.get("backend") or "") == BACKEND_CODEX
         and root_thread_id
-        and codex_manager is not None
     ):
         subagent_stop = await stop_codex_descendant_subagents(
             session_id,
@@ -97260,6 +97341,7 @@ async def stop_turn(
                         "pending": False,
                         "superseded": True,
                         "subagents": subagent_stop,
+                        **codex_subagent_stop_status(session, subagent_stop),
                     }
                 if bound_active:
                     # The runner bound while Stop was waiting. Re-enter through
@@ -97286,6 +97368,7 @@ async def stop_turn(
                         "stopped": True,
                         "pending": False,
                         "subagents": subagent_stop,
+                        **codex_subagent_stop_status(session, subagent_stop),
                         **goal_result,
                     }
                 remaining = deadline - asyncio.get_running_loop().time()
@@ -97367,6 +97450,7 @@ async def stop_turn(
                         "pending": False,
                         "hard_stop": True,
                         "subagents": subagent_stop,
+                        **codex_subagent_stop_status(session, subagent_stop),
                         **goal_result,
                     }
                 # Keep the deferred STOP_REQUESTS marker. A legitimate slow
@@ -97403,6 +97487,7 @@ async def stop_turn(
                 "stopped": True,
                 "pending": False,
                 "subagents": subagent_stop,
+                **codex_subagent_stop_status(session, subagent_stop),
                 **goal_result,
             }
         schedule_unpaused_queue_after_release()
@@ -97414,6 +97499,7 @@ async def stop_turn(
             "stopped": True,
             "pending": False,
             "subagents": subagent_stop,
+            **codex_subagent_stop_status(session, subagent_stop),
             **goal_result,
         }
     proc = active.get("proc") if active else None
@@ -97451,6 +97537,7 @@ async def stop_turn(
                 "Turn stopped. The stale Codex goal thread was fenced and "
                 "will not be reused."
             ),
+            **codex_subagent_stop_status(session, subagent_stop),
         }
 
     async def hard_terminalize_active_stop(
@@ -97502,6 +97589,7 @@ async def stop_turn(
                 "native_interrupt": native_interrupt,
                 "goal_paused": goal_paused,
                 "subagents": subagent_stop,
+                **codex_subagent_stop_status(session, subagent_stop),
             }
 
         if is_claude_sdk:
@@ -97583,6 +97671,7 @@ async def stop_turn(
                     else "Turn stopped. The unresponsive provider runner was retired."
                 )
             ),
+            **codex_subagent_stop_status(session, subagent_stop),
         }
 
     native_interrupt = False
@@ -97697,6 +97786,7 @@ async def stop_turn(
                 "native_interrupt": native_interrupt,
                 "goal_paused": goal_paused,
                 "subagents": subagent_stop,
+                **codex_subagent_stop_status(session, subagent_stop),
                 "message": (
                     goal_pause_error
                     or "Stop was sent; waiting for the steering transition to settle."
@@ -97756,6 +97846,7 @@ async def stop_turn(
                 "native_interrupt": native_interrupt,
                 "goal_paused": goal_paused,
                 "subagents": subagent_stop,
+                **codex_subagent_stop_status(session, subagent_stop),
             }
         if not still_busy:
             if not goal_pause_ok:
@@ -97776,6 +97867,7 @@ async def stop_turn(
                 "native_interrupt": native_interrupt,
                 "goal_paused": goal_paused,
                 "subagents": subagent_stop,
+                **codex_subagent_stop_status(session, subagent_stop),
             }
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
@@ -97823,6 +97915,7 @@ async def stop_turn(
             "native_interrupt": native_interrupt,
             "goal_paused": goal_paused,
             "subagents": subagent_stop,
+            **codex_subagent_stop_status(session, subagent_stop),
         }
 
     # A provider interrupt is an acknowledgement, not terminal state. Leave

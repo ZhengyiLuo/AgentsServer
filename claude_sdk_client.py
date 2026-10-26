@@ -1142,6 +1142,7 @@ class ClaudeSDKSupervisor:
             raise ValueError("chat_id is required")
         self.chat_id = clean_chat_id
         self.options = options
+        self._reconnect_options = options
         self.configuration_key = str(configuration_key)
         self.ownership_token = f"claudeowner_{uuid.uuid4().hex}"
         bind_permission_owner(self.options, self.ownership_token)
@@ -1657,6 +1658,11 @@ class ClaudeSDKSupervisor:
     async def _new_client(self) -> ClaudeSDKClientProtocol:
         client: ClaudeSDKClientProtocol | None = None
         try:
+            # A fork's saved native ID changes after its first turn. Keep the
+            # latest supplied binding for reconnects that happen inside the
+            # actor, without replacing callbacks on the still-live client.
+            self.options = self._reconnect_options
+            bind_permission_owner(self.options, self.ownership_token)
             client_options, background_hook = _connection_background_hook(self.options)
             self._background_reconciliation_hook = background_hook
             client_options, self._pending_mail_hint_hook = _connection_mail_hint_hook(client_options)
@@ -1714,6 +1720,15 @@ class ClaudeSDKSupervisor:
         if client is None or not self._connected:
             client = await self._new_client()
         return client
+
+    def _query_provider_session_id(self, supplied: str | None) -> str | None:
+        if supplied is not None and supplied != "default":
+            return supplied
+        options = self._reconnect_options
+        value = options.get if isinstance(options, dict) else lambda key: getattr(options, key, None)
+        # A first fork submission runs in a newly assigned child UUID, not
+        # its resume source. The exact process/query/prompt still owns its hook.
+        return None if value("fork_session") else value("resume")
 
     def _observe_live_background_work(self, message: Any) -> None:
         subtype, task_id, task_type, status = _task_lifecycle_fields(message)
@@ -2005,9 +2020,7 @@ class ClaudeSDKSupervisor:
         if mail_hook is not None:
             mail_hook.retire()
             if callable(command.pending_mail_hint):
-                provider_id = command.query_session_id
-                if provider_id is None or provider_id == "default":
-                    provider_id = self.options.get("resume") if isinstance(self.options, dict) else getattr(self.options, "resume", None)
+                provider_id = self._query_provider_session_id(command.query_session_id)
                 generation = self._generation
                 mail_hook.bind(
                     handle, command.pending_mail_hint, _receipt_field(provider_id),
@@ -2015,9 +2028,7 @@ class ClaudeSDKSupervisor:
                     and self._generation == generation and self._pending_mail_hint_hook is mail_hook,
                 )
         if background_hook is not None and command.background_task_reconciliation is not None:
-            provider_id = command.query_session_id
-            if provider_id is None or provider_id == "default":
-                provider_id = self.options.get("resume") if isinstance(self.options, dict) else getattr(self.options, "resume", None)
+            provider_id = self._query_provider_session_id(command.query_session_id)
             background_hook.bind(
                 handle,
                 command.prompt,
@@ -3267,6 +3278,10 @@ class ClaudeSDKSupervisorManager:
             )
             self._supervisors[chat_id] = supervisor
         else:
+            # Preserve current callbacks and owned work, but never discard a
+            # newer persisted resume/fork binding merely because this client
+            # is connected. Its actor may need to reconnect after this lookup.
+            supervisor._reconnect_options = options
             # A disconnected actor has no live provider state. Refresh its
             # lazy reconnect options so a newly persisted resume/fork binding
             # is honored after a stream failure without changing the stable

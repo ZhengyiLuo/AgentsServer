@@ -1597,6 +1597,105 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
         await second_client.emit({"type": "result", "result": "done"})
         await asyncio.wait_for(collect(second), 1)
 
+    async def test_fork_reconnect_uses_latest_child_binding_without_replacing_live_owner(self) -> None:
+        options = {
+            "cwd": "/shared-project", "resume": "parent-native", "fork_session": True,
+            "extra_args": {"resume-session-at": "parent-cutoff"},
+            "hooks": claude_background_tracking_hooks(),
+        }
+        first = await self.manager.start_run(
+            "child-chat", "First child turn", run_id="child-1",
+            options=options, configuration_key="same",
+            background_task_reconciliation={"tasks": [{
+                "task_id": "prior-task", "task_type": "local_workflow",
+                "owner_run_id": "prior-run", "status": "completed",
+            }]},
+        )
+        first_client = self.factory.clients[0]
+        child_options = {**options, "resume": "child-native", "fork_session": False,
+                         "extra_args": {}}
+        # The persisted native binding changes while this same process is
+        # still active. Updating future reconnect options must not replace it.
+        owner = await self.manager.get("child-chat", options=child_options, configuration_key="same")
+        self.assertFalse(first_client.disconnected)
+        self.assertIs(owner.options, options)
+        await first_client.emit({"type": "result", "session_id": "child-native", "result": "child B"})
+        await asyncio.wait_for(collect(first), 1)
+
+        # No hook receipt was observed, so the actor itself reconnects. This
+        # must resume B, not fork an updated parent conversation again.
+        second = await self.manager.start_run(
+            "child-chat", "Recall child B", run_id="child-2",
+            options=child_options, configuration_key="same",
+        )
+        second_client = self.factory.clients[1]
+        self.assertTrue(first_client.disconnected)
+        self.assertEqual(second_client.options["resume"], "child-native")
+        self.assertFalse(second_client.options["fork_session"])
+        self.assertNotIn("resume-session-at", second_client.options["extra_args"])
+        await second_client.emit({"type": "result", "session_id": "child-native", "result": "child B retained"})
+        await asyncio.wait_for(collect(second), 1)
+
+    async def test_fork_receiver_close_after_lookup_keeps_latest_child_binding(self) -> None:
+        options = {"resume": "parent-native", "fork_session": True}
+        first = await self.manager.start_run(
+            "child-chat", "First child turn", run_id="child-1",
+            options=options, configuration_key="same",
+        )
+        client = self.factory.clients[0]
+        await client.emit({"type": "result", "session_id": "child-native", "result": "done"})
+        await asyncio.wait_for(collect(first), 1)
+        owner = await self.manager.get("child-chat", options=options, configuration_key="same")
+        start = owner.start_run
+
+        async def start_after_receiver_close(*args, **kwargs):
+            # A real EOF lands after the registry lookup but before the actor
+            # handles this start. There is no second lookup to refresh options.
+            await client.emit(StopAsyncIteration)
+            async def wait_for_close():
+                while owner.connected:
+                    await asyncio.sleep(0)
+            await asyncio.wait_for(wait_for_close(), 1)
+            return await start(*args, **kwargs)
+
+        owner.start_run = start_after_receiver_close
+        second = await self.manager.start_run(
+            "child-chat", "Keep child context", run_id="child-2",
+            options={"resume": "child-native", "fork_session": False},
+            configuration_key="same",
+        )
+        replacement = self.factory.clients[1]
+        self.assertEqual(replacement.options["resume"], "child-native")
+        self.assertFalse(replacement.options["fork_session"])
+        await replacement.emit({"type": "result", "session_id": "child-native", "result": "done"})
+        await asyncio.wait_for(collect(second), 1)
+
+    async def test_fork_reconciliation_matches_new_child_then_persisted_child_identity(self) -> None:
+        options = {"resume": "parent-native", "fork_session": True,
+                   "hooks": claude_background_tracking_hooks()}
+        receipt = {"tasks": [{"task_id": "task", "task_type": "local_workflow",
+                              "owner_run_id": "old", "status": "completed"}]}
+        for index, current_options in enumerate((
+            options, {**options, "resume": "child-native", "fork_session": False},
+        )):
+            prompt = f"Child turn {index}"
+            handle = await self.manager.start_run(
+                "child-chat", prompt, run_id=f"child-{index}",
+                options=current_options, configuration_key="same",
+                background_task_reconciliation=receipt,
+            )
+            self.assertEqual(len(self.factory.clients), 1)
+            client = self.factory.clients[0]
+            hook = client.options["hooks"]["UserPromptSubmit"][0].hooks[0]
+            if index:
+                self.assertEqual(await hook({"hook_event_name": "UserPromptSubmit",
+                    "prompt": prompt, "session_id": "parent-native"}, None, {}), {})
+            value = await hook({"hook_event_name": "UserPromptSubmit",
+                "prompt": prompt, "session_id": "child-native"}, None, {})
+            self.assertIn("additionalContext", value.get("hookSpecificOutput", {}))
+            await client.emit({"type": "result", "session_id": "child-native", "result": "done"})
+            await asyncio.wait_for(collect(handle), 1)
+
     async def test_validated_local_command_rejects_changed_generation_before_query(self) -> None:
         _info, generation = await self.manager.get_server_info(
             "generation-chat",

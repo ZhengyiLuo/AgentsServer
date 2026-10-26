@@ -6904,15 +6904,31 @@ fi
 # links or configuration. Legacy runners can report a failed installer, so an
 # unfinished journal must never leave their old, unfenced API accepting work.
 if [[ "${EXECUTION_MODE:-legacy}" == "split" ]]; then
-  if ! execution_activation_command durability "$STAGE_DIR" \
-    || ! execution_recovery_arm "$STAGE_DIR" \
-    || ! record_activation_phase quiescing "$STAGE_DIR" \
-    || ! execution_stop_services "$STAGE_DIR" preflight \
-    || ! execution_activation_command suppress "$STAGE_DIR" \
-    || ! execution_stop_services "$STAGE_DIR" stop \
-    || ! record_activation_phase quiesced "$STAGE_DIR"; then
+  # Name the quiesce boundary that actually failed. Arming the activation
+  # recovery owner validates the recovery interpreter's ownership and
+  # permission bits, which needs a different operator response than a native
+  # service-stop failure; the single generic message below previously blamed
+  # the service stop for every failure in this chain.
+  ACTIVATION_QUIESCE_BOUNDARY=""
+  if ! execution_activation_command durability "$STAGE_DIR"; then
+    ACTIVATION_QUIESCE_BOUNDARY="recording activation durability evidence"
+  elif ! execution_recovery_arm "$STAGE_DIR"; then
+    ACTIVATION_QUIESCE_BOUNDARY="arming the activation recovery owner"
+  elif ! record_activation_phase quiescing "$STAGE_DIR"; then
+    ACTIVATION_QUIESCE_BOUNDARY="journaling the quiescing phase"
+  elif ! execution_stop_services "$STAGE_DIR" preflight; then
+    ACTIVATION_QUIESCE_BOUNDARY="preflighting the admitted execution service"
+  elif ! execution_activation_command suppress "$STAGE_DIR"; then
+    ACTIVATION_QUIESCE_BOUNDARY="suppressing the admitted execution service"
+  elif ! execution_stop_services "$STAGE_DIR" stop; then
+    ACTIVATION_QUIESCE_BOUNDARY="stopping the admitted execution service"
+  elif ! record_activation_phase quiesced "$STAGE_DIR"; then
+    ACTIVATION_QUIESCE_BOUNDARY="journaling the quiesced phase"
+  fi
+  if [[ -n "$ACTIVATION_QUIESCE_BOUNDARY" ]]; then
     [[ "$COLD_TEAM_HUB_HANDOFF" != "true" ]] || resume_install_signals
     echo "The admitted execution service could not be durably stopped before takeover." >&2
+    echo "  The failure occurred while $ACTIVATION_QUIESCE_BOUNDARY; the error above identifies the specific cause." >&2
     exit 1
   fi
 fi

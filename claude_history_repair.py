@@ -72,15 +72,17 @@ def _stamp(path: Path) -> tuple[int, int, int, int]:
     return value
 
 
-def _records(path: Path, expected: tuple[int, int, int, int]):
+def _records(path: Path, expected: tuple[int, int, int, int], *, allow_nul_padding=False):
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     with os.fdopen(descriptor, "rb") as stream:
         info = os.fstat(stream.fileno())
         if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) != expected:
             raise _Unproven()
         try:
-            yield from jsonl_records(stream, end=expected[2], strict=True,
-                max_records=MAX_RECORDS, max_retained_bytes=MAX_LINE_BYTES)
+            for event, offset, raw in jsonl_records(stream, end=expected[2], strict=True,
+                    max_records=MAX_RECORDS, max_retained_bytes=MAX_LINE_BYTES,
+                    allow_nul_padding=allow_nul_padding):
+                yield event if event is not None else {}, offset, raw
         except ValueError as exc:
             raise _Unproven() from exc
         final = os.fstat(stream.fileno())
@@ -490,6 +492,81 @@ class _AsyncDeliveryInputs:
         return targets
 
 
+class _ScheduledJobInputs(_AsyncDeliveryInputs):
+    """Complete scheduled occurrence plus exact source identity and full input."""
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.prompt_hashes = None
+
+    def source(self, event, offset):
+        if self.prompt_hashes is None:
+            self.prompt_hashes = {_text_key(" ".join(start["prompt"].split()))
+                                  for starts in self.native.starts.values() for start in starts
+                                  if start.get("purpose") == "scheduled_job" and start.get("job_id")
+                                  and isinstance(start.get("prompt"), str) and len(start["prompt"]) <= MAX_TEXT_CHARS}
+        if not self.prompt_hashes:
+            return
+        if event.get("type") != "user" or event.get("sessionId") != self.provider_id or self.normalize_full_user is None:
+            return
+        identity = (event.get("uuid"), self.provider_id, event.get("timestamp"))
+        if not all(isinstance(value, str) and 0 < len(value) <= 256 for value in identity):
+            return
+        self.source_counts[identity] = self.source_counts.get(identity, 0) + 1
+        if len(self.source_counts) > MAX_KEYS:
+            raise _Unproven()
+        if (any(event.get(key) is True for key in ("isMeta", "isCompactSummary", "isSidechain", "provider_user_authored"))
+                or any(event.get(key) for key in ("clientUserMessageId", "clientId", "client_user_message_id", "client_id"))):
+            return
+        full, display = self.normalize_full_user(event), self.normalize_user(event)
+        if (isinstance(full, str) and full and len(full) <= MAX_TEXT_CHARS
+                and isinstance(display, str) and display and _timestamp(identity[2]) is not None):
+            digest = _text_key(" ".join(full.split()))
+            if digest in self.prompt_hashes:
+                self.sources.setdefault(digest, []).append((identity, _text_key(display), offset))
+        if len(self.source_counts) + len(self.sources) > MAX_KEYS:
+            raise _Unproven()
+
+    def prove(self, eligible):
+        matches, credits, candidate_counts = {}, {}, {}
+        for target, identity in self.candidates:
+            candidate_counts[(target[1], identity)] = candidate_counts.get((target[1], identity), 0) + 1
+        for run, starts in self.native.starts.items():
+            ends = self.native.ends.get(run, ())
+            if len(starts) != 1 or len(ends) != 1:
+                continue
+            start, end = starts[0], ends[0]
+            owners = (start, end, *self.native.owners.get(run, ()))
+            provider_ids = {row.get("provider_session_id") for row in owners
+                            if row.get("provider_session_id") not in (None, "")}
+            first, last = _timestamp(start.get("ts")), _timestamp(end.get("ts"))
+            prompt = start.get("prompt")
+            if (start.get("purpose") != "scheduled_job" or not start.get("job_id")
+                    or not isinstance(prompt, str) or not prompt or len(prompt) > MAX_TEXT_CHARS
+                    or provider_ids != {self.provider_id}
+                    or first is None or last is None or first > last
+                    or type(start.get("seq")) is not int or type(end.get("seq")) is not int
+                    or start["seq"] >= end["seq"]
+                    or any(type(row.get("seq")) is not int or not start["seq"] <= row["seq"] <= end["seq"]
+                           for row in self.native.owners.get(run, ()))):
+                continue
+            for identity, key, offset in self.sources.get(_text_key(" ".join(prompt.split())), ()):
+                timestamp = _timestamp(identity[2])
+                if self.source_counts.get(identity) != 1 or timestamp is None or not first <= timestamp <= last:
+                    continue
+                matches.setdefault((identity, key), []).append((run, offset))
+                credits[run] = credits.get(run, 0) + 1
+        targets = set()
+        for target, identity in self.candidates:
+            seq, run, key = target
+            batch, matched = eligible.get(run), matches.get((identity, key), ())
+            if batch and len(matched) == 1 and candidate_counts[(run, identity)] == 1 and credits.get(matched[0][0]) == 1:
+                first, last, start, end = batch[:4]
+                if first < seq < last and start < matched[0][1] <= end:
+                    targets.add(target)
+        return targets
+
+
 class _MailboxWakeInputs(_AsyncDeliveryInputs):
     """Exact generated native input hash, current provider and checkpoint identity."""
     def __init__(self, *args):
@@ -615,20 +692,24 @@ def filter_native_claude_mailbox_wake_items(
                     or not isinstance(previous, str) or not _DIGEST.fullmatch(previous))):
             return items
         proof = _MailboxWakeInputs(provider_id, native, normalize_user, normalize_full_user)
+        scheduled = _ScheduledJobInputs(provider_id, native, normalize_user, normalize_full_user)
         # Temporary proof coordinates only; no synthetic event is persisted.
         batch = "import_mailbox_wake_filter"
         assistant_targets = {}
         for index, item in enumerate(items, 1):
-            if item.get("kind") == "user" and item.get("source_text_sha256") is None:
-                proof.event({**item, "seq": index, "run_id": batch, "type": "turn_started",
-                             "backend": "claude", "imported": True, "prompt": item.get("text")})
+            if item.get("kind") == "user":
+                candidate = {**item, "seq": index, "run_id": batch, "type": "turn_started",
+                             "backend": "claude", "imported": True, "prompt": item.get("text")}
+                scheduled.event(candidate)
+                if item.get("source_text_sha256") is None:
+                    proof.event(candidate)
             elif item.get("kind") == "assistant":
                 candidate = {**item, "seq": index, "run_id": batch, "type": "assistant_text",
                              "backend": "claude", "imported": True}
                 native.event(candidate)
                 assistant_targets[index] = _assistant_target(candidate)
         digest, verified = hashlib.sha256(), set()
-        for event, offset, line in _records(source, source_stamp):
+        for event, offset, line in _records(source, source_stamp, allow_nul_padding=True):
             line.update_hash(digest)
             if offset == start and hmac.compare_digest(digest.hexdigest(), previous):
                 verified.add(start)
@@ -636,11 +717,13 @@ def filter_native_claude_mailbox_wake_items(
                 verified.add(end)
             if offset <= end:
                 proof.source(event, offset)
+                scheduled.source(event, offset)
                 native.source(event, offset)
         if end not in verified or start and start not in verified:
             return items
         eligible = {batch: (0, len(items) + 1, start, end)}
         targets, assistant_replays = proof.prove(eligible), native.prove(eligible)
+        targets.update(scheduled.prove(eligible))
         _assistants, owned_inputs = native.exact_owned_sources()
         projected = []
         for index, item in enumerate(items, 1):
@@ -956,7 +1039,7 @@ def _prove(session_id: str, provider_id: str, events: Path, root: Path,
             if start_time is not None and end_time is not None and start_time <= end_time:
                 scheduled_ranges.setdefault(key, []).append((run, start_time, end_time))
     scheduled_sources, scheduled_counts = {}, {}
-    for event, offset, line in _records(source, source_stamp):
+    for event, offset, line in _records(source, source_stamp, allow_nul_padding=True):
         line.update_hash(digest)
         for wanted in prefix_digests.get(offset, ()):
             if hmac.compare_digest(digest.hexdigest(), wanted):
@@ -1119,7 +1202,7 @@ def _prove(session_id: str, provider_id: str, events: Path, root: Path,
                   tuple(corrected), frozenset(companions), proven_assistants, tuple(goal_commands))
 
 
-def _bounded_records(path: Path, expected, start: int, end: int):
+def _bounded_records(path: Path, expected, start: int, end: int, *, allow_nul_padding=False):
     """Read complete records in one fixed window, never the oversized prefix."""
     if not 0 <= start < end <= expected[2] or end - start > MAX_EVENTS_BYTES:
         raise _Unproven()
@@ -1144,8 +1227,9 @@ def _bounded_records(path: Path, expected, start: int, end: int):
                     raise _Unproven()
         try:
             for event, offset, _raw in jsonl_records(stream, end=end, strict=True,
-                    deadline=deadline, max_records=MAX_RECORDS, max_retained_bytes=MAX_LINE_BYTES):
-                yield event, offset
+                    deadline=deadline, max_records=MAX_RECORDS, max_retained_bytes=MAX_LINE_BYTES,
+                    allow_nul_padding=allow_nul_padding):
+                yield event if event is not None else {}, offset
         except ValueError as exc:
             raise _Unproven() from exc
         final = os.fstat(stream.fileno())
@@ -1280,7 +1364,7 @@ def _prove_recent_scheduled(session_id: str, provider_id: str, events: Path, roo
             if start_time is not None and end_time is not None and start_time <= end_time:
                 ranges.setdefault(key, []).append((run, start_time, end_time))
     source_matches, occurrence_counts, identity_counts, source_metadata = {}, {}, {}, {}
-    for event, offset in _bounded_records(source, source_stamp, window_start, checkpoint_end):
+    for event, offset in _bounded_records(source, source_stamp, window_start, checkpoint_end, allow_nul_padding=True):
         assistant_replays.source(event, offset)
         async_inputs.source(event, offset)
         wake_inputs.source(event, offset)

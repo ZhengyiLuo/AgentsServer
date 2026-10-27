@@ -278,9 +278,9 @@ class ClaudeHistoryRepairTests(unittest.TestCase):
         self.fixture()
         real_records = repair._records
 
-        def growing_records(path, stamp):
+        def growing_records(path, stamp, **kwargs):
             changed = False
-            for record in real_records(path, stamp):
+            for record in real_records(path, stamp, **kwargs):
                 yield record
                 if path == self.source.resolve() and not changed:
                     changed = True

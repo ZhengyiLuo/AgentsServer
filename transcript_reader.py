@@ -281,7 +281,7 @@ class _RecordParser:
 def jsonl_records(stream: BinaryIO, *, end: int, project=True, strict=False,
                   require_newline=True, max_records=250_000, deadline=None,
                   cancelled=None, max_retained_bytes=MAX_RETAINED_BYTES, retained_fields=None,
-                  max_nodes=-1, max_depth=None):
+                  max_nodes=-1, max_depth=None, allow_nul_padding=False):
     """Yield (projected object or None, ending offset, RawRecord).
 
     Malformed provider lines may be represented by None, as before. Resource
@@ -289,6 +289,8 @@ def jsonl_records(stream: BinaryIO, *, end: int, project=True, strict=False,
     A fixed end excludes concurrent appends; callers own file identity checks.
     Native-import work budgets remain the default. Durable metadata-only scans
     can supply separate structural limits without imposing import caps on logs.
+    Native Claude recovery can explicitly accept NUL-only padding lines. They
+    provide no event or ownership evidence, but retain their exact raw receipt.
     """
     # Externally supplied deadlines can belong to a larger operation. Do not
     # invent a duration for them; the caller can provide its own timeout detail.
@@ -306,14 +308,23 @@ def jsonl_records(stream: BinaryIO, *, end: int, project=True, strict=False,
         parser = _RecordParser(stream, end, deadline, cancelled, project, max_retained_bytes, budget_seconds, retained_fields, max_nodes, max_depth)
         blank = False
         malformed = False
+        nul_padding = False
         try:
             try:
-                parser.space()
-                blank = parser.peek() is None
-                value = None if blank else parser.value()
-                parser.space()
-                if parser.peek() is not None:
-                    raise InvalidRecord('trailing JSON content')
+                if allow_nul_padding and parser.peek() == 0:
+                    while parser.peek() == 0:
+                        parser.index += 1
+                    if parser.take() != 10 or parser.peek() is not None:
+                        raise InvalidRecord('invalid NUL padding record')
+                    nul_padding = malformed = True
+                    value = None
+                else:
+                    parser.space()
+                    blank = parser.peek() is None
+                    value = None if blank else parser.value()
+                    parser.space()
+                    if parser.peek() is not None:
+                        raise InvalidRecord('trailing JSON content')
             except (InvalidRecord, UnicodeDecodeError, json.JSONDecodeError) as error:
                 if strict:
                     raise ValueError('malformed transcript record') from error
@@ -329,6 +340,6 @@ def jsonl_records(stream: BinaryIO, *, end: int, project=True, strict=False,
             raise ValueError('transcript cursor does not end on a complete line')
         raw = RawRecord(stream, start, stop, parser.complete, blank, malformed or blank,
                         deadline, cancelled, count, budget_seconds)
-        if strict and not isinstance(value, dict):
+        if strict and not isinstance(value, dict) and not nul_padding:
             raise ValueError('transcript object expected')
         yield value if isinstance(value, dict) else None, stop, raw

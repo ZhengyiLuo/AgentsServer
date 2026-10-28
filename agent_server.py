@@ -106,6 +106,7 @@ from claude_sdk_client import (
     ClaudeSDKGoalReceipt,
     ClaudeSDKMCPServerNotFound,
     ClaudeSDKNativeContinuation,
+    ClaudeSDKNativeWakeDeferred,
     ClaudeSDKQueryError,
     ClaudeSDKRunActive,
     ClaudeSDKSupervisorClosed,
@@ -14341,6 +14342,9 @@ CODEX_APP_SERVER_MANAGER_EPOCH = 0
 CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH: int | None = None
 CLAUDE_SDK_MANAGER: ClaudeSDKSupervisorManager | None = None
 CLAUDE_SDK_MANAGER_LOCK = asyncio.Lock()
+CLAUDE_TURN_ADMISSIONS: dict[str, asyncio.Event] = {}
+CLAUDE_NATIVE_PAUSED_STARTS: dict[str, dict[str, Any]] = {}
+CLAUDE_START_TASKS: dict[tuple[str, str], asyncio.Task[Any]] = {}
 CODEX_GOALS_CONFIG_LOCK = asyncio.Lock()
 CODEX_GOALS_RECONFIGURING = False
 CODEX_AUTH_LOCK = asyncio.Lock()
@@ -17068,6 +17072,9 @@ def inherit_internal_status_run_metadata(
     stored = dict(payload or {})
     run_id = str(stored.get("run_id") or "").strip()
     metadata = run_event_metadata(run_id) if run_id else {}
+    predecessor = metadata.get("provider_admission_after_run_id")
+    if isinstance(predecessor, str) and predecessor:
+        stored.setdefault("provider_admission_after_run_id", predecessor)
     if metadata.get("cross_chat_exchange_status") is not True:
         return stored
     for key in (
@@ -30383,6 +30390,7 @@ async def release_turn_slot(
     *,
     expected_run_id: str | None = None,
     expected_admission_id: str | None = None,
+    resume_paused_claude_start: bool = False,
 ) -> bool:
     """Release a chat turn reservation without clearing a newer owner.
 
@@ -30427,11 +30435,37 @@ async def release_turn_slot(
                 conflicting_owner = bool(active_run_id)
             if not owns_slot or conflicting_owner:
                 return False
+        paused = CLAUDE_NATIVE_PAUSED_STARTS.get(session_id)
+        if paused is not None and paused["native_run_id"] == expected_run_id:
+            restored = bool(
+                resume_paused_claude_start
+                and session_id not in STOP_REQUESTS
+                and expected_run_id not in STOPPED_RUNS
+                and not stop_cleanup_in_progress(session_id)
+                and not SERVER_SHUTTING_DOWN
+                and session_id not in DELETING_SESSIONS
+                and session_id not in DELETED_SESSION_TOMBSTONES
+                and session_id in STORE.sessions
+                and not paused.get("cancelled")
+            )
+            paused.update(released=True, restored=restored)
+            if restored:
+                RUN_METADATA.setdefault(paused["run_id"], {})["provider_admission_after_run_id"] = expected_run_id
+                CURRENT_TURNS[session_id] = paused["turn"]
+                if paused["active"] is not None:
+                    ACTIVE[session_id] = paused["active"]
+                else:
+                    ACTIVE.pop(session_id, None)
+                # Keep the original admission reserved until its first query.
+                # Its runner is released only after native terminal persistence.
+                return True
         ACTIVE.pop(session_id, None)
         BUSY_SESSIONS.discard(session_id)
         CURRENT_TURNS.pop(session_id, None)
         STOP_REQUESTS.discard(session_id)
-        return True
+    if paused is not None and paused["native_run_id"] == expected_run_id:
+        await finish_claude_paused_start(session_id, expected_run_id)
+    return True
 
 
 async def bind_active_turn(
@@ -62192,11 +62226,24 @@ async def discover_session_provider_commands(
                 cwd,
                 codex_manifest_path(session_id),
             )
-            raw, generation = await manager.get_server_info(
-                session_id,
-                options=options,
-                configuration_key=configuration_key,
-            )
+            cached_getter = getattr(manager, "get_cached_server_info", None)
+            cached = (cached_getter(session_id, configuration_key=configuration_key)
+                      if session_id in CLAUDE_TURN_ADMISSIONS and callable(cached_getter)
+                      else None)
+            if cached is not None:
+                # Native wake admission may be waiting for this human's
+                # local persistence. Its exact initialization snapshot needs
+                # no actor request, including before that collision occurs.
+                raw, generation = cached
+            else:
+                if (session_id in CLAUDE_TURN_ADMISSIONS and callable(cached_getter)
+                        and manager.is_loaded(session_id)):
+                    raise ClaudeSDKUnavailable("Claude initialization metadata is unavailable for this admission")
+                raw, generation = await manager.get_server_info(
+                    session_id,
+                    options=options,
+                    configuration_key=configuration_key,
+                )
             inventory = claude_provider_command_inventory(
                 raw,
                 cwd=cwd,
@@ -65563,7 +65610,7 @@ async def bind_claude_native_continuation_authority(
 ) -> None:
     """Rebind retained parent authority without minting new user intent.
 
-    The exact record survives only in its SDK generation's task callback. Its
+    The exact record survives only in its SDK generation's native callback. Its
     expiry, original instruction, revocation generations, consumed grants and
     counters survive the rollover; the retired run's token is never revived.
     """
@@ -65634,11 +65681,63 @@ async def claude_native_continuation_context(
     }
 
 
+async def wait_for_claude_paused_start(session_id: str, run_id: str) -> bool:
+    """Wait for the original, never-submitted admission; do not create intent."""
+    while True:
+        paused = CLAUDE_NATIVE_PAUSED_STARTS.get(session_id)
+        if paused is None or paused["run_id"] != run_id:
+            return True
+        await paused["ready"].wait()
+        if CLAUDE_NATIVE_PAUSED_STARTS.get(session_id) is not paused:
+            continue
+        if paused["ready"].is_set():
+            CLAUDE_NATIVE_PAUSED_STARTS.pop(session_id, None)
+            return paused.get("restored") is True
+
+
+async def finish_claude_paused_start(session_id: str, native_run_id: str | None) -> None:
+    paused = CLAUDE_NATIVE_PAUSED_STARTS.get(session_id)
+    if paused is None or paused["native_run_id"] != native_run_id:
+        return
+    async with paused.setdefault("finish_lock", asyncio.Lock()):
+        if (CLAUDE_NATIVE_PAUSED_STARTS.get(session_id) is not paused
+                or not paused.get("released")
+                or (paused["ready"].is_set()
+                    and not (paused.get("cancelled") and paused.get("restored")))):
+            return
+        try:
+            if paused.get("restored") and (
+                paused.get("cancelled")
+                or session_id in STOP_REQUESTS or paused["run_id"] in STOPPED_RUNS
+                or stop_cleanup_in_progress(session_id) or SERVER_SHUTTING_DOWN
+                or session_id in DELETING_SESSIONS or session_id in DELETED_SESSION_TOMBSTONES
+                or session_id not in STORE.sessions
+            ):
+                paused["restored"] = False
+                await release_turn_slot(session_id, expected_run_id=paused["run_id"])
+            if not paused.get("restored"):
+                run_id = paused["run_id"]
+                await revoke_cross_chat_capability(run_id)
+                await append_event(session_id, "turn_stopped", {
+                    "run_id": run_id, "backend": BACKEND_CLAUDE,
+                    "transport": CLAUDE_TRANSPORT_AGENT_SDK,
+                    "stopped": True, "provider_query_submitted": False,
+                    "message": "Stopped before the pending message was sent to Claude.",
+                    **run_event_metadata(run_id),
+                })
+                RUN_METADATA.pop(run_id, None)
+        finally:
+            paused["ready"].set()
+            if paused.get("cancelled") and CLAUDE_NATIVE_PAUSED_STARTS.get(session_id) is paused:
+                CLAUDE_NATIVE_PAUSED_STARTS.pop(session_id, None)
+
+
 async def admit_claude_native_continuation(
     receipt: ClaudeSDKNativeContinuation, context: dict[str, Any],
 ) -> bool:
     """Own an already-running native wake; never submit another provider query."""
     session_id, run_id = receipt.chat_id, receipt.run_id
+    scheduled_wake = getattr(receipt, "wake_kind", "task") == "schedule"
     parent_done = context["completed"].get(receipt.parent_run_id)
     if parent_done is None:
         return False
@@ -65648,6 +65747,11 @@ async def admit_claude_native_continuation(
         await asyncio.wait_for(parent_done.wait(), timeout=10.0)
     except asyncio.TimeoutError:
         return False
+    admission = CLAUDE_TURN_ADMISSIONS.get(session_id)
+    if admission is not None:
+        # The accepted human request finishes local persistence independently
+        # of the SDK actor. Preserve those effects rather than re-enqueueing it.
+        await admission.wait()
     lock = session_lifecycle_lock(session_id)
     # A human admission may hold this lock while waiting on the SDK actor
     # that invoked us. Refuse instead of waiting and deadlocking that actor.
@@ -65663,7 +65767,9 @@ async def admit_claude_native_continuation(
             or session_id in SERVER_MAINTENANCE_SESSIONS
             or stop_cleanup_in_progress(session_id)
             or session_id in STOP_REQUESTS
-            or receipt.parent_run_id in STOPPED_RUNS
+            # A clean native interrupt stops that turn, while successful
+            # cron registrations remain live in the same SDK generation.
+            or (receipt.parent_run_id in STOPPED_RUNS and not scheduled_wake)
             or str(sess.get("backend") or DEFAULT_BACKEND) != BACKEND_CLAUDE
             or claude_provider_id_for_session(sess) != receipt.provider_session_id
             or not manager.owns_active_run(session_id, receipt.ownership_token, run_id)
@@ -65675,9 +65781,37 @@ async def admit_claude_native_continuation(
         ):
             return False
         async with ACTIVE_LOCK:
-            if (session_id in BUSY_SESSIONS or session_id in ACTIVE
-                    or session_id in CURRENT_TURNS or session_id in STOP_REQUESTS):
-                return False
+            current = CURRENT_TURNS.get(session_id)
+            active = ACTIVE.get(session_id)
+            if session_id in BUSY_SESSIONS or active is not None or current is not None:
+                pending_human = bool(
+                    current is not None and current.get("run_id")
+                    and current.get("run_id") != run_id
+                    and current.get("backend") == BACKEND_CLAUDE
+                    and current.get("purpose") is None
+                    and current.get("provider_context_mode", "chat") == "chat"
+                    and current.get("_claude_native_pause_allowed") is True
+                    and (active is None or (
+                        active.get("provider_starting") is True
+                        and active.get("claude_sdk_run") is None
+                        and not active.get("claude_sdk_owner_token")
+                        and not active.get("stop_requested")
+                    ))
+                )
+                if not pending_human:
+                    return False
+                paused = CLAUDE_NATIVE_PAUSED_STARTS.get(session_id)
+                if paused is None:
+                    paused = {"run_id": current["run_id"], "turn": current,
+                              "active": active, "ready": asyncio.Event()}
+                    owner = CLAUDE_START_TASKS.get((session_id, current["run_id"]))
+                    paused["cancelled"] = owner is not None and owner.done()
+                    CLAUDE_NATIVE_PAUSED_STARTS[session_id] = paused
+                elif paused["run_id"] != current["run_id"]:
+                    return False
+                paused.update(native_run_id=run_id, released=False, restored=False)
+                paused["ready"].clear()
+                ACTIVE.pop(session_id, None)
             BUSY_SESSIONS.add(session_id)
             CURRENT_TURNS[session_id] = {
                 **context["turn"], "run_id": run_id,
@@ -65691,11 +65825,24 @@ async def admit_claude_native_continuation(
             "provider_generated": True, "provider_context_mode": "chat",
             "parent_run_id": receipt.parent_run_id,
             "parent_run_ids": list(getattr(receipt, "parent_run_ids", ()) or (receipt.parent_run_id,)),
-            "provider_task_id": receipt.task_id,
-            "provider_task_ids": list(receipt.task_ids),
-            "provider_task_type": receipt.task_type,
             "provider_tool_use_id": receipt.tool_use_id,
         }
+        if scheduled_wake:
+            metadata.update({
+                "provider_wake_kind": "schedule",
+                "provider_schedule_ids": list(receipt.schedule_ids),
+                "provider_native_wake_id": receipt.native_wake_id,
+            })
+            if receipt.schedule_id:
+                metadata["provider_schedule_id"] = receipt.schedule_id
+            if getattr(receipt, "concurrent_task_ids", ()):
+                metadata["provider_concurrent_task_ids"] = list(receipt.concurrent_task_ids)
+        else:
+            metadata.update({
+                "provider_task_id": receipt.task_id,
+                "provider_task_ids": list(receipt.task_ids),
+                "provider_task_type": receipt.task_type,
+            })
         RUN_METADATA[run_id] = metadata
         ready = asyncio.get_running_loop().create_future()
         runner: asyncio.Task[Any] | None = None
@@ -65774,6 +65921,31 @@ async def run_claude_sdk(
 ) -> None:
     """Run Claude on one persistent, chat-owned Agent SDK process."""
 
+    start_task = asyncio.current_task()
+    if preaccepted_native_continuation is None and start_task is not None:
+        key = (session_id, run_id)
+        CLAUDE_START_TASKS[key] = start_task
+
+        def start_finished(completed: asyncio.Task[Any]) -> None:
+            if CLAUDE_START_TASKS.get(key) is completed:
+                CLAUDE_START_TASKS.pop(key, None)
+            pending = CLAUDE_NATIVE_PAUSED_STARTS.get(session_id)
+            if pending is not None and pending["run_id"] == run_id:
+                pending["cancelled"] = True
+                if pending.get("released"):
+                    if pending["ready"].is_set() and not pending.get("restored"):
+                        CLAUDE_NATIVE_PAUSED_STARTS.pop(session_id, None)
+                    else:
+                        pending["cleanup_task"] = asyncio.create_task(
+                            finish_claude_paused_start(session_id, pending["native_run_id"]),
+                        )
+
+        start_task.add_done_callback(start_finished)
+    paused = CLAUDE_NATIVE_PAUSED_STARTS.get(session_id)
+    admitted_turn = dict(paused["turn"] if paused is not None and paused["run_id"] == run_id
+                         else CURRENT_TURNS.get(session_id) or {})
+    if not await wait_for_claude_paused_start(session_id, run_id):
+        return
     requested_cwd = str(sess.get("cwd") or DEFAULT_CWD)
     cwd = existing_cwd(requested_cwd)
     resume_provider_id, resume_skip_message = resolve_claude_resume_provider(
@@ -65868,13 +66040,15 @@ async def run_claude_sdk(
         "stdout_total_lines": 0,
         "stdout_updated_at": None,
     }
-    bound, stop_requested = await bind_active_turn(
-        session_id,
-        run_id,
-        startup_active,
-    )
-    if not bound:
-        return
+    while True:
+        if not await wait_for_claude_paused_start(session_id, run_id):
+            return
+        bound, stop_requested = await bind_active_turn(session_id, run_id, startup_active)
+        if bound:
+            break
+        paused = CLAUDE_NATIVE_PAUSED_STARTS.get(session_id)
+        if paused is None or paused["run_id"] != run_id:
+            return
     if stop_requested:
         if preaccepted_native_continuation is not None:
             return
@@ -65893,6 +66067,13 @@ async def run_claude_sdk(
 
     async def activate_initial_supervisor(ownership_token: str) -> None:
         async with ACTIVE_LOCK:
+            paused = CLAUDE_NATIVE_PAUSED_STARTS.get(session_id)
+            if (paused is not None and paused["run_id"] == run_id
+                    and (not paused["ready"].is_set() or not paused.get("restored"))):
+                raise ClaudeSDKNativeWakeDeferred(
+                    blocking_run_id=paused["native_run_id"], native_wake_id=None,
+                    settled=paused["ready"],
+                )
             active = ACTIVE.get(session_id)
             if (
                 active is not startup_active
@@ -65913,7 +66094,7 @@ async def run_claude_sdk(
     )
     if native_continuation_context is None:
         native_continuation_context = await claude_native_continuation_context(
-            session_id, run_id, prompt, CURRENT_TURNS.get(session_id) or {},
+            session_id, run_id, prompt, admitted_turn,
             manager, (options, configuration_key, cli_path), manifest_path,
         )
 
@@ -65941,20 +66122,26 @@ async def run_claude_sdk(
             handle.set_pending_mail_hint(lambda: take_chat_mailbox_hint(session_id, run_id))
             await activate_initial_supervisor(preaccepted_native_continuation.ownership_token)
         else:
-            handle = await manager.start_run(
-                session_id,
-                prompt,
-                run_id=run_id,
-                options=options,
-                configuration_key=configuration_key,
-                on_supervisor_ready=activate_initial_supervisor,
-                pending_mail_hint=lambda: take_chat_mailbox_hint(session_id, run_id),
-                **({"native_continuation_callback": accept_native_continuation}
-                   if native_continuation_context is not None else {}),
-                **provider_command_start_options,
-                **({"background_task_reconciliation": reconciliation_envelope(initial_reconciliation_batches)}
-                   if initial_reconciliation_batches else {}),
-            )
+            while True:
+                if not await wait_for_claude_paused_start(session_id, run_id):
+                    return
+                try:
+                    handle = await manager.start_run(
+                        session_id, prompt, run_id=run_id, options=options,
+                        configuration_key=configuration_key,
+                        on_supervisor_ready=activate_initial_supervisor,
+                        pending_mail_hint=lambda: take_chat_mailbox_hint(session_id, run_id),
+                        **({"native_continuation_callback": accept_native_continuation}
+                           if native_continuation_context is not None else {}),
+                        **provider_command_start_options,
+                        **({"background_task_reconciliation": reconciliation_envelope(initial_reconciliation_batches)}
+                           if initial_reconciliation_batches else {}),
+                    )
+                    break
+                except ClaudeSDKNativeWakeDeferred as deferred:
+                    # The actor proves zero query delivery. Keep this exact
+                    # admission and its effects while the native run owns it.
+                    await deferred.settled.wait()
     except asyncio.CancelledError:
         if preaccepted_native_continuation is not None:
             raise
@@ -67586,6 +67773,10 @@ async def run_claude_sdk(
         released = await release_turn_slot(
             session_id,
             expected_run_id=current_run_id,
+            **({"resume_paused_claude_start": True}
+               if not stopped and not retire_supervisor
+               and (CLAUDE_NATIVE_PAUSED_STARTS.get(session_id) or {}).get("native_run_id") == current_run_id
+               else {}),
         )
         if released:
             try:
@@ -67629,6 +67820,7 @@ async def run_claude_sdk(
         STOPPED_RUNS.add(current_run_id)
         await join_task_despite_caller_cancellation(finalize_task)
     finally:
+        await finish_claude_paused_start(session_id, current_run_id)
         if native_continuation_context is not None:
             native_continuation_context["completed"][current_run_id].set()
     if cancelled_error is not None:
@@ -74499,7 +74691,23 @@ async def start_turn(
                     SESSION_TURN_TASKS.pop(session_id, None)
 
 
-async def _start_turn_locked(
+async def _start_turn_locked(session_id: str, req: TurnRequest, **kwargs: Any) -> dict[str, Any]:
+    session = STORE.sessions.get(session_id) or {}
+    track = (str(req.backend or session.get("backend") or DEFAULT_BACKEND) == BACKEND_CLAUDE
+             and req.purpose is None and kwargs.get("provider_context_mode", "chat") == "chat")
+    ready = asyncio.Event() if track else None
+    if ready is not None:
+        CLAUDE_TURN_ADMISSIONS[session_id] = ready
+    try:
+        return await _start_turn_admission_locked(session_id, req, **kwargs)
+    finally:
+        if ready is not None:
+            if CLAUDE_TURN_ADMISSIONS.get(session_id) is ready:
+                CLAUDE_TURN_ADMISSIONS.pop(session_id, None)
+            ready.set()
+
+
+async def _start_turn_admission_locked(
     session_id: str,
     req: TurnRequest,
     *,
@@ -75097,6 +75305,10 @@ async def _start_turn_locked(
                 # checks, so the blocker revision needs its own token to
                 # distinguish a replacement reservation in that interval.
                 "_server_restart_admission_id": reservation_admission_id,
+                "_claude_native_pause_allowed": bool(
+                    interactive_agent_sdk and req.purpose is None
+                    and provider_context_mode == "chat"
+                ),
                 "prompt": req.prompt,
                 "display_prompt": req.display_prompt,
                 "file_ids": list(req.file_ids),

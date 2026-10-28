@@ -69,7 +69,7 @@ class DelegationAdmissionTests(unittest.TestCase):
         self.assertEqual(actual_delegation_grants([]), set())  # Existing routes alone are insufficient.
 
     def test_internal_and_standalone_turns_cannot_mint_user_origin(self):
-        start = next(node for node in TREE.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "_start_turn_locked")
+        start = next(node for node in TREE.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "_start_turn_admission_locked")
         issuance = next(node for node in ast.walk(start) if isinstance(node, ast.Call)
                         and isinstance(node.func, ast.Name) and node.func.id == "issue_cross_chat_capability")
         expression = next(keyword.value for keyword in issuance.keywords if keyword.arg == "source_is_user_turn")
@@ -113,7 +113,7 @@ def isolated_source():
     # Run the exact final ledger admission block, not a hand-written substitute
     # for the production claim/CAS. Everything before provider launch is inert.
     start = next(node for node in TREE.body if isinstance(node, ast.AsyncFunctionDef)
-                 and node.name == "_start_turn_locked")
+                 and node.name == "_start_turn_admission_locked")
     admission = [node for node in ast.walk(start) if isinstance(node, ast.If)
                  and ast.unparse(node.test) == "mailbox_wake_claim is not None"
                  and any(isinstance(call, ast.Call) and call.args
@@ -169,7 +169,7 @@ class ChatMailboxRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     def test_final_mailbox_admission_precedes_every_provider_launch(self):
         start = next(node for node in TREE.body if isinstance(node, ast.AsyncFunctionDef)
-                     and node.name == "_start_turn_locked")
+                     and node.name == "_start_turn_admission_locked")
         admissions = [node for node in ast.walk(start) if isinstance(node, ast.Call)
                       and node.args and isinstance(node.args[0], ast.Constant)
                       and node.args[0].value == "admit_wake"]
@@ -182,7 +182,7 @@ class ChatMailboxRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     def test_mailbox_wake_authority_snapshot_uses_read_eligible_pairs(self):
         start = next(node for node in TREE.body if isinstance(node, ast.AsyncFunctionDef)
-                     and node.name == "_start_turn_locked")
+                     and node.name == "_start_turn_admission_locked")
         selections = [node for node in start.body if isinstance(node, ast.If)
                       and ast.unparse(node.test) == "mailbox_wake_claim is not None"
                       and any(isinstance(child, ast.Assign)

@@ -325,7 +325,9 @@ class CronContinuationRunnerTests(unittest.IsolatedAsyncioTestCase):
                 with self.human_patches():
                     receipt = self.receipt()
                     self.assertTrue(await server.admit_claude_native_continuation(receipt, self.context))
-                    human = asyncio.create_task(self.human_runner())
+                    human = asyncio.create_task(server.supervise_provider_turn_task(
+                        "chat-claude", "run_human", "claude", self.human_runner(),
+                    ))
                     await asyncio.sleep(0)
                     paused = server.CLAUDE_NATIVE_PAUSED_STARTS["chat-claude"]
                     complete = self.complete
@@ -333,6 +335,8 @@ class CronContinuationRunnerTests(unittest.IsolatedAsyncioTestCase):
                         human.cancel()
                         with self.assertRaises(asyncio.CancelledError):
                             await human
+                        self.assertEqual(server.RUN_METADATA["run_human"]["cross_chat_direct_message_ids"],
+                                         ["already-admitted-effect"])
                     elif phase == "after_restore":
                         async def finish_after_restore(_session_id, payload):
                             self.assertTrue(paused["restored"])
@@ -372,6 +376,57 @@ class CronContinuationRunnerTests(unittest.IsolatedAsyncioTestCase):
                     stopped = [call.args[2] for call in self.events.await_args_list
                                if call.args[1] == "turn_stopped" and call.args[2].get("run_id") == "run_human"]
                     self.assertEqual(len(stopped), 1)
+
+    async def test_cancelled_deferred_start_has_one_terminal_owner_after_restoration(self):
+        await self.prepare_human()
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def deferred_start(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            raise ClaudeSDKNativeWakeDeferred(
+                blocking_run_id="run_cron1", native_wake_id="native-scheduled-user-1",
+            )
+
+        self.manager.start_run = deferred_start
+        with self.human_patches():
+            human = asyncio.create_task(server.supervise_provider_turn_task(
+                        "chat-claude", "run_human", "claude", self.human_runner(),
+                    ))
+            await asyncio.wait_for(entered.wait(), 2)
+            receipt = self.receipt()
+            self.assertTrue(await server.admit_claude_native_continuation(receipt, self.context))
+            paused = server.CLAUDE_NATIVE_PAUSED_STARTS["chat-claude"]
+            release.set()
+            await asyncio.sleep(0)
+
+            async def finish_after_restore(_session_id, payload):
+                self.assertTrue(paused["restored"])
+                self.assertFalse(paused["ready"].is_set())
+                human.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await human
+                await server.revoke_cross_chat_capability(payload["run_id"])
+                return payload
+
+            self.finished.side_effect = finish_after_restore
+            await self.complete(receipt)
+            await asyncio.sleep(0)
+            if paused.get("cleanup_task") is not None:
+                await asyncio.wait_for(paused["cleanup_task"], 2)
+            self.assertNotIn("chat-claude", server.CLAUDE_NATIVE_PAUSED_STARTS)
+            self.assertNotIn(("chat-claude", "run_human"), server.CLAUDE_START_TASKS)
+            self.assertNotIn("chat-claude", server.BUSY_SESSIONS)
+            self.assertNotIn("chat-claude", server.CURRENT_TURNS)
+            self.assertNotIn("chat-claude", server.ACTIVE)
+            self.assertEqual(server.CROSS_CHAT_CAPABILITIES, {})
+            self.assertEqual(self.manager.start_calls, [])
+            self.assertEqual(self.manager.evict_calls, [])
+            stopped = [call.args[2] for call in self.events.await_args_list
+                       if call.args[1] == "turn_stopped" and call.args[2].get("run_id") == "run_human"]
+            self.assertEqual(len(stopped), 1)
+            self.assertFalse(stopped[0]["provider_query_submitted"])
+            self.assertEqual(stopped[0]["cross_chat_direct_message_ids"], ["already-admitted-effect"])
 
     async def test_missing_live_command_cache_does_not_wait_on_admitting_actor(self):
         await self.prepare()

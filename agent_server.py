@@ -30590,6 +30590,10 @@ async def reconcile_provider_task_exit(
     prevents delayed cleanup from touching a replacement turn.
     """
 
+    if backend == BACKEND_CLAUDE and await cancel_claude_paused_start(session_id, run_id):
+        # The paused admission owns its terminal and metadata, even while
+        # the native wake still owns the live chat reservation.
+        return False
     if backend == BACKEND_GEMINI:
         async with ACTIVE_LOCK:
             active = ACTIVE.get(session_id) or {}
@@ -65695,6 +65699,15 @@ async def wait_for_claude_paused_start(session_id: str, run_id: str) -> bool:
             return paused.get("restored") is True
 
 
+async def cancel_claude_paused_start(session_id: str, run_id: str) -> bool:
+    paused = CLAUDE_NATIVE_PAUSED_STARTS.get(session_id)
+    if paused is None or paused["run_id"] != run_id:
+        return False
+    paused["cancelled"] = True
+    await finish_claude_paused_start(session_id, paused["native_run_id"])
+    return True
+
+
 async def finish_claude_paused_start(session_id: str, native_run_id: str | None) -> None:
     paused = CLAUDE_NATIVE_PAUSED_STARTS.get(session_id)
     if paused is None or paused["native_run_id"] != native_run_id:
@@ -66145,8 +66158,11 @@ async def run_claude_sdk(
     except asyncio.CancelledError:
         if preaccepted_native_continuation is not None:
             raise
-        cleanup_task = asyncio.create_task(
-            finish_cancelled_claude_sdk_start(
+
+        async def finish_cancelled_start() -> None:
+            if await cancel_claude_paused_start(session_id, run_id):
+                return
+            await finish_cancelled_claude_sdk_start(
                 session_id,
                 run_id,
                 manager,
@@ -66155,7 +66171,8 @@ async def run_claude_sdk(
                     or None
                 ),
             )
-        )
+
+        cleanup_task = asyncio.create_task(finish_cancelled_start())
         await join_task_despite_caller_cancellation(cleanup_task)
         raise
     except ClaudeSDKUnavailable:

@@ -9,7 +9,11 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import agent_server as server
 from claude_sdk_client import ClaudeSDKNativeContinuation
-import test_claude_sdk_runner as fixtures
+
+if __package__:
+    from . import test_claude_sdk_runner as fixtures
+else:
+    import test_claude_sdk_runner as fixtures
 
 
 class NativeHandle(fixtures.FakeClaudeRun):

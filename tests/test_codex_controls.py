@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import json
 import tempfile
 import threading
@@ -2528,7 +2529,8 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await finish_unpin.wait()
 
         manager = AsyncMock()
-        schedule = Mock()
+        manager.wait_for_notification_handler = AsyncMock(return_value=None)
+        schedule = Mock(return_value=None)
         with (
             patch.object(
                 agent_server,
@@ -2543,6 +2545,7 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 agent_server,
                 "release_codex_interactive_control_lease",
+                return_value=None,
             ),
             patch.object(
                 agent_server,
@@ -2550,6 +2553,11 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 schedule,
             ),
         ):
+            # Full-suite discovery retains large AST fixture graphs. Reclaim
+            # earlier fixture cycles before starting the one-second deadline;
+            # a multi-second collection is unrelated to publication ordering.
+            # Eager mock results above also avoid lazy child allocation here.
+            gc.collect()
             old_consumer = asyncio.create_task(
                 agent_server.consume_codex_native_turn(
                     "chat",

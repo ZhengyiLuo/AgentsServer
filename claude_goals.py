@@ -117,7 +117,8 @@ class ClaudeGoalProjection:
     A native set sentinel establishes the goal. Evaluator and clear records
     update that exact condition; unrelated sessions/sidechains cannot establish
     or finish it. A fork starts empty until its own native set evidence arrives.
-    No failure, pause, or success is inferred from a result/assistant message.
+    Native failed evaluations are terminal. No failure, pause, or success is
+    inferred from a result/assistant message.
     """
 
     def __init__(self, provider_session_id: str):
@@ -156,6 +157,7 @@ class ClaudeGoalProjection:
         timestamp = _timestamp_ms(event.get("timestamp"))
         condition = attachment.get("condition")
         met = attachment.get("met")
+        failed = attachment.get("failed", False)
         sentinel = attachment.get("sentinel", False)
         if (
             timestamp is None or timestamp < self._last_timestamp
@@ -163,6 +165,7 @@ class ClaudeGoalProjection:
             or not isinstance(condition, str) or not condition.strip()
             or len(condition) > 16_384
             or type(met) is not bool or type(sentinel) is not bool
+            or type(failed) is not bool or failed and (met or sentinel)
         ):
             return False
         previous = self.goal
@@ -174,7 +177,7 @@ class ClaudeGoalProjection:
             if not sentinel and previous["status"] != "active":
                 return False
             goal = dict(previous)
-            goal["status"] = "cleared" if sentinel else "achieved" if met else "active"
+            goal["status"] = "cleared" if sentinel else "failed" if failed else "achieved" if met else "active"
             if sentinel:
                 for field in ("iterations", "duration_ms", "tokens"):
                     goal.pop(field, None)

@@ -105,6 +105,7 @@ from claude_sdk_client import (
     ClaudeSDKGenerationChanged,
     ClaudeSDKGoalReceipt,
     ClaudeSDKMCPServerNotFound,
+    ClaudeSDKNativeContinuation,
     ClaudeSDKQueryError,
     ClaudeSDKRunActive,
     ClaudeSDKSupervisorClosed,
@@ -56775,9 +56776,13 @@ async def stop_idle_claude_background_subagents(
         return result
     manager = CLAUDE_SDK_MANAGER
     loaded = False
+    pending_native = False
     if manager is not None:
         try:
             loaded = manager.is_loaded(session_id)
+            pending_check = getattr(manager, "has_pending_native_continuations", None)
+            pending_native = bool(loaded and callable(pending_check)
+                                  and pending_check(session_id) is True)
         except Exception as exc:
             # Do not claim success or hide historical work when ownership of
             # a potentially live process cannot be determined.
@@ -56805,8 +56810,11 @@ async def stop_idle_claude_background_subagents(
         active = []
         active_count = 1
         result["errors"].append(concise_error_message(exc))
-    if not active_count:
+    if not active_count and not pending_native:
         return result
+    # Native background Bash tasks do not appear in the Agent-only durable
+    # subagent snapshot. Their exact SDK wake provenance still belongs to Stop.
+    active_count = max(active_count, int(pending_native))
 
     result["fence_committed"] = False
 
@@ -56840,7 +56848,7 @@ async def stop_idle_claude_background_subagents(
             "run_ids": run_ids,
             "subagent_ids": subagent_ids,
             "all": True,
-            "message": "Stopped background Claude agents with the parent chat.",
+            "message": "Stopped background Claude work with the parent chat.",
         })
         result["fence_committed"] = True
     except Exception as exc:
@@ -61876,12 +61884,15 @@ def build_claude_sdk_options(
         raise ValueError("The completed Claude fork snapshot is unavailable; refusing an empty resume.")
     permission_owner = {"token": ""}
     provider_tool_owner = {"ownership_token": "", "run_id": ""}
+    native_admission_gate: asyncio.Event | None = None
 
     async def can_use_tool(
         tool_name: str,
         input_data: dict[str, Any],
         context: Any,
     ) -> Any:
+        if native_admission_gate is not None:
+            await native_admission_gate.wait()
         return await handle_claude_tool_permission(
             session_id,
             tool_name,
@@ -61896,6 +61907,8 @@ def build_claude_sdk_options(
     setattr(can_use_tool, "_agentsdock_bind_owner", bind_permission_owner)
 
     async def run_agentsdock_tool(input_data: dict[str, Any]) -> dict[str, Any]:
+        if native_admission_gate is not None:
+            await native_admission_gate.wait()
         ownership_token = str(provider_tool_owner["ownership_token"] or "")
         owner_run_id = str(provider_tool_owner["run_id"] or "")
         try:
@@ -61999,11 +62012,17 @@ def build_claude_sdk_options(
         provider_tool_owner["ownership_token"] = str(ownership_token)
         provider_tool_owner["run_id"] = str(run_id)
 
+    def bind_native_admission_gate(gate: asyncio.Event | None) -> None:
+        nonlocal native_admission_gate
+        native_admission_gate = gate
+
     if isinstance(options, dict):
+        options["_agentsdock_bind_native_admission_gate"] = bind_native_admission_gate
         options["_agentsdock_bind_provider_tool_owner"] = (
             bind_provider_tool_owner
         )
     else:
+        setattr(options, "_agentsdock_bind_native_admission_gate", bind_native_admission_gate)
         setattr(
             options,
             "_agentsdock_bind_provider_tool_owner",
@@ -65539,6 +65558,207 @@ async def send_claude_followup(
         ) from exc
 
 
+async def bind_claude_native_continuation_authority(
+    session_id: str, run_id: str, authority: dict[str, Any],
+) -> None:
+    """Rebind retained parent authority without minting new user intent.
+
+    The exact record survives only in its SDK generation's task callback. Its
+    expiry, original instruction, revocation generations, consumed grants and
+    counters survive the rollover; the retired run's token is never revived.
+    """
+    async with CROSS_CHAT_CAPABILITY_LOCK:
+        if (
+            authority.get("source_session_id") != session_id
+            or authority.get("server_identity") != server_identity()
+            or any(record is authority for record in CROSS_CHAT_CAPABILITIES.values())
+        ):
+            raise ProviderToolError("native continuation authority is unavailable")
+        token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        path = cross_chat_authority_path(run_id, secrets.token_hex(16))
+        payload = json.dumps({
+            "version": 1, "server_identity": authority["server_identity"],
+            "provider_server_origin": provider_helper_server_origin(),
+            "source_session_id": session_id, "source_run_id": run_id,
+            "provider_capability": token, "capability": token,
+            "provider_jobs_access": authority.get("provider_jobs_access", "blocked"),
+            "expires_at": authority["expires_at"],
+        }, separators=(",", ":")).encode("utf-8")
+        descriptor = -1
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                 | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            write_all(descriptor, payload)
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+            if os.name != "nt":
+                directory_fd = os.open(CROSS_CHAT_AUTHORITY_ROOT,
+                                       os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            runtime_env = dict(authority.get("provider_runtime_env") or {})
+            runtime_env["AGENTSDOCK_PROVIDER_AUTHORITY_FILE"] = str(path)
+            authority.update({
+                "source_run_id": run_id, "authority_path": str(path),
+                "native_transition_nonce": "",
+                "provider_runtime_env": validate_provider_runtime_env(runtime_env),
+            })
+            CROSS_CHAT_CAPABILITIES[token_hash] = authority
+        except BaseException:
+            with suppress(OSError):
+                path.unlink()
+            raise
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+
+async def claude_native_continuation_context(
+    session_id: str, run_id: str, prompt: str, turn: dict[str, Any],
+    manager: Any, options: tuple[Any, str, str], manifest_path: Path,
+) -> dict[str, Any] | None:
+    async with CROSS_CHAT_CAPABILITY_LOCK:
+        authorities = [record for record in CROSS_CHAT_CAPABILITIES.values()
+                       if record.get("source_session_id") == session_id
+                       and record.get("source_run_id") == run_id]
+    if len(authorities) != 1:
+        return None
+    return {
+        "authority": authorities[0], "manager": manager, "options": options,
+        "manifest_path": manifest_path, "prompt": prompt, "turn": dict(turn),
+        "completed": {run_id: asyncio.Event()},
+    }
+
+
+async def admit_claude_native_continuation(
+    receipt: ClaudeSDKNativeContinuation, context: dict[str, Any],
+) -> bool:
+    """Own an already-running native wake; never submit another provider query."""
+    session_id, run_id = receipt.chat_id, receipt.run_id
+    parent_done = context["completed"].get(receipt.parent_run_id)
+    if parent_done is None:
+        return False
+    # A fast child may wake while the parent's terminal persistence is still
+    # releasing authority. Wait for that exact finalizer, never another turn.
+    try:
+        await asyncio.wait_for(parent_done.wait(), timeout=10.0)
+    except asyncio.TimeoutError:
+        return False
+    lock = session_lifecycle_lock(session_id)
+    # A human admission may hold this lock while waiting on the SDK actor
+    # that invoked us. Refuse instead of waiting and deadlocking that actor.
+    if lock.locked():
+        return False
+    async with lock:
+        sess = STORE.sessions.get(session_id)
+        manager = context["manager"]
+        if (
+            sess is None or SERVER_SHUTTING_DOWN
+            or session_id in DELETING_SESSIONS
+            or session_id in DELETED_SESSION_TOMBSTONES
+            or session_id in SERVER_MAINTENANCE_SESSIONS
+            or stop_cleanup_in_progress(session_id)
+            or session_id in STOP_REQUESTS
+            or receipt.parent_run_id in STOPPED_RUNS
+            or str(sess.get("backend") or DEFAULT_BACKEND) != BACKEND_CLAUDE
+            or claude_provider_id_for_session(sess) != receipt.provider_session_id
+            or not manager.owns_active_run(session_id, receipt.ownership_token, run_id)
+            or claude_sdk_configuration_key(
+                sess, existing_cwd(str(sess.get("cwd") or DEFAULT_CWD)),
+                context["options"][2],
+                session_system_prompt(session_id, sess, context["manifest_path"]),
+            ) != context["options"][1]
+        ):
+            return False
+        async with ACTIVE_LOCK:
+            if (session_id in BUSY_SESSIONS or session_id in ACTIVE
+                    or session_id in CURRENT_TURNS or session_id in STOP_REQUESTS):
+                return False
+            BUSY_SESSIONS.add(session_id)
+            CURRENT_TURNS[session_id] = {
+                **context["turn"], "run_id": run_id,
+                "purpose": "provider_background_wake",
+                "parent_run_id": receipt.parent_run_id,
+                "provider_context_mode": "chat",
+                "queued_id": None, "skill_selection": None,
+            }
+        metadata = {
+            "purpose": "provider_background_wake",
+            "provider_generated": True, "provider_context_mode": "chat",
+            "parent_run_id": receipt.parent_run_id,
+            "parent_run_ids": list(getattr(receipt, "parent_run_ids", ()) or (receipt.parent_run_id,)),
+            "provider_task_id": receipt.task_id,
+            "provider_task_ids": list(receipt.task_ids),
+            "provider_task_type": receipt.task_type,
+            "provider_tool_use_id": receipt.tool_use_id,
+        }
+        RUN_METADATA[run_id] = metadata
+        ready = asyncio.get_running_loop().create_future()
+        runner: asyncio.Task[Any] | None = None
+        started = False
+        context["completed"][run_id] = asyncio.Event()
+        try:
+            await bind_claude_native_continuation_authority(
+                session_id, run_id, context["authority"],
+            )
+            event = await append_durable_event(session_id, "turn_started", {
+                "run_id": run_id, "backend": BACKEND_CLAUDE,
+                "transport": CLAUDE_TRANSPORT_AGENT_SDK,
+                "provider_session_id": receipt.provider_session_id,
+                "prompt": "", "file_ids": [], "metadata_only": True,
+                **metadata,
+            })
+            if event.get("discarded"):
+                return False
+            started = True
+
+            async def consume() -> None:
+                try:
+                    await supervise_provider_turn_task(
+                        session_id, run_id, BACKEND_CLAUDE,
+                        run_claude_sdk(
+                            session_id, run_id, context["prompt"], dict(sess),
+                            context["manifest_path"],
+                            preaccepted_native_continuation=receipt,
+                            native_continuation_context=context,
+                            native_continuation_ready=ready,
+                        ),
+                    )
+                except Exception as exc:
+                    logger.warning("Claude native continuation runner failed session=%s run=%s error_type=%s",
+                                   session_id, run_id, type(exc).__name__)
+                finally:
+                    if not ready.done():
+                        ready.set_result(False)
+                    context["completed"][run_id].set()
+
+            runner = asyncio.create_task(consume())
+            register_session_task(SESSION_TURN_TASKS, session_id, runner)
+            done, _ = await asyncio.wait({ready, runner}, timeout=10.0,
+                                         return_when=asyncio.FIRST_COMPLETED)
+            if ready in done and ready.result() is True:
+                return True
+            return False
+        finally:
+            if not (ready.done() and not ready.cancelled() and ready.result() is True):
+                if runner is not None and not runner.done():
+                    runner.cancel()
+                    # Actor retirement follows callback refusal. Do not join a
+                    # runner that may be trying to interrupt that same actor.
+                await revoke_cross_chat_capability(run_id)
+                if started:
+                    await finalize_owned_turn_finished(session_id, run_id, stopped=True,
+                        payload={"run_id": run_id, "backend": BACKEND_CLAUDE,
+                                 "stopped": True, **metadata})
+                else:
+                    await release_turn_slot(session_id, expected_run_id=run_id)
+                    RUN_METADATA.pop(run_id, None)
+
+
 async def run_claude_sdk(
     session_id: str,
     run_id: str,
@@ -65548,6 +65768,9 @@ async def run_claude_sdk(
     *,
     provider_command: ProviderCommandRecord | None = None,
     provider_runtime_env: dict[str, str] | None = None,
+    preaccepted_native_continuation: ClaudeSDKNativeContinuation | None = None,
+    native_continuation_context: dict[str, Any] | None = None,
+    native_continuation_ready: asyncio.Future[bool] | None = None,
 ) -> None:
     """Run Claude on one persistent, chat-owned Agent SDK process."""
 
@@ -65559,14 +65782,15 @@ async def run_claude_sdk(
     )
     diff_baseline = await capture_git_baseline(session_id, run_id, cwd)
     try:
-        options, configuration_key, cli_path = build_claude_sdk_options(
-            session_id,
-            sess,
-            cwd,
-            manifest_path,
-            provider_runtime_env,
-        )
-        manager = await claude_sdk_manager()
+        if preaccepted_native_continuation is not None:
+            assert native_continuation_context is not None
+            options, configuration_key, cli_path = native_continuation_context["options"]
+            manager = native_continuation_context["manager"]
+        else:
+            options, configuration_key, cli_path = build_claude_sdk_options(
+                session_id, sess, cwd, manifest_path, provider_runtime_env,
+            )
+            manager = await claude_sdk_manager()
     except ClaudeSDKUnavailable:
         raise
     except Exception as exc:
@@ -65652,6 +65876,8 @@ async def run_claude_sdk(
     if not bound:
         return
     if stop_requested:
+        if preaccepted_native_continuation is not None:
+            return
         # Stop won before provider delivery. Do not submit the prompt merely
         # to acquire a handle that would immediately be interrupted.
         await finish_cancelled_claude_sdk_start(
@@ -65685,6 +65911,18 @@ async def run_claude_sdk(
         (STORE.sessions.get(session_id) or {}).get(CLAUDE_BACKGROUND_SESSION_FIELD),
         provider_session_id=str(resume_provider_id or ""),
     )
+    if native_continuation_context is None:
+        native_continuation_context = await claude_native_continuation_context(
+            session_id, run_id, prompt, CURRENT_TURNS.get(session_id) or {},
+            manager, (options, configuration_key, cli_path), manifest_path,
+        )
+
+    async def accept_native_continuation(
+        receipt: ClaudeSDKNativeContinuation, context: dict[str, Any] | None = native_continuation_context,
+    ) -> bool:
+        assert context is not None
+        return await admit_claude_native_continuation(receipt, context)
+
     try:
         provider_command_start_options = (
             {
@@ -65698,19 +65936,28 @@ async def run_claude_sdk(
             if provider_command is not None
             else {}
         )
-        handle = await manager.start_run(
-            session_id,
-            prompt,
-            run_id=run_id,
-            options=options,
-            configuration_key=configuration_key,
-            on_supervisor_ready=activate_initial_supervisor,
-            pending_mail_hint=lambda: take_chat_mailbox_hint(session_id, run_id),
-            **provider_command_start_options,
-            **({"background_task_reconciliation": reconciliation_envelope(initial_reconciliation_batches)}
-               if initial_reconciliation_batches else {}),
-        )
+        if preaccepted_native_continuation is not None:
+            handle = preaccepted_native_continuation.handle
+            handle.set_pending_mail_hint(lambda: take_chat_mailbox_hint(session_id, run_id))
+            await activate_initial_supervisor(preaccepted_native_continuation.ownership_token)
+        else:
+            handle = await manager.start_run(
+                session_id,
+                prompt,
+                run_id=run_id,
+                options=options,
+                configuration_key=configuration_key,
+                on_supervisor_ready=activate_initial_supervisor,
+                pending_mail_hint=lambda: take_chat_mailbox_hint(session_id, run_id),
+                **({"native_continuation_callback": accept_native_continuation}
+                   if native_continuation_context is not None else {}),
+                **provider_command_start_options,
+                **({"background_task_reconciliation": reconciliation_envelope(initial_reconciliation_batches)}
+                   if initial_reconciliation_batches else {}),
+            )
     except asyncio.CancelledError:
+        if preaccepted_native_continuation is not None:
+            raise
         cleanup_task = asyncio.create_task(
             finish_cancelled_claude_sdk_start(
                 session_id,
@@ -65804,6 +66051,8 @@ async def run_claude_sdk(
         else:
             stop_requested = True
     if not attached:
+        if preaccepted_native_continuation is not None:
+            return
         # Stop/delete may have hard-terminalized and released the placeholder
         # while a cancellation-hostile SDK query was returning. Interrupt only
         # this old handle; chat-ID eviction could target a newer replacement.
@@ -65811,6 +66060,8 @@ async def run_claude_sdk(
             await interrupt_claude_sdk_run_bounded(handle)
         return
     if stop_requested:
+        if preaccepted_native_continuation is not None:
+            return
         try:
             await interrupt_claude_sdk_run_bounded(handle)
         except Exception:
@@ -65828,6 +66079,8 @@ async def run_claude_sdk(
     sdk_ownership_token = str(
         startup_active.get("claude_sdk_owner_token") or ""
     )
+    if native_continuation_ready is not None and not native_continuation_ready.done():
+        native_continuation_ready.set_result(True)
     current_run_id = run_id
     current_handle = handle
     current_reconciliation_batches = initial_reconciliation_batches
@@ -66431,7 +66684,8 @@ async def run_claude_sdk(
                     cwd=cwd,
                 )
                 provider_persisted_id = provider_id
-            if result_details is not None and provider_id:
+            if (result_details is not None and provider_id
+                    and not getattr(current_handle, "native_continuation_pending", False)):
                 # The SDK's authoritative usage RPC is only sampled after its
                 # terminal ResultMessage and remains serialized through the
                 # chat-owned actor. Failure is telemetry-only and cannot hold
@@ -66744,6 +66998,12 @@ async def run_claude_sdk(
                     manifest_path,
                     steer_state["candidate_runtime_env"],
                 )
+                candidate_native_context = await claude_native_continuation_context(
+                    session_id, candidate_run_id, str(steer_state["request_prompt"]),
+                    selected, manager,
+                    (candidate_options, candidate_configuration_key, _candidate_cli_path),
+                    manifest_path,
+                )
                 # Once manager.start_run is entered, cancellation cannot
                 # prove whether client.query accepted the prompt: the SDK
                 # actor deliberately shields its command response. Preserve
@@ -66757,6 +67017,10 @@ async def run_claude_sdk(
                     configuration_key=candidate_configuration_key,
                     on_supervisor_ready=activate_candidate_supervisor,
                     pending_mail_hint=lambda: take_chat_mailbox_hint(session_id, candidate_run_id),
+                    **({"native_continuation_callback": (
+                        lambda receipt, context=candidate_native_context:
+                            admit_claude_native_continuation(receipt, context)
+                    )} if candidate_native_context is not None else {}),
                     **({"background_task_reconciliation": reconciliation_envelope(candidate_reconciliation_batches)}
                        if candidate_reconciliation_batches else {}),
                 )
@@ -66967,6 +67231,11 @@ async def run_claude_sdk(
                     **previous_metadata,
                 })
             await revoke_cross_chat_capability(previous_run_id)
+            if native_continuation_context is not None:
+                native_continuation_context["completed"][previous_run_id].set()
+            native_continuation_context = candidate_native_context
+            if native_continuation_context is not None:
+                native_continuation_context["turn"] = dict(CURRENT_TURNS.get(session_id) or {})
             await append_durable_event_batch(session_id, [
                 ("turn_queue_run_now", {
                     "queued_id": selected.get("queued_id"),
@@ -67359,6 +67628,9 @@ async def run_claude_sdk(
         retire_supervisor = True
         STOPPED_RUNS.add(current_run_id)
         await join_task_despite_caller_cancellation(finalize_task)
+    finally:
+        if native_continuation_context is not None:
+            native_continuation_context["completed"][current_run_id].set()
     if cancelled_error is not None:
         raise cancelled_error
 

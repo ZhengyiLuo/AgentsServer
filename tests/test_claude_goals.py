@@ -123,6 +123,33 @@ class ClaudeGoalProjectionTests(unittest.TestCase):
         self.assertNotIn("iterations", projection.goal)
         self.assertNotIn("tokens", projection.goal)
 
+    def test_native_impossible_verdict_is_terminal_and_keeps_reason_and_usage(self):
+        projection = ClaudeGoalProjection(SESSION)
+        projection.consume(record(sentinel=True))
+        started = projection.goal["set_at"]
+        self.assertTrue(projection.consume(record(second=1, failed=True,
+            reason="The required service is unavailable", iterations=3, durationMs=12000, tokens=800)))
+        self.assertEqual(projection.goal, {
+            "condition": "Reply STAGE2", "status": "failed", "set_at": started,
+            "last_reason": "The required service is unavailable", "iterations": 3,
+            "duration_ms": 12000, "tokens": 800,
+        })
+        self.assertFalse(projection.consume(record(second=2)))
+        self.assertEqual(projection.goal["status"], "failed")
+        self.assertTrue(projection.consume(record(second=3, sentinel=True)))
+        self.assertEqual(projection.goal["status"], "active")
+        self.assertNotIn("last_reason", projection.goal)
+
+    def test_invalid_failed_verdicts_cannot_change_native_goal(self):
+        projection = ClaudeGoalProjection(SESSION)
+        projection.consume(record(sentinel=True))
+        for fields in ({"failed": "true"}, {"failed": 1}, {"failed": None},
+                       {"failed": True, "met": True}, {"failed": True, "sentinel": True},
+                       {"failed": True, "condition": "Different goal"}):
+            with self.subTest(fields=fields):
+                self.assertFalse(projection.consume(record(second=1, **fields)))
+                self.assertEqual(projection.goal["status"], "active")
+
     def test_only_exact_native_session_evidence_establishes_or_finishes_goal(self):
         projection = ClaudeGoalProjection(SESSION)
         for extra in [{"sessionId": FORK}, {"isSidechain": True}, {"isSidechain": None},

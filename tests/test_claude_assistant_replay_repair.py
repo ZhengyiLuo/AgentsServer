@@ -48,8 +48,9 @@ class AssistantReplayRepairTests(unittest.TestCase):
             {**common, "seq": 110, "run_id": "import_shared", "type": "turn_finished", "imported": True},
         ]
 
-    def prepare(self, *, oversized=False, normalize_assistant=None):
+    def prepare(self, *, oversized=False, normalize_assistant=None, padding=b""):
         prefix = encode([{"type": "progress", "data": "x" * 1000}] * 20) if oversized else b""
+        prefix += padding
         raw = prefix + encode(self.source_rows)
         self.source.write_bytes(raw)
         stamp = self.source.stat()
@@ -118,6 +119,41 @@ class AssistantReplayRepairTests(unittest.TestCase):
         self.prepare(normalize_assistant=CLEAN_ASSISTANT_TEXT)
         self.assertIsNotNone(self.cache.project_event("chat-one", self.imported))
         self.assertIsNone(self.cache.project_event("chat-one", other_import))
+
+    def test_ordinary_sdk_final_after_nul_padding_repairs_and_prevents_only_exact_uuid_replay(self):
+        for oversized in (False, True):
+            with self.subTest(oversized=oversized):
+                self.setUp()
+                for row in self.rows[:4]:
+                    row.pop("purpose", None)
+                    row.pop("job_id", None)
+                self.native.update(type="assistant_text", provider_message_id="source-one")
+                self.native.pop("phase")
+                self.rows[3]["result_text"] = self.native["text"]
+                other = {**self.imported, "seq": 109,
+                         "provider_origin": {**self.imported["provider_origin"], "event_id": "source-two"}}
+                self.source_rows.append({**self.source_rows[0], "uuid": "source-two"})
+                self.rows[-2] = other
+                self.assertTrue(self.prepare(oversized=oversized, padding=b"\0" * 3377 + b"\n"))
+                before = (self.events.read_bytes(), self.source.read_bytes())
+                self.assertTrue(self.cache.project_event("chat-one", self.imported)["metadata_only"])
+                self.assertIsNone(self.cache.project_event("chat-one", other))
+                self.assertIsNone(self.cache.project_event("chat-one", self.native))
+                window = self.cache.prepare_window(
+                    "chat-one", "provider-one", self.events, self.root, lambda row: None,
+                    event_window_end=self.events.stat().st_size, normalize_full_user=lambda row: None)
+                self.assertTrue(window.project_event(self.imported)["metadata_only"])
+                self.assertIsNone(window.project_event(other))
+                items = [{"kind": "assistant", "text": row["text"], "provider_origin": row["provider_origin"]}
+                         for row in (self.imported, other)]
+                filtered = repair.filter_native_claude_mailbox_wake_items(
+                    "chat-one", "provider-one", self.events, items, sync_checkpoint=self.checkpoint,
+                    source_path=self.source, root=self.root, normalize_user=lambda row: None,
+                    normalize_full_user=lambda row: None)
+                self.assertTrue(filtered[0]["metadata_only"])
+                self.assertEqual(filtered[0]["provider_history_repair"], "source_proven_assistant_replay")
+                self.assertEqual(filtered[1], items[1])
+                self.assertEqual((self.events.read_bytes(), self.source.read_bytes()), before)
 
     def test_normalization_is_opt_in_nonempty_and_cannot_repair_modified_target(self):
         self.decorate()

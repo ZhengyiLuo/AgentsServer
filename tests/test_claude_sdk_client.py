@@ -28,6 +28,7 @@ from claude_sdk_client import (
     reject_subagent_provider_tool_hook,
     _parse_claude_sdk_message,
     _query_message_stream,
+    _ReceivedMessage,
 )
 
 
@@ -1921,6 +1922,359 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(client.disconnected)
         await self.manager.evict("background", force=True)
         self.assertEqual(self.manager.background_work_snapshot(), ())
+
+    async def _native_wake_fixture(self, callback, *, chat="native-wake", options=None):
+        options = {} if options is None else options
+        parent = await self.manager.start_run(
+            chat, "Authorized background work", run_id="parent", options=options,
+            configuration_key="same", query_session_id="native-session",
+            native_continuation_callback=callback,
+        )
+        client = self.factory.clients[-1]
+        supervisor = self.manager._supervisors[chat]
+        started = {"type": "system", "subtype": "task_started", "task_id": "bash",
+                   "task_type": "local_bash", "session_id": "native-session", "tool_use_id": "tool-1"}
+        await client.emit(started)
+        await client.emit({"type": "result", "result": "Started"})
+        await asyncio.wait_for(collect(parent), 1)
+        notification = {"type": "system", "subtype": "task_notification", "task_id": "bash",
+                        "status": "completed", "session_id": "native-session", "tool_use_id": "tool-1"}
+        init = {"type": "system", "subtype": "init", "session_id": "native-session"}
+        return parent, client, supervisor, notification, init
+
+    async def test_native_task_wake_gets_new_owned_handle_without_query(self) -> None:
+        receipts = []
+        async def admit(receipt):
+            receipts.append(receipt)
+            self.assertTrue(self.manager.owns_active_run(
+                receipt.chat_id, receipt.ownership_token, receipt.run_id))
+            self.assertTrue(receipt.handle.accepted)
+            self.assertTrue(receipt.handle.acknowledged)
+            return True
+        parent, client, supervisor, notification, init = await self._native_wake_fixture(admit)
+        self.assertTrue(parent.done)
+        self.assertIsNone(supervisor.active_run_id)
+        self.assertTrue(self.manager.has_pending_native_continuations("native-wake"))
+        # A terminal progress patch may precede the completion notification.
+        await client.emit({**notification, "subtype": "task_updated"})
+        await client.emit(notification)
+        await client.emit(init)
+        assistant = {"type": "assistant", "message": "Native continuation"}
+        result = {"type": "result", "result": "Complete"}
+        await client.emit(assistant)
+        await client.emit(result)
+        await asyncio.sleep(0)
+        await supervisor.get_context_usage()
+        self.assertEqual(len(receipts), 1)
+        receipt = receipts[0]
+        self.assertEqual(receipt.parent_run_id, parent.run_id)
+        self.assertEqual(receipt.provider_session_id, "native-session")
+        self.assertEqual(receipt.task_ids, ("bash",))
+        self.assertEqual(receipt.control_generation, supervisor.control_generation)
+        self.assertEqual(await collect(receipt.handle), [init, assistant, result])
+        self.assertEqual(len(client.query_envelopes), 1)
+        self.assertIsNone(supervisor.active_run_id)
+        self.assertFalse(self.manager.has_pending_native_continuations("native-wake"))
+
+    async def test_native_admission_holds_permissions_before_idle_and_stream_delivery(self) -> None:
+        bindings = []; gates = []; entered = asyncio.Event(); allow = asyncio.Event(); receipts = []
+        options = {"_agentsdock_bind_provider_tool_owner": lambda *owner: bindings.append(owner),
+                   "_agentsdock_bind_native_admission_gate": gates.append}
+        async def admit(receipt):
+            receipts.append(receipt)
+            entered.set()
+            await allow.wait()
+            return True
+        _parent, client, supervisor, notification, init = await self._native_wake_fixture(admit, options=options)
+        gate = gates[-1]
+        self.assertIsNotNone(gate)
+        self.assertFalse(gate.is_set())
+        self.assertEqual(bindings[-1], ("", ""))
+        await client.emit(notification)
+        await client.emit(init)
+        await asyncio.wait_for(entered.wait(), 1)
+        receipt = receipts[0]
+        self.assertEqual(bindings[-1], (supervisor.ownership_token, receipt.run_id))
+        self.assertFalse(gate.is_set())
+        self.assertTrue(receipt.handle._messages.empty())
+        await client.emit({"type": "result", "result": "Complete"})
+        allow.set()
+        messages = await asyncio.wait_for(collect(receipt.handle), 1)
+        self.assertEqual(messages[0], init)
+        self.assertTrue(gate.is_set())
+        self.assertIsNone(gates[-1])
+
+    async def test_native_wake_requires_exact_task_provider_tool_and_fresh_init(self) -> None:
+        for invalid in ("task", "provider", "tool", "status", "no-init", "init-only"):
+            with self.subTest(invalid=invalid):
+                receipts = []
+                async def admit(receipt):
+                    receipts.append(receipt)
+                    return True
+                _parent, client, supervisor, notification, init = await self._native_wake_fixture(admit, chat=invalid)
+                if invalid == "task": notification["task_id"] = "unowned"
+                if invalid == "provider": notification["session_id"] = "another-session"
+                if invalid == "tool": notification["tool_use_id"] = "another-tool"
+                if invalid == "status": notification["status"] = "running"
+                if invalid != "init-only": await client.emit(notification)
+                if invalid != "no-init": await client.emit(init)
+                await client.emit({"type": "assistant", "message": "Unowned output"})
+                await asyncio.sleep(0)
+                await supervisor.get_context_usage()
+                self.assertEqual(receipts, [])
+                self.assertIsNone(supervisor.active_run_id)
+                await self.manager.evict(invalid, force=True)
+
+    async def test_native_admission_refusal_retires_connection_and_clears_gate(self) -> None:
+        receipts = []; bindings = []; gates = []
+        async def refuse(receipt):
+            receipts.append(receipt)
+            return False
+        options = {"_agentsdock_bind_provider_tool_owner": lambda *owner: bindings.append(owner),
+                   "_agentsdock_bind_native_admission_gate": gates.append}
+        _parent, client, supervisor, notification, init = await self._native_wake_fixture(refuse, options=options)
+        gate = gates[-1]
+        await client.emit(notification)
+        await client.emit(init)
+        for _ in range(50):
+            if client.disconnected: break
+            await asyncio.sleep(0)
+        self.assertTrue(client.disconnected)
+        self.assertIsNone(supervisor.active_run_id)
+        self.assertEqual(bindings[-1], ("", ""))
+        self.assertTrue(gate.is_set())
+        self.assertIsNone(gates[-1])
+        self.assertEqual(len(client.query_envelopes), 1)
+        with self.assertRaises(ClaudeSDKSupervisorClosed):
+            await collect(receipts[0].handle)
+
+    async def test_native_continuation_inherits_callback_for_child_tasks(self) -> None:
+        receipts = []
+        async def admit(receipt):
+            receipts.append(receipt)
+            return True
+        _parent, client, supervisor, notification, init = await self._native_wake_fixture(admit)
+        await client.emit(notification)
+        await client.emit(init)
+        await client.emit({"type": "system", "subtype": "task_started", "task_id": "second",
+                           "task_type": "local_bash", "session_id": "native-session", "tool_use_id": "tool-2"})
+        await client.emit({"type": "result", "result": "Spawned another child"})
+        await asyncio.sleep(0)
+        await supervisor.get_context_usage()
+        self.assertEqual(len(receipts), 1)
+        self.assertTrue(receipts[0].handle.done)
+        await client.emit({**notification, "task_id": "second", "tool_use_id": "tool-2"})
+        await client.emit(init)
+        await client.emit({"type": "result", "result": "Complete"})
+        await asyncio.sleep(0)
+        await supervisor.get_context_usage()
+        self.assertEqual(len(receipts), 2)
+        self.assertEqual(receipts[1].parent_run_id, receipts[0].run_id)
+        self.assertTrue(receipts[1].handle.done)
+        self.assertEqual(len(client.query_envelopes), 1)
+
+    async def test_stop_fences_task_provenance_before_normal_terminal_result(self) -> None:
+        receipts = []
+        async def admit(receipt):
+            receipts.append(receipt)
+            return True
+        handle = await self.manager.start_run(
+            "stopped", "Start", run_id="parent", options={}, configuration_key="same",
+            query_session_id="native-session", native_continuation_callback=admit,
+        )
+        client = self.factory.clients[-1]
+        supervisor = self.manager._supervisors["stopped"]
+        await client.emit({"type": "system", "subtype": "task_started", "task_id": "bash",
+                           "task_type": "local_bash", "session_id": "native-session", "tool_use_id": "tool"})
+        await asyncio.sleep(0)
+        self.assertTrue(await handle.interrupt())
+        await client.emit({"type": "result", "result": "Stopped"})
+        await asyncio.wait_for(collect(handle), 1)
+        await client.emit({"type": "system", "subtype": "task_notification", "task_id": "bash",
+                           "status": "completed", "session_id": "native-session", "tool_use_id": "tool"})
+        await client.emit({"type": "system", "subtype": "init", "session_id": "native-session"})
+        await asyncio.sleep(0)
+        await supervisor.get_context_usage()
+        self.assertEqual(receipts, [])
+        self.assertFalse(supervisor._native_task_origins)
+
+    async def test_new_user_run_consumes_older_task_without_reassigning_owner(self) -> None:
+        receipts = []
+        async def admit(receipt):
+            receipts.append(receipt)
+            return True
+        parent, client, supervisor, notification, init = await self._native_wake_fixture(admit)
+        self.assertTrue(parent.native_continuation_pending)
+        newer = await self.manager.start_run(
+            "native-wake", "New instruction", run_id="newer-user", options={}, configuration_key="same",
+            query_session_id="native-session", native_continuation_callback=admit,
+        )
+        await client.emit(notification)
+        await client.emit(init)
+        await client.emit({"type": "result", "result": "Handled by current user turn"})
+        messages = await asyncio.wait_for(collect(newer), 1)
+        self.assertIn(notification, messages)
+        self.assertEqual(receipts, [])
+        self.assertFalse(newer.native_continuation_pending)
+        await client.emit(init)
+        await asyncio.sleep(0)
+        await supervisor.get_context_usage()
+        self.assertEqual(receipts, [])
+        self.assertIsNone(supervisor.active_run_id)
+
+    async def test_native_admission_abort_releases_gate_and_fails_provisional_handle(self) -> None:
+        entered = asyncio.Event(); receipts = []; gates = []
+        async def admit(receipt):
+            receipts.append(receipt)
+            entered.set()
+            await asyncio.Event().wait()
+        options = {"_agentsdock_bind_native_admission_gate": gates.append}
+        _parent, client, supervisor, notification, init = await self._native_wake_fixture(admit, options=options)
+        gate = gates[-1]
+        await client.emit(notification)
+        await client.emit(init)
+        await asyncio.wait_for(entered.wait(), 1)
+        await asyncio.wait_for(supervisor.abort(), 2)
+        self.assertTrue(gate.is_set())
+        self.assertIsNone(gates[-1])
+        self.assertTrue(client.disconnected)
+        self.assertIsNone(supervisor.active_run_id)
+        with self.assertRaises(ClaudeSDKSupervisorClosed):
+            await collect(receipts[0].handle)
+
+    async def test_native_wake_foreign_init_retires_exact_connection(self) -> None:
+        receipts = []
+        async def admit(receipt):
+            receipts.append(receipt)
+            return True
+        _parent, client, supervisor, notification, init = await self._native_wake_fixture(admit)
+        await client.emit(notification)
+        await client.emit({**init, "session_id": "foreign-session"})
+        for _ in range(50):
+            if client.disconnected: break
+            await asyncio.sleep(0)
+        self.assertTrue(client.disconnected)
+        self.assertEqual(receipts, [])
+        self.assertIsNone(supervisor.active_run_id)
+
+    async def test_native_notification_before_parent_result_can_admit_next_init(self) -> None:
+        receipts = []
+        async def admit(receipt):
+            receipts.append(receipt)
+            return True
+        parent = await self.manager.start_run(
+            "early", "Start background work", run_id="parent", options={}, configuration_key="same",
+            query_session_id="native-session", native_continuation_callback=admit,
+        )
+        client = self.factory.clients[-1]
+        supervisor = self.manager._supervisors["early"]
+        started = {"type": "system", "subtype": "task_started", "task_id": "bash",
+                   "task_type": "local_bash", "session_id": "native-session", "tool_use_id": "tool"}
+        await client.emit(started)
+        await client.emit({**started, "subtype": "task_notification", "status": "completed"})
+        await client.emit({"type": "result", "result": "Parent complete"})
+        await asyncio.wait_for(collect(parent), 1)
+        self.assertTrue(parent.native_continuation_pending)
+        await client.emit({"type": "system", "subtype": "init", "session_id": "native-session"})
+        await client.emit({"type": "result", "result": "Native follow-up complete"})
+        await asyncio.sleep(0)
+        await supervisor.get_context_usage()
+        self.assertEqual(len(receipts), 1)
+        self.assertFalse(receipts[0].handle.native_continuation_pending)
+        self.assertEqual(len(client.query_envelopes), 1)
+
+    async def test_native_notification_consumed_by_active_init_cannot_wake_again(self) -> None:
+        receipts = []
+        async def admit(receipt):
+            receipts.append(receipt)
+            return True
+        handle = await self.manager.start_run(
+            "consumed", "Start", run_id="parent", options={}, configuration_key="same",
+            query_session_id="native-session", native_continuation_callback=admit,
+        )
+        client = self.factory.clients[-1]
+        supervisor = self.manager._supervisors["consumed"]
+        started = {"type": "system", "subtype": "task_started", "task_id": "bash",
+                   "task_type": "local_bash", "session_id": "native-session", "tool_use_id": "tool"}
+        init = {"type": "system", "subtype": "init", "session_id": "native-session"}
+        await client.emit(started)
+        await client.emit({**started, "subtype": "task_notification", "status": "completed"})
+        await client.emit(init)
+        await client.emit({"type": "assistant", "message": "Already handled the task"})
+        await client.emit({"type": "result", "result": "Complete"})
+        await asyncio.wait_for(collect(handle), 1)
+        self.assertFalse(handle.native_continuation_pending)
+        self.assertIsNone(supervisor._native_admission_gate)
+        await client.emit(init)
+        await asyncio.sleep(0)
+        await supervisor.get_context_usage()
+        self.assertEqual(receipts, [])
+
+    async def test_mixed_parent_task_batch_uses_latest_owner_not_notification_order(self) -> None:
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                receipts = []; selected = []
+                async def older(receipt):
+                    selected.append("older"); receipts.append(receipt)
+                    return True
+                async def newer(receipt):
+                    selected.append("newer"); receipts.append(receipt)
+                    return True
+                chat = f"mixed-{reverse}"
+                _parent, client, supervisor, old_notification, init = await self._native_wake_fixture(older, chat=chat)
+                current = await self.manager.start_run(
+                    chat, "Another authorized task", run_id="newer", options={}, configuration_key="same",
+                    query_session_id="native-session", native_continuation_callback=newer,
+                )
+                await client.emit({"type": "system", "subtype": "task_started", "task_id": "newer-task",
+                                   "task_type": "local_bash", "session_id": "native-session", "tool_use_id": "newer-tool"})
+                await client.emit({"type": "result", "result": "Started second task"})
+                await asyncio.wait_for(collect(current), 1)
+                new_notification = {**old_notification, "task_id": "newer-task", "tool_use_id": "newer-tool"}
+                notifications = [old_notification, new_notification]
+                if reverse: notifications.reverse()
+                for notification in notifications: await client.emit(notification)
+                await client.emit(init)
+                await client.emit({"type": "result", "result": "Both complete"})
+                await asyncio.sleep(0)
+                await supervisor.get_context_usage()
+                self.assertEqual(selected, ["newer"])
+                self.assertEqual(receipts[0].parent_run_id, "newer")
+                self.assertEqual(receipts[0].parent_run_ids, ("parent", "newer"))
+                self.assertEqual(set(receipts[0].task_ids), {"bash", "newer-task"})
+                self.assertEqual(receipts[0].task_id, "newer-task")
+                self.assertEqual(receipts[0].tool_use_id, "newer-tool")
+                self.assertFalse(client.disconnected)
+                self.assertTrue(receipts[0].handle.done)
+                self.assertEqual(len(client.query_envelopes), 2)
+
+    async def test_stale_generation_notification_cannot_admit_native_wake(self) -> None:
+        receipts = []
+        async def admit(receipt):
+            receipts.append(receipt)
+            return True
+        _parent, client, supervisor, notification, init = await self._native_wake_fixture(admit)
+        await supervisor._commands.put(_ReceivedMessage(supervisor._generation - 1, notification))
+        await client.emit(init)
+        await asyncio.sleep(0)
+        await supervisor.get_context_usage()
+        self.assertEqual(receipts, [])
+        self.assertIsNone(supervisor.active_run_id)
+
+    async def test_idle_result_consumes_notification_without_authorizing_later_init(self) -> None:
+        receipts = []
+        async def admit(receipt):
+            receipts.append(receipt)
+            return True
+        _parent, client, supervisor, notification, init = await self._native_wake_fixture(admit)
+        await client.emit(notification)
+        await client.emit({"type": "result", "is_error": True, "result": "Native wake declined"})
+        await client.emit(init)
+        await asyncio.sleep(0)
+        await supervisor.get_context_usage()
+        self.assertEqual(receipts, [])
+        self.assertIsNone(supervisor._native_admission_gate)
+        self.assertFalse(self.manager.has_pending_native_continuations("native-wake"))
 
     async def test_context_observation_cancel_or_timeout_keeps_native_background_owner(self) -> None:
         for cancel in (False, True):

@@ -38,6 +38,7 @@ FILES = (
     "local_session_ownership.py",
     "cursor_history.py",
     "workspace_git.py",
+    "workspace_intelligence.py",
     "team_hub_host.py",
     "secure_peer_runtime.py",
     "team_mail_runtime.py",

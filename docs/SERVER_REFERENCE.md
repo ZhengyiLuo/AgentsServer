@@ -1397,6 +1397,57 @@ Workspace-files capability v4 adds no-overwrite creation. Post
 descriptor-relative, rejects symlinked parents and existing destinations, and
 is unavailable for archived chats.
 
+## Workspace intelligence
+
+The optional `workspace_intelligence` v1 capability provides project-aware
+completion, hover information, definitions, and diagnostics for Python and
+TypeScript/JavaScript in the desktop editor. Language servers run on the
+connected server machine, rooted in the chat's exact working directory.
+
+Install the language server on that machine before enabling intelligence:
+
+- Python uses `pyright-langserver --stdio`. Discovery prefers
+  `.venv/bin/pyright-langserver`, then `node_modules/.bin/pyright-langserver`,
+  then the server's executable search path. A project-local npm installation
+  can be prepared with `npm install --save-dev pyright`.
+- TypeScript/JavaScript uses `typescript-language-server --stdio`. Discovery
+  prefers `node_modules/.bin/typescript-language-server`, then the server's
+  executable search path. For a compatible project-local installation, use
+  `npm install --save-dev typescript-language-server typescript@6`.
+  The language server requires a TypeScript installation containing
+  `lib/tsserver.js`; TypeScript 7 alone does not provide it. Validation used
+  Pyright 1.1.414, typescript-language-server 6.0.2, and TypeScript 6.0.3.
+
+Installation is a separate user action. AgentsServer discovers existing
+executables and returns setup guidance when missing; it never installs these
+packages automatically. Checking availability does not start a process.
+
+```text
+GET /api/sessions/{session_id}/workspace/intelligence
+WS  /api/sessions/{session_id}/workspace/intelligence/{language}
+```
+
+The status result contains `root`, its server-generated `root_uri`, and a
+`languages` array with `id` (`python` or `typescript`), `available`, and optional
+`message`/`install_hint`. Availability indicates executable discovery; language
+server initialization can still report a missing or incompatible project
+dependency. HTTP requires exactly one native token header. WebSockets require
+`agentsdock-intelligence-v1` plus the existing canonical
+`agentsdock-token.<base64url>` subprotocol; browser-origin requests, cookies,
+alternate credentials, and query parameters are rejected.
+
+Each WebSocket exchanges individual JSON-RPC 2.0 objects and owns a separate
+stdio language-server process, so unsaved buffers from two editors cannot
+overwrite each other. The bridge forwards requests, responses, notifications,
+and cancellation messages in both directions. Initialization uses the actual
+chat workspace and no client-supplied executable or process identity. The only
+accepted initialization option is TypeScript's `tsserver.useSyntaxServer: "never"`,
+used by symbol search to wait for the semantic project instead of a partial
+syntax index. A changed workspace closes the old connection; closing the editor or shutting down the
+server reaps only its owned language-server process group. No agent turn or
+terminal process is started or stopped. Bridge failures can send
+`{type: "intelligence_error", message}` before closing the connection.
+
 ## Workspace Git
 
 Native administrator clients can inspect the canonical Git worktree containing

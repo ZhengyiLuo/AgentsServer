@@ -1603,6 +1603,32 @@ time.sleep(5)
         self.assertTrue(terminal["is_error"])
         self.assertEqual(terminal["result_text"], "")
 
+    async def test_current_composite_tool_id_completes_turn(self) -> None:
+        # Same-shape fixture from the real 2026.10.22 Cursor read-tool stream.
+        call_id = ("call-00000000-0000-4000-8000-000000000001-0\n"
+                   "fc_00000000-0000-4000-8000-000000000002_0")
+        events = await self._run_script(_event_script([
+            _init_event(),
+            {"type": "tool_call", "subtype": "started", "call_id": call_id,
+             "session_id": "cursor-sess-test", "tool_call": {
+                 "toolCallId": call_id,
+                 "readToolCall": {"args": {"path": "hello.txt"}}}},
+            {"type": "tool_call", "subtype": "completed", "call_id": call_id,
+             "session_id": "cursor-sess-test", "tool_call": {
+                 "toolCallId": call_id,
+                 "readToolCall": {"args": {"path": "hello.txt"},
+                                  "result": {"success": {"content": "fixture"}}}}},
+            _result_event(),
+        ]))
+        started = next(event for event in events if event["type"] == "tool_started")
+        finished = next(event for event in events if event["type"] == "tool_finished")
+        self.assertEqual(started["tool"]["id"], finished["tool_id"])
+        self.assertNotIn("\n", finished["tool_id"])
+        self.assertFalse(any(event["type"] == "error" for event in events))
+        terminal = next(event for event in events if event["type"] == "turn_finished")
+        self.assertFalse(terminal["is_error"])
+        self.assertEqual(terminal["result_text"], "Done.")
+
     async def test_tool_cardinality_ceiling_fails_visibly(self) -> None:
         agent_server.CURSOR_MAX_TOOL_CALLS = 2
         tool_events = []

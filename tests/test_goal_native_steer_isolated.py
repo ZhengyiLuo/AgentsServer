@@ -5,6 +5,7 @@ import ast
 import asyncio
 from collections import deque
 from contextlib import suppress
+import hmac
 import json
 from pathlib import Path
 import re
@@ -21,6 +22,8 @@ from tests.test_goal_followup_admission_isolated import AdmissionHTTPException, 
 SOURCE = (Path(__file__).resolve().parents[1] / "agent_server.py")
 NAMES = {
     "NativeSteerHandoffError", "send_codex_goal_steer", "commit_codex_goal_steer",
+    "suspend_codex_goal_steer_user_delegation", "settle_codex_goal_steer_user_delegation",
+    "provider_capability_is_attached_to_live_run",
     "consume_codex_native_turn", "codex_goal_steer_selection_is_plain",
     "codex_shell_intents_pending", "observe_codex_shell_notification",
     "publish_codex_shell_completions",
@@ -88,7 +91,7 @@ class NativeGoalSteerTests(unittest.IsolatedAsyncioTestCase):
 
         self.ns = {
             "team_mail_grants": team_mail_grants,
-            "asyncio": asyncio, "deque": deque, "suppress": suppress, "json": json,
+            "asyncio": asyncio, "deque": deque, "suppress": suppress, "json": json, "hmac": hmac,
             "re": re, "time": time, "CodexAppServerError": CodexAppServerError,
             "CodexAppServerProtocolError": CodexAppServerProtocolError,
             "CodexAppServerRequestError": CodexAppServerRequestError,
@@ -98,6 +101,7 @@ class NativeGoalSteerTests(unittest.IsolatedAsyncioTestCase):
             "BACKEND_CODEX": "codex", "DEFAULT_BACKEND": "codex",
             "CODEX_APP_SERVER_LIFECYCLE_TIMEOUT_SECONDS": 2, "IDLE_KILL_SECONDS": 2,
             "ACTIVE": {"chat": self.active}, "CURRENT_TURNS": {"chat": self.current},
+            "CROSS_CHAT_CAPABILITIES": {}, "AGENT_TOKEN": "synthetic-test-token",
             "ACTIVE_LOCK": asyncio.Lock(), "QUEUE_LOCK": asyncio.Lock(),
             "SESSION_LIFECYCLE_LOCKS": {},
             "QUEUED_TURNS": {}, "BUSY_SESSIONS": {"chat"}, "STOPPED_RUNS": set(),
@@ -176,6 +180,136 @@ class NativeGoalSteerTests(unittest.IsolatedAsyncioTestCase):
             "chat", "operation", self.manager, "thread", "",
             self.subscription, self.queue, request,
         )
+
+    def delegation_capability(self):
+        capability = {
+            "source_session_id": "chat", "source_run_id": "operation",
+            "source_user_instruction": "Investigate with the other chat and deploy the fix.",
+            "source_is_user_turn": True,
+            "user_delegation_grants": {("recipient", "route")},
+            "provider_route_grants": {"route": {"target_session_id": "recipient"}},
+            "actions": {"agent_cross_chat_routes", "publish"},
+        }
+        self.ns["CROSS_CHAT_CAPABILITIES"]["token"] = capability
+        return capability
+
+    async def test_goal_correction_suspends_old_task_at_wire_then_attests_exact_user_text(self):
+        self.ordinary_owner()
+        capability = self.delegation_capability()
+        reserved_before = dict(capability)
+        request = self.request()
+        exact_user_text = "  Do not deploy. Ask the other chat for a read-only investigation. 😀\n"
+        request["selected"]["prompt"] = exact_user_text
+        self.ns["build_user_provider_prompt"] = lambda _chat, prompt, _files: prompt + "[Prepared file context]"
+        original_rpc = self.manager.steer_turn_with_notification_watermark
+
+        async def rpc(*args, **kwargs):
+            self.assertTrue(capability["source_is_user_turn"])
+            result = await original_rpc(*args, **kwargs)
+            self.assertIs(capability["source_is_user_turn"], False)
+            self.assertEqual(capability["user_delegation_grants"], set())
+            return result
+
+        self.manager.steer_turn_with_notification_watermark = rpc
+        pending = await self.send_ordinary(request)
+        self.assertEqual(capability["source_user_instruction"], exact_user_text)
+        self.assertIs(capability["source_is_user_turn"], True)
+        self.assertEqual(capability["user_delegation_grants"], set())
+        self.assertEqual(reserved_before["source_user_instruction"], "Investigate with the other chat and deploy the fix.")
+        self.assertEqual(reserved_before["user_delegation_grants"], {("recipient", "route")})
+        self.assertIs(capability["provider_route_grants"], reserved_before["provider_route_grants"])
+        self.assertIs(capability["actions"], reserved_before["actions"])
+        self.assertEqual(self.calls[0][2][0]["text"], exact_user_text + "[Prepared file context]")
+        # Failed timeline publication cannot erase user input already accepted
+        # by the provider or restore the superseded instruction.
+        self.ns["append_durable_event_batch"] = AsyncMock(side_effect=OSError("synthetic disk failure"))
+        with self.assertRaises(OSError):
+            await self.ns["commit_codex_goal_steer"]("chat", "operation", "thread", "", pending)
+        self.assertEqual(capability["source_user_instruction"], exact_user_text)
+
+    async def test_goal_steer_before_write_rejection_keeps_previous_provenance(self):
+        capability = self.delegation_capability()
+        previous = dict(capability)
+
+        async def stop_before_write():
+            self.active["stop_requested"] = True
+
+        self.before_rpc = stop_before_write
+        with self.assertRaises(self.ns["NativeSteerHandoffError"]):
+            await self.send(self.request())
+        self.assertEqual(capability, previous)
+        self.assertEqual(self.calls, [])
+
+    async def test_goal_steer_explicit_rejection_restores_exact_previous_provenance(self):
+        capability = self.delegation_capability()
+        previous = dict(capability)
+        self.rpc_error = CodexAppServerRequestError("turn/steer", {"message": "turn changed"})
+        with self.assertRaises(self.ns["NativeSteerHandoffError"]) as rejected:
+            await self.send(self.request())
+        self.assertTrue(rejected.exception.safe_to_requeue)
+        self.assertEqual(capability, previous)
+
+    async def test_goal_steer_uncertain_or_cancelled_write_never_restores_old_attestation(self):
+        for error in (
+            CodexAppServerProtocolError("lost acknowledgement", request_sent=True, safe_to_retry=False),
+            asyncio.CancelledError(),
+        ):
+            with self.subTest(error=type(error).__name__):
+                capability = self.delegation_capability()
+                self.rpc_error = error
+                request = self.request()
+                with self.assertRaises((self.ns["NativeSteerHandoffError"], asyncio.CancelledError)):
+                    await self.send(request)
+                self.assertIs(capability["source_is_user_turn"], False)
+                self.assertEqual(capability["user_delegation_grants"], set())
+                self.assertEqual(capability["actions"], {"agent_cross_chat_routes", "publish"})
+                self.assertNotIn("_goal_steer_user_delegation_marker", capability)
+                self.assertNotIn("_goal_steer_user_delegation", request)
+
+    async def test_invalid_goal_steer_acknowledgement_cannot_attest_new_or_old_task(self):
+        capability = self.delegation_capability()
+        original_rpc = self.manager.steer_turn_with_notification_watermark
+
+        async def rpc(*args, **kwargs):
+            await original_rpc(*args, **kwargs)
+            return "wrong-turn", 0
+
+        self.manager.steer_turn_with_notification_watermark = rpc
+        with self.assertRaises(self.ns["NativeSteerHandoffError"]):
+            await self.send(self.request())
+        self.assertIs(capability["source_is_user_turn"], False)
+        self.assertEqual(capability["user_delegation_grants"], set())
+
+    async def test_goal_steer_ack_cannot_rebind_retired_or_replaced_capability(self):
+        for race in ("retired-run", "replacement-capability", "newer-provenance"):
+            with self.subTest(race=race):
+                self.current["run_id"] = "operation"
+                capability = self.delegation_capability()
+                original_rpc = self.manager.steer_turn_with_notification_watermark
+
+                async def rpc(*args, **kwargs):
+                    result = await original_rpc(*args, **kwargs)
+                    if race == "retired-run":
+                        self.current["run_id"] = "next-operation"
+                    elif race == "replacement-capability":
+                        self.ns["CROSS_CHAT_CAPABILITIES"]["token"] = replacement
+                    else:
+                        capability["_goal_steer_user_delegation_marker"] = object()
+                        capability["source_user_instruction"] = "A newer accepted instruction"
+                    return result
+
+                replacement = {**capability, "source_user_instruction": "Replacement owner"}
+                self.manager.steer_turn_with_notification_watermark = rpc
+                await self.send(self.request())
+                self.manager.steer_turn_with_notification_watermark = original_rpc
+                if race == "replacement-capability":
+                    self.assertIs(self.ns["CROSS_CHAT_CAPABILITIES"]["token"], replacement)
+                    self.assertEqual(replacement["source_user_instruction"], "Replacement owner")
+                else:
+                    self.assertIs(capability["source_is_user_turn"], False)
+                    self.assertEqual(capability["source_user_instruction"],
+                                     "A newer accepted instruction" if race == "newer-provenance"
+                                     else "Investigate with the other chat and deploy the fix.")
 
     def consumer(self):
         return asyncio.create_task(self.ns["consume_codex_native_turn"](

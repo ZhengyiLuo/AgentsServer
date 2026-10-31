@@ -331,9 +331,9 @@ class AsyncRouteAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         self.capability["source_user_instruction"] = original
         receipt = await self.send()
         self.capability["source_user_instruction"] = "Render six videos instead."
-        with self.assertRaises(HTTPException) as conflict:
-            await self.send()
-        self.assertEqual(conflict.exception.status_code, 409)
+        replay = await self.send()
+        self.assertEqual(replay["message_id"], receipt["message_id"])
+        self.assertTrue(replay["duplicate"])
         self.assertEqual((await self.ledger.get(receipt["message_id"]))["source_user_instruction"], original)
         self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM chat_mailbox_messages").fetchone()[0], 1)
 

@@ -136,6 +136,17 @@ def _message(row: sqlite3.Row) -> dict:
     return message
 
 
+def validate_message_response_size(message: dict, *, now: str) -> None:
+    """Require the complete readable message to fit with response metadata."""
+    readable = {**message, "read_id": "mailread_" + "0" * 32, "read_at": now}
+    try:
+        size = len(json.dumps(readable, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise MailboxConflict("Message and user delegation must be valid UTF-8") from exc
+    if 8192 + size > MAX_PAGE_BYTES:
+        raise MailboxConflict("Message and source user instruction exceed the bounded mailbox response")
+
+
 def store_message(connection: sqlite3.Connection, message_id: str, *, now: str,
                   in_reply_to_message_id: str | None = None) -> dict:
     """Register one already-authorized stored envelope in the same transaction."""
@@ -173,13 +184,7 @@ def store_message(connection: sqlite3.Connection, message_id: str, *, now: str,
         raise MailboxConflict("Stored mailbox identity changed")
     message = _message(row)
     # Include all provenance in the same bounded response before accepting.
-    readable = {**message, "read_id": "mailread_" + "0" * 32, "read_at": now}
-    try:
-        size = len(json.dumps(readable, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-    except UnicodeEncodeError as exc:
-        raise MailboxConflict("Message and user delegation must be valid UTF-8") from exc
-    if 8192 + size > MAX_PAGE_BYTES:
-        raise MailboxConflict("Message and source user instruction exceed the bounded mailbox response")
+    validate_message_response_size(message, now=now)
     return message
 
 

@@ -112,7 +112,11 @@ class GoalFollowupLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.manager.start_turn = AsyncMock(return_value=self.turn)
         self.manager.client = SimpleNamespace(unmatched_notifications=[])
         self.manager.retire_generation = AsyncMock()
-        self.authority = object()
+        self.authority = {
+            "source_session_id": "chat", "source_run_id": "operation",
+            "source_user_instruction": "Original goal request", "source_is_user_turn": True,
+            "user_delegation_grants": set(), "actions": {"publish", "agent_cross_chat_routes"},
+        }
         self.tasks = []
         self.requests = []
         self.before_wait = None

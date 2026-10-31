@@ -19,6 +19,7 @@ NEW_MODULES = {
     "local_session_ownership.py",
     "cursor_history.py",
     "workspace_git.py",
+    "workspace_intelligence.py",
     "codex_auth.py",
     "codex_provider.py",
     "provider_connections.py",

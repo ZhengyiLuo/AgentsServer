@@ -76,6 +76,7 @@ import websockets
 import team_mail_grants
 import chat_mailbox
 import workspace_git
+import workspace_intelligence
 import codex_auth
 import codex_provider
 import provider_connections
@@ -80690,7 +80691,10 @@ async def lifespan(app: FastAPI):
             "terminal-attachments",
             TERMINAL_ATTACHMENTS.close_admission_and_all(permanent=True),
         )
-        await bounded_shutdown_phase("port-tunnels", PORT_TUNNELS.close_all())
+        await bounded_shutdown_phase(
+            "workspace-transports",
+            asyncio.gather(PORT_TUNNELS.close_all(), WORKSPACE_INTELLIGENCE.shutdown()),
+        )
         secure_peer_task.cancel()
         secure_peer_connector_task.cancel()
         secure_peer_response_outbox_task.cancel()
@@ -84314,6 +84318,14 @@ async def health() -> dict[str, Any]:
                 "max_text_file_bytes": workspace_text_bytes_capability(),
                 "max_preview_file_bytes": MAX_WORKSPACE_PREVIEW_BYTES,
                 "preview_media_types": sorted(set(WORKSPACE_PREVIEW_MEDIA_TYPES.values())),
+            },
+            "workspace_intelligence": {
+                "available": bool(AGENT_TOKEN) and WORKSPACE_SECURE_OPEN_AVAILABLE,
+                "required": False,
+                "version": 1,
+                "languages": list(workspace_intelligence.LANGUAGES),
+                "websocket_protocol": workspace_intelligence.WEBSOCKET_PROTOCOL,
+                "message": "Project language servers are discovered on demand for each editor connection.",
             },
             "working_directory_completion": {
                 "available": True,
@@ -99674,6 +99686,17 @@ async def put_session_workspace_file(session_id: str, req: WorkspaceWriteRequest
 
 workspace_git.register_workspace_git_routes(
     app, authorize=require_native_admin_control, workspace_root=session_workspace_root,
+)
+
+
+WORKSPACE_INTELLIGENCE = workspace_intelligence.register_workspace_intelligence_routes(
+    app, authorize=require_native_admin_control,
+    authorize_websocket=lambda ws: (
+        not privileged_native_browser_request_forbidden(ws)
+        and port_tunnel_websocket_authorized(ws)
+    ),
+    protocols=port_tunnel_requested_protocols,
+    workspace_root=session_workspace_root, environment=runner_env,
 )
 
 

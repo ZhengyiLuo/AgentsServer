@@ -31786,7 +31786,7 @@ def build_subagent_snapshot(session_id: str, limit: int = 64) -> dict[str, Any]:
             SUBAGENT_SNAPSHOT_STATE_LIMIT,
         )
         for state in claude.get("subagents") or []:
-            key = f"{str(state.get('backend') or BACKEND_CLAUDE)}:{state.get('subagent_id')}"
+            key = f"{str(state.get('backend') or BACKEND_CLAUDE)}:{state.get('run_id')}:{state.get('subagent_id')}"
             merged[key] = dict(state)
     with CODEX_SUBAGENT_INDEX_LOCK:
         codex_states = [dict(state) for state in CODEX_SUBAGENT_STATE.values()]
@@ -31839,6 +31839,69 @@ def codex_child_status_from_turn(turn: Any) -> str | None:
     if status in {"completed", "interrupted", "failed"}:
         return normalize_subagent_status(status)
     return None
+
+
+def reconcile_claude_subagent_snapshot(
+    session_id: str, snapshot: dict[str, Any], limit: int,
+) -> dict[str, Any]:
+    """Reconcile display state with existing ownership on the event loop.
+
+    History alone cannot establish present liveness after a restart, eviction,
+    or replacement run. This read neither contacts Claude nor writes history;
+    operational Stop/update guards continue to inspect the durable ledger.
+    """
+    try:
+        owner = (CLAUDE_SDK_MANAGER.subagent_tracking_snapshot(session_id)
+                 if CLAUDE_SDK_MANAGER is not None else {"run_id": "", "tasks": ()})
+        owned_runs = {str(owner.get("run_id") or "")} - {""}
+        active = ACTIVE.get(session_id) or {}
+        process = active.get("proc")
+        if (active.get("backend") == BACKEND_CLAUDE
+                and active.get("transport") == CLAUDE_TRANSPORT_PRINT
+                and process is not None and process.returncode is None
+                and active.get("run_id")):
+            owned_runs.add(str(active.get("run_id") or ""))
+        receipts = tuple(owner.get("tasks") or ())
+    except Exception:
+        # An inspection failure is not evidence that a known owner has gone.
+        logger.warning("Claude subagent ownership inspection failed session=%s", session_id, exc_info=True)
+        return {**snapshot, "subagents": list(snapshot.get("subagents") or [])[:limit]}
+
+    states = []
+    for original in snapshot.get("subagents") or []:
+        state = dict(original)
+        if (state.get("backend") == BACKEND_CLAUDE
+                and state.get("subagent_status") in {"starting", "running"}):
+            run_id = str(state.get("run_id") or "")
+            status = None
+            for receipt in receipts:
+                if (receipt.get("owner_run_id") == run_id and run_id in owned_runs
+                        and (receipt.get("task_id") == state.get("subagent_id")
+                             or (receipt.get("tool_use_id")
+                                 and receipt.get("tool_use_id") == state.get("subagent_tool_id")))):
+                    status = normalize_subagent_status(receipt.get("status"))
+                    break
+            if status not in {None, "starting", "running"}:
+                state["subagent_status"] = status
+                state["subagent_activity"] = f"Subagent {status.replace('_', ' ')}"
+            elif run_id not in owned_runs:
+                state["subagent_status"] = "tracking_lost"
+                state["subagent_activity"] = "Background task tracking lost; completion is not confirmed"
+            if state["subagent_status"] != original.get("subagent_status"):
+                state["subagent_log"] = [
+                    *(state.get("subagent_log") or []),
+                    {"ts": state.get("ts"), "text": state["subagent_activity"]},
+                ][-SUBAGENT_SNAPSHOT_LOG_LIMIT:]
+        states.append(state)
+    states.sort(key=lambda state: (
+        0 if state.get("subagent_status") in {"starting", "running"} else 1,
+        -(durable_event_seq(state) or 0),
+    ))
+    return {
+        **snapshot,
+        "subagents": states[:limit],
+        "active_count": sum(state.get("subagent_status") in {"starting", "running"} for state in states),
+    }
 
 
 async def reconcile_codex_subagents(
@@ -32395,11 +32458,18 @@ def build_claude_subagent_snapshot(session_id: str, limit: int = 64) -> dict[str
         started = [value for value in (primary["started_at"], secondary["started_at"]) if value]
         if started:
             primary["started_at"] = min(started)
-        if int(secondary["seq"]) > int(primary["seq"]):
+        def status_priority(state: dict[str, Any]) -> int:
+            if not state["terminal_confirmed"]:
+                return 0
+            return 1 if state["status"] == "tracking_lost" else 2
+        primary_priority, secondary_priority = status_priority(primary), status_priority(secondary)
+        if ((secondary_priority > primary_priority)
+                or (primary_priority == secondary_priority and int(secondary["seq"]) > int(primary["seq"]))):
             primary["updated_at"] = secondary["updated_at"]
             primary["activity"] = secondary["activity"] or primary["activity"]
             primary["summary"] = secondary["summary"] or primary["summary"]
             primary["status"] = secondary["status"]
+            primary["terminal_confirmed"] = secondary["terminal_confirmed"]
         primary["seq"] = max(int(primary["seq"]), int(secondary["seq"]))
         primary["background"] = bool(primary["background"] or secondary["background"])
         primary["saw_task_started"] = bool(primary["saw_task_started"] or secondary["saw_task_started"])
@@ -32426,13 +32496,23 @@ def build_claude_subagent_snapshot(session_id: str, limit: int = 64) -> dict[str
         kind: Any = "",
         status: str = "running",
         background: bool | None = None,
-    ) -> dict[str, Any]:
+        terminal_confirmed: bool = True,
+    ) -> dict[str, Any] | None:
         run_id = str(event.get("run_id") or "")
         task_state_key = task_keys.get(scoped(run_id, task_id)) if task_id else None
         tool_state_key = tool_keys.get(scoped(run_id, tool_id)) if tool_id else None
         if task_state_key and tool_state_key and task_state_key != tool_state_key:
             merge_states(task_state_key, tool_state_key)
         state_key, state = find(run_id, task_id, tool_id)
+        ignore_update = False
+        if state is not None and state["terminal_confirmed"]:
+            incoming_status = normalize_subagent_status(status)
+            # Provider snapshots/progress can arrive after terminal receipts.
+            # Never reopen that task or replace its final activity with stale
+            # progress. A lost task may still acquire an explicit final receipt.
+            if (incoming_status in {"starting", "running"}
+                    or (state["status"] != "tracking_lost" and incoming_status != state["status"])):
+                ignore_update = True
         if state is None:
             provider_id = task_id or tool_id
             state_key = f"{run_id}\x00{provider_id}\x00{event.get('seq', 0)}"
@@ -32443,6 +32523,7 @@ def build_claude_subagent_snapshot(session_id: str, limit: int = 64) -> dict[str
                 "name": compact_subagent_text(name) or "Claude subagent",
                 "kind": compact_subagent_text(kind) or "agent",
                 "status": normalize_subagent_status(status),
+                "terminal_confirmed": terminal_confirmed and normalize_subagent_status(status) not in {"starting", "running"},
                 "started_at": str(event.get("ts") or ""),
                 "updated_at": str(event.get("ts") or ""),
                 "seq": int(event.get("seq") or 0),
@@ -32459,6 +32540,8 @@ def build_claude_subagent_snapshot(session_id: str, limit: int = 64) -> dict[str
         if tool_id:
             state["tool_id"] = tool_id
             tool_keys[scoped(run_id, tool_id)] = state_key
+        if ignore_update:
+            return None
         clean_name = compact_subagent_text(name)
         clean_kind = compact_subagent_text(kind)
         if clean_name:
@@ -32468,6 +32551,7 @@ def build_claude_subagent_snapshot(session_id: str, limit: int = 64) -> dict[str
         if background is not None:
             state["background"] = bool(background)
         state["status"] = normalize_subagent_status(status)
+        state["terminal_confirmed"] = terminal_confirmed and state["status"] not in {"starting", "running"}
         state["updated_at"] = str(event.get("ts") or state["updated_at"])
         state["seq"] = max(int(state["seq"]), int(event.get("seq") or 0))
         states.move_to_end(state_key)
@@ -32513,6 +32597,8 @@ def build_claude_subagent_snapshot(session_id: str, limit: int = 64) -> dict[str
                             kind="" if previous is not None else receipt["task_type"],
                             status=receipt["status"], background=True,
                         )
+                        if state is None:
+                            continue
                         note(state, event, (
                             "Background task tracking lost; completion is not confirmed"
                             if receipt["status"] == "tracking_lost"
@@ -32534,6 +32620,8 @@ def build_claude_subagent_snapshot(session_id: str, limit: int = 64) -> dict[str
                         status="starting",
                         background=tool_input.get("run_in_background") is True,
                     )
+                    if state is None:
+                        continue
                     note(state, event, f"Starting {state['name']}")
                     continue
 
@@ -32541,10 +32629,11 @@ def build_claude_subagent_snapshot(session_id: str, limit: int = 64) -> dict[str
                     tool = event.get("tool") if isinstance(event.get("tool"), dict) else {}
                     tool_id = str(event.get("tool_id") or tool.get("id") or "")
                     _, state = find(run_id, tool_id=tool_id)
-                    if state is None:
+                    if state is None or state["status"] not in {"starting", "running"}:
                         continue
                     if event.get("is_error") is True:
                         state["status"] = "failed"
+                        state["terminal_confirmed"] = True
                         note(state, event, "Subagent failed")
                     elif state["background"] or state["saw_task_started"]:
                         if state["status"] == "starting":
@@ -32552,6 +32641,9 @@ def build_claude_subagent_snapshot(session_id: str, limit: int = 64) -> dict[str
                         note(state, event, state["activity"])
                     elif state["status"] in {"starting", "running"}:
                         state["status"] = "completed"
+                        # A foreground tool result is only a fallback: Claude
+                        # may report its native async launch/task identity later.
+                        state["terminal_confirmed"] = False
                         note(state, event, "Subagent completed")
                     continue
 
@@ -32588,6 +32680,8 @@ def build_claude_subagent_snapshot(session_id: str, limit: int = 64) -> dict[str
                                     status="running",
                                     background=True,
                                 )
+                                if state is None:
+                                    continue
                                 note(state, event, "Subagent running")
                         continue
 
@@ -32606,6 +32700,8 @@ def build_claude_subagent_snapshot(session_id: str, limit: int = 64) -> dict[str
                                 status=normalize_subagent_status(task.get("status")),
                                 background=True,
                             )
+                            if state is None:
+                                continue
                             note(state, event, task.get("description") or f"Subagent {state['status']}")
                         continue
 
@@ -32618,6 +32714,8 @@ def build_claude_subagent_snapshot(session_id: str, limit: int = 64) -> dict[str
                             kind=raw.get("subagent_type"),
                             status="running",
                         )
+                        if state is None:
+                            continue
                         state["saw_task_started"] = True
                         note(state, event, raw.get("description") or "Subagent started")
                         continue
@@ -32634,6 +32732,8 @@ def build_claude_subagent_snapshot(session_id: str, limit: int = 64) -> dict[str
                             kind=raw.get("subagent_type"),
                             status="running",
                         )
+                        if state is None:
+                            continue
                         state["status"] = "running"
                         note(state, event, claude_subagent_progress_activity(raw) or "Working")
                         continue
@@ -32641,6 +32741,9 @@ def build_claude_subagent_snapshot(session_id: str, limit: int = 64) -> dict[str
                     if raw.get("type") == "system" and subtype == "task_updated" and task_id:
                         patch = raw.get("patch") if isinstance(raw.get("patch"), dict) else {}
                         _, state = find(run_id, task_id, tool_id)
+                        if (state is not None and state["terminal_confirmed"]
+                                and not (patch.get("status") or raw.get("status"))):
+                            continue
                         is_agent = state is not None or raw.get("task_type") == "local_agent" or bool(raw.get("subagent_type"))
                         if not is_agent:
                             continue
@@ -32652,7 +32755,10 @@ def build_claude_subagent_snapshot(session_id: str, limit: int = 64) -> dict[str
                             kind=raw.get("subagent_type"),
                             status=normalize_subagent_status(status_value),
                             background=True if patch.get("is_backgrounded") is True else None,
+                            terminal_confirmed=bool(patch.get("status") or raw.get("status")),
                         )
+                        if state is None:
+                            continue
                         state["status"] = normalize_subagent_status(status_value)
                         summary = compact_subagent_text(patch.get("summary") or raw.get("summary"))
                         if summary:
@@ -32673,6 +32779,8 @@ def build_claude_subagent_snapshot(session_id: str, limit: int = 64) -> dict[str
                             kind=raw.get("subagent_type"),
                             status=normalize_subagent_status(raw.get("status")),
                         )
+                        if state is None:
+                            continue
                         state["status"] = normalize_subagent_status(raw.get("status"))
                         state["summary"] = compact_subagent_text(raw.get("summary"))
                         note(state, event, state["summary"] or f"Subagent {state['status']}")
@@ -32682,7 +32790,7 @@ def build_claude_subagent_snapshot(session_id: str, limit: int = 64) -> dict[str
                     if parent_tool_id:
                         _, state = find(run_id, tool_id=parent_tool_id)
                         activity = claude_subagent_child_activity(raw)
-                        if state is not None and activity:
+                        if state is not None and state["status"] in {"starting", "running"} and activity:
                             note(state, event, activity)
                     continue
 
@@ -32701,6 +32809,7 @@ def build_claude_subagent_snapshot(session_id: str, limit: int = 64) -> dict[str
                         if event_type == "turn_finished" and state["background"]:
                             continue
                         state["status"] = terminal_status
+                        state["terminal_confirmed"] = terminal_status != "completed"
                         note(state, event, activity)
                     continue
 
@@ -32725,6 +32834,7 @@ def build_claude_subagent_snapshot(session_id: str, limit: int = 64) -> dict[str
                         ):
                             continue
                         state["status"] = "stopped"
+                        state["terminal_confirmed"] = True
                         note(state, event, "Stopped with parent chat")
 
     active_statuses = {"starting", "running"}
@@ -89281,6 +89391,13 @@ async def get_session_subagents(
                 session_id,
                 concise_error_message(exc),
             )
+    if str(session.get("backend") or "") == BACKEND_CLAUDE:
+        # Fold all bounded states first: reconciling only the response page
+        # would leave active_count wrong and let stale rows hide live children.
+        snapshot = await asyncio.to_thread(
+            build_subagent_snapshot, session_id, SUBAGENT_SNAPSHOT_STATE_LIMIT,
+        )
+        return reconcile_claude_subagent_snapshot(session_id, snapshot, limit)
     return await asyncio.to_thread(build_subagent_snapshot, session_id, limit)
 
 

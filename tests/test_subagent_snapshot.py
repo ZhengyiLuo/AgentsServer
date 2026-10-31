@@ -3,7 +3,8 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import HTTPException
 
@@ -336,6 +337,136 @@ class ClaudeSubagentSnapshotTests(unittest.IsolatedAsyncioTestCase):
             "stopped",
         )
 
+    def legacy_background_events(self, run_id: str, seq: int = 1) -> list[dict[str, object]]:
+        return [
+            self.event(seq, "tool_started", run_id=run_id, tool={
+                "id": "reused-tool", "name": "Agent",
+                "input": {"description": "Historical worker", "run_in_background": True},
+            }),
+            self.event(seq + 1, "tool_finished", run_id=run_id, tool_id="reused-tool", is_error=False),
+            self.event(seq + 2, "turn_finished", run_id=run_id, exit_code=0),
+        ]
+
+    async def read_public_snapshot(self, *, owner=None, active=None, limit=64):
+        with patch.dict(agent_server.STORE.sessions, {
+            self.session_id: {"id": self.session_id, "backend": "claude"},
+        }, clear=True), patch.dict(agent_server.ACTIVE, active or {}, clear=True), \
+                patch.object(agent_server, "CLAUDE_SDK_MANAGER", owner), \
+                patch.dict(agent_server.CODEX_SUBAGENT_STATE, {}, clear=True):
+            return await agent_server.get_session_subagents(self.session_id, limit=limit)
+
+    async def test_public_snapshot_loses_legacy_tracking_without_rewriting_history(self) -> None:
+        self.write_events(self.legacy_background_events("old-run"))
+        path = agent_server.events_path(self.session_id)
+        original = path.read_bytes()
+        for owner in (None, SimpleNamespace(subagent_tracking_snapshot=lambda _sid: {"run_id": "", "tasks": ()})):
+            snapshot = await self.read_public_snapshot(owner=owner)
+            self.assertEqual(snapshot["active_count"], 0)
+            state = snapshot["subagents"][0]
+            self.assertEqual(state["subagent_status"], "tracking_lost")
+            self.assertIn("completion is not confirmed", state["subagent_activity"])
+            self.assertEqual(state["seq"], 2)
+            self.assertEqual(state["subagent_started_at"], self.event(1, "unused")["ts"])
+            self.assertEqual(path.read_bytes(), original)
+        # Operational stop/update admission still sees the original ledger.
+        self.assertEqual(agent_server.build_claude_subagent_snapshot(self.session_id)["active_count"], 1)
+
+    async def test_exact_owner_preserves_old_live_child_and_limit_counts_all_states(self) -> None:
+        # Reused tool IDs belong to different runs. A replacement owner cannot
+        # keep its predecessor alive, even in the same connected chat.
+        self.write_events(self.legacy_background_events("live-run") + self.legacy_background_events("old-run", 4))
+        inspect = Mock(return_value={"run_id": "live-run", "tasks": ()})
+        snapshot = await self.read_public_snapshot(owner=SimpleNamespace(subagent_tracking_snapshot=inspect), limit=1)
+        self.assertEqual(snapshot["count"], 2)
+        self.assertEqual(snapshot["active_count"], 1)
+        self.assertEqual(snapshot["subagents"][0]["run_id"], "live-run")
+        self.assertEqual(snapshot["subagents"][0]["subagent_status"], "running")
+        inspect.assert_called_once_with(self.session_id)
+        replacement = await self.read_public_snapshot(owner=SimpleNamespace(
+            subagent_tracking_snapshot=lambda _sid: {"run_id": "replacement-run", "tasks": ()}))
+        self.assertEqual(replacement["active_count"], 0)
+
+    async def test_public_snapshot_uses_exact_print_process_and_owned_terminal_receipts(self) -> None:
+        self.write_events(self.legacy_background_events("live-run"))
+        active = {self.session_id: {"backend": "claude", "transport": agent_server.CLAUDE_TRANSPORT_PRINT,
+                                   "run_id": "live-run", "proc": SimpleNamespace(returncode=None)}}
+        self.assertEqual((await self.read_public_snapshot(active=active))["active_count"], 1)
+        active[self.session_id]["proc"].returncode = 0
+        self.assertEqual((await self.read_public_snapshot(active=active))["active_count"], 0)
+        for receipt_run, expected in (("other-run", "running"), ("live-run", "completed")):
+            snapshot = await self.read_public_snapshot(owner=SimpleNamespace(subagent_tracking_snapshot=lambda _sid: {
+                "run_id": "live-run", "tasks": ({"owner_run_id": receipt_run, "task_id": "task",
+                                                   "tool_use_id": "reused-tool", "status": "completed"},),
+            }))
+            self.assertEqual(snapshot["subagents"][0]["subagent_status"], expected)
+
+    async def test_ownership_inspection_failure_does_not_invent_lost_tracking(self) -> None:
+        self.write_events(self.legacy_background_events("live-run"))
+        with self.assertLogs(agent_server.logger, level="WARNING"):
+            snapshot = await self.read_public_snapshot(owner=SimpleNamespace(
+                subagent_tracking_snapshot=Mock(side_effect=RuntimeError("inspection unavailable"))))
+        self.assertEqual(snapshot["active_count"], 1)
+        self.assertEqual(snapshot["subagents"][0]["subagent_status"], "running")
+
+    async def test_terminal_receipt_survives_late_progress_snapshot_and_async_ack(self) -> None:
+        events = self.legacy_background_events("old-run")[:2] + [
+            self.raw(3, {"type": "system", "subtype": "task_notification", "task_id": "task",
+                         "tool_use_id": "reused-tool", "status": "completed", "summary": "Finished"}, run_id="old-run"),
+            self.raw(4, {"type": "system", "subtype": "task_progress", "task_id": "task",
+                         "description": "Late progress"}, run_id="old-run"),
+            self.raw(5, {"type": "system", "subtype": "background_tasks_changed", "tasks": [
+                {"task_id": "task", "task_type": "local_agent", "status": "running"}]}, run_id="old-run"),
+            self.raw(6, {"type": "user", "tool_use_result": {"isAsync": True, "agentId": "task"},
+                         "message": {"content": [{"type": "tool_result", "tool_use_id": "reused-tool"}]}}, run_id="old-run"),
+        ]
+        self.write_events(events)
+        for snapshot in (agent_server.build_claude_subagent_snapshot(self.session_id), await self.read_public_snapshot()):
+            self.assertEqual(snapshot["active_count"], 0)
+            self.assertEqual(snapshot["subagents"][0]["subagent_status"], "completed")
+            self.assertEqual(snapshot["subagents"][0]["subagent_activity"], "Finished")
+            self.assertEqual(snapshot["subagents"][0]["seq"], 3)
+
+    def test_late_alias_merge_preserves_terminal_status_and_tool_identity(self) -> None:
+        self.write_events([
+            self.raw(1, {"type": "system", "subtype": "task_notification", "task_id": "task",
+                         "task_type": "local_agent", "status": "completed", "summary": "Provider confirmed completion"}),
+            self.event(2, "tool_started", tool={"id": "tool", "name": "Agent", "input": {}}),
+            self.raw(3, {"type": "system", "subtype": "task_progress", "task_id": "task", "tool_use_id": "tool"}),
+        ])
+        snapshot = agent_server.build_claude_subagent_snapshot(self.session_id)
+        self.assertEqual(snapshot["count"], 1)
+        self.assertEqual(snapshot["active_count"], 0)
+        self.assertEqual(snapshot["subagents"][0]["subagent_status"], "completed")
+        self.assertEqual(snapshot["subagents"][0]["subagent_tool_id"], "tool")
+
+    async def test_native_async_ack_after_foreground_tool_result_preserves_owned_child(self) -> None:
+        self.write_events([
+            self.event(1, "tool_started", tool={"id": "tool", "name": "Agent", "input": {"description": "Native child"}}),
+            self.event(2, "tool_finished", tool_id="tool", is_error=False),
+            self.raw(3, {"type": "user", "tool_use_result": {"isAsync": True, "agentId": "task"},
+                         "message": {"content": [{"type": "tool_result", "tool_use_id": "tool"}]}}),
+            self.raw(4, {"type": "system", "subtype": "task_started", "task_id": "task",
+                         "tool_use_id": "tool", "task_type": "local_agent"}),
+            self.event(5, "turn_finished", exit_code=0),
+        ])
+        owner = SimpleNamespace(subagent_tracking_snapshot=lambda _sid: {"run_id": "run-1", "tasks": ()})
+        snapshot = await self.read_public_snapshot(owner=owner)
+        self.assertEqual(snapshot["active_count"], 1)
+        self.assertEqual(snapshot["subagents"][0]["subagent_status"], "running")
+        self.assertEqual(snapshot["subagents"][0]["subagent_id"], "task")
+
+    def test_lost_task_accepts_explicit_terminal_receipt(self) -> None:
+        self.write_events([
+            self.event(1, "claude_background_tasks_reconciled", backend="claude", provider_session_id="provider",
+                       tasks=[{"task_id": "task", "tool_use_id": "tool", "task_type": "local_agent",
+                               "owner_run_id": "run-1", "provider_session_id": "provider", "status": "tracking_lost"}]),
+            self.raw(2, {"type": "system", "subtype": "task_progress", "task_id": "task", "description": "Late"}),
+            self.raw(3, {"type": "system", "subtype": "task_notification", "task_id": "task", "status": "completed"}),
+        ])
+        snapshot = agent_server.build_claude_subagent_snapshot(self.session_id)
+        self.assertEqual(snapshot["active_count"], 0)
+        self.assertEqual(snapshot["subagents"][0]["subagent_status"], "completed")
+
     def test_snapshot_bounds_states_logs_and_endpoint_limit(self) -> None:
         events: list[dict[str, object]] = []
         seq = 0
@@ -462,7 +593,7 @@ class ClaudeSubagentSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.write_events([])
         original_to_thread = asyncio.to_thread
         offload = AsyncMock(side_effect=original_to_thread)
-        with patch.dict(agent_server.STORE.sessions, {self.session_id: {"id": self.session_id}}, clear=True), patch.object(
+        with patch.dict(agent_server.STORE.sessions, {self.session_id: {"id": self.session_id, "backend": "claude"}}, clear=True), patch.object(
             agent_server.asyncio,
             "to_thread",
             new=offload,
@@ -474,7 +605,7 @@ class ClaudeSubagentSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["subagents"], [])
         self.assertEqual(offload.await_count, 1)
         self.assertIs(offload.await_args.args[0], agent_server.build_subagent_snapshot)
-        self.assertEqual(offload.await_args.args[1:], (self.session_id, 12))
+        self.assertEqual(offload.await_args.args[1:], (self.session_id, agent_server.SUBAGENT_SNAPSHOT_STATE_LIMIT))
         self.assertEqual(raised.exception.status_code, 404)
 
 

@@ -1290,6 +1290,32 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
             receipts[0]["status"] = "running"
         self.assertEqual(handle.background_task_overflow_count, 0)
 
+    async def test_subagent_tracking_snapshot_is_detached_exact_owner_without_provider_calls(self) -> None:
+        self.assertEqual(self.manager.subagent_tracking_snapshot("chat-tracking"), {"run_id": "", "tasks": ()})
+        handle = await self.manager.start_run("chat-tracking", "Work", run_id="old-run",
+                                              options={}, configuration_key="same")
+        client = self.factory.clients[0]
+        await client.emit({"type": "system", "subtype": "task_started", "task_id": "child",
+                           "task_type": "local_agent", "tool_use_id": "agent-tool"})
+        await asyncio.wait_for(handle.__anext__(), 1)
+        calls = list(client.calls)
+        snapshot = self.manager.subagent_tracking_snapshot("chat-tracking")
+        self.assertEqual(snapshot["run_id"], "old-run")
+        self.assertTrue(snapshot["generation"])
+        self.assertEqual(snapshot["tasks"][0]["owner_run_id"], "old-run")
+        snapshot["tasks"][0]["status"] = "completed"
+        self.assertEqual(handle.background_task_receipts[0]["status"], "running")
+        self.assertEqual(client.calls, calls)
+        await client.emit({"type": "system", "subtype": "task_notification", "task_id": "child", "status": "completed"})
+        await client.emit({"type": "result", "result": "Done"})
+        await asyncio.wait_for(collect(handle), 1)
+        self.assertTrue(self.manager.is_loaded("chat-tracking"))
+        self.assertEqual(self.manager.subagent_tracking_snapshot("chat-tracking"), {"run_id": "", "tasks": ()})
+        replacement = await self.manager.start_run("chat-tracking", "Next", run_id="new-run",
+                                                   options={}, configuration_key="same")
+        self.assertEqual(self.manager.subagent_tracking_snapshot("chat-tracking")["run_id"], replacement.run_id)
+        self.assertEqual(self.manager.subagent_tracking_snapshot("chat-tracking")["tasks"], ())
+
     async def test_reconciliation_hook_is_query_scoped_and_old_generation_cannot_consume_it(self) -> None:
         options = {"hooks": claude_background_tracking_hooks(), "resume": "provider-one"}
         reconciliation = {"tasks": [{"task_id": "prior-task", "task_type": "local_workflow",

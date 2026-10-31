@@ -4462,6 +4462,24 @@ class ClaudeSDKSupervisorManager:
             and not supervisor.closed
         )
 
+    def subagent_tracking_snapshot(self, chat_id: str) -> dict[str, Any]:
+        """Copy the exact existing task owner without connecting or issuing RPCs.
+
+        Call on the manager's event loop. An idle connected supervisor is not
+        evidence that tasks from an earlier run are still being tracked.
+        """
+        supervisor = self._supervisors.get(str(chat_id))
+        if supervisor is None or supervisor.closed or not supervisor.connected:
+            return {"run_id": "", "tasks": ()}
+        active = supervisor._active_run
+        if active is None or active.done:
+            return {"run_id": "", "tasks": ()}
+        return {
+            "run_id": active.run_id,
+            "generation": supervisor.control_generation,
+            "tasks": tuple(dict(task) for task in active.background_task_receipts),
+        }
+
     def usage_generation(self, chat_id: str, *, run_id: str | None = None) -> str | None:
         """Identify the existing native owner without connecting or issuing RPCs."""
         supervisor = self._supervisors.get(str(chat_id))

@@ -91389,6 +91389,7 @@ CLAUDE_GOAL_PATHS: dict[str, Path] = {}
 CLAUDE_GOAL_LOCKS: dict[str, asyncio.Lock] = {}
 CLAUDE_GOAL_PENDING: dict[str, dict[str, Any]] = {}
 CLAUDE_GOAL_ERRORS: dict[str, str] = {}
+CLAUDE_GOAL_CLEAR_ARGUMENTS = frozenset({"clear", "stop", "off", "reset", "none", "cancel"})
 
 
 async def settle_claude_goal_command(
@@ -91460,7 +91461,41 @@ def require_claude_goal_session(session_id: str) -> dict[str, Any]:
     return session
 
 
-async def start_claude_goal_command(session_id: str, argument: str) -> dict[str, Any]:
+async def queued_claude_goal(session_id: str) -> dict[str, Any] | None:
+    """Project the next durable goal request, separately from native goal state."""
+    await wait_for_queue_recovery_admission(session_id)
+    session = STORE.sessions.get(session_id) or {}
+    async with QUEUE_LOCK:
+        promoted = RUN_NOW_TURNS.get(session_id)
+        rows = ([promoted] if promoted is not None else []) + list(QUEUED_TURNS.get(session_id) or [])
+        goals = []
+        for position, item in enumerate(rows, 1):
+            selection = item.get("skill_selection")
+            prompt = str(item.get("prompt") or "")
+            # Selection admission (including queue edits) validates the exact
+            # native invocation. Plain slash-looking user text is not a goal.
+            if (item.get("_durable") is False or not item.get("queued_id")
+                    or item.get("purpose") is not None
+                    or str(item.get("backend") or session.get("backend") or DEFAULT_BACKEND) != BACKEND_CLAUDE
+                    or not isinstance(selection, dict) or not selection.get("id") or not selection.get("revision")
+                    or not provider_command_prompt_matches(prompt, "/goal")):
+                continue
+            condition = prompt[len("/goal"):].strip()
+            if not condition or len(condition) > 4000 or condition.lower() in CLAUDE_GOAL_CLEAR_ARGUMENTS:
+                continue
+            uncertain = item.get("_native_delivery_fenced") is True
+            paused = uncertain or item.get("_paused_after_stop") is True
+            goals.append({
+                "queued_id": str(item["queued_id"]), "condition": condition,
+                "position": position, "paused": paused,
+                "pause_reason": "delivery_uncertain" if uncertain else "stopped" if paused else None,
+            })
+    return {**goals[0], "queued_count": len(goals)} if goals else None
+
+
+async def start_claude_goal_command(
+    session_id: str, argument: str, *, queue_if_busy: bool = False,
+) -> dict[str, Any]:
     session = require_claude_goal_session(session_id)
     snapshot, inventory = await discover_session_provider_commands(session_id, session)
     command = next((record for record in inventory.records
@@ -91517,7 +91552,7 @@ async def start_claude_goal_command(session_id: str, argument: str) -> dict[str,
         prompt=f"/goal {argument}",
         skill_selection=SkillSelection(id=command.public["id"], revision=inventory.revision),
         client_capabilities=[CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY],
-    ), queue_if_busy=False)
+    ), queue_if_busy=queue_if_busy)
 
 
 class ClaudeGoalRequest(BaseModel):
@@ -91528,10 +91563,13 @@ class ClaudeGoalRequest(BaseModel):
 async def put_claude_goal(session_id: str, req: ClaudeGoalRequest) -> dict[str, Any]:
     require_claude_goal_session(session_id)
     condition = req.condition.strip()
-    if not condition or condition.lower() in {"clear", "stop", "off", "reset", "none", "cancel"}:
+    if not condition or condition.lower() in CLAUDE_GOAL_CLEAR_ARGUMENTS:
         raise HTTPException(status_code=400, detail="Enter a completion condition for Claude")
     previous = await refresh_claude_goal(session_id, notify=False)
-    accepted = await start_claude_goal_command(session_id, condition)
+    # Loaded SDK owners use native goal delivery at their safe boundary.
+    # During admission without a loaded owner, retain ordinary durable queue
+    # cancellation/recovery instead of interrupting or rejecting existing work.
+    accepted = await start_claude_goal_command(session_id, condition, queue_if_busy=True)
     # Bind pending display state only after actual admission. A competing
     # request or an older run's cleanup cannot clear the winner's operation.
     async with ACTIVE_LOCK:
@@ -91633,6 +91671,7 @@ async def claude_runtime_snapshot(session_id: str) -> dict[str, Any]:
         "goal_starting": bool(session_id in CLAUDE_GOAL_PENDING
                               and not CLAUDE_GOAL_PENDING[session_id].get("delivery_uncertain")),
         "goal_error": CLAUDE_GOAL_ERRORS.get(session_id),
+        "queued_goal": await queued_claude_goal(session_id) if is_claude else None,
         "goal_loading": bool(is_claude and claude_provider_id_for_session(session)
                              and not getattr(CLAUDE_GOAL_PROJECTIONS.get(session_id), "caught_up", False)),
         "stop_fence_pending": session_id in CLAUDE_STOP_FENCE_SESSIONS,

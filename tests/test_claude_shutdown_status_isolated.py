@@ -65,6 +65,7 @@ if late_shutdown:
         "ClaudeSDKSupervisorClosed": ClaudeSDKSupervisorClosed,
         "SERVER_SHUTTING_DOWN": shutting_down,
         "STOPPED_RUNS": {"unrelated-run"}, "RUN_METADATA": {},
+        "CLAUDE_NATIVE_PAUSED_STARTS": {},
         "previous_error": previous_error, "initial_result": result,
         "initial_projection_error": projection_error,
         "concise_error_message": str, "clean_assistant_text": str,

@@ -18,6 +18,7 @@ from claude_sdk_client import (
     ClaudeSDKGoalReceipt,
     ClaudeSDKLoopError,
     ClaudeSDKMCPServerNotFound,
+    ClaudeSDKNativeWakeDeferred,
     ClaudeSDKQueryError,
     ClaudeSDKRunActive,
     ClaudeSDKSupervisorError,
@@ -28,6 +29,7 @@ from claude_sdk_client import (
     reject_subagent_provider_tool_hook,
     _parse_claude_sdk_message,
     _query_message_stream,
+    _ReceivedMessage,
 )
 
 
@@ -153,6 +155,9 @@ class FakeClaudeClient:
     async def get_server_info(self) -> dict[str, Any]:
         self._record("get_server_info")
         return dict(self.server_info)
+
+    def get_cached_server_info(self) -> dict[str, Any]:
+        return self.server_info
 
     async def reconnect_mcp_server(self, server_name: str) -> None:
         self._record("reconnect_mcp_server", server_name)
@@ -1922,6 +1927,359 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
         await self.manager.evict("background", force=True)
         self.assertEqual(self.manager.background_work_snapshot(), ())
 
+    async def _native_wake_fixture(self, callback, *, chat="native-wake", options=None):
+        options = {} if options is None else options
+        parent = await self.manager.start_run(
+            chat, "Authorized background work", run_id="parent", options=options,
+            configuration_key="same", query_session_id="native-session",
+            native_continuation_callback=callback,
+        )
+        client = self.factory.clients[-1]
+        supervisor = self.manager._supervisors[chat]
+        started = {"type": "system", "subtype": "task_started", "task_id": "bash",
+                   "task_type": "local_bash", "session_id": "native-session", "tool_use_id": "tool-1"}
+        await client.emit(started)
+        await client.emit({"type": "result", "result": "Started"})
+        await asyncio.wait_for(collect(parent), 1)
+        notification = {"type": "system", "subtype": "task_notification", "task_id": "bash",
+                        "status": "completed", "session_id": "native-session", "tool_use_id": "tool-1"}
+        init = {"type": "system", "subtype": "init", "session_id": "native-session"}
+        return parent, client, supervisor, notification, init
+
+    async def test_native_task_wake_gets_new_owned_handle_without_query(self) -> None:
+        receipts = []
+        async def admit(receipt):
+            receipts.append(receipt)
+            self.assertTrue(self.manager.owns_active_run(
+                receipt.chat_id, receipt.ownership_token, receipt.run_id))
+            self.assertTrue(receipt.handle.accepted)
+            self.assertTrue(receipt.handle.acknowledged)
+            return True
+        parent, client, supervisor, notification, init = await self._native_wake_fixture(admit)
+        self.assertTrue(parent.done)
+        self.assertIsNone(supervisor.active_run_id)
+        self.assertTrue(self.manager.has_pending_native_continuations("native-wake"))
+        # A terminal progress patch may precede the completion notification.
+        await client.emit({**notification, "subtype": "task_updated"})
+        await client.emit(notification)
+        await client.emit(init)
+        assistant = {"type": "assistant", "message": "Native continuation"}
+        result = {"type": "result", "result": "Complete"}
+        await client.emit(assistant)
+        await client.emit(result)
+        await asyncio.sleep(0)
+        await supervisor.get_context_usage()
+        self.assertEqual(len(receipts), 1)
+        receipt = receipts[0]
+        self.assertEqual(receipt.parent_run_id, parent.run_id)
+        self.assertEqual(receipt.provider_session_id, "native-session")
+        self.assertEqual(receipt.task_ids, ("bash",))
+        self.assertEqual(receipt.control_generation, supervisor.control_generation)
+        self.assertEqual(await collect(receipt.handle), [init, assistant, result])
+        self.assertEqual(len(client.query_envelopes), 1)
+        self.assertIsNone(supervisor.active_run_id)
+        self.assertFalse(self.manager.has_pending_native_continuations("native-wake"))
+
+    async def test_native_admission_holds_permissions_before_idle_and_stream_delivery(self) -> None:
+        bindings = []; gates = []; entered = asyncio.Event(); allow = asyncio.Event(); receipts = []
+        options = {"_agentsdock_bind_provider_tool_owner": lambda *owner: bindings.append(owner),
+                   "_agentsdock_bind_native_admission_gate": gates.append}
+        async def admit(receipt):
+            receipts.append(receipt)
+            entered.set()
+            await allow.wait()
+            return True
+        _parent, client, supervisor, notification, init = await self._native_wake_fixture(admit, options=options)
+        gate = gates[-1]
+        self.assertIsNotNone(gate)
+        self.assertFalse(gate.is_set())
+        self.assertEqual(bindings[-1], ("", ""))
+        await client.emit(notification)
+        await client.emit(init)
+        await asyncio.wait_for(entered.wait(), 1)
+        receipt = receipts[0]
+        self.assertEqual(bindings[-1], (supervisor.ownership_token, receipt.run_id))
+        self.assertFalse(gate.is_set())
+        self.assertTrue(receipt.handle._messages.empty())
+        await client.emit({"type": "result", "result": "Complete"})
+        allow.set()
+        messages = await asyncio.wait_for(collect(receipt.handle), 1)
+        self.assertEqual(messages[0], init)
+        self.assertTrue(gate.is_set())
+        self.assertIsNone(gates[-1])
+
+    async def test_native_wake_requires_exact_task_provider_tool_and_fresh_init(self) -> None:
+        for invalid in ("task", "provider", "tool", "status", "no-init", "init-only"):
+            with self.subTest(invalid=invalid):
+                receipts = []
+                async def admit(receipt):
+                    receipts.append(receipt)
+                    return True
+                _parent, client, supervisor, notification, init = await self._native_wake_fixture(admit, chat=invalid)
+                if invalid == "task": notification["task_id"] = "unowned"
+                if invalid == "provider": notification["session_id"] = "another-session"
+                if invalid == "tool": notification["tool_use_id"] = "another-tool"
+                if invalid == "status": notification["status"] = "running"
+                if invalid != "init-only": await client.emit(notification)
+                if invalid != "no-init": await client.emit(init)
+                await client.emit({"type": "assistant", "message": "Unowned output"})
+                await asyncio.sleep(0)
+                await supervisor.get_context_usage()
+                self.assertEqual(receipts, [])
+                self.assertIsNone(supervisor.active_run_id)
+                await self.manager.evict(invalid, force=True)
+
+    async def test_native_admission_refusal_retires_connection_and_clears_gate(self) -> None:
+        receipts = []; bindings = []; gates = []
+        async def refuse(receipt):
+            receipts.append(receipt)
+            return False
+        options = {"_agentsdock_bind_provider_tool_owner": lambda *owner: bindings.append(owner),
+                   "_agentsdock_bind_native_admission_gate": gates.append}
+        _parent, client, supervisor, notification, init = await self._native_wake_fixture(refuse, options=options)
+        gate = gates[-1]
+        await client.emit(notification)
+        await client.emit(init)
+        for _ in range(50):
+            if client.disconnected: break
+            await asyncio.sleep(0)
+        self.assertTrue(client.disconnected)
+        self.assertIsNone(supervisor.active_run_id)
+        self.assertEqual(bindings[-1], ("", ""))
+        self.assertTrue(gate.is_set())
+        self.assertIsNone(gates[-1])
+        self.assertEqual(len(client.query_envelopes), 1)
+        with self.assertRaises(ClaudeSDKSupervisorClosed):
+            await collect(receipts[0].handle)
+
+    async def test_native_continuation_inherits_callback_for_child_tasks(self) -> None:
+        receipts = []
+        async def admit(receipt):
+            receipts.append(receipt)
+            return True
+        _parent, client, supervisor, notification, init = await self._native_wake_fixture(admit)
+        await client.emit(notification)
+        await client.emit(init)
+        await client.emit({"type": "system", "subtype": "task_started", "task_id": "second",
+                           "task_type": "local_bash", "session_id": "native-session", "tool_use_id": "tool-2"})
+        await client.emit({"type": "result", "result": "Spawned another child"})
+        await asyncio.sleep(0)
+        await supervisor.get_context_usage()
+        self.assertEqual(len(receipts), 1)
+        self.assertTrue(receipts[0].handle.done)
+        await client.emit({**notification, "task_id": "second", "tool_use_id": "tool-2"})
+        await client.emit(init)
+        await client.emit({"type": "result", "result": "Complete"})
+        await asyncio.sleep(0)
+        await supervisor.get_context_usage()
+        self.assertEqual(len(receipts), 2)
+        self.assertEqual(receipts[1].parent_run_id, receipts[0].run_id)
+        self.assertTrue(receipts[1].handle.done)
+        self.assertEqual(len(client.query_envelopes), 1)
+
+    async def test_stop_fences_task_provenance_before_normal_terminal_result(self) -> None:
+        receipts = []
+        async def admit(receipt):
+            receipts.append(receipt)
+            return True
+        handle = await self.manager.start_run(
+            "stopped", "Start", run_id="parent", options={}, configuration_key="same",
+            query_session_id="native-session", native_continuation_callback=admit,
+        )
+        client = self.factory.clients[-1]
+        supervisor = self.manager._supervisors["stopped"]
+        await client.emit({"type": "system", "subtype": "task_started", "task_id": "bash",
+                           "task_type": "local_bash", "session_id": "native-session", "tool_use_id": "tool"})
+        await asyncio.sleep(0)
+        self.assertTrue(await handle.interrupt())
+        await client.emit({"type": "result", "result": "Stopped"})
+        await asyncio.wait_for(collect(handle), 1)
+        await client.emit({"type": "system", "subtype": "task_notification", "task_id": "bash",
+                           "status": "completed", "session_id": "native-session", "tool_use_id": "tool"})
+        await client.emit({"type": "system", "subtype": "init", "session_id": "native-session"})
+        await asyncio.sleep(0)
+        await supervisor.get_context_usage()
+        self.assertEqual(receipts, [])
+        self.assertFalse(supervisor._native_task_origins)
+
+    async def test_new_user_run_consumes_older_task_without_reassigning_owner(self) -> None:
+        receipts = []
+        async def admit(receipt):
+            receipts.append(receipt)
+            return True
+        parent, client, supervisor, notification, init = await self._native_wake_fixture(admit)
+        self.assertTrue(parent.native_continuation_pending)
+        newer = await self.manager.start_run(
+            "native-wake", "New instruction", run_id="newer-user", options={}, configuration_key="same",
+            query_session_id="native-session", native_continuation_callback=admit,
+        )
+        await client.emit(notification)
+        await client.emit(init)
+        await client.emit({"type": "result", "result": "Handled by current user turn"})
+        messages = await asyncio.wait_for(collect(newer), 1)
+        self.assertIn(notification, messages)
+        self.assertEqual(receipts, [])
+        self.assertFalse(newer.native_continuation_pending)
+        await client.emit(init)
+        await asyncio.sleep(0)
+        await supervisor.get_context_usage()
+        self.assertEqual(receipts, [])
+        self.assertIsNone(supervisor.active_run_id)
+
+    async def test_native_admission_abort_releases_gate_and_fails_provisional_handle(self) -> None:
+        entered = asyncio.Event(); receipts = []; gates = []
+        async def admit(receipt):
+            receipts.append(receipt)
+            entered.set()
+            await asyncio.Event().wait()
+        options = {"_agentsdock_bind_native_admission_gate": gates.append}
+        _parent, client, supervisor, notification, init = await self._native_wake_fixture(admit, options=options)
+        gate = gates[-1]
+        await client.emit(notification)
+        await client.emit(init)
+        await asyncio.wait_for(entered.wait(), 1)
+        await asyncio.wait_for(supervisor.abort(), 2)
+        self.assertTrue(gate.is_set())
+        self.assertIsNone(gates[-1])
+        self.assertTrue(client.disconnected)
+        self.assertIsNone(supervisor.active_run_id)
+        with self.assertRaises(ClaudeSDKSupervisorClosed):
+            await collect(receipts[0].handle)
+
+    async def test_native_wake_foreign_init_retires_exact_connection(self) -> None:
+        receipts = []
+        async def admit(receipt):
+            receipts.append(receipt)
+            return True
+        _parent, client, supervisor, notification, init = await self._native_wake_fixture(admit)
+        await client.emit(notification)
+        await client.emit({**init, "session_id": "foreign-session"})
+        for _ in range(50):
+            if client.disconnected: break
+            await asyncio.sleep(0)
+        self.assertTrue(client.disconnected)
+        self.assertEqual(receipts, [])
+        self.assertIsNone(supervisor.active_run_id)
+
+    async def test_native_notification_before_parent_result_can_admit_next_init(self) -> None:
+        receipts = []
+        async def admit(receipt):
+            receipts.append(receipt)
+            return True
+        parent = await self.manager.start_run(
+            "early", "Start background work", run_id="parent", options={}, configuration_key="same",
+            query_session_id="native-session", native_continuation_callback=admit,
+        )
+        client = self.factory.clients[-1]
+        supervisor = self.manager._supervisors["early"]
+        started = {"type": "system", "subtype": "task_started", "task_id": "bash",
+                   "task_type": "local_bash", "session_id": "native-session", "tool_use_id": "tool"}
+        await client.emit(started)
+        await client.emit({**started, "subtype": "task_notification", "status": "completed"})
+        await client.emit({"type": "result", "result": "Parent complete"})
+        await asyncio.wait_for(collect(parent), 1)
+        self.assertTrue(parent.native_continuation_pending)
+        await client.emit({"type": "system", "subtype": "init", "session_id": "native-session"})
+        await client.emit({"type": "result", "result": "Native follow-up complete"})
+        await asyncio.sleep(0)
+        await supervisor.get_context_usage()
+        self.assertEqual(len(receipts), 1)
+        self.assertFalse(receipts[0].handle.native_continuation_pending)
+        self.assertEqual(len(client.query_envelopes), 1)
+
+    async def test_native_notification_consumed_by_active_init_cannot_wake_again(self) -> None:
+        receipts = []
+        async def admit(receipt):
+            receipts.append(receipt)
+            return True
+        handle = await self.manager.start_run(
+            "consumed", "Start", run_id="parent", options={}, configuration_key="same",
+            query_session_id="native-session", native_continuation_callback=admit,
+        )
+        client = self.factory.clients[-1]
+        supervisor = self.manager._supervisors["consumed"]
+        started = {"type": "system", "subtype": "task_started", "task_id": "bash",
+                   "task_type": "local_bash", "session_id": "native-session", "tool_use_id": "tool"}
+        init = {"type": "system", "subtype": "init", "session_id": "native-session"}
+        await client.emit(started)
+        await client.emit({**started, "subtype": "task_notification", "status": "completed"})
+        await client.emit(init)
+        await client.emit({"type": "assistant", "message": "Already handled the task"})
+        await client.emit({"type": "result", "result": "Complete"})
+        await asyncio.wait_for(collect(handle), 1)
+        self.assertFalse(handle.native_continuation_pending)
+        self.assertIsNone(supervisor._native_admission_gate)
+        await client.emit(init)
+        await asyncio.sleep(0)
+        await supervisor.get_context_usage()
+        self.assertEqual(receipts, [])
+
+    async def test_mixed_parent_task_batch_uses_latest_owner_not_notification_order(self) -> None:
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                receipts = []; selected = []
+                async def older(receipt):
+                    selected.append("older"); receipts.append(receipt)
+                    return True
+                async def newer(receipt):
+                    selected.append("newer"); receipts.append(receipt)
+                    return True
+                chat = f"mixed-{reverse}"
+                _parent, client, supervisor, old_notification, init = await self._native_wake_fixture(older, chat=chat)
+                current = await self.manager.start_run(
+                    chat, "Another authorized task", run_id="newer", options={}, configuration_key="same",
+                    query_session_id="native-session", native_continuation_callback=newer,
+                )
+                await client.emit({"type": "system", "subtype": "task_started", "task_id": "newer-task",
+                                   "task_type": "local_bash", "session_id": "native-session", "tool_use_id": "newer-tool"})
+                await client.emit({"type": "result", "result": "Started second task"})
+                await asyncio.wait_for(collect(current), 1)
+                new_notification = {**old_notification, "task_id": "newer-task", "tool_use_id": "newer-tool"}
+                notifications = [old_notification, new_notification]
+                if reverse: notifications.reverse()
+                for notification in notifications: await client.emit(notification)
+                await client.emit(init)
+                await client.emit({"type": "result", "result": "Both complete"})
+                await asyncio.sleep(0)
+                await supervisor.get_context_usage()
+                self.assertEqual(selected, ["newer"])
+                self.assertEqual(receipts[0].parent_run_id, "newer")
+                self.assertEqual(receipts[0].parent_run_ids, ("parent", "newer"))
+                self.assertEqual(set(receipts[0].task_ids), {"bash", "newer-task"})
+                self.assertEqual(receipts[0].task_id, "newer-task")
+                self.assertEqual(receipts[0].tool_use_id, "newer-tool")
+                self.assertFalse(client.disconnected)
+                self.assertTrue(receipts[0].handle.done)
+                self.assertEqual(len(client.query_envelopes), 2)
+
+    async def test_stale_generation_notification_cannot_admit_native_wake(self) -> None:
+        receipts = []
+        async def admit(receipt):
+            receipts.append(receipt)
+            return True
+        _parent, client, supervisor, notification, init = await self._native_wake_fixture(admit)
+        await supervisor._commands.put(_ReceivedMessage(supervisor._generation - 1, notification))
+        await client.emit(init)
+        await asyncio.sleep(0)
+        await supervisor.get_context_usage()
+        self.assertEqual(receipts, [])
+        self.assertIsNone(supervisor.active_run_id)
+
+    async def test_idle_result_consumes_notification_without_authorizing_later_init(self) -> None:
+        receipts = []
+        async def admit(receipt):
+            receipts.append(receipt)
+            return True
+        _parent, client, supervisor, notification, init = await self._native_wake_fixture(admit)
+        await client.emit(notification)
+        await client.emit({"type": "result", "is_error": True, "result": "Native wake declined"})
+        await client.emit(init)
+        await asyncio.sleep(0)
+        await supervisor.get_context_usage()
+        self.assertEqual(receipts, [])
+        self.assertIsNone(supervisor._native_admission_gate)
+        self.assertFalse(self.manager.has_pending_native_continuations("native-wake"))
+
     async def test_context_observation_cancel_or_timeout_keeps_native_background_owner(self) -> None:
         for cancel in (False, True):
             with self.subTest(cancel=cancel):
@@ -3119,7 +3477,446 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
         await manager.close_all()
 
 
+class ClaudeSDKNativeCronTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.factory = FakeFactory()
+        self.manager = ClaudeSDKSupervisorManager(client_factory=self.factory, idle_ttl_seconds=None)
+        self.receipts = []
+        self.parents = []
+
+    async def asyncTearDown(self):
+        await self.manager.close_all()
+
+    async def start(self, run="creator", chat="cron", options=None):
+        async def admit(receipt):
+            self.parents.append(run)
+            self.receipts.append(receipt)
+            return True
+        handle = await self.manager.start_run(chat, "Create schedule", run_id=run,
+            query_session_id="native", options=options or {}, configuration_key="same",
+            native_continuation_callback=admit)
+        await asyncio.wait_for(handle.wait_acknowledged(), 1)
+        self.client = self.factory.clients[-1]
+        self.supervisor = self.manager._supervisors[chat]
+        return handle
+
+    async def flush(self):
+        await asyncio.sleep(0)
+        await self.supervisor.get_context_usage()
+
+    async def tool(self, name, argument, result, *, tool_id="create-tool", error=False, child=False):
+        await self.client.emit({"type": "assistant", "session_id": "native",
+            "parent_tool_use_id": "child" if child else None,
+            "message": {"content": [{"type": "tool_use", "name": name, "id": tool_id, "input": argument}]}})
+        await self.client.emit({"type": "user", "session_id": "native", "tool_use_result": result,
+            "message": {"content": [{"type": "tool_result", "tool_use_id": tool_id, "is_error": error}]}})
+        await self.flush()
+
+    async def register(self, schedule="schedule", prompt="Check progress", recurring=True, **kwargs):
+        await self.tool("CronCreate", {"cron": "* * * * *", "prompt": prompt},
+                        {"id": schedule, "recurring": recurring, "durable": False}, **kwargs)
+
+    async def finish(self, handle, **extra):
+        await self.client.emit({"type": "result", "result": "Done", **extra})
+        await asyncio.wait_for(collect(handle), 1)
+
+    async def command(self, command_id="native-wake", provider="native"):
+        await self.client.emit({"type": "command_lifecycle", "state": "started",
+                               "command_uuid": command_id, "session_id": provider})
+        await self.flush()
+
+    async def hook(self, prompt="Check progress", prompt_id="native-prompt", **extra):
+        callback = self.client.options["hooks"]["UserPromptSubmit"][-1].hooks[0]
+        result = await callback({"hook_event_name": "UserPromptSubmit", "session_id": "native",
+            "prompt_id": prompt_id, "prompt": prompt, **extra}, None, {})
+        self.assertEqual(result, {})
+        await self.flush()
+
+    async def init(self, provider="native"):
+        await self.client.emit({"type": "system", "subtype": "init", "session_id": provider})
+        await self.flush()
+
+    async def wake(self, suffix="1"):
+        await self.command("wake-" + suffix)
+        await self.hook(prompt_id="independent-prompt-" + suffix)
+        await self.init()
+
+    async def test_one_shot_native_cron_gets_owned_run_without_another_query(self):
+        parent = await self.start()
+        await self.register(recurring=False)
+        await self.finish(parent)
+        self.assertTrue(parent.native_continuation_pending)
+        self.assertFalse(self.manager.has_pending_native_continuations("cron"))
+        self.assertFalse(self.manager.background_work_snapshot()[0][4])
+        await self.wake()
+        self.assertEqual(len(self.receipts), 1)
+        receipt = self.receipts[0]
+        self.assertEqual((receipt.wake_kind, receipt.schedule_id, receipt.schedule_ids),
+                         ("schedule", "schedule", ("schedule",)))
+        self.assertEqual(receipt.native_wake_id, "wake-1")
+        self.assertEqual((receipt.task_id, receipt.task_ids, receipt.task_type), ("", (), ""))
+        self.assertEqual(receipt.tool_use_id, "create-tool")
+        self.assertEqual(receipt.parent_run_id, "creator")
+        await self.client.emit({"type": "assistant", "message": "Cron output"})
+        await self.finish(receipt.handle)
+        self.assertFalse(self.supervisor._native_schedule_origins)
+        self.assertEqual(len(self.client.query_envelopes), 1)
+        await self.wake("2")
+        self.assertEqual(len(self.receipts), 1)
+
+    async def test_recurring_schedule_retains_creator_across_identical_human_input(self):
+        parent = await self.start()
+        await self.register()
+        await self.finish(parent)
+        human = await self.start("human")
+        await self.hook(prompt_id="human-prompt")
+        await self.finish(human)
+        # A replayed human command/hook never establishes a native wake.
+        await self.command(human.correlation_id)
+        await self.hook(prompt_id="human-prompt")
+        await self.init()
+        self.assertEqual(self.receipts, [])
+        for index in ("1", "2"):
+            await self.wake(index)
+            await self.finish(self.receipts[-1].handle)
+        self.assertEqual(self.parents, ["creator", "creator"])
+        self.assertEqual(len(self.client.query_envelopes), 2)
+
+    async def test_native_cron_requires_successful_root_creation_and_complete_fresh_proof(self):
+        cases = ("failed-create", "child-create", "no-create", "no-command", "no-hook", "wrong-prompt",
+                 "wrong-provider", "missing-prompt-id", "child-hook", "wrong-init", "hook-before-command")
+        for case in cases:
+            with self.subTest(case=case):
+                parent = await self.start(chat=case)
+                if case != "no-create":
+                    await self.register(error=case == "failed-create", child=case == "child-create")
+                await self.finish(parent)
+                if case == "hook-before-command":
+                    await self.hook()
+                if case != "no-command":
+                    await self.command()
+                if case not in {"no-hook", "hook-before-command"}:
+                    await self.hook(prompt="Different" if case == "wrong-prompt" else "Check progress",
+                        prompt_id="" if case == "missing-prompt-id" else "hook",
+                        **({"session_id": "other"} if case == "wrong-provider" else {}),
+                        **({"agent_id": "child"} if case == "child-hook" else {}))
+                await self.init("other" if case == "wrong-init" else "native")
+                self.assertEqual(self.receipts, [])
+                self.assertIsNone(self.supervisor.active_run_id)
+                await self.manager.evict(case, force=True)
+
+    async def test_duplicate_prompts_keep_candidate_ids_and_latest_original_authority(self):
+        first = await self.start("first")
+        await self.register("old", recurring=False)
+        await self.finish(first)
+        second = await self.start("second")
+        await self.register("new", recurring=False)
+        await self.finish(second)
+        await self.wake()
+        receipt = self.receipts[-1]
+        self.assertIsNone(receipt.schedule_id)
+        self.assertEqual(receipt.schedule_ids, ("old", "new"))
+        self.assertEqual(receipt.parent_run_ids, ("first", "second"))
+        self.assertEqual(self.parents, ["second"])
+        await self.finish(receipt.handle)
+        self.assertEqual(set(self.supervisor._native_schedule_origins), {"old", "new"})
+        deleter = await self.start("deleter")
+        await self.tool("CronDelete", {"id": "new"}, {"id": "new"}, tool_id="delete")
+        await self.finish(deleter)
+        await self.wake("2")
+        self.assertEqual(self.parents, ["second", "first"])
+        self.assertEqual(self.receipts[-1].schedule_id, "old")
+        self.assertFalse(self.supervisor._native_schedule_origins)
+        await self.finish(self.receipts[-1].handle)
+
+    async def test_only_matching_successful_delete_retires_future_schedule(self):
+        parent = await self.start()
+        await self.register()
+        await self.tool("CronDelete", {"id": "schedule"}, {"id": "schedule"}, error=True)
+        self.assertIn("schedule", self.supervisor._native_schedule_origins)
+        await self.tool("CronDelete", {"id": "schedule"}, {"id": "different"})
+        self.assertIn("schedule", self.supervisor._native_schedule_origins)
+        await self.tool("CronDelete", {"id": "schedule"}, {"id": "schedule"})
+        await self.finish(parent)
+        await self.wake()
+        self.assertEqual(self.receipts, [])
+
+    async def test_live_schedule_registrations_are_not_evicted_by_receipt_window(self):
+        from claude_sdk_client import CLAUDE_BACKGROUND_TASK_RECEIPT_LIMIT
+        parent = await self.start()
+        count = CLAUDE_BACKGROUND_TASK_RECEIPT_LIMIT + 1
+        for index in range(count):
+            await self.register(str(index), prompt="Check progress" if index == 0 else f"Prompt {index}",
+                                tool_id=f"tool-{index}")
+        await self.finish(parent)
+        self.assertEqual(len(self.supervisor._native_schedule_origins), count)
+        await self.wake()
+        self.assertEqual(self.receipts[-1].schedule_id, "0")
+        await self.finish(self.receipts[-1].handle)
+
+    async def test_clean_interrupt_preserves_registered_future_cron(self):
+        parent = await self.start()
+        await self.register()
+        await self.manager.interrupt("cron", run_id=parent.run_id)
+        await self.finish(parent, terminal_reason="interrupted")
+        self.assertIn("schedule", self.supervisor._native_schedule_origins)
+        await self.wake()
+        first = self.receipts[-1].handle
+        await self.manager.interrupt("cron", run_id=first.run_id)
+        await self.finish(first, terminal_reason="interrupted")
+        await self.wake("2")
+        self.assertEqual(self.parents, ["creator", "creator"])
+        await self.finish(self.receipts[-1].handle)
+        self.assertFalse(self.client.disconnected)
+
+    async def test_exact_cron_prompt_keeps_its_authority_with_concurrent_task_provenance(self):
+        parent = await self.start()
+        await self.register()
+        await self.finish(parent)
+        newer = await self.start("newer-task-parent")
+        task = {"type": "system", "subtype": "task_started", "task_id": "bash",
+                "task_type": "local_bash", "session_id": "native", "tool_use_id": "bash-tool"}
+        await self.client.emit(task)
+        await self.finish(newer)
+        await self.client.emit({**task, "subtype": "task_notification", "status": "completed"})
+        await self.wake()
+        receipt = self.receipts[-1]
+        self.assertEqual(self.parents, ["creator"])
+        self.assertEqual(receipt.parent_run_ids, ("creator", "newer-task-parent"))
+        self.assertEqual(receipt.concurrent_task_ids, ("bash",))
+        self.assertEqual(receipt.task_ids, ())
+        await self.finish(receipt.handle)
+        await self.init()
+        self.assertEqual(len(self.receipts), 1)
+
+    async def test_hook_proof_cannot_cross_command_result_or_connection(self):
+        parent = await self.start()
+        await self.register()
+        await self.finish(parent)
+        await self.command("old")
+        await self.hook()
+        await self.command("replacement")
+        await self.init()
+        self.assertEqual(self.receipts, [])
+        await self.command("result-before-init")
+        await self.hook(prompt_id="before-result")
+        await self.client.emit({"type": "result"})
+        await self.flush()
+        self.assertIsNotNone(self.supervisor._native_admission_gate)
+        await self.init()
+        self.assertEqual(self.receipts, [])
+        stale = self.client.options["hooks"]["UserPromptSubmit"][-1].hooks[0]
+        await self.manager.evict("cron", force=True)
+        parent = await self.start("replacement-creator")
+        await self.register()
+        await self.finish(parent)
+        await self.command()
+        await stale({"hook_event_name": "UserPromptSubmit", "session_id": "native",
+                     "prompt": "Check progress", "prompt_id": "stale"}, None, {})
+        await self.init()
+        self.assertEqual(self.receipts, [])
+        await self.wake("fresh")
+        self.assertEqual(self.parents, ["replacement-creator"])
+        await self.finish(self.receipts[-1].handle)
+
+    async def test_intervening_prompt_known_human_or_cancelled_command_invalidates_proof(self):
+        parent = await self.start()
+        await self.register()
+        await self.finish(parent)
+        for state in ("discarded", "refused", "cancelled", "known-human", "different-prompt"):
+            with self.subTest(state=state):
+                await self.command(state)
+                await self.hook(prompt_id="prompt-" + state)
+                if state == "known-human":
+                    await self.command(parent.correlation_id)
+                elif state == "different-prompt":
+                    await self.hook("Other input", prompt_id="other")
+                else:
+                    await self.client.emit({"type": "command_lifecycle", "state": state,
+                                           "command_uuid": state, "session_id": "native"})
+                await self.init()
+                self.assertEqual(self.receipts, [])
+
+    async def test_proven_native_wake_defers_unsubmitted_human_until_exact_native_result(self):
+        parent = await self.start()
+        await self.register()
+        await self.finish(parent)
+        supervisor = self.supervisor
+        await self.command()
+        await self.hook()
+        with self.assertRaises(ClaudeSDKNativeWakeDeferred) as pending:
+            await self.start("human")
+        self.assertFalse(pending.exception.delivery_uncertain)
+        self.assertIsNone(pending.exception.blocking_run_id)
+        self.assertEqual(pending.exception.native_wake_id, "native-wake")
+        self.assertFalse(pending.exception.settled.is_set())
+        self.assertEqual(len(self.client.query_envelopes), 1)
+        await self.init()
+        self.assertTrue(pending.exception.settled.is_set())
+        receipt = self.receipts[-1]
+        with self.assertRaises(ClaudeSDKNativeWakeDeferred) as adopted:
+            await self.start("human")
+        self.assertEqual(adopted.exception.blocking_run_id, receipt.run_id)
+        self.assertTrue(adopted.exception.settled.is_set())
+        self.assertEqual(len(self.client.query_envelopes), 1)
+        await self.finish(receipt.handle)
+        human = await self.start("human")
+        self.assertIs(self.supervisor, supervisor)
+        self.assertEqual(human.run_id, "human")
+        self.assertEqual(len(self.client.query_envelopes), 2)
+        self.assertFalse(self.client.disconnected)
+        await self.finish(human)
+
+    async def test_unsubmitted_human_wait_settles_when_native_proof_is_invalidated(self):
+        for reason in ("discarded", "refused", "cancelled", "completed", "failed", "result",
+                       "replacement", "different-prompt", "disconnect"):
+            with self.subTest(reason=reason):
+                parent = await self.start(chat=reason)
+                await self.register()
+                await self.finish(parent)
+                await self.command()
+                await self.hook()
+                with self.assertRaises(ClaudeSDKNativeWakeDeferred) as deferred:
+                    await self.start("human", chat=reason)
+                self.assertFalse(deferred.exception.settled.is_set())
+                if reason == "disconnect":
+                    await self.manager.evict(reason, force=True)
+                elif reason == "replacement":
+                    await self.command("replacement")
+                elif reason == "different-prompt":
+                    await self.hook("Other input", prompt_id="other")
+                elif reason == "result":
+                    await self.client.emit({"type": "result"})
+                    await self.flush()
+                else:
+                    await self.client.emit({"type": "command_lifecycle", "state": reason,
+                                           "command_uuid": "native-wake", "session_id": "native"})
+                    await self.flush()
+                self.assertTrue(deferred.exception.settled.is_set())
+                self.assertEqual(len(self.client.query_envelopes), 1)
+                if reason != "disconnect":
+                    human = await self.start("human", chat=reason)
+                    self.assertEqual(len(self.client.query_envelopes), 2)
+                    self.assertFalse(self.client.disconnected)
+                    await self.finish(human)
+
+    async def test_late_admission_deferral_keeps_connection_and_never_submits_query(self):
+        parent = await self.start()
+        await self.register()
+        await self.finish(parent)
+        await self.wake()
+        receipt = self.receipts[-1]
+        await self.finish(receipt.handle)
+        supervisor = self.supervisor
+        async def paused_admission(_owner):
+            raise ClaudeSDKNativeWakeDeferred(blocking_run_id=receipt.run_id,
+                                               native_wake_id=receipt.native_wake_id)
+        with self.assertRaises(ClaudeSDKNativeWakeDeferred):
+            await self.manager.start_run("cron", "Human input", run_id="human",
+                query_session_id="native", options={}, configuration_key="same",
+                on_supervisor_ready=paused_admission)
+        self.assertEqual(len(self.client.query_envelopes), 1)
+        self.assertIsNone(self.supervisor.active_run_id)
+        self.assertIs(self.manager._supervisors["cron"], supervisor)
+        self.assertFalse(self.client.disconnected)
+        human = await self.start("human")
+        self.assertEqual(len(self.client.query_envelopes), 2)
+        await self.finish(human)
+
+    async def test_already_submitted_human_keeps_proven_cron_progress_and_native_folded_result(self):
+        parent = await self.start()
+        await self.register(recurring=False)
+        await self.finish(parent)
+        self.client.auto_ack = False
+        human = await self.manager.start_run("cron", "Human input", run_id="human",
+            query_session_id="native", options={}, configuration_key="same")
+        await self.client.emit({"type": "assistant", "message": "Unproven old output"})
+        await self.command()
+        await self.hook()
+        await self.init()
+        cron = {"type": "assistant", "message": "Cron progress before human ACK"}
+        tool_result = {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "bash", "content": "Native tool output"}]}}
+        await self.client.emit(cron)
+        await self.client.emit(tool_result)
+        await self.client.emit(replay_ack("unrelated-input"))
+        await self.flush()
+        self.assertFalse(human.acknowledged)
+        self.assertFalse(human.done)
+        # The app's existing active human run can stream this native progress;
+        # neither transport acceptance nor progress invents the human's ACK.
+        init = await asyncio.wait_for(anext(human), 1)
+        self.assertEqual(init["subtype"], "init")
+        self.assertEqual(await asyncio.wait_for(anext(human), 1), cron)
+        self.assertEqual(await asyncio.wait_for(anext(human), 1), tool_result)
+        self.assertTrue(human._messages.empty())
+        await self.hook("Human input", prompt_id="human-hook")
+        await self.client.emit(replay_ack(human.correlation_id))
+        await asyncio.wait_for(human.wait_acknowledged(), 1)
+        final = {"type": "assistant", "message": "Combined human final"}
+        result = {"type": "result", "user_message_uuid": human.correlation_id, "result": "Combined final"}
+        await self.client.emit(final)
+        await self.client.emit(result)
+        self.assertEqual(await asyncio.wait_for(collect(human), 1), [final, result])
+        self.assertEqual(self.receipts, [])
+        self.assertEqual(len(self.client.query_envelopes), 2)
+        self.assertFalse(self.client.disconnected)
+
+    async def test_earlier_cron_result_cannot_finish_accepted_human_before_or_after_its_ack(self):
+        for result_before_ack in (True, False):
+            with self.subTest(result_before_ack=result_before_ack):
+                chat = str(result_before_ack)
+                parent = await self.start(chat=chat)
+                await self.register()
+                await self.finish(parent)
+                self.client.auto_ack = False
+                human = await self.manager.start_run(chat, "Human input", run_id="human",
+                    query_session_id="native", options={}, configuration_key="same")
+                await self.command()
+                await self.hook()
+                await self.init()
+                if not result_before_ack:
+                    await self.client.emit(replay_ack(human.correlation_id))
+                await self.client.emit({"type": "result", "user_message_uuid": "native-wake",
+                                       "result": "Earlier cron terminal"})
+                await self.flush()
+                self.assertFalse(human.done)
+                if result_before_ack:
+                    await self.client.emit(replay_ack(human.correlation_id))
+                await asyncio.wait_for(human.wait_acknowledged(), 1)
+                result = {"type": "result", "user_message_uuid": human.correlation_id}
+                await self.client.emit(result)
+                messages = await asyncio.wait_for(collect(human), 1)
+                self.assertEqual([item for item in messages if item.get("type") == "result"], [result])
+                self.assertEqual(len(self.client.query_envelopes), 2)
+
+
 class ClaudeSDKMCPControlTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cached_provider_commands_are_exact_loaded_scope_and_need_no_actor_rpc(self):
+        factory = FakeFactory()
+        manager = ClaudeSDKSupervisorManager(client_factory=factory, idle_ttl_seconds=None)
+        try:
+            self.assertIsNone(manager.get_cached_server_info("chat", configuration_key="profile"))
+            handle = await manager.start_run("chat", "Work", run_id="run", options={},
+                                             configuration_key="profile")
+            client = factory.clients[0]
+            calls_before = list(client.calls)
+            info, generation = manager.get_cached_server_info("chat", configuration_key="profile")
+            self.assertEqual(info, {"commands": [{"name": "review", "description": "Review the current changes",
+                                                   "argumentHint": "[focus]"}],
+                                    "_agentsdock_provider_commands_truncated": False})
+            self.assertEqual(generation, manager._supervisors["chat"].control_generation)
+            self.assertEqual(client.calls, calls_before)
+            self.assertIsNone(manager.get_cached_server_info("chat", configuration_key="other"))
+            info["commands"][0]["name"] = "changed"
+            self.assertEqual(client.server_info["commands"][0]["name"], "review")
+            await client.emit({"type": "result"})
+            await asyncio.wait_for(collect(handle), 1)
+            await manager.evict("chat", force=True)
+            self.assertIsNone(manager.get_cached_server_info("chat", configuration_key="profile"))
+        finally:
+            await manager.close_all()
+
     async def test_pinned_sdk_serializes_per_message_verbatim_metadata(self) -> None:
         from claude_agent_sdk import ClaudeSDKClient, Transport
 

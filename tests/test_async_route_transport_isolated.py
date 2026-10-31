@@ -116,7 +116,7 @@ class AsyncRouteProjectionTests(unittest.TestCase):
 
     def test_actual_started_and_current_metadata_project_only_delivery_messages(self):
         function = next(node for node in TREE.body if isinstance(node, ast.AsyncFunctionDef)
-                        and node.name == "_start_turn_locked")
+                        and node.name == "_start_turn_admission_locked")
         dictionaries = [node.value for node in ast.walk(function)
                         if isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict)
                         and any(isinstance(target, ast.Name) and target.id in {"started_payload", "run_metadata"}

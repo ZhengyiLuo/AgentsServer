@@ -197,6 +197,7 @@ class FakeClaudeManager:
         query_session_id: str | None = None,
         on_supervisor_ready: object | None = None,
         pending_mail_hint: Callable[[], str | None] | None = None,
+        native_continuation_callback: Any | None = None,
     ) -> FakeClaudeRun:
         self.start_calls.append(
             (
@@ -273,6 +274,7 @@ class FakeClaudeManagerFailingAfterOwnership(FakeClaudeManager):
         query_session_id: str | None = None,
         on_supervisor_ready: object | None = None,
         pending_mail_hint: Callable[[], str | None] | None = None,
+        native_continuation_callback: Any | None = None,
     ) -> FakeClaudeRun:
         self.start_calls.append(
             (chat_id, prompt, run_id, options, configuration_key, query_session_id)
@@ -299,6 +301,7 @@ class SequencedClaudeManager(FakeClaudeManager):
         query_session_id: str | None = None,
         on_supervisor_ready: object | None = None,
         pending_mail_hint: Callable[[], str | None] | None = None,
+        native_continuation_callback: Any | None = None,
     ) -> FakeClaudeRun:
         self.start_calls.append(
             (
@@ -346,6 +349,7 @@ class PermissionDuringStartManager(SequencedClaudeManager):
         query_session_id: str | None = None,
         on_supervisor_ready: object | None = None,
         pending_mail_hint: Callable[[], str | None] | None = None,
+        native_continuation_callback: Any | None = None,
     ) -> FakeClaudeRun:
         call_number = len(self.start_calls) + 1
         self.start_calls.append(
@@ -429,6 +433,7 @@ class BlockingCandidateStartManager(SequencedClaudeManager):
         query_session_id: str | None = None,
         on_supervisor_ready: object | None = None,
         pending_mail_hint: Callable[[], str | None] | None = None,
+        native_continuation_callback: Any | None = None,
     ) -> FakeClaudeRun:
         call_number = len(self.start_calls) + 1
         self.start_calls.append(
@@ -468,6 +473,7 @@ class SafeFailingCandidateStartManager(SequencedClaudeManager):
         query_session_id: str | None = None,
         on_supervisor_ready: object | None = None,
         pending_mail_hint: Callable[[], str | None] | None = None,
+        native_continuation_callback: Any | None = None,
     ) -> FakeClaudeRun:
         call_number = len(self.start_calls) + 1
         self.start_calls.append((

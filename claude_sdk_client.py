@@ -178,6 +178,19 @@ class ClaudeSDKRunActive(ClaudeSDKSupervisorError):
     safe_to_requeue = True
 
 
+class ClaudeSDKNativeWakeDeferred(ClaudeSDKRunActive):
+    """An observed native wake won before this human prompt was submitted."""
+
+    def __init__(self, *, blocking_run_id: str | None, native_wake_id: str | None,
+                 settled: asyncio.Event | None = None) -> None:
+        super().__init__("Claude is completing an already-started native wake before this prompt")
+        self.blocking_run_id = blocking_run_id
+        self.native_wake_id = native_wake_id
+        self.settled = settled if settled is not None else asyncio.Event()
+        if settled is None:
+            self.settled.set()
+
+
 class ClaudeSDKConfigurationConflict(ClaudeSDKSupervisorError):
     """A connected chat cannot be reconfigured while its run is active."""
 
@@ -629,6 +642,12 @@ def default_claude_sdk_client_factory(options: Any) -> ClaudeSDKClientProtocol:
                 except Exception:
                     pass  # Do not log raw initialization/account data.
 
+        def get_cached_server_info(self) -> dict[str, Any] | None:
+            # The pinned SDK's async getter reads this same initialization
+            # object. An admission callback may need it while holding the
+            # supervisor actor, so expose the read without another actor RPC.
+            return getattr(self._query, "_initialization_result", None)
+
         async def receive_messages(self) -> AsyncIterator[Any]:
             # SDK 0.2.130 drops local-command provenance and active_goal. Keep
             # those native fields without changing parsing of normal messages.
@@ -818,6 +837,20 @@ class ClaudeSDKRunHandle:
         self._background_task_reconciliation_consumed = False
         self._background_reconciliation_progress_observed = False
         self._background_reconciliation_aborted = False
+        self._native_continuation_callback: NativeContinuationCallback | None = None
+        self._provider_session_id: str | None = None
+        self._pending_mail_hint: Callable[[], str | None] | None = None
+        self._native_continuation_pending = False
+        self._native_owner_order = 0
+        self._is_native_continuation = False
+        self._native_wake_id: str | None = None
+        self._native_schedule_progress = False
+
+    @property
+    def native_continuation_pending(self) -> bool:
+        """Terminal snapshot: this connection can still emit an owned task wake."""
+
+        return self._native_continuation_pending
 
     @property
     def background_task_receipts(self) -> tuple[MappingProxyType, ...]:
@@ -922,6 +955,14 @@ class ClaudeSDKRunHandle:
         self._check_loop()
         return await self._interrupt_callback(self.run_id)
 
+    def set_pending_mail_hint(self, callback: Callable[[], str | None]) -> None:
+        """Bind the admitted native continuation's mailbox to its new run owner."""
+
+        self._check_loop()
+        if self.done:
+            raise ClaudeSDKSupervisorClosed("Cannot bind a completed Claude run")
+        self._pending_mail_hint = callback
+
     def __aiter__(self) -> ClaudeSDKRunHandle:
         return self
 
@@ -953,12 +994,13 @@ class ClaudeSDKRunHandle:
         return True
 
     def _mark_acknowledged_without_replay(self) -> None:
-        """Open the stream gate for a validated local slash command.
+        """Open the stream gate for an independently proven native owner.
 
         Claude Code local commands bypass the ordinary query replay loop and
         therefore do not emit the UUID-bearing ``UserMessage`` used as the
-        ownership fence for normal prompts. The actor calls this only after a
-        server-validated raw command has been accepted by ``client.query``.
+        ownership fence for normal prompts. Task notification turns similarly
+        have no submitted query UUID. The actor requires either a validated
+        accepted command or an exact same-connection task origin and new init.
         """
 
         if self._acknowledged:
@@ -998,6 +1040,65 @@ class ClaudeSDKSupervisorSnapshot:
     last_used_at: float
 
 
+@dataclass(frozen=True)
+class ClaudeSDKNativeContinuation:
+    """Observed native task wake; admission never submits another user prompt."""
+
+    chat_id: str
+    run_id: str
+    parent_run_id: str
+    parent_run_ids: tuple[str, ...]
+    provider_session_id: str
+    ownership_token: str
+    control_generation: str
+    task_id: str
+    task_ids: tuple[str, ...]
+    task_type: str
+    tool_use_id: str
+    handle: ClaudeSDKRunHandle
+    wake_kind: str = "task"
+    schedule_id: str | None = None
+    native_wake_id: str | None = None
+    schedule_ids: tuple[str, ...] = ()
+    concurrent_task_ids: tuple[str, ...] = ()
+
+
+NativeContinuationCallback = Callable[[ClaudeSDKNativeContinuation], Awaitable[bool]]
+
+
+@dataclass(frozen=True)
+class _NativeTaskOrigin:
+    parent_run_id: str
+    owner_order: int
+    provider_session_id: str
+    task_id: str
+    task_type: str
+    tool_use_id: str
+    callback: NativeContinuationCallback
+
+
+@dataclass(frozen=True)
+class _NativeScheduleOrigin(_NativeTaskOrigin):
+    schedule_id: str
+    prompt_digest: str
+    recurring: bool
+
+
+@dataclass(frozen=True)
+class _NativeScheduleTool:
+    name: str
+    argument: str
+    owner: _NativeTaskOrigin
+
+
+@dataclass(frozen=True)
+class _NativeSchedulePrompt:
+    generation: int
+    provider_session_id: str
+    prompt_id: str
+    prompt_digest: str
+
+
 @dataclass
 class _StartRun:
     prompt: str
@@ -1009,6 +1110,7 @@ class _StartRun:
     response: asyncio.Future[ClaudeSDKRunHandle]
     background_task_reconciliation: dict[str, Any] | None = None
     pending_mail_hint: Callable[[], str | None] | None = None
+    native_continuation_callback: NativeContinuationCallback | None = None
 
 
 @dataclass
@@ -1186,6 +1288,18 @@ class ClaudeSDKSupervisor:
         self._goal_stop_result: Any | None = None
         self._inflight_tasks: set[str] = set()
         self._live_background_tasks: set[str] = set()
+        self._native_task_origins: OrderedDict[str, _NativeTaskOrigin] = OrderedDict()
+        self._pending_native_wake: list[_NativeTaskOrigin] = []
+        self._native_schedule_origins: OrderedDict[str, _NativeScheduleOrigin] = OrderedDict()
+        self._native_schedule_tools: OrderedDict[str, _NativeScheduleTool] = OrderedDict()
+        self._native_schedule_command: tuple[str, str] | None = None
+        self._native_schedule_prompt: tuple[_NativeSchedulePrompt, str] | None = None
+        self._native_schedule_settled = asyncio.Event()
+        self._native_schedule_settled.set()
+        self._native_schedule_wake_ids: OrderedDict[str, None] = OrderedDict()
+        self._native_schedule_prompt_ids: OrderedDict[str, None] = OrderedDict()
+        self._native_admission_gate: asyncio.Event | None = None
+        self._native_owner_order = 0
         self._background_work_revision = 0
         self._background_reconciliation_hook: _BackgroundReconciliationHook | None = None
         self._pending_mail_hint_hook: _PendingMailHintHook | None = None
@@ -1283,6 +1397,7 @@ class ClaudeSDKSupervisor:
         on_supervisor_ready: SupervisorReadyCallback | None = None,
         background_task_reconciliation: dict[str, Any] | None = None,
         pending_mail_hint: Callable[[], str | None] | None = None,
+        native_continuation_callback: NativeContinuationCallback | None = None,
     ) -> ClaudeSDKRunHandle:
         """Submit one prompt and return after the SDK accepts ``query()``."""
 
@@ -1314,6 +1429,7 @@ class ClaudeSDKSupervisor:
                 response=response,
                 background_task_reconciliation=_normalized_task_reconciliation(background_task_reconciliation),
                 pending_mail_hint=pending_mail_hint,
+                native_continuation_callback=native_continuation_callback,
             )
         )
         return await asyncio.shield(response)
@@ -1666,6 +1782,32 @@ class ClaudeSDKSupervisor:
             client_options, background_hook = _connection_background_hook(self.options)
             self._background_reconciliation_hook = background_hook
             client_options, self._pending_mail_hint_hook = _connection_mail_hint_hook(client_options)
+            # Native SDK cron turns omit their user frame. The native prompt
+            # hook supplies its exact input before init, without changing it.
+            generation = self._generation + 1
+            async def observe_schedule_prompt(data, _tool_use_id, _context):
+                if (self._closed or self._generation != generation or self._commands is None
+                        or not isinstance(data, dict) or data.get("hook_event_name") != "UserPromptSubmit"
+                        or data.get("agent_id") or data.get("parent_tool_use_id")):
+                    return {}
+                provider_id = _receipt_field(data.get("session_id"))
+                prompt_id = _receipt_field(data.get("prompt_id"))
+                prompt = data.get("prompt")
+                if provider_id and prompt_id and isinstance(prompt, str):
+                    self._commands.put_nowait(_NativeSchedulePrompt(
+                        generation, provider_id, prompt_id,
+                        hashlib.sha256(prompt.encode("utf-8", "surrogatepass")).hexdigest(),
+                    ))
+                return {}
+            client_options = copy.copy(client_options)
+            hooks = (client_options.get("hooks") if isinstance(client_options, dict)
+                     else getattr(client_options, "hooks", None)) or {}
+            hooks = {**hooks, "UserPromptSubmit": [*hooks.get("UserPromptSubmit", []),
+                ClaudeSDKHookMatcher(None, [observe_schedule_prompt], timeout=5.0)]}
+            if isinstance(client_options, dict):
+                client_options["hooks"] = hooks
+            else:
+                client_options.hooks = hooks
             candidate = self._client_factory(client_options)
             client = await candidate if inspect.isawaitable(candidate) else candidate
             self._connecting_client = client
@@ -1779,6 +1921,11 @@ class ClaudeSDKSupervisor:
                 )
 
     async def _disconnect_current_client(self) -> None:
+        self._clear_native_continuations()
+        self._native_schedule_origins.clear()
+        self._native_schedule_tools.clear()
+        self._native_schedule_wake_ids.clear()
+        self._native_schedule_prompt_ids.clear()
         self._supports_send_now = False
         self._supports_command_lifecycle = False
         self._fail_pending_steer("Claude disconnected before confirming Force Send")
@@ -1798,6 +1945,7 @@ class ClaudeSDKSupervisor:
             self._background_reconciliation_hook.retire()
             self._background_reconciliation_hook = None
         bind_provider_tool_owner(self.options, "", "")
+        self._release_native_admission_gate()
         client = self._client
         receiver = self._receiver_task
         self._client = None
@@ -1811,12 +1959,14 @@ class ClaudeSDKSupervisor:
             await self._cancel_task_bounded(receiver)
 
     def _fail_active(self, error: BaseException) -> None:
+        self._clear_native_continuations()
         self._fail_pending_steer("Claude ended before confirming Force Send")
         self._fail_pending_goal("Claude ended before applying the queued goal")
         self._cancel_ack_timeout()
         active = self._active_run
         self._active_run = None
         bind_provider_tool_owner(self.options, "", "")
+        self._release_native_admission_gate()
         self._inflight_tasks.clear()
         self._goal_stop_run_id = None
         self._goal_stop_tasks.clear()
@@ -1921,11 +2071,21 @@ class ClaudeSDKSupervisor:
         if self._active_run is not None and not self._active_run.done:
             if not command.response.done():
                 command.response.set_exception(
-                    ClaudeSDKRunActive(
+                    ClaudeSDKNativeWakeDeferred(
+                        blocking_run_id=self._active_run.run_id,
+                        native_wake_id=self._active_run._native_wake_id,
+                    ) if self._active_run._is_native_continuation else ClaudeSDKRunActive(
                         f"Claude SDK chat {self.chat_id} already has active run "
                         f"{self._active_run.run_id}"
                     )
                 )
+            return
+        if self._pending_native_schedule_is_proven():
+            if not command.response.done():
+                command.response.set_exception(ClaudeSDKNativeWakeDeferred(
+                    blocking_run_id=None, native_wake_id=self._native_schedule_command[0],
+                    settled=self._native_schedule_settled,
+                ))
             return
         self._active_run = None
         raw_provider_command = command.validated_provider_command_name is not None
@@ -1975,6 +2135,7 @@ class ClaudeSDKSupervisor:
             return await self.interrupt(run_id=run_id)
 
         correlation_id = str(uuid.uuid4())
+        self._remember_native_schedule_command(correlation_id)
         handle = ClaudeSDKRunHandle(
             self.chat_id,
             command.run_id,
@@ -1983,6 +2144,15 @@ class ClaudeSDKSupervisor:
             interrupt_this_run,
         )
         handle._background_task_reconciliation = command.background_task_reconciliation
+        handle._native_continuation_callback = command.native_continuation_callback
+        handle._provider_session_id = _receipt_field(self._query_provider_session_id(command.query_session_id))
+        handle._pending_mail_hint = command.pending_mail_hint
+        self._native_owner_order += 1
+        handle._native_owner_order = self._native_owner_order
+        # A user submission consumes any pending native notification batch.
+        # Older still-running tasks retain their exact original authority.
+        self._pending_native_wake.clear()
+        self._clear_native_schedule_wake()
         self._active_run = handle
         self._superseded_query_ids.clear()
         self._current_query_id = correlation_id
@@ -2015,6 +2185,7 @@ class ClaudeSDKSupervisor:
             self.ownership_token,
             command.run_id,
         )
+        self._release_native_admission_gate()
         background_hook = self._background_reconciliation_hook
         mail_hook = self._pending_mail_hint_hook
         if mail_hook is not None:
@@ -2231,6 +2402,7 @@ class ClaudeSDKSupervisor:
             ))
             return
         command.generation = generation
+        self._clear_native_continuations()
         self._pending_goal_clear = command
         active._background_reconciliation_aborted = True
 
@@ -2298,6 +2470,7 @@ class ClaudeSDKSupervisor:
                 )
             return
         active._background_reconciliation_aborted = True
+        self._clear_native_continuations()
         stopping_queued_goal = self._pending_goal is not None or self._goal_stop_run_id == active.run_id
         if stopping_queued_goal:
             self._goal_stop_run_id = active.run_id
@@ -2825,9 +2998,317 @@ class ClaudeSDKSupervisor:
         if not command.response.done():
             command.response.set_result((value, generation))
 
+    def _hold_native_admission_gate(self) -> None:
+        if self._native_admission_gate is not None:
+            return
+        gate = asyncio.Event()
+        self._native_admission_gate = gate
+        binder = (self.options.get("_agentsdock_bind_native_admission_gate")
+                  if isinstance(self.options, dict)
+                  else getattr(self.options, "_agentsdock_bind_native_admission_gate", None))
+        if callable(binder):
+            binder(gate)
+
+    def _release_native_admission_gate(self) -> None:
+        gate = self._native_admission_gate
+        self._native_admission_gate = None
+        if gate is not None:
+            gate.set()
+        binder = (self.options.get("_agentsdock_bind_native_admission_gate")
+                  if isinstance(self.options, dict)
+                  else getattr(self.options, "_agentsdock_bind_native_admission_gate", None))
+        if callable(binder):
+            binder(None)
+
+    def _clear_native_continuations(self) -> None:
+        self._native_task_origins.clear()
+        self._pending_native_wake.clear()
+        self._native_schedule_tools.clear()
+        self._clear_native_schedule_wake()
+        if self._active_run is not None:
+            self._active_run._native_continuation_callback = None
+
+    def _observe_native_schedule_tool(self, message: Any, active: ClaudeSDKRunHandle) -> None:
+        """Record only an exact root CronCreate/CronDelete success receipt."""
+        if (_message_field(message, "parent_tool_use_id") or active._background_reconciliation_aborted
+                or active._native_continuation_callback is None or active._provider_session_id is None):
+            return
+        provider_id = _message_field(message, "session_id")
+        if provider_id is not None and provider_id != active._provider_session_id:
+            return
+        blocks = _message_field(message, "content")
+        if blocks is None:
+            blocks = _message_field(_message_field(message, "message", {}), "content")
+        if not isinstance(blocks, list):
+            return
+        kind = _message_type(message)
+        for block in blocks:
+            block_kind = _message_field(block, "type") or type(block).__name__
+            if kind in {"assistant", "assistantmessage"} and block_kind in {"tool_use", "ToolUseBlock"}:
+                name, tool_id = _message_field(block, "name"), _receipt_field(_message_field(block, "id"))
+                values = _message_field(block, "input", {})
+                if name not in {"CronCreate", "CronDelete"} or tool_id is None or not isinstance(values, dict):
+                    continue
+                argument = values.get("prompt" if name == "CronCreate" else "id")
+                if not isinstance(argument, str) or not argument:
+                    continue
+                if name == "CronCreate":
+                    argument = hashlib.sha256(argument.encode("utf-8", "surrogatepass")).hexdigest()
+                self._native_schedule_tools[tool_id] = _NativeScheduleTool(name, argument, _NativeTaskOrigin(
+                    active.run_id, active._native_owner_order, active._provider_session_id,
+                    "", "", tool_id, active._native_continuation_callback,
+                ))
+            elif kind in {"user", "usermessage"} and block_kind in {"tool_result", "ToolResultBlock"}:
+                tool_id = _receipt_field(_message_field(block, "tool_use_id"))
+                tool = self._native_schedule_tools.pop(tool_id, None)
+                result = _message_field(message, "tool_use_result")
+                if (tool is None or tool.owner.parent_run_id != active.run_id
+                        or _message_field(block, "is_error") is True or not isinstance(result, dict)):
+                    continue
+                schedule_id = _receipt_field(result.get("id"))
+                if schedule_id is None:
+                    continue
+                if tool.name == "CronDelete":
+                    if schedule_id == tool.argument:
+                        self._native_schedule_origins.pop(schedule_id, None)
+                    continue
+                if type(result.get("recurring")) is not bool:
+                    continue
+                owner = tool.owner
+                self._native_schedule_origins[schedule_id] = _NativeScheduleOrigin(
+                    owner.parent_run_id, owner.owner_order, owner.provider_session_id,
+                    "", "", tool_id, owner.callback, schedule_id, tool.argument, result["recurring"],
+                )
+
+    def _observe_native_schedule_prompt(self, command: _NativeSchedulePrompt) -> None:
+        if command.generation != self._generation or self._closed:
+            return
+        if command.prompt_id in self._native_schedule_prompt_ids:
+            return
+        self._native_schedule_prompt_ids[command.prompt_id] = None
+        while len(self._native_schedule_prompt_ids) > CLAUDE_BACKGROUND_TASK_RECEIPT_LIMIT:
+            self._native_schedule_prompt_ids.popitem(last=False)
+        # An acknowledged user owns new activity, including identical text.
+        # Before its ACK, the CLI can still be running an earlier native cron
+        # and fold the queued human input into that turn after a tool result.
+        if (self._active_run is not None and not self._active_run.done and self._active_run.acknowledged
+                or self._native_schedule_command is None
+                or self._native_schedule_command[1] != command.provider_session_id):
+            return
+        if self._native_schedule_prompt is not None:
+            # A second distinct hook invalidates the exact proof on which an
+            # unsubmitted human may already be waiting.
+            self._clear_native_schedule_wake()
+            return
+        if any(origin.provider_session_id == command.provider_session_id
+               and origin.prompt_digest == command.prompt_digest
+               for origin in self._native_schedule_origins.values()):
+            # Native prompt_id and command_uuid are independent UUIDs. Bind
+            # this one-use hook to the observed started command, not equality.
+            self._native_schedule_prompt = (command, self._native_schedule_command[0])
+
+    def _remember_native_schedule_command(self, command_id: str) -> None:
+        self._native_schedule_wake_ids[command_id] = None
+        while len(self._native_schedule_wake_ids) > CLAUDE_BACKGROUND_TASK_RECEIPT_LIMIT:
+            self._native_schedule_wake_ids.popitem(last=False)
+
+    def _clear_native_schedule_wake(self) -> None:
+        self._native_schedule_settled.set()
+        self._native_schedule_command = None
+        self._native_schedule_prompt = None
+
+    def _pending_native_schedule_is_proven(self) -> bool:
+        command, proof = self._native_schedule_command, self._native_schedule_prompt
+        return bool(command is not None and proof is not None and command[0] == proof[1]
+                    and command[1] == proof[0].provider_session_id
+                    and command[0] not in self._native_schedule_wake_ids
+                    and any(origin.provider_session_id == command[1]
+                            and origin.prompt_digest == proof[0].prompt_digest
+                            for origin in self._native_schedule_origins.values()))
+
+    def _consume_native_schedule_wake(self, provider_id: str | None) -> tuple[list[_NativeScheduleOrigin], str | None]:
+        command, proof = self._native_schedule_command, self._native_schedule_prompt
+        self._clear_native_schedule_wake()
+        if (command is None or proof is None or provider_id != command[1]
+                or provider_id != proof[0].provider_session_id or command[0] != proof[1]
+                or command[0] in self._native_schedule_wake_ids):
+            return [], None
+        prompt = proof[0]
+        origins = [origin for origin in self._native_schedule_origins.values()
+                   if origin.provider_session_id == provider_id and origin.prompt_digest == prompt.prompt_digest]
+        if not origins:
+            return [], None
+        self._remember_native_schedule_command(command[0])
+        # SDK mode exposes the prompt, not a schedule ID. Identical prompts
+        # retain all candidates; do not falsely consume a particular one-shot.
+        if len(origins) == 1 and not origins[0].recurring:
+            self._native_schedule_origins.pop(origins[0].schedule_id, None)
+        return origins, command[0]
+
+    def _observe_native_task_origin(self, message: Any, active: ClaudeSDKRunHandle) -> None:
+        subtype, task_id, task_type, _status = _task_lifecycle_fields(message)
+        if subtype == "task_notification":
+            origin = self._native_task_origins.get(task_id)
+            if origin is not None and origin.parent_run_id == active.run_id:
+                # A completion can beat its parent's final Result. Retain the
+                # exact receipt until the next init proves which turn owns it.
+                self._record_native_notification(message)
+            else:
+                # A newer user turn already owns this notification. It must
+                # not authorize another later run under the old instruction.
+                self._native_task_origins.pop(task_id, None)
+            return
+        if (subtype != "task_started" or task_type not in {*_DEFERRING_TASK_TYPES, "local_bash"}
+                or active._native_continuation_callback is None
+                or active._background_reconciliation_aborted):
+            return
+        data = _message_field(message, "data", {})
+        data = data if isinstance(data, dict) else {}
+        provider_id = _receipt_field(_message_field(message, "session_id") or data.get("session_id"))
+        tool_id = _receipt_field(_message_field(message, "tool_use_id") or data.get("tool_use_id"))
+        if (not _receipt_field(task_id) or not provider_id or not tool_id
+                or provider_id != active._provider_session_id):
+            return
+        if task_id in self._native_task_origins:
+            return
+        if len(self._native_task_origins) + len(self._pending_native_wake) >= CLAUDE_BACKGROUND_TASK_RECEIPT_LIMIT:
+            return
+        self._native_task_origins[task_id] = _NativeTaskOrigin(
+            active.run_id, active._native_owner_order, provider_id, task_id, task_type, tool_id,
+            active._native_continuation_callback,
+        )
+
+    def _record_native_notification(self, message: Any) -> None:
+        data = _message_field(message, "data", {})
+        data = data if isinstance(data, dict) else {}
+        _subtype, task_id, _task_type, status = _task_lifecycle_fields(message)
+        origin = self._native_task_origins.get(task_id)
+        provider_id = _receipt_field(_message_field(message, "session_id") or data.get("session_id"))
+        tool_id = _receipt_field(_message_field(message, "tool_use_id") or data.get("tool_use_id"))
+        if (origin is not None and status in _TERMINAL_TASK_STATUSES
+                and provider_id == origin.provider_session_id and tool_id == origin.tool_use_id):
+            self._native_task_origins.pop(task_id)
+            self._pending_native_wake.append(origin)
+
+    async def _receive_idle_native_wake(self, message: Any) -> None:
+        """Admit a fresh init only after an owned task or scheduled prompt."""
+
+        data = _message_field(message, "data", {})
+        data = data if isinstance(data, dict) else {}
+        provider_id = _receipt_field(_message_field(message, "session_id") or data.get("session_id"))
+        subtype, task_id, _task_type, status = _task_lifecycle_fields(message)
+        if _message_type(message) == "command_lifecycle":
+            command_id = _receipt_field(_message_field(message, "command_uuid"))
+            state = _message_field(message, "state")
+            if state == "started":
+                if not command_id or not provider_id or command_id in self._native_schedule_wake_ids:
+                    self._clear_native_schedule_wake()
+                else:
+                    if self._native_schedule_command != (command_id, provider_id):
+                        self._clear_native_schedule_wake()
+                        self._native_schedule_settled = asyncio.Event()
+                    self._native_schedule_command = (command_id, provider_id)
+            elif state in {"completed", "cancelled", "failed", "discarded", "refused"} and self._native_schedule_command == (command_id, provider_id):
+                self._clear_native_schedule_wake()
+            return
+        if self._is_result_message(message):
+            # A native turn that already ended without a matching init cannot
+            # leave notification credit for a later unrelated turn.
+            self._pending_native_wake.clear()
+            self._clear_native_schedule_wake()
+            if not self._native_task_origins and not self._native_schedule_origins:
+                self._release_native_admission_gate()
+            return
+        if subtype == "task_notification":
+            self._record_native_notification(message)
+            return
+        if subtype != "init":
+            return
+        schedules, native_wake_id = self._consume_native_schedule_wake(provider_id)
+        concurrent_tasks = self._pending_native_wake if schedules else []
+        origins = schedules or self._pending_native_wake
+        self._pending_native_wake = []
+        if not origins:
+            return
+        # Native notifications share the current conversation. If several
+        # already-authorized parents wake together, use the most recent owner
+        # just as notifications received during a newer human turn do. Keep
+        # every provenance ID, but never combine their capability grants.
+        first = max(origins, key=lambda item: item.owner_order)
+        if (provider_id != first.provider_session_id
+                or any(item.provider_session_id != provider_id for item in origins)):
+            # A different native session cannot inherit this chat's authority.
+            await self._disconnect_current_client()
+            return
+        assert self._loop is not None
+        generation = self.control_generation
+        if generation is None:
+            return
+        self._hold_native_admission_gate()
+        handle = ClaudeSDKRunHandle(
+            self.chat_id, f"run_{uuid.uuid4().hex[:16]}", str(uuid.uuid4()), self._loop,
+            lambda run_id: self.interrupt(run_id=run_id),
+        )
+        handle._native_continuation_callback = first.callback
+        handle._provider_session_id = provider_id
+        handle._is_native_continuation = True
+        handle._native_wake_id = native_wake_id
+        self._native_owner_order += 1
+        handle._native_owner_order = self._native_owner_order
+        handle._mark_accepted()
+        handle._mark_acknowledged_without_replay()
+        self._active_run = handle
+        self._current_query_id = None
+        self._superseded_query_ids.clear()
+        self._last_used_at = time.monotonic()
+        bind_provider_tool_owner(self.options, self.ownership_token, handle.run_id)
+        receipt = ClaudeSDKNativeContinuation(
+            self.chat_id, handle.run_id, first.parent_run_id,
+            tuple(dict.fromkeys(item.parent_run_id for item in sorted(
+                [*origins, *concurrent_tasks], key=lambda item: item.owner_order))),
+            provider_id,
+            self.ownership_token, generation, first.task_id,
+            tuple(item.task_id for item in origins if item.task_id), first.task_type, first.tool_use_id, handle,
+            wake_kind="schedule" if schedules else "task",
+            schedule_id=schedules[0].schedule_id if len(schedules) == 1 else None,
+            native_wake_id=native_wake_id,
+            schedule_ids=tuple(item.schedule_id for item in schedules),
+            concurrent_task_ids=tuple(item.task_id for item in concurrent_tasks),
+        )
+        try:
+            admitted = await asyncio.wait_for(first.callback(receipt), self._control_timeout_seconds)
+        except asyncio.CancelledError:
+            self._fail_active(ClaudeSDKSupervisorClosed("Claude native continuation admission was cancelled"))
+            raise
+        except Exception:
+            admitted = False
+            logger.warning("Claude native continuation admission failed for chat %s", self.chat_id)
+        if admitted is not True or self._closed:
+            self._fail_active(ClaudeSDKSupervisorClosed("Claude native continuation was not admitted"))
+            await self._disconnect_current_client()
+            return
+        mail_hook = self._pending_mail_hint_hook
+        if mail_hook is not None and callable(handle._pending_mail_hint):
+            mail_hook.bind(
+                handle, handle._pending_mail_hint, provider_id,
+                lambda: self._active_run is handle and not self._closed
+                and self.control_generation == generation and self._pending_mail_hint_hook is mail_hook,
+            )
+        self._release_native_admission_gate()
+
     async def _handle_received(self, command: _ReceivedMessage) -> None:
         if command.generation != self._generation:
             return
+        if self._active_run is not None and _message_type(command.message) == "command_lifecycle":
+            command_id = _receipt_field(_message_field(command.message, "command_uuid"))
+            if (not self._active_run.acknowledged
+                    and command_id != self._active_run.correlation_id):
+                # Query() may have written a human input just before the
+                # receiver observed a cron start. It is already delivered, so
+                # retain exact native proof without retrying that human input.
+                await self._receive_idle_native_wake(command.message)
+            elif command_id and _message_field(command.message, "state") in {"queued", "started"}:
+                self._remember_native_schedule_command(command_id)
         data = _message_field(command.message, "data", {})
         if _message_field(command.message, "subtype") == "init":
             capabilities = _message_field(command.message, "capabilities")
@@ -2867,7 +3348,24 @@ class ClaudeSDKSupervisor:
                 return
         active = self._active_run
         if active is None or active.done:
-            return
+            await self._receive_idle_native_wake(command.message)
+            active = self._active_run
+            if active is None or active.done:
+                return
+        if _message_field(command.message, "subtype") == "init" and active._provider_session_id is None:
+            active._provider_session_id = _receipt_field(
+                _message_field(command.message, "session_id")
+                or (data.get("session_id") if isinstance(data, dict) else None)
+            )
+        if _message_field(command.message, "subtype") == "init":
+            self._pending_native_wake.clear()
+            if not active.acknowledged:
+                provider_id = _receipt_field(_message_field(command.message, "session_id")
+                    or (data.get("session_id") if isinstance(data, dict) else None))
+                schedules, native_wake_id = self._consume_native_schedule_wake(provider_id)
+                active._native_schedule_progress = bool(schedules and provider_id == active._provider_session_id)
+                if active._native_schedule_progress and native_wake_id:
+                    self._superseded_query_ids.add(native_wake_id)
         if self._goal_stop_run_id == active.run_id:
             await self._receive_goal_stop(command.message, active)
             return
@@ -2931,16 +3429,33 @@ class ClaudeSDKSupervisor:
                 ))
                 return
             if active._acknowledge(command.message):
+                active._native_schedule_progress = False
                 self._cancel_ack_timeout()
                 return
+            if self._is_result_message(command.message):
+                active._native_schedule_progress = False
+                self._clear_native_schedule_wake()
+                return
             # The persistent stream may contain resumed-session output from
-            # before this query. Nothing owns the new run until its exact UUID
-            # is replayed by the CLI.
-            return
+            # before this query. Only a proven same-connection cron may add
+            # nonterminal progress to the accepted human run before its ACK.
+            # Keep both the exact human ACK and Result ownership fences.
+            if not active._native_schedule_progress:
+                return
+            if _message_type(command.message) == "user":
+                blocks = _message_field(command.message, "content")
+                if blocks is None:
+                    blocks = _message_field(_message_field(command.message, "message", {}), "content")
+                if not isinstance(blocks, list) or not any(
+                    (_message_field(block, "type") or type(block).__name__) in {"tool_result", "ToolResultBlock"}
+                    for block in blocks
+                ):
+                    return
 
         active._observe_reconciliation_progress(command.message)
         if self._pending_mail_hint_hook is not None:
             self._pending_mail_hint_hook.observe(command.message)
+        self._observe_native_schedule_tool(command.message, active)
         if self._is_result_message(command.message):
             result_query_id = str(_message_field(command.message, "user_message_uuid") or "")
             if goal is not None:
@@ -2977,6 +3492,18 @@ class ClaudeSDKSupervisor:
             forced_run_end = _result_forces_run_end(command.message)
             if had_inflight_tasks and not forced_run_end:
                 return
+            if forced_run_end:
+                self._clear_native_continuations()
+            if self._native_task_origins or self._pending_native_wake or self._native_schedule_origins:
+                # Permission/MCP callbacks run outside this actor. Fence them
+                # before the idle interval so a native wake cannot use stale
+                # authority while the server admits its new logical run.
+                self._hold_native_admission_gate()
+                active._native_continuation_pending = True
+            self._native_schedule_tools = OrderedDict(
+                (tool_id, tool) for tool_id, tool in self._native_schedule_tools.items()
+                if tool.owner.parent_run_id != active.run_id
+            )
             active._deliver(command.message)
             self._cancel_ack_timeout()
             active._finish(command.message)
@@ -3002,6 +3529,7 @@ class ClaudeSDKSupervisor:
             command.message
         )
         active._observe_background_task(command.message)
+        self._observe_native_task_origin(command.message, active)
         if task_id:
             if subtype == "task_started" and task_type in _DEFERRING_TASK_TYPES:
                 self._inflight_tasks.add(task_id)
@@ -3098,6 +3626,8 @@ class ClaudeSDKSupervisor:
                     await self._handle_mutate_mcp_server(command)
                 elif isinstance(command, _ReceivedMessage):
                     await self._handle_received(command)
+                elif isinstance(command, _NativeSchedulePrompt):
+                    self._observe_native_schedule_prompt(command)
                 elif isinstance(command, _AckTimeout):
                     await self._handle_ack_timeout(command)
                 elif isinstance(command, _ReceiverStopped):
@@ -3335,6 +3865,7 @@ class ClaudeSDKSupervisorManager:
         on_supervisor_ready: SupervisorReadyCallback | None = None,
         background_task_reconciliation: dict[str, Any] | None = None,
         pending_mail_hint: Callable[[], str | None] | None = None,
+        native_continuation_callback: NativeContinuationCallback | None = None,
     ) -> ClaudeSDKRunHandle:
         """Pin a chat through query acceptance, then return its run handle."""
 
@@ -3367,6 +3898,7 @@ class ClaudeSDKSupervisorManager:
                 on_supervisor_ready=on_supervisor_ready,
                 background_task_reconciliation=background_task_reconciliation,
                 pending_mail_hint=pending_mail_hint,
+                native_continuation_callback=native_continuation_callback,
             )
         except (ClaudeSDKUnavailable, asyncio.CancelledError):
             # A cold-connect failure or a Stop that cancels start_run before
@@ -3408,6 +3940,34 @@ class ClaudeSDKSupervisorManager:
             and supervisor.ownership_token == str(ownership_token)
             and supervisor.active_run_id == str(run_id)
         )
+
+    def has_pending_native_continuations(self, chat_id: str) -> bool:
+        """Whether explicit idle Stop must retire retained native task authority."""
+
+        supervisor = self._supervisors.get(str(chat_id))
+        return bool(
+            supervisor is not None and not supervisor.closed
+            and (supervisor._native_task_origins or supervisor._pending_native_wake)
+        )
+
+    def get_cached_server_info(
+        self, chat_id: str, *, configuration_key: str,
+    ) -> tuple[dict[str, Any], str] | None:
+        """Read commands from the exact loaded connection without actor RPC."""
+
+        supervisor = self._supervisors.get(str(chat_id))
+        if (supervisor is None or supervisor.closed or not supervisor._connected
+                or supervisor.configuration_key != str(configuration_key)):
+            return None
+        generation = supervisor.control_generation
+        getter = getattr(supervisor._client, "get_cached_server_info", None)
+        if generation is None or not callable(getter):
+            return None
+        try:
+            value = supervisor._provider_commands_from_server_info(getter())
+        except ClaudeSDKSupervisorError:
+            return None
+        return value, generation
 
     async def interrupt(self, chat_id: str, *, run_id: str | None = None) -> bool:
         self._bind_loop()

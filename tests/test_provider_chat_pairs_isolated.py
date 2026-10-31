@@ -562,7 +562,7 @@ class ChatPairTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_direct_acceptance_payload_contains_exact_recovery_snapshot(self):
         mutation = await self.stage()
-        started_function = next(node for node in TREE.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "_start_turn_locked")
+        started_function = next(node for node in TREE.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "_start_turn_admission_locked")
         payload = next(node.value for node in ast.walk(started_function) if isinstance(node, ast.Assign)
                        and any(isinstance(target, ast.Name) and target.id == "started_payload" for target in node.targets)
                        and isinstance(node.value, ast.Dict))
@@ -639,7 +639,7 @@ class ChatPairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.call("queued_turn_run_metadata", recovered)["conversation_id"], message["authorization_pair_id"])
 
     async def test_async_mode_issuance_is_negotiated_for_users_and_derived_for_deliveries(self):
-        function = next(node for node in TREE.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "_start_turn_locked")
+        function = next(node for node in TREE.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "_start_turn_admission_locked")
         issuance = next(node for node in ast.walk(function) if isinstance(node, ast.Call)
                         and isinstance(node.func, ast.Name) and node.func.id == "issue_cross_chat_capability")
         expression = next(keyword.value for keyword in issuance.keywords if keyword.arg == "async_route_v1")

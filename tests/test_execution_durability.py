@@ -157,8 +157,9 @@ class DurabilityTests(unittest.TestCase):
 
     def test_installer_flush_failure_precedes_native_mutation(self):
         source = (Path(__file__).resolve().parents[1] / "install.sh").read_text()
-        begin = source.index('if [[ "${EXECUTION_MODE:-legacy}" == "split" ]]; then\n  if ! execution_activation_command durability')
-        end = source.index('\nfi\n', begin) + len('\nfi\n')
+        end = source.index('# Materialize and link the new runtime')
+        begin = source.rfind('if [[ "${EXECUTION_MODE:-legacy}" == "split" ]]; then', 0, end)
+        self.assertGreaterEqual(begin, 0)
         events = self.base / "events"
         original = (self.runtime / "VERSION").read_bytes()
         child = subprocess.Popen(["/bin/sleep", "30"])
@@ -174,6 +175,7 @@ execution_stop_services() { kill "$PROVIDER_PID"; }
 ''' + source[begin:end]
             result = subprocess.run(["/bin/bash", "-c", script], env={**os.environ, "EVENTS": str(events), "PROVIDER_PID": str(child.pid)}, capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
+            self.assertIn("recording activation durability evidence", result.stderr)
             self.assertEqual(events.read_text().splitlines(), ["durability"])
             self.assertIsNone(child.poll())
             self.assertEqual((self.runtime / "VERSION").read_bytes(), original)

@@ -400,8 +400,8 @@ class ExecutionTransportServer:
             _done, pending = await asyncio.wait(tuple(self._connections), timeout=max(0.0, timeout))
             for task in pending:
                 task.cancel()
-        # A peer that stopped reading can prevent close() from flushing its
-        # buffered response indefinitely. Only explicit worker shutdown aborts
+        # A connected peer that stopped reading can prevent close() from
+        # flushing its buffered response. Explicit worker shutdown aborts
         # those remaining transports after the drain window.
         for writer in writers:
             connection = writer.get_extra_info("socket")
@@ -431,6 +431,16 @@ class ExecutionTransportServer:
         accepted = False
         disconnected = asyncio.Event()
         incoming: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=4)
+
+        def disconnect_ingress() -> None:
+            disconnected.set()
+            # The accepted application keeps its task and queued input, but
+            # a departed ingress no longer needs an IPC descriptor or output.
+            # Abort also retires a socket with buffered, undeliverable output.
+            connection = writer.get_extra_info("socket")
+            if connection is not None and connection.fileno() >= 0:
+                writer.transport.abort()
+
         try:
             opening = await asyncio.wait_for(_read_frame(reader), HANDSHAKE_TIMEOUT)
             _fields(opening, {"v", "kind", "secret", "scope"})
@@ -453,14 +463,18 @@ class ExecutionTransportServer:
                         if frame["kind"] != "event":
                             raise ExecutionTransportError("Unexpected private protocol message")
                         event = _event(frame["event"], encode=False, kind=kind, direction="request")
-                        await incoming.put(event)
                         if event["type"].endswith(".disconnect"):
+                            # Do not wait behind a full input queue to release
+                            # the dead socket. receive() still drains every
+                            # accepted body event before this disconnect.
+                            disconnect.update(event)
                             break
+                        await incoming.put(event)
                 except (ExecutionTransportError, asyncio.IncompleteReadError, ConnectionError, OSError):
                     pass
                 # Cancellation by our own completed app's cleanup is not peer
                 # disconnection: leave its bounded input drain enabled.
-                disconnected.set()
+                disconnect_ingress()
 
             async def receive() -> dict[str, Any]:
                 if not incoming.empty():
@@ -486,7 +500,7 @@ class ExecutionTransportServer:
                     try:
                         await _write_frame(writer, {"kind": "event", "event": event})
                     except (ConnectionError, OSError):
-                        disconnected.set()
+                        disconnect_ingress()
                         return
 
             pump = asyncio.create_task(read_events(), name="execution-request-reader")
@@ -516,8 +530,10 @@ class ExecutionTransportServer:
 
                 with suppress(asyncio.TimeoutError, ConnectionError, OSError):
                     await asyncio.wait_for(drain_ingress(), 1.0)
-            self._writers.discard(writer)
-            await _close_writer(writer)
+            try:
+                await _close_writer(writer)
+            finally:
+                self._writers.discard(writer)
 
 
 class ExecutionGateway:

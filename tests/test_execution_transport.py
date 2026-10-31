@@ -1,5 +1,7 @@
 import asyncio
+import base64
 from concurrent.futures import ThreadPoolExecutor
+import errno
 import json
 import os
 import struct
@@ -72,6 +74,19 @@ class ExecutionTransportTests(unittest.IsolatedAsyncioTestCase):
         await _write_frame(writer, {"kind": "open", "secret": self.secret if secret is None else secret,
                                     "scope": _scope(scope or http_scope(), encode=True)})
         return reader, writer
+
+    async def assert_descriptor_closed(self, writer, descriptor):
+        connection = writer.get_extra_info("socket")
+        self.assertGreaterEqual(descriptor, 0)
+
+        async def closed():
+            while connection.fileno() >= 0:
+                await asyncio.sleep(0.001)
+
+        await asyncio.wait_for(closed(), 1)
+        with self.assertRaises(OSError) as error:
+            os.fstat(descriptor)
+        self.assertEqual(error.exception.errno, errno.EBADF)
 
     async def test_exact_peer_headers_query_origin_and_no_injected_authority(self):
         captured = []
@@ -158,10 +173,13 @@ class ExecutionTransportTests(unittest.IsolatedAsyncioTestCase):
         committed = asyncio.Event()
         cancelled = []
         calls = []
+        owned_writers = []
 
         async def app(scope, receive, send):
             calls.append(True)
             await receive()
+            owned_writers.extend((writer, writer.get_extra_info("socket").fileno())
+                                 for writer in server._writers)
             await send({"type": "http.response.start", "status": 200})
             await send({"type": "http.response.body", "body": b"complete"})
             try:
@@ -190,11 +208,114 @@ class ExecutionTransportTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(server.active_connections, 1)
             self.assertFalse(committed.is_set())
             self.assertFalse(cancelled)
+            self.assertEqual(len(owned_writers), 1)
+            # The reply is delivered; its background work still owns the app
+            # task but must not retain an already disconnected IPC descriptor.
+            await self.assert_descriptor_closed(*owned_writers[0])
         finally:
             finish.set()
         await asyncio.wait_for(committed.wait(), 2)
         self.assertEqual(calls, [True])
         self.assertFalse(cancelled)
+
+    async def assert_disconnected_waiting_app_releases_socket(self, explicit):
+        accepted = asyncio.Event()
+        finish = asyncio.Event()
+        committed = asyncio.Event()
+        received = []
+        cancelled = []
+
+        async def app(scope, receive, send):
+            await receive()
+            accepted.set()
+            try:
+                await finish.wait()
+                while True:
+                    event = await receive()
+                    received.append(event)
+                    if event["type"] == "http.disconnect":
+                        break
+                await send({"type": "http.response.start", "status": 200})
+                await send({"type": "http.response.body", "body": b"committed"})
+                committed.set()
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+
+        server, _ = await self.start(app)
+        reader, writer = await self.raw_open()
+        try:
+            self.assertEqual((await _read_frame(reader))["kind"], "ready")
+            await _write_frame(writer, {"kind": "event", "event": {
+                "type": "http.request", "body": "", "more_body": True}})
+            await asyncio.wait_for(accepted.wait(), 1)
+            owned = next(iter(server._writers))
+            descriptor = owned.get_extra_info("socket").fileno()
+            os.fstat(descriptor)
+            if explicit:
+                # Fill the input queue before the validated disconnect. The
+                # app must receive these bytes after it resumes, in order.
+                for index in range(4):
+                    await _write_frame(writer, {"kind": "event", "event": {
+                        "type": "http.request",
+                        "body": base64.b64encode(str(index).encode()).decode(),
+                        "more_body": index < 3}})
+                await _write_frame(writer, {"kind": "event", "event": {"type": "http.disconnect"}})
+            else:
+                writer.close()
+                await writer.wait_closed()
+            await self.assert_descriptor_closed(owned, descriptor)
+            self.assertEqual(server.active_connections, 1)
+            self.assertFalse(committed.is_set())
+            self.assertFalse(cancelled)
+        finally:
+            finish.set()
+            writer.close()
+            await writer.wait_closed()
+        await asyncio.wait_for(committed.wait(), 1)
+        self.assertFalse(cancelled)
+        self.assertEqual(received[-1], {"type": "http.disconnect"})
+        self.assertEqual([event["body"] for event in received[:-1]],
+                         [str(index).encode() for index in range(4)] if explicit else [])
+
+    async def test_peer_eof_releases_socket_without_cancelling_accepted_app(self):
+        await self.assert_disconnected_waiting_app_releases_socket(explicit=False)
+
+    async def test_explicit_disconnect_releases_socket_with_full_input_queue(self):
+        await self.assert_disconnected_waiting_app_releases_socket(explicit=True)
+
+    async def test_peer_websocket_disconnect_releases_socket_and_preserves_close_reason(self):
+        accepted = asyncio.Event()
+        finish = asyncio.Event()
+        committed = asyncio.Event()
+        disconnect = {"type": "websocket.disconnect", "code": 4409, "reason": "Client leaving"}
+
+        async def app(scope, receive, send):
+            self.assertEqual(await receive(), {"type": "websocket.connect"})
+            accepted.set()
+            await finish.wait()
+            self.assertEqual(await receive(), disconnect)
+            committed.set()
+
+        server, _ = await self.start(app)
+        scope = http_scope(type="websocket", scheme="wss")
+        scope.pop("method")
+        reader, writer = await self.raw_open(scope=scope)
+        try:
+            self.assertEqual((await _read_frame(reader))["kind"], "ready")
+            await _write_frame(writer, {"kind": "event", "event": {"type": "websocket.connect"}})
+            await asyncio.wait_for(accepted.wait(), 1)
+            owned = next(iter(server._writers))
+            descriptor = owned.get_extra_info("socket").fileno()
+            await _write_frame(writer, {"kind": "event", "event": disconnect})
+            await self.assert_descriptor_closed(owned, descriptor)
+            self.assertEqual(server.active_connections, 1)
+            self.assertFalse(committed.is_set())
+        finally:
+            finish.set()
+            writer.close()
+            await writer.wait_closed()
+        await asyncio.wait_for(committed.wait(), 1)
 
     async def test_declared_trailers_are_forwarded_before_response_completes(self):
         body_sent = asyncio.Event()

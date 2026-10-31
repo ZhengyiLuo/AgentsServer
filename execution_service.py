@@ -16,6 +16,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import resource
 import socket
 import stat
 import time
@@ -33,6 +34,28 @@ from execution_transport import (
 
 PROTOCOL_VERSION = 1
 MAX_HEALTH_BYTES = 1024 * 1024
+FILE_DESCRIPTOR_HEADROOM = 8192
+
+
+def ensure_file_descriptor_headroom() -> None:
+    """Raise a small inherited soft limit without replacing OS/user policy.
+
+    In particular, existing launchd jobs can inherit only 256 descriptors for
+    all client sockets, provider pipes, databases and listeners combined. Do
+    this in the entrypoint so an updated runtime also fixes older service
+    definitions; never lower a larger limit or increase the hard limit.
+    """
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft == resource.RLIM_INFINITY or soft >= FILE_DESCRIPTOR_HEADROOM:
+            return
+        target = FILE_DESCRIPTOR_HEADROOM if hard == resource.RLIM_INFINITY else min(FILE_DESCRIPTOR_HEADROOM, hard)
+        if target > soft:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    except (OSError, ValueError) as error:
+        # A restricted host remains usable with its existing limit. Failure to
+        # gain headroom is diagnostic information, not a startup/admission gate.
+        logging.warning("Could not raise execution file-descriptor soft limit: %s", error)
 
 
 class ProcessLease:
@@ -374,6 +397,7 @@ def main() -> int:
         parser.error("Invalid listener port")
     if args.role == "gateway" and args.application != "agent_server:app":
         parser.error("Only workers load applications")
+    ensure_file_descriptor_headroom()
     try:
         with ProcessLease(args.runtime_dir, args.role) as lease:
             asyncio.run(serve_worker(args, lease) if args.role == "worker" else serve_gateway(args, lease))

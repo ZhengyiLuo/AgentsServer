@@ -52,7 +52,7 @@ import unicodedata
 import uuid
 import weakref
 from collections import Counter, OrderedDict, defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager, suppress
 from contextvars import ContextVar, copy_context
 from dataclasses import dataclass
@@ -16732,6 +16732,10 @@ HANDOFF_DIGEST_FINALIZING: set[str] = set()
 RUNTIME_DIAGNOSTICS: dict[str, dict[str, Any]] = {}
 RUNTIME_DIAGNOSTICS_LOCK = threading.RLock()
 RUNTIME_DIAGNOSTIC_GENERATIONS: dict[str, int] = {}
+# Only overlapping work is shared; completed catalogs are never cached here.
+RUNTIME_DIAGNOSTIC_PROBES: dict[tuple[str, int], Future[dict[str, Any]]] = {}
+RUNTIME_DIAGNOSTIC_REVISION = 0
+RUNTIME_CATALOG_TASKS: dict[bool, tuple[tuple[Any, ...] | None, asyncio.Task[dict[str, Any]]]] = {}
 CODEX_MODEL_MIGRATION_TARGET = "gpt-6-luna"
 ABANDONED_FORK_PROVIDER_THREADS: set[str] = set()
 ABANDONED_FORK_PROVIDER_THREADS_LOCK = asyncio.Lock()
@@ -59986,7 +59990,8 @@ def probe_runtime(backend: str) -> dict[str, Any]:
     return runtime_diagnostic_payload(backend, "error", installed=True, authenticated=None, version=version)
 
 
-def store_runtime_diagnostic(diagnostic: dict[str, Any], *, preserve_last_error: bool = True) -> dict[str, Any]:
+def store_runtime_diagnostic(diagnostic: dict[str, Any], *, preserve_last_error: bool = True, from_probe: bool = False) -> dict[str, Any]:
+    global RUNTIME_DIAGNOSTIC_REVISION
     backend = str(diagnostic.get("backend") or "")
     with RUNTIME_DIAGNOSTICS_LOCK:
         previous = RUNTIME_DIAGNOSTICS.get(backend) or {}
@@ -59995,6 +60000,8 @@ def store_runtime_diagnostic(diagnostic: dict[str, Any], *, preserve_last_error:
             current["last_error"] = previous.get("last_error")
             current["last_error_at"] = previous.get("last_error_at")
         RUNTIME_DIAGNOSTICS[backend] = current
+        if not from_probe:
+            RUNTIME_DIAGNOSTIC_REVISION += 1
         RUNTIME_DIAGNOSTIC_GENERATIONS[backend] = (
             RUNTIME_DIAGNOSTIC_GENERATIONS.get(backend, 0) + 1
         )
@@ -60014,34 +60021,70 @@ def expire_codex_login_diagnostic() -> None:
         store_runtime_diagnostic(current)
 
 
+def runtime_diagnostic_budget_fallback(backend: str) -> dict[str, Any]:
+    # Do not cache an incomplete check or make old evidence look fresh.
+    # In particular, budget starvation must not mark another provider
+    # missing, incompatible, or signed out for the diagnostic cache TTL.
+    with RUNTIME_DIAGNOSTICS_LOCK:
+        current = dict(RUNTIME_DIAGNOSTICS.get(backend) or {})
+    if current:
+        return current
+    return runtime_diagnostic_payload(
+        backend, "unknown", installed=None, authenticated=None,
+        message=(
+            f"{runtime_display_name(backend)} check did not finish before the "
+            "runtime refresh deadline. Try Re-check again."
+        ),
+    )
+
+
 def runtime_diagnostic(backend: str, *, force: bool = False) -> dict[str, Any]:
     with RUNTIME_DIAGNOSTICS_LOCK:
         cached = dict(RUNTIME_DIAGNOSTICS.get(backend) or {})
         generation = RUNTIME_DIAGNOSTIC_GENERATIONS.get(backend, 0)
-    checked_at = cached.get("_installation_checked_at_epoch", cached.get("checked_at_epoch"))
-    if backend == BACKEND_CODEX and cached.get("_codex_auth_mode_checked_at_epoch") is not None:
-        checked_at = min(checked_at or 0, cached["_codex_auth_mode_checked_at_epoch"])
-    if not force and isinstance(checked_at, (int, float)) and time.time() - checked_at < RUNTIME_DIAGNOSTIC_TTL_SECONDS:
-        return cached
+        checked_at = cached.get("_installation_checked_at_epoch", cached.get("checked_at_epoch"))
+        if backend == BACKEND_CODEX and cached.get("_codex_auth_mode_checked_at_epoch") is not None:
+            checked_at = min(checked_at or 0, cached["_codex_auth_mode_checked_at_epoch"])
+        if not force and isinstance(checked_at, (int, float)) and time.time() - checked_at < RUNTIME_DIAGNOSTIC_TTL_SECONDS:
+            return cached
+        if runtime_catalog_budget_expired():
+            return runtime_diagnostic_budget_fallback(backend)
+        # A changed login/runtime generation must not join a pre-change probe.
+        key = (backend, generation)
+        pending = RUNTIME_DIAGNOSTIC_PROBES.get(key)
+        owner = pending is None
+        if pending is None:
+            pending = Future()
+            RUNTIME_DIAGNOSTIC_PROBES[key] = pending
+    if not owner:
+        deadline = RUNTIME_CATALOG_DEADLINE.get()
+        try:
+            return dict(pending.result(timeout=None if deadline is None else max(0.0, deadline - time.monotonic())))
+        except TimeoutError:
+            if pending.done():
+                return dict(pending.result())  # Preserve an owner's own exception.
+            return runtime_diagnostic_budget_fallback(backend)
+    try:
+        result = probe_runtime_diagnostic(backend, cached, generation)
+    except BaseException as exc:
+        with RUNTIME_DIAGNOSTICS_LOCK:
+            RUNTIME_DIAGNOSTIC_PROBES.pop(key, None)
+            pending.set_exception(exc)
+        raise
+    else:
+        with RUNTIME_DIAGNOSTICS_LOCK:
+            RUNTIME_DIAGNOSTIC_PROBES.pop(key, None)
+            pending.set_result(result)
+        return dict(result)
+
+
+def probe_runtime_diagnostic(backend: str, cached: dict[str, Any], generation: int) -> dict[str, Any]:
     try:
         if runtime_catalog_budget_expired():
             raise RuntimeCatalogBudgetExpired()
         probed = probe_runtime(backend)
     except RuntimeCatalogBudgetExpired:
-        # Do not cache an incomplete check or make old evidence look fresh.
-        # In particular, budget starvation must not mark another provider
-        # missing, incompatible, or signed out for the diagnostic cache TTL.
-        with RUNTIME_DIAGNOSTICS_LOCK:
-            current = dict(RUNTIME_DIAGNOSTICS.get(backend) or {})
-        if current:
-            return current
-        return runtime_diagnostic_payload(
-            backend, "unknown", installed=None, authenticated=None,
-            message=(
-                f"{runtime_display_name(backend)} check did not finish before the "
-                "runtime refresh deadline. Try Re-check again."
-            ),
-        )
+        return runtime_diagnostic_budget_fallback(backend)
     with RUNTIME_DIAGNOSTICS_LOCK:
         if RUNTIME_DIAGNOSTIC_GENERATIONS.get(backend, 0) != generation:
             current = dict(RUNTIME_DIAGNOSTICS.get(backend) or {})
@@ -60062,7 +60105,7 @@ def runtime_diagnostic(backend: str, *, force: bool = False) -> dict[str, Any]:
                 "version": probed.get("version"),
                 "_installation_checked_at_epoch": probed.get("checked_at_epoch"),
             }
-        return store_runtime_diagnostic(probed)
+        return store_runtime_diagnostic(probed, from_probe=True)
 
 
 def refresh_runtime_diagnostics(*, force: bool = False) -> dict[str, dict[str, Any]]:
@@ -88743,12 +88786,55 @@ async def host_diagnostics(limit: int = 40) -> dict[str, Any]:
     }
 
 
+def runtime_catalog_scope() -> tuple[Any, ...]:
+    # External auth/runtime evidence and saved endpoint changes invalidate only
+    # in-flight sharing. A probe publishing its own result does not fork work.
+    with RUNTIME_DIAGNOSTICS_LOCK:
+        revision = RUNTIME_DIAGNOSTIC_REVISION
+    paths = [CODEX_PROVIDER_STORE.root / "settings.json", *(
+        PROVIDER_CONNECTION_STORE.root / f"{backend}.json"
+        for backend in sorted(VALID_BACKENDS) if backend != BACKEND_CODEX
+    )]
+    login_revision = codex_auth.native_login_revision(
+        codex_app_server_env(), cwd=existing_cwd(DEFAULT_CWD),
+    )
+    return revision, login_revision, *(file_signature(str(path)) for path in paths)
+
+
+async def refresh_runtime_catalog(refresh: bool) -> dict[str, Any]:
+    task = asyncio.current_task()
+    try:
+        if refresh:
+            await refresh_codex_app_server_binary(force=True)
+            await refresh_codex_app_server_login(source="catalog_refresh")
+        # Preflight can itself observe a new login. Joiners during preflight
+        # share it; subsequent joiners compare against its resulting scope.
+        scope = await asyncio.to_thread(runtime_catalog_scope)
+        pending = RUNTIME_CATALOG_TASKS.get(refresh)
+        if pending is not None and pending[1] is task:
+            RUNTIME_CATALOG_TASKS[refresh] = (scope, task)
+        return await asyncio.to_thread(discover_runtime_catalog, force_runtime_probe=refresh)
+    finally:
+        pending = RUNTIME_CATALOG_TASKS.get(refresh)
+        if pending is not None and pending[1] is task:
+            RUNTIME_CATALOG_TASKS.pop(refresh, None)
+
+
 @app.get("/api/runtime/catalog")
 async def runtime_catalog(refresh: bool = False) -> dict[str, Any]:
-    if refresh:
-        await refresh_codex_app_server_binary(force=True)
-        await refresh_codex_app_server_login(source="catalog_refresh")
-    return await asyncio.to_thread(discover_runtime_catalog, force_runtime_probe=refresh)
+    # Passive reads may share a manual recheck. A manual recheck must not be
+    # satisfied by a passive read's cached diagnostics, or wait out its budget.
+    scope = await asyncio.to_thread(runtime_catalog_scope)
+    task = next((pending[1] for mode in (True, refresh)
+                 if (pending := RUNTIME_CATALOG_TASKS.get(mode)) is not None
+                 and pending[0] in (None, scope)), None)
+    if task is None:
+        task = asyncio.create_task(refresh_runtime_catalog(refresh))
+        RUNTIME_CATALOG_TASKS[refresh] = (None, task)
+        # A disconnected client must neither cancel shared work nor leave an
+        # unobserved failure when all its waiters have gone away.
+        task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+    return copy.deepcopy(await asyncio.shield(task))
 
 
 @app.get("/api/runtime/usage")

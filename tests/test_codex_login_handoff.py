@@ -124,10 +124,13 @@ class LoginHandoffTests(binary.BinaryRefreshTests):
     def catalog_app(self):
         source = Path(__file__).resolve().parents[1] / "agent_server.py"
         nodes = [node for node in ast.parse(source.read_text()).body
-                 if isinstance(node, ast.AsyncFunctionDef) and node.name in {"runtime_catalog", "reload_codex_login"}]
+                 if isinstance(node, ast.AsyncFunctionDef) and node.name in {"runtime_catalog", "refresh_runtime_catalog", "reload_codex_login"}]
         for node in nodes:
             node.decorator_list = []
         module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *nodes], type_ignores=[])
+        self.ns["RUNTIME_CATALOG_TASKS"] = {}
+        self.ns["runtime_catalog_scope"] = lambda: ()
+        self.ns["copy"] = __import__("copy")
         self.ns["discover_runtime_catalog"] = lambda **kwargs: {"backends": {}, "forced": kwargs["force_runtime_probe"]}
         exec(compile(ast.fix_missing_locations(module), str(source), "exec"), self.ns)
         app = FastAPI()

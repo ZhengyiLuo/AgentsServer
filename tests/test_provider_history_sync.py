@@ -929,6 +929,55 @@ class UnsyncedHistoryItemsTests(unittest.TestCase):
         self.assertEqual(fresh, [user("external message")])
         self.assertEqual(consumed_seq, 7)
 
+    def test_goal_resume_control_boundary_does_not_duplicate_steered_history(self) -> None:
+        prompt = "@Target Keep the original work running"
+        events = [
+            {"seq": 1, "type": "turn_finished", "run_id": "run_previous"},
+            {"seq": 2, "type": "turn_started", "backend": "codex", "purpose": "codex_goal_resume",
+             "run_id": "run_goal", "message": "Resuming the persistent Codex goal."},
+            {"seq": 3, "type": "reasoning_summary", "phase": "commentary", "backend": "codex",
+             "run_id": "run_goal", "item_id": "msg_progress", "text": "Starting the work"},
+            {"seq": 4, "type": "turn_steered", "backend": "codex", "purpose": "codex_goal_resume",
+             "run_id": "run_goal", "provider_turn_id": "turn_goal", "queued_id": "queued_user",
+             "native_steer": True, "native_goal_steer": True, "provider_user_authored": True, "prompt": prompt},
+            {"seq": 5, "type": "assistant_text", "phase": "final_answer", "backend": "codex",
+             "run_id": "run_goal", "item_id": "msg_final", "provider_turn_id": "turn_goal", "text": "Done"},
+            {"seq": 6, "type": "turn_finished", "run_id": "run_goal"},
+        ]
+        native = [
+            {**assistant("Starting the work"), "provider_origin": {"provider": "codex", "kind": "assistant", "event_id": "msg_progress"}},
+            {**user(prompt), "provider_user_authored": True,
+             "provider_origin": {"provider": "codex", "kind": "user", "turn_id": "turn_goal"}},
+            {**assistant("Done"), "provider_origin": {"provider": "codex", "kind": "assistant", "event_id": "msg_final"}},
+        ]
+        # An equal-text later exchange is a distinct occurrence, not another
+        # copy to delete merely because it matches an earlier goal message.
+        external = [user(prompt), assistant("Done")]
+        with tempfile.TemporaryDirectory() as tempdir:
+            event_path = Path(tempdir) / "events.jsonl"
+            event_path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            with patch.object(agent_server, "events_path", return_value=event_path):
+                fresh, consumed = agent_server.reconcile_cursor_history_items(
+                    "chat-x", native + external, timeline_after_seq=1, timeline_through_seq=6)
+        self.assertEqual(fresh, external)
+        self.assertEqual(consumed, 6)
+
+    def test_goal_history_scanner_keeps_real_user_input_and_attachment_credits(self) -> None:
+        events = [
+            {"seq": 1, "type": "turn_started", "backend": "codex", "purpose": "codex_goal_resume",
+             "prompt": "A real request"},
+            {"seq": 2, "type": "turn_started", "backend": "codex", "purpose": "codex_goal_resume",
+             "prompt": "", "file_ids": ["image"]},
+            {"seq": 3, "type": "turn_started", "backend": "codex", "prompt": ""},
+        ]
+        with tempfile.TemporaryDirectory() as tempdir:
+            event_path = Path(tempdir) / "events.jsonl"
+            event_path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            with patch.object(agent_server, "events_path", return_value=event_path):
+                keys, _has_messages, _truncated = agent_server.history_timeline_message_keys(
+                    "chat-x", timeline_after_seq=0, timeline_through_seq=3, tail=False, include_imported=False)
+        self.assertEqual([seq for seq, _key in keys], [1, 2, 3])
+
     def test_cursor_ownership_credit_overflow_advances_across_front_windows(
         self,
     ) -> None:

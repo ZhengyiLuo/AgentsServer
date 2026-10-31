@@ -2360,6 +2360,37 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_rejected_goal_skill_survives_durable_queue_recovery(self) -> None:
+        selection = {"id": "pcmd_" + "a" * 32, "revision": "pcmdrev_" + "b" * 32}
+        selected = {
+            "queued_id": "queued-skill", "prompt": "/review Check the result",
+            "file_ids": [], "backend": "codex", "skill_selection": selection,
+            "client_capabilities": ["codex_interactive_v1", "codex_goal_steer_v1"],
+            "_durable": True,
+        }
+        append_batch = AsyncMock(return_value=[])
+        with patch.object(agent_server, "append_durable_event_batch", append_batch):
+            await agent_server.requeue_native_steer_after_safe_rejection(
+                "chat-1", selected, selected_index=0,
+                selected_predecessor_id=None, selected_successor_id=None,
+                preserve_pause=True,
+            )
+        specs = append_batch.await_args.args[1]
+        events = [{"seq": index, "id": f"event-{index}", "type": kind,
+                   "session_id": "chat-1", "ts": "2026-10-18T08:00:00Z", **payload}
+                  for index, (kind, payload) in enumerate(specs, 1)]
+        agent_server.QUEUED_TURNS.clear()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "events.jsonl"
+            path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            with patch.object(agent_server, "events_path", return_value=path):
+                self.assertEqual(rebuild_queued_turns_from_events(), 1)
+        restored = agent_server.QUEUED_TURNS["chat-1"][0]
+        self.assertEqual(restored["skill_selection"], selection)
+        self.assertEqual(restored["prompt"], selected["prompt"])
+        self.assertEqual(restored["client_capabilities"], selected["client_capabilities"])
+        self.assertTrue(restored["_paused_after_stop"])
+
     async def test_safe_native_rejection_compensation_failure_stays_fenced(
         self,
     ) -> None:

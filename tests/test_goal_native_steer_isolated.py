@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import copy
 from collections import deque
 from contextlib import suppress
 import hmac
 import json
+import hashlib
 from pathlib import Path
 import re
 import time
@@ -14,6 +16,8 @@ import team_mail_grants
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock
+from pydantic import BaseModel, Field
+from provider_commands import ProviderCommandInventory, ProviderCommandRecord
 
 from codex_app_server import CodexAppServerError, CodexAppServerProtocolError, CodexAppServerRequestError
 from tests.test_goal_followup_admission_isolated import AdmissionHTTPException, saved_route_snapshots
@@ -27,6 +31,7 @@ NAMES = {
     "consume_codex_native_turn", "codex_goal_steer_selection_is_plain",
     "codex_shell_intents_pending", "observe_codex_shell_notification",
     "publish_codex_shell_completions",
+    "codex_goal_steer_selection_is_supported",
     "mark_native_steer_accepted", "fence_native_steer_delivery",
     "requeue_native_steer_after_safe_rejection", "native_steer_requeue_event_payload",
     "join_task_despite_caller_cancellation", "concise_error_message",
@@ -36,6 +41,9 @@ NAMES = {
     "session_lifecycle_lock",
     "_run_queued_turn_now_once", "codex_goal_followup_requires_native",
     "async_route_queue_fields", "NonNativeForceSendRequiresLifecycleLock",
+    "SkillSelection", "ProviderCommandSelectionInvalid", "ProviderCommandSelectionUnavailable",
+    "resolve_provider_command_selection", "codex_provider_command_turn_input",
+    "provider_command_prompt_matches", "history_dedup_key",
 }
 TREE = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
 NODES = [node for node in TREE.body if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in NAMES]
@@ -91,7 +99,9 @@ class NativeGoalSteerTests(unittest.IsolatedAsyncioTestCase):
 
         self.ns = {
             "team_mail_grants": team_mail_grants,
-            "asyncio": asyncio, "deque": deque, "suppress": suppress, "json": json, "hmac": hmac,
+            "asyncio": asyncio, "copy": copy, "deque": deque, "suppress": suppress, "json": json, "hmac": hmac,
+            "BaseModel": BaseModel, "Field": Field, "hashlib": hashlib,
+            "HTTPException": AdmissionHTTPException,
             "re": re, "time": time, "CodexAppServerError": CodexAppServerError,
             "CodexAppServerProtocolError": CodexAppServerProtocolError,
             "CodexAppServerRequestError": CodexAppServerRequestError,
@@ -99,6 +109,8 @@ class NativeGoalSteerTests(unittest.IsolatedAsyncioTestCase):
             "CODEX_GOALS_ENABLED": True, "CODEX_GOAL_STEER_CLIENT_CAPABILITY": "codex_goal_steer_v1",
             "PROVIDER_CROSS_CHAT_ROUTE_KIND_REFERENCE": "prompt_reference",
             "BACKEND_CODEX": "codex", "DEFAULT_BACKEND": "codex",
+            "BACKEND_CLAUDE": "claude", "BACKEND_OPENCODE": "opencode", "BACKEND_GEMINI": "gemini",
+            "CODEX_INTERACTIVE_CLIENT_CAPABILITY": "codex-app-server-interactive-v1",
             "CODEX_APP_SERVER_LIFECYCLE_TIMEOUT_SECONDS": 2, "IDLE_KILL_SECONDS": 2,
             "ACTIVE": {"chat": self.active}, "CURRENT_TURNS": {"chat": self.current},
             "CROSS_CHAT_CAPABILITIES": {}, "AGENT_TOKEN": "synthetic-test-token",
@@ -118,6 +130,12 @@ class NativeGoalSteerTests(unittest.IsolatedAsyncioTestCase):
             "codex_app_server_tool": lambda item: None,
             "project_codex_notification": Mock(),
             "append_event": append_event, "append_durable_event_batch": append_batch,
+            "prepare_codex_goal_route_steer": AsyncMock(return_value=None),
+            "commit_codex_goal_route_steer": AsyncMock(return_value=True),
+            "issue_codex_goal_route_steer_authority": AsyncMock(return_value=False),
+            "CROSS_CHAT_CAPABILITIES": {},
+            "live_provider_cross_chat_route": lambda _session, route: route,
+            "revoke_cross_chat_capability": AsyncMock(),
             # These goal/child lifecycle fixtures do not host a live summary
             # registry. Retain the real completed-summary commit above while
             # isolating the unrelated transient transport and finalizer.
@@ -151,6 +169,220 @@ class NativeGoalSteerTests(unittest.IsolatedAsyncioTestCase):
             return turn, watermark
 
         self.manager.steer_turn_with_notification_watermark = steer
+
+    def selected_skill(self, request):
+        command = ProviderCommandRecord(
+            public={"id": "pcmd_" + "a" * 32, "invocation": "/review"},
+            native={"name": "review", "path": "/synthetic/project/.agents/skills/review/SKILL.md"})
+        inventory = ProviderCommandInventory(backend="codex", revision="pcmdrev_" + "b" * 32, records=(command,))
+        request["selected"].update(prompt="/review Verify the result", skill_selection={
+            "id": command.public["id"], "revision": inventory.revision},
+            client_capabilities=["codex_goal_steer_v1", self.ns["CODEX_INTERACTIVE_CLIENT_CAPABILITY"]])
+        self.ns["discover_session_provider_commands"] = AsyncMock(return_value=({"support": {"available": True}}, inventory))
+        return command, inventory
+
+    async def test_skill_crosses_validation_native_input_and_history_without_changing_owner(self):
+        for ordinary in (False, True):
+            with self.subTest(ordinary=ordinary):
+                self.setUp()
+                if ordinary:
+                    self.ordinary_owner()
+                self.active["cwd"] = "/synthetic/active-workspace"
+                self.ns["STORE"].sessions["chat"]["cwd"] = "/synthetic/next-workspace"
+                active_before, current_before = dict(self.active), dict(self.current)
+                request = self.request()
+                command, _inventory = self.selected_skill(request)
+                pending = await (self.send_ordinary(request) if ordinary else self.send(request))
+                result = await self.ns["commit_codex_goal_steer"](
+                    "chat", "operation", "thread", "" if ordinary else "reservation", pending)
+                discovery = self.ns["discover_session_provider_commands"].await_args
+                self.assertIs(discovery.kwargs["codex_manager"], self.manager)
+                self.assertTrue(discovery.kwargs["refresh"])
+                self.assertEqual(discovery.args[1]["cwd"], "/synthetic/active-workspace")
+                self.assertEqual(self.calls[0][2], [
+                    {"type": "text", "text": "$review Verify the result", "text_elements": []},
+                    {"type": "skill", "name": "review", "path": command.native["path"]}])
+                accepted = next(payload for kind, payload in self.events if kind == "turn_steered")
+                self.assertEqual(accepted["prompt"], "/review Verify the result")
+                self.assertEqual(accepted["skill_selection"], request["selected"]["skill_selection"])
+                self.assertEqual(self.ns["history_dedup_key"]("user", accepted["prompt"], source_text_sha256=accepted["source_text_sha256"]),
+                                 self.ns["history_dedup_key"]("user", "$review Verify the result"))
+                self.assertNotIn(command.native["path"], json.dumps(self.events))
+                self.assertEqual(self.active, active_before)
+                self.assertEqual(self.current, current_before)
+                self.assertEqual(self.goal["status"], "active")
+                self.assertFalse(result["interrupted"])
+
+    async def test_invalid_or_unavailable_skill_is_rejected_before_delivery_fence(self):
+        for failure in ("stale", "missing", "mismatch", "unavailable", "capability", "malformed"):
+            with self.subTest(failure=failure):
+                self.setUp()
+                request = self.request()
+                _command, inventory = self.selected_skill(request)
+                if failure == "stale":
+                    request["selected"]["skill_selection"]["revision"] = "pcmdrev_" + "c" * 32
+                elif failure == "missing":
+                    request["selected"]["skill_selection"]["id"] = "pcmd_" + "c" * 32
+                elif failure == "mismatch":
+                    request["selected"]["prompt"] = "/other Verify the result"
+                elif failure == "unavailable":
+                    self.ns["discover_session_provider_commands"].return_value = ({"support": {"available": False}}, inventory)
+                    self.ns.update(CODEX_TRANSPORT="app_server", CODEX_TRANSPORT_EXEC="exec")
+                elif failure == "capability":
+                    request["selected"]["client_capabilities"] = []
+                else:
+                    request["selected"]["skill_selection"]["path"] = "/untrusted/client/path"
+                with self.assertRaises(self.ns["NativeSteerHandoffError"]) as caught:
+                    await self.send(request)
+                self.assertTrue(caught.exception.safe_to_requeue)
+                self.assertEqual(self.calls, [])
+                self.assertNotIn("_native_delivery_fenced", request["selected"])
+                self.assertFalse(any(kind == "turn_steered" for kind, _ in self.events))
+
+    async def test_owner_change_while_skill_revalidation_awaits_cannot_reach_provider(self):
+        request = self.request()
+        _command, inventory = self.selected_skill(request)
+        async def changed(*args, **kwargs):
+            self.active["provider_turn_id"] = "new-turn"
+            return {"support": {"available": True}}, inventory
+        self.ns["discover_session_provider_commands"].side_effect = changed
+        with self.assertRaises(self.ns["NativeSteerHandoffError"]) as caught:
+            await self.send(request)
+        self.assertTrue(caught.exception.safe_to_requeue)
+        self.assertEqual(self.calls, [])
+
+    async def test_selected_chat_access_commits_only_after_native_ack_and_durable_message(self):
+        request = self.request()
+        request["selected"].update(prompt="Ask @Target to check this", chat_references=[{
+            "session_id": "target", "action": "route", "grant_intent": True}])
+        prepared = self.prepared_routes()
+        authority = prepared["capability"]
+        async def before_send():
+            self.assertEqual(authority["routes"], ["original"])
+            self.ns["commit_codex_goal_route_steer"].assert_not_awaited()
+            self.assertFalse(any(kind == "turn_steered" for kind, _ in self.events))
+        self.before_rpc = before_send
+        async def apply_routes(chat, run, value):
+            self.assertIs(value, prepared)
+            self.assertEqual(len(self.calls), 1)
+            self.assertEqual(sum(kind == "turn_steered" for kind, _ in self.events), 1)
+            authority["routes"].append("target")
+            return True
+        self.ns["commit_codex_goal_route_steer"].side_effect = apply_routes
+        pending = await self.send(request)
+        self.assertIs(pending["route_steer"], prepared)
+        self.assertEqual(authority["routes"], ["original"])
+        result = await self.ns["commit_codex_goal_steer"]("chat", "operation", "thread", "reservation", pending)
+        self.assertTrue(result["chat_access_applied"])
+        self.assertEqual(authority["routes"], ["original", "target"])
+        self.assertEqual(authority["source_user_instruction"], "Original work")
+        self.assertEqual(self.current["run_id"], "operation")
+        self.assertEqual(self.goal["status"], "active")
+        self.ns["issue_codex_goal_route_steer_authority"].assert_not_awaited()
+        accepted = next(payload for kind, payload in self.events if kind == "turn_steered")
+        self.assertEqual(accepted["chat_references"], request["selected"]["chat_references"])
+
+    async def test_durable_message_failure_after_ack_never_applies_chat_access(self):
+        request = self.request()
+        self.prepared_routes()
+        pending = await self.send(request)
+        self.ns["append_durable_event_batch"] = AsyncMock(side_effect=OSError("disk unavailable"))
+        with self.assertRaises(OSError):
+            await self.ns["commit_codex_goal_steer"]("chat", "operation", "thread", "reservation", pending)
+        self.assertTrue(request["_goal_steer_rpc_started"])
+        self.assertEqual(len(self.calls), 1)
+        self.ns["commit_codex_goal_route_steer"].assert_not_awaited()
+        self.ns["issue_codex_goal_route_steer_authority"].assert_not_awaited()
+
+    async def test_access_revoked_after_ack_reports_accepted_input_without_replay(self):
+        request = self.request()
+        self.prepared_routes()
+        self.ns["commit_codex_goal_route_steer"].return_value = False
+        pending = await self.send(request)
+        result = await self.ns["commit_codex_goal_steer"]("chat", "operation", "thread", "reservation", pending)
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["chat_access_applied"])
+        self.assertFalse(result["interrupted"])
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(sum(kind == "turn_steered" for kind, _ in self.events), 1)
+        self.assertTrue(request["_goal_steer_rpc_started"])
+
+    async def test_standalone_goal_issues_missing_authority_only_after_accepted_message(self):
+        request = self.request()
+        prepared = {"token_hash": None, "capability": None, "routes": ({"target_session_id": "target"},)}
+        self.ns["prepare_codex_goal_route_steer"].return_value = prepared
+        async def issue(chat, run, value):
+            self.assertIs(value, prepared)
+            self.assertEqual(sum(kind == "turn_steered" for kind, _ in self.events), 1)
+            prepared.update(token_hash="new", capability={"new": True})
+            return True
+        self.ns["issue_codex_goal_route_steer_authority"].side_effect = issue
+        pending = await self.send(request)
+        self.ns["issue_codex_goal_route_steer_authority"].assert_not_awaited()
+        result = await self.ns["commit_codex_goal_steer"]("chat", "operation", "thread", "reservation", pending)
+        self.assertTrue(result["chat_access_applied"])
+        self.ns["issue_codex_goal_route_steer_authority"].assert_awaited_once_with("chat", "operation", prepared)
+        self.ns["commit_codex_goal_route_steer"].assert_awaited_once_with("chat", "operation", prepared)
+
+    def prepared_routes(self):
+        authority = {"routes": ["original"], "source_user_instruction": "Original work",
+                     "expires_at": time.time() + 3600}
+        prepared = {"token_hash": "same-token", "capability": authority,
+                    "routes": ({"target_session_id": "target"},)}
+        self.ns["CROSS_CHAT_CAPABILITIES"]["same-token"] = authority
+        self.ns["prepare_codex_goal_route_steer"].return_value = prepared
+        return prepared
+
+    async def test_chat_access_revocation_replacement_expiry_and_selection_change_fence_writer(self):
+        for change in ("revoked", "replaced", "expired", "reference"):
+            with self.subTest(change=change):
+                self.setUp()
+                request = self.request()
+                request["selected"]["chat_references"] = [{
+                    "session_id": "target", "action": "route", "grant_intent": True}]
+                prepared = self.prepared_routes()
+                async def before_send():
+                    if change == "revoked":
+                        self.ns["live_provider_cross_chat_route"] = lambda *_args: None
+                    elif change == "replaced":
+                        self.ns["CROSS_CHAT_CAPABILITIES"]["same-token"] = dict(prepared["capability"])
+                    elif change == "expired":
+                        prepared["capability"]["expires_at"] = 0
+                    else:
+                        request["selected"]["chat_references"][0]["session_id"] = "other"
+                self.before_rpc = before_send
+                with self.assertRaises(self.ns["NativeSteerHandoffError"]) as caught:
+                    await self.send(request)
+                self.assertTrue(caught.exception.safe_to_requeue)
+                self.assertFalse(request["_goal_steer_rpc_started"])
+                self.assertEqual(self.calls, [])
+                self.ns["commit_codex_goal_route_steer"].assert_not_awaited()
+                self.ns["issue_codex_goal_route_steer_authority"].assert_not_awaited()
+
+    async def test_changed_owner_after_chat_access_ack_never_applies_or_requeues(self):
+        request = self.request()
+        self.prepared_routes()
+        pending = await self.send(request)
+        self.ns["ACTIVE"]["chat"] = {"run_id": "replacement"}
+        with self.assertRaises(self.ns["NativeSteerHandoffError"]) as caught:
+            await self.ns["commit_codex_goal_steer"]("chat", "operation", "thread", "reservation", pending)
+        self.assertFalse(caught.exception.safe_to_requeue)
+        self.assertTrue(caught.exception.delivery_uncertain)
+        self.assertEqual(len(self.calls), 1)
+        self.ns["commit_codex_goal_route_steer"].assert_not_awaited()
+        self.ns["issue_codex_goal_route_steer_authority"].assert_not_awaited()
+
+    async def test_native_goal_terminal_revokes_only_its_own_authority_once(self):
+        task = self.consumer()
+        await self.finish(task)
+        self.ns["revoke_cross_chat_capability"].assert_awaited_once_with("operation")
+
+    async def test_inline_ordinary_consumer_retains_original_authority(self):
+        task = asyncio.create_task(self.ns["consume_codex_native_turn"](
+            "chat", "operation", "goal_resume", self.manager, "thread", "reservation", self.subscription,
+            turn_id="turn-1", finalize_operation=False))
+        await self.finish(task)
+        self.ns["revoke_cross_chat_capability"].assert_not_awaited()
 
     def request(self):
         return {"selected": {"queued_id": "queued-1", "prompt": "Please check this too", "client_capabilities": ["codex_goal_steer_v1"]},

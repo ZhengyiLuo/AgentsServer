@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException
@@ -12,6 +13,21 @@ from provider_commands import ProviderCommandRecord, codex_provider_command_inve
 
 
 class ProviderCommandAPIContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_codex_steer_inventory_uses_the_existing_owner_manager(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            native = {"data": [{"cwd": directory, "skills": [
+                {"name": "review", "path": str(Path(directory, "review", "SKILL.md"))},
+            ]}]}
+            owner = SimpleNamespace(request=AsyncMock(return_value=native))
+            with patch.object(agent_server, "PROVIDER_COMMAND_SELECTOR_SECRET", "a" * 64), \
+                    patch.object(agent_server, "CODEX_TRANSPORT", "app_server"), \
+                    patch.object(agent_server, "codex_app_server_manager", AsyncMock(side_effect=AssertionError("new owner"))):
+                snapshot, inventory = await agent_server.discover_session_provider_commands(
+                    "chat", {"backend": "codex", "cwd": directory}, refresh=True, codex_manager=owner)
+            self.assertTrue(snapshot["support"]["available"])
+            self.assertEqual(inventory.records[0].native["name"], "review")
+            owner.request.assert_awaited_once_with("skills/list", {"cwds": [directory], "forceReload": True})
+
     async def test_gemini_native_selection_requires_capability_and_revalidates_content(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

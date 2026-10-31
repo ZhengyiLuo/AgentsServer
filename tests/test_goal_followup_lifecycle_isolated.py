@@ -169,7 +169,7 @@ class GoalFollowupLifecycleTests(unittest.IsolatedAsyncioTestCase):
             "acquire_codex_run_thread": AsyncMock(return_value="thread"),
             "persist_run_provider_session": AsyncMock(return_value=True),
             "codex_provider_mcp_run_proof": Mock(return_value="synthetic-original-proof"),
-            "codex_provider_command_turn_input": lambda prompt, command: [{"type": "text", "text": prompt}],
+            "codex_provider_command_turn_input": lambda prompt, command: [{"type": "text", "text": prompt, "text_elements": []}],
             "watch_manifest_artifacts": watch, "append_event": append_event,
             "append_durable_event": append_event, "append_durable_event_batch": append_batch,
             "await_native_steer_result": observe_wait,

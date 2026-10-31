@@ -533,3 +533,67 @@ class RecoveryOwnerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InterpreterTrustDetailTests(unittest.TestCase):
+    """Recovery-arm trust rejections must name the requirement, path and mode."""
+
+    def _digest(self, path):
+        import sys
+
+        root = Path(__file__).resolve().parents[1]
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+        import execution_recovery as recovery
+
+        return recovery._interpreter_digest(path)
+
+    def test_writable_interpreter_is_rejected_with_mode_and_path(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temporary:
+            interpreter = Path(temporary) / "python"
+            interpreter.write_bytes(b"#!/bin/sh\n")
+            interpreter.chmod(0o777)
+            with self.assertRaises(PermissionError) as caught:
+                self._digest(interpreter)
+            message = str(caught.exception)
+            self.assertIn("recovery interpreter is not a trusted executable", message)
+            self.assertIn(str(interpreter), message)
+            self.assertIn("writable", message)
+            self.assertIn("0777", message)
+
+    def test_non_executable_interpreter_is_rejected_with_mode(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temporary:
+            interpreter = Path(temporary) / "python"
+            interpreter.write_bytes(b"#!/bin/sh\n")
+            interpreter.chmod(0o644)
+            with self.assertRaises(PermissionError) as caught:
+                self._digest(interpreter)
+            message = str(caught.exception)
+            self.assertIn("recovery interpreter is not a trusted executable", message)
+            self.assertIn("execute", message)
+            self.assertIn("0644", message)
+
+    def test_directory_is_rejected_as_not_a_regular_file(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaises(PermissionError) as caught:
+                self._digest(Path(temporary))
+            self.assertIn("not a regular file", str(caught.exception))
+
+    def test_trusted_interpreter_is_accepted(self) -> None:
+        import hashlib
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temporary:
+            interpreter = Path(temporary) / "python"
+            interpreter.write_bytes(b"#!/bin/sh\n")
+            interpreter.chmod(0o755)
+            self.assertEqual(
+                self._digest(interpreter),
+                hashlib.sha256(b"#!/bin/sh\n").hexdigest(),
+            )

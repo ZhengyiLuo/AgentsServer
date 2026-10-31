@@ -126,6 +126,27 @@ async def wait_until(predicate: Callable[[], bool], timeout: float = 1.0) -> Non
 
 
 class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_shell_rechecks_owner_at_stdin_boundary_after_waiting_for_writer(self) -> None:
+        factory = FakeProcessFactory()
+        client = self.make_client(factory)
+        self.addAsyncCleanup(client.close)
+        factory.process.responders["thread/shellCommand"] = lambda _: {}
+        await client.start()
+        await client._write_lock.acquire()
+        owns_thread = True
+        request = asyncio.create_task(client.run_thread_shell_command(
+            "thread", "printf explicit", before_send=lambda: owns_thread,
+        ))
+        await wait_until(lambda: any(row[0] == "thread/shellCommand" for row in client._pending.values()))
+        owns_thread = False
+        client._write_lock.release()
+        with self.assertRaises(CodexAppServerProtocolError) as caught:
+            await request
+        self.assertFalse(caught.exception.request_sent)
+        self.assertFalse(any(row.get("method") == "thread/shellCommand" for row in factory.process.messages))
+        await client.run_thread_shell_command("thread", "printf explicit", before_send=lambda: True)
+        self.assertEqual(len([row for row in factory.process.messages if row.get("method") == "thread/shellCommand"]), 1)
+
     async def test_inflight_work_keeps_thread_ownership_for_session_handoff(self) -> None:
         factory = FakeProcessFactory()
         client = self.make_client(factory)

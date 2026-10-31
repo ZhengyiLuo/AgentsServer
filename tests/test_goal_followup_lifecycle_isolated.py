@@ -27,6 +27,10 @@ NAMES = {
     "_run_queued_turn_now_once", "NonNativeForceSendRequiresLifecycleLock",
     "async_route_queue_fields", "await_native_steer_result",
     "withdraw_unaccepted_native_steer", "codex_native_archive_rejection",
+    # The runner classifies failed terminals before checking continuation
+    # fences. Load its real, side-effect-free compaction helpers too.
+    "is_codex_compaction_failure", "codex_compaction_retry_mode",
+    "codex_compaction_error_message",
 }
 tree = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
 nodes = [node for node in tree.body if isinstance(node, (
@@ -108,7 +112,11 @@ class GoalFollowupLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.manager.start_turn = AsyncMock(return_value=self.turn)
         self.manager.client = SimpleNamespace(unmatched_notifications=[])
         self.manager.retire_generation = AsyncMock()
-        self.authority = object()
+        self.authority = {
+            "source_session_id": "chat", "source_run_id": "operation",
+            "source_user_instruction": "Original goal request", "source_is_user_turn": True,
+            "user_delegation_grants": set(), "actions": {"publish", "agent_cross_chat_routes"},
+        }
         self.tasks = []
         self.requests = []
         self.before_wait = None

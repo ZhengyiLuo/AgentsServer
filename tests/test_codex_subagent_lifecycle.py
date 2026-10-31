@@ -290,6 +290,133 @@ class CodexSubagentLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("child-b", manager.turn_reads)
         self.assertEqual(result["interrupted"], ["child-a"])
 
+    async def test_stop_repairs_a_stale_running_child_that_already_completed(self) -> None:
+        manager = FakeSubagentManager()
+        manager.descendants = [manager.descendants[1]]
+        await self.seed_running_child("child-b")
+        with (
+            patch.object(agent_server, "append_event", AsyncMock(side_effect=self.append)),
+            patch.object(agent_server.STORE, "save", AsyncMock()),
+        ):
+            result = await agent_server.stop_codex_descendant_subagents("chat", "parent-thread", manager=manager)
+        self.assertEqual(manager.interrupts, [])
+        self.assertEqual(result["pending"], [])
+        self.assertEqual(agent_server.CODEX_SUBAGENT_STATE["child-b"]["subagent_status"], "completed")
+
+    async def seed_running_child(self, child: str) -> None:
+        with (
+            patch.object(agent_server, "append_event", AsyncMock(side_effect=self.append)),
+            patch.object(agent_server.STORE, "save", AsyncMock()),
+        ):
+            await agent_server.emit_codex_subagent_state(
+                "chat", child, "running", parent_thread_id="parent-thread",
+            )
+
+    async def test_idle_parent_does_not_report_success_for_unfinished_children(self) -> None:
+        for child_result in (
+            {"pending": ["child-a"], "errors": []},
+            {"pending": [], "errors": ["Native interrupt failed"]},
+        ):
+            with (
+                self.subTest(child_result=child_result),
+                patch.object(agent_server, "ACTIVE", {}),
+                patch.object(agent_server, "BUSY_SESSIONS", set()),
+                patch.object(agent_server, "CODEX_APP_SERVER_MANAGER", FakeSubagentManager()),
+                patch.object(agent_server, "stop_codex_descendant_subagents", AsyncMock(return_value=child_result)),
+                patch.object(agent_server, "cancel_codex_interactions", AsyncMock()),
+                patch.object(agent_server, "schedule_next_queued_turn"),
+            ):
+                result = await agent_server.stop_turn("chat")
+            self.assertFalse(result["stopped"])
+            self.assertTrue(result["pending"])
+            self.assertIn("subagent", result["message"])
+
+    async def test_missing_runtime_does_not_claim_known_running_children_stopped(self) -> None:
+        await self.seed_running_child("child-a")
+        with patch.object(agent_server, "existing_codex_app_server_manager", return_value=None):
+            result = await agent_server.stop_codex_descendant_subagents("chat", "parent-thread")
+        self.assertTrue(result["errors"])
+        self.assertEqual(agent_server.CODEX_SUBAGENT_STATE["child-a"]["subagent_status"], "running")
+
+    async def test_empty_target_set_stops_nothing(self) -> None:
+        manager = FakeSubagentManager()
+        result = await agent_server.stop_codex_descendant_subagents(
+            "chat", "parent-thread", manager=manager, target_thread_ids=set(),
+        )
+        self.assertEqual(manager.turn_reads, {})
+        self.assertEqual(result["requested"], [])
+
+    async def test_stop_does_not_interrupt_an_adopted_chat_or_foreign_child(self) -> None:
+        manager = FakeSubagentManager()
+        with (
+            patch.object(agent_server, "CODEX_THREAD_SESSION_INDEX", {"child-a": "separate-chat"}),
+            patch.dict(agent_server.CODEX_SUBAGENT_SESSION_INDEX, {"child-b": "another-chat"}),
+        ):
+            result = await agent_server.stop_codex_descendant_subagents("chat", "parent-thread", manager=manager)
+        self.assertEqual(manager.turn_reads, {})
+        self.assertEqual(result["requested"], [])
+
+    async def test_stop_rechecks_ownership_after_native_read(self) -> None:
+        manager = FakeSubagentManager()
+        manager.descendants = manager.descendants[:1]
+
+        async def adopt_during_read(*_args, **_kwargs):
+            agent_server.CODEX_THREAD_SESSION_INDEX["child-a"] = "separate-chat"
+            return [{"id": "turn-a", "status": "inProgress"}]
+
+        manager.list_turns = AsyncMock(side_effect=adopt_during_read)
+        with patch.object(agent_server, "CODEX_THREAD_SESSION_INDEX", {}):
+            result = await agent_server.stop_codex_descendant_subagents("chat", "parent-thread", manager=manager)
+        self.assertEqual(manager.interrupts, [])
+        self.assertEqual(result["requested"], [])
+
+    async def test_stop_does_not_overwrite_new_turn_with_stale_terminal_read(self) -> None:
+        for race_on_read in (1, 2):
+            with self.subTest(race_on_read=race_on_read):
+                manager = FakeSubagentManager()
+                manager.descendants = manager.descendants[:1]
+                await self.seed_running_child("child-a")
+                reads = 0
+
+                async def native_turns(*_args, **_kwargs):
+                    nonlocal reads
+                    reads += 1
+                    if reads == race_on_read:
+                        await agent_server.emit_codex_subagent_state(
+                            "chat", "child-a", "running", activity="New native turn",
+                            run_id=f"new-{race_on_read}", parent_thread_id="parent-thread",
+                        )
+                        return [{"id": "old-turn", "status": "completed"}]
+                    if reads < race_on_read:
+                        return [{"id": "old-turn", "status": "inProgress"}]
+                    if ("child-a", "new-turn") not in manager.interrupts:
+                        return [{"id": "new-turn", "status": "inProgress"}]
+                    return [{"id": "new-turn", "status": "interrupted"}]
+
+                manager.list_turns = AsyncMock(side_effect=native_turns)
+                with (
+                    patch.object(agent_server, "append_event", AsyncMock(side_effect=self.append)),
+                    patch.object(agent_server.STORE, "save", AsyncMock()),
+                ):
+                    result = await agent_server.stop_codex_descendant_subagents("chat", "parent-thread", manager=manager)
+                self.assertIn(("child-a", "new-turn"), manager.interrupts)
+                self.assertEqual(result["pending"], [])
+                self.assertEqual(result["interrupted"], ["child-a"])
+
+    async def test_unconfirmed_interrupt_stays_pending_and_is_not_repeated(self) -> None:
+        manager = FakeSubagentManager()
+        manager.descendants = manager.descendants[:1]
+        manager.list_turns = AsyncMock(return_value=[{"id": "turn-a", "status": "inProgress"}])
+        with (
+            patch.object(agent_server, "STOP_CONFIRM_TIMEOUT_SECONDS", 0.06),
+            patch.object(agent_server, "append_event", AsyncMock(side_effect=self.append)),
+            patch.object(agent_server.STORE, "save", AsyncMock()),
+        ):
+            result = await agent_server.stop_codex_descendant_subagents("chat", "parent-thread", manager=manager)
+        self.assertEqual(manager.interrupts, [("child-a", "turn-a")])
+        self.assertEqual(result["pending"], ["child-a"])
+        self.assertEqual(result["interrupted"], [])
+
     async def test_reconciliation_retires_not_loaded_running_child(self) -> None:
         await self._seed_running_child()
         manager = FakeSubagentManager()

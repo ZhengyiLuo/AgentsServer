@@ -28,11 +28,19 @@ class PublicTranscriptError(ValueError):
 def _is_goal_followup(event: dict) -> bool:
     return bool(
         event.get("type") == "turn_steered"
-        and event.get("native_goal_steer") is True
         and event.get("native_steer") is True
         and event.get("provider_user_authored") is True
-        and event.get("backend") == "codex"
-        and event.get("purpose") == "codex_goal_resume"
+        and (
+            (event.get("native_goal_steer") is True
+             and event.get("backend") == "codex"
+             and event.get("purpose") == "codex_goal_resume")
+            or (event.get("native_followup") is True
+                and event.get("backend") == "claude"
+                and event.get("purpose") is None
+                and event.get("provider_generated") is not True
+                and isinstance(event.get("provider_message_id"), str)
+                and event["provider_message_id"].strip())
+        )
         and isinstance(event.get("run_id"), str)
         and event["run_id"].strip()
     )

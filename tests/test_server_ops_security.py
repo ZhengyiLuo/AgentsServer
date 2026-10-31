@@ -84,6 +84,19 @@ class FakeProviderProcess:
 
 
 class ServerOpsSecurityTests(unittest.IsolatedAsyncioTestCase):
+    def test_agent_notification_route_has_bounded_helper_access(self):
+        self.assertEqual(
+            agent_server.agent_helper_route_body_limit(
+                "POST", "/api/agent/sessions/chat/notifications"
+            ),
+            8 * 1024,
+        )
+        self.assertIsNone(
+            agent_server.agent_helper_route_body_limit(
+                "GET", "/api/agent/sessions/chat/notifications"
+            )
+        )
+
     async def test_user_authored_authority_lookalike_is_never_stripped(self):
         lookalike = (
             "Keep this literal text.\n\n"
@@ -1781,6 +1794,50 @@ class ServerOpsSecurityTests(unittest.IsolatedAsyncioTestCase):
             snapshot = await asyncio.wait_for(snapshot_task, timeout=2)
 
         self.assertFalse(snapshot["has_blockers"])
+
+    async def test_idle_native_bash_blocks_drain_until_its_exact_connection_receipt_settles(self):
+        state = [("claude-chat", "owner", 1, 1, True)]
+        manager = SimpleNamespace(is_loaded=lambda _: True, background_work_snapshot=lambda: tuple(state))
+        with patch.multiple(agent_server,
+            CLAUDE_SDK_MANAGER=manager, BUSY_SESSIONS=set(), SERVER_MAINTENANCE_SESSIONS=set(),
+            active_codex_work_labels=lambda: [],
+            prepare_codex_subagent_terminal_snapshot=AsyncMock(return_value={}),
+            build_claude_subagent_snapshot=lambda *_args, **_kwargs: {"active_count": 0},
+        ), patch.object(agent_server.STORE, "sessions", {"claude-chat": {"backend": "claude"}}):
+            snapshot = await agent_server.prepare_provider_background_work_snapshot()
+            self.assertEqual(agent_server.provider_background_work_labels_from_snapshot(snapshot),
+                             ["Claude background command in claude-chat"])
+            state[:] = [("claude-chat", "owner", 1, 2, False)]
+            stale = agent_server.provider_background_work_labels_from_snapshot(snapshot)
+            self.assertIn("Claude provider state changed during inspection", stale)
+            snapshot = await agent_server.prepare_provider_background_work_snapshot()
+            self.assertEqual(agent_server.provider_background_work_labels_from_snapshot(snapshot), [])
+            state[:] = [("claude-chat", "replacement", 1, 2, False)]
+            self.assertIn("Claude provider state changed during inspection",
+                          agent_server.provider_background_work_labels_from_snapshot(snapshot))
+
+    async def test_side_native_background_probe_runs_before_admission_locks(self):
+        from side_questions import SideQuestions, _NativeConversation
+        side = SideQuestions()
+        active = True
+        async def inspect():
+            self.assertFalse(agent_server.ACTIVE_LOCK.locked())
+            self.assertFalse(agent_server.UNSAFE_HTTP_MUTATION_ADMISSION_LOCK.locked())
+            return active
+        handle = SimpleNamespace(background_work_scope=lambda: "native-owner", has_background_work=inspect,
+                                 close=AsyncMock())
+        side.conversations[("user", "chat", "side")] = _NativeConversation(handle=handle)
+        with patch.multiple(agent_server, SIDE_QUESTIONS=side, CLAUDE_SDK_MANAGER=None,
+                            active_codex_work_labels=lambda: [],
+                            prepare_codex_subagent_terminal_snapshot=AsyncMock(return_value={})):
+            snapshot = await agent_server.prepare_provider_background_work_snapshot()
+            async with agent_server.ACTIVE_LOCK:
+                self.assertEqual(agent_server.provider_background_work_labels_from_snapshot(snapshot),
+                                 ["Side chat background work in chat"])
+            active = False
+            snapshot = await agent_server.prepare_provider_background_work_snapshot()
+            self.assertEqual(agent_server.provider_background_work_labels_from_snapshot(snapshot), [])
+        await side.close()
 
     async def test_changed_claude_events_fail_closed_after_prelock_fold(self):
         manager = MagicMock()

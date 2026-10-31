@@ -18,6 +18,9 @@ from unittest.mock import AsyncMock, Mock
 _SOURCE = (Path(__file__).resolve().parents[1] / "agent_server.py")
 _FUNCTIONS = {
     "consume_codex_native_turn",
+    "codex_shell_intents_pending",
+    "observe_codex_shell_notification",
+    "publish_codex_shell_completions",
     "concise_error_message",
     "is_codex_reconnect_notice",
     "is_codex_app_server_retry_notice",

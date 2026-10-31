@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock
 import uuid
+import session_unread
 from codex_history_repair import codex_public_item_origin, filter_native_codex_history_items
 
 
@@ -83,6 +84,7 @@ def load_projection():
         "re": re, "datetime": datetime, "hashlib": hashlib, "hmac": hmac,
         "json": json, "deque": deque, "uuid": uuid, "suppress": suppress, "Path": Path,
         "asyncio": asyncio, "threading": threading, "QUEUE_CHECKPOINT_DIRTY": set(),
+        "session_unread": session_unread, "run_event_metadata": lambda _run_id: {},
         "MAX_IMPORTED_TEXT_CHARS": 100_000, "MAX_IMPORT_MESSAGES": 400,
         "CODEX_TRANSCRIPT_SCAN_LINES": 1000, "CODEX_APP_SERVER_TOOL_OUTPUT_MAX_CHARS": 100_000,
         "BACKEND_CODEX": "codex", "BACKEND_CLAUDE": "claude", "DEFAULT_BACKEND": "claude",

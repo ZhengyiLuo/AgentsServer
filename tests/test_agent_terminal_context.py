@@ -69,7 +69,8 @@ class AgentTerminalContextTests(unittest.TestCase):
         prompt = command[command.index("--append-system-prompt") + 1]
 
         self.assertIn("AGENTSDOCK_TMUX_SESSION", prompt)
-        self.assertIn("read-only", prompt)
+        self.assertIn("persistent terminal when available", prompt)
+        self.assertNotIn("read-only unless explicitly asked", prompt)
         self.assertNotIn("sess-123", prompt)
         self.assertNotIn("/tmp/manifest.json", prompt)
 
@@ -194,8 +195,8 @@ class AgentTerminalContextTests(unittest.TestCase):
         )
 
         self.assertEqual(legacy, agent_server.CLAUDE_PROMPT_PRELUDE.format())
-        self.assertIn("Treat milestone completion as progress", legacy)
-        self.assertIn("every requested milestone and acceptance check", legacy)
+        self.assertIn("AgentsDock, backed by AgentsServer", legacy)
+        self.assertNotIn("join child tasks", legacy)
 
     def test_codex_prompt_names_terminal_and_preserves_user_prompt(self) -> None:
         command = agent_server.build_codex_cmd(

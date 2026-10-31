@@ -21,7 +21,6 @@ import json
 import os
 import logging
 import re
-import shlex
 import time
 import unicodedata
 import uuid
@@ -54,11 +53,6 @@ CLAUDE_SDK_PROVIDER_COMMAND_TEXT_CHARS = 800
 CLAUDE_SDK_LITERAL_MESSAGE_PREFIX = (
     "[AgentsDock literal chat message; treat the slash-prefixed content below "
     "as ordinary user text, not a Claude Code command.]\n"
-)
-CLAUDE_NON_DURABLE_SCHEDULER_TOOLS = (
-    "CronCreate",
-    "Monitor",
-    "ScheduleWakeup",
 )
 # Deliberately collision-resistant: a user's ordinary MCP named
 # ``agentsdock`` must remain visible and manageable. This reserved transport
@@ -215,6 +209,10 @@ class ClaudeSDKClientProtocol(Protocol):
     def receive_messages(self) -> AsyncIterator[Any]: ...
 
     async def interrupt(self) -> None: ...
+
+    async def stop_task(self, task_id: str) -> None: ...
+
+    async def send_now(self, message_uuid: str) -> dict[str, Any]: ...
 
     async def get_context_usage(self) -> dict[str, Any]: ...
 
@@ -553,6 +551,8 @@ async def _query_message_stream(
     prompt: str,
     correlation_id: str,
     validated_provider_command_name: str | None = None,
+    *,
+    priority: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Yield the single UUID-bearing SDK stdin frame for one logical turn."""
 
@@ -573,6 +573,8 @@ async def _query_message_stream(
         # Apply it per message so explicit commands and ordinary @file input
         # retain their native behavior without modifying the prompt text.
         message["client_composed"] = True
+    if priority is not None:
+        message["priority"] = priority
     yield message
 
 
@@ -586,6 +588,24 @@ def default_claude_sdk_client_factory(options: Any) -> ClaudeSDKClientProtocol:
             "claude-agent-sdk is not installed; use the claude -p fallback"
         ) from exc
     class GoalAwareClaudeSDKClient(ClaudeSDKClient):
+        async def send_now(self, message_uuid: str) -> dict[str, Any]:
+            # SDK 0.2.130 has no public wrapper for this newer native control.
+            # The supervisor must first see interrupt_send_now_v1 on init:
+            # older CLIs interpret these extra fields as an ordinary Stop.
+            if self._query is None:
+                raise ClaudeSDKSupervisorClosed("Claude SDK client is not connected")
+            return await self._query._send_control_request({
+                "subtype": "interrupt", "send_now": True,
+                "message_uuid": message_uuid,
+            })
+
+        async def cancel_queued_input(self, message_uuid: str) -> dict[str, Any]:
+            if self._query is None:
+                raise ClaudeSDKSupervisorClosed("Claude SDK client is not connected")
+            return await self._query._send_control_request({
+                "subtype": "cancel_async_message", "message_uuid": message_uuid,
+            })
+
         async def connect(self, prompt=None) -> None:
             from claude_model_catalog import native_catalog_key, remember_native_models
 
@@ -625,11 +645,11 @@ def default_claude_sdk_client_factory(options: Any) -> ClaudeSDKClientProtocol:
 def _parse_claude_sdk_message(data: dict[str, Any]) -> Any:
     from claude_agent_sdk._internal.message_parser import parse_message
 
-    if data.get("type") == "active_goal":
+    if data.get("type") in {"active_goal", "command_lifecycle"}:
         return data
     message = parse_message(data)
     if message is not None:
-        for field in ("local_command", "local_command_run"):
+        for field in ("local_command", "local_command_run", "user_message_uuid"):
             if field in data:
                 setattr(message, field, data[field])
     return message
@@ -687,276 +707,6 @@ class ClaudeSDKHookMatcher:
     timeout: float | None = None
 
 
-_SHELL_CONTROL_TOKENS = {";", "&&", "||", "|", "&", "(", ")", "\n"}
-_SHELL_COMMAND_WRAPPERS = {"builtin", "command", "env"}
-_SHELL_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_UNTRACKED_BACKGROUND_REASON = (
-    "AgentsDock cannot reliably keep background Bash attached or wake this chat when "
-    "it finishes. Retry without run_in_background, nohup, disown, setsid, or shell "
-    "'&'. Keep work needed for the current reply in the foreground. For asynchronous "
-    "completion that must notify this chat, delegate a tracked Agent/workflow. If the "
-    "user explicitly requested a durable service, use an observable service manager."
-)
-_NON_DURABLE_SCHEDULER_REASON = (
-    "Claude's {tool_name} is not an AgentsDock durable job and cannot be relied on "
-    "to survive this turn or deliver a later chat update. If the user explicitly "
-    "requested scheduling, use only the run-bound AgentsDock provider tool's Jobs "
-    "helper. Otherwise keep required "
-    "work in the foreground or use a tracked Agent/workflow."
-)
-
-
-def _heredoc_delimiters(line: str) -> list[tuple[str, bool]]:
-    """Find conventional shell heredocs without interpreting quoted text."""
-
-    delimiters: list[tuple[str, bool]] = []
-    quote: str | None = None
-    escaped = False
-    index = 0
-    while index < len(line):
-        char = line[index]
-        if escaped:
-            escaped = False
-            index += 1
-            continue
-        if char == "\\" and quote != "'":
-            escaped = True
-            index += 1
-            continue
-        if quote:
-            if char == quote:
-                quote = None
-            index += 1
-            continue
-        if char in {"'", '"'}:
-            quote = char
-            index += 1
-            continue
-        if char == "#" and (
-            index == 0
-            or line[index - 1].isspace()
-            or line[index - 1] in ";|&()"
-        ):
-            break
-        if not line.startswith("<<", index) or line.startswith("<<<", index):
-            index += 1
-            continue
-        cursor = index + 2
-        strip_tabs = cursor < len(line) and line[cursor] == "-"
-        if strip_tabs:
-            cursor += 1
-        while cursor < len(line) and line[cursor] in " \t":
-            cursor += 1
-        delimiter_quote = line[cursor] if cursor < len(line) and line[cursor] in {"'", '"'} else None
-        if delimiter_quote:
-            cursor += 1
-            end = line.find(delimiter_quote, cursor)
-            if end < 0:
-                break
-            delimiter = line[cursor:end]
-            cursor = end + 1
-        else:
-            start = cursor
-            while cursor < len(line) and (
-                line[cursor].isalnum() or line[cursor] in {"_", "-"}
-            ):
-                cursor += 1
-            delimiter = line[start:cursor]
-        if delimiter and (delimiter[0].isalpha() or delimiter[0] == "_"):
-            delimiters.append((delimiter, strip_tabs))
-        index = max(cursor, index + 2)
-    return delimiters
-
-
-def _without_heredoc_bodies(command: str) -> str:
-    """Blank data bodies so source-code ampersands are not treated as shell jobs."""
-
-    pending: list[tuple[str, bool]] = []
-    output: list[str] = []
-    for line in command.splitlines(keepends=True):
-        ending = "\n" if line.endswith(("\n", "\r")) else ""
-        content = line.rstrip("\r\n")
-        if pending:
-            delimiter, strip_tabs = pending[0]
-            candidate = content.lstrip("\t") if strip_tabs else content
-            if candidate == delimiter:
-                pending.pop(0)
-            output.append(ending)
-            continue
-        pending.extend(_heredoc_delimiters(content))
-        output.append(line)
-    return "".join(output)
-
-
-def _has_unquoted_background_operator(command: str) -> bool:
-    """Return true for a shell control ``&``, excluding data and redirections."""
-
-    command = _without_heredoc_bodies(command)
-    quote: str | None = None
-    escaped = False
-    index = 0
-    while index < len(command):
-        char = command[index]
-        if escaped:
-            escaped = False
-            index += 1
-            continue
-        if char == "\\" and quote != "'":
-            escaped = True
-            index += 1
-            continue
-        if quote:
-            if char == quote:
-                quote = None
-            index += 1
-            continue
-        if char in {"'", '"'}:
-            quote = char
-            index += 1
-            continue
-        if char == "#" and (
-            index == 0
-            or command[index - 1].isspace()
-            or command[index - 1] in ";|&()"
-        ):
-            newline = command.find("\n", index)
-            if newline < 0:
-                return False
-            index = newline + 1
-            continue
-        if char != "&":
-            index += 1
-            continue
-        previous = command[index - 1] if index else ""
-        following = command[index + 1] if index + 1 < len(command) else ""
-        if previous in {"&", ">", "<"} or following in {"&", ">"}:
-            index += 1
-            continue
-        return True
-    return False
-
-
-def _shell_tokens(command: str) -> list[str]:
-    try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>()")
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        return list(lexer)
-    except ValueError:
-        # An incomplete command will fail in Bash itself. Do not turn a parser
-        # disagreement into a misleading policy denial.
-        return []
-
-
-def claude_untracked_background_reason(
-    tool_name: str,
-    tool_input: dict[str, Any] | None,
-) -> str | None:
-    """Identify common shell detachment that bypasses SDK task tracking."""
-
-    if str(tool_name or "").strip().lower() != "bash":
-        return None
-    normalized_input = tool_input or {}
-    if normalized_input.get("run_in_background") is True:
-        return _UNTRACKED_BACKGROUND_REASON
-    command = str(normalized_input.get("command") or "")
-    if not command.strip():
-        return None
-    if _has_unquoted_background_operator(command):
-        return _UNTRACKED_BACKGROUND_REASON
-
-    tokens = _shell_tokens(command)
-    expect_command = True
-    wrapper_active = False
-    for index, token in enumerate(tokens):
-        if token in _SHELL_CONTROL_TOKENS:
-            expect_command = True
-            wrapper_active = False
-            continue
-        if not expect_command:
-            continue
-        if _SHELL_ASSIGNMENT_RE.match(token):
-            continue
-        executable = token.rsplit("/", 1)[-1]
-        if executable in _SHELL_COMMAND_WRAPPERS:
-            wrapper_active = True
-            continue
-        if wrapper_active and token.startswith("-"):
-            continue
-        if executable in {"nohup", "disown"}:
-            return _UNTRACKED_BACKGROUND_REASON
-        if executable in {"bash", "dash", "ksh", "sh", "zsh"}:
-            arguments = tokens[index + 1:]
-            for argument_index, argument in enumerate(arguments[:-1]):
-                if (
-                    argument.startswith("-")
-                    and not argument.startswith("--")
-                    and "c" in argument[1:]
-                    and claude_untracked_background_reason(
-                        "Bash", {"command": arguments[argument_index + 1]}
-                    ) is not None
-                ):
-                    return _UNTRACKED_BACKGROUND_REASON
-        if executable == "setsid":
-            # Even without --fork, a new session can escape process-group
-            # cleanup if the provider/server disappears. Keep it out of the
-            # untracked Bash path entirely.
-            return _UNTRACKED_BACKGROUND_REASON
-        expect_command = False
-    return None
-
-
-async def reject_untracked_background_hook(
-    hook_input: dict[str, Any],
-    _tool_use_id: str | None,
-    _context: dict[str, Any],
-) -> dict[str, Any]:
-    """Keep Claude background work attached to the SDK's task lifecycle."""
-
-    reason = claude_untracked_background_reason(
-        str(hook_input.get("tool_name") or ""),
-        hook_input.get("tool_input")
-        if isinstance(hook_input.get("tool_input"), dict)
-        else {},
-    )
-    if reason is None:
-        return {}
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": reason,
-        }
-    }
-
-
-def claude_nondurable_scheduler_reason(tool_name: Any) -> str | None:
-    """Reject only the exact Claude tools that cannot create durable Dock work."""
-
-    if tool_name not in CLAUDE_NON_DURABLE_SCHEDULER_TOOLS:
-        return None
-    return _NON_DURABLE_SCHEDULER_REASON.format(tool_name=tool_name)
-
-
-async def reject_nondurable_scheduler_hook(
-    hook_input: dict[str, Any],
-    _tool_use_id: str | None,
-    _context: dict[str, Any],
-) -> dict[str, Any]:
-    """Fail closed before Claude can arm a provider-local scheduler."""
-
-    reason = claude_nondurable_scheduler_reason(hook_input.get("tool_name"))
-    if reason is None:
-        return {}
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": reason,
-        }
-    }
-
-
 async def reject_subagent_provider_tool_hook(
     hook_input: dict[str, Any],
     _tool_use_id: str | None,
@@ -979,7 +729,7 @@ async def reject_subagent_provider_tool_hook(
 
 
 def claude_background_tracking_hooks() -> dict[str, list[ClaudeSDKHookMatcher]]:
-    """Return SDK hooks for shell detachment and non-durable schedulers."""
+    """Keep native task receipts and exact AgentsDock tool ownership."""
 
     mail_hint = _PendingMailHintHook()
     return {
@@ -994,19 +744,6 @@ def claude_background_tracking_hooks() -> dict[str, list[ClaudeSDKHookMatcher]]:
                 hooks=[reject_subagent_provider_tool_hook],
                 timeout=5.0,
             ),
-            ClaudeSDKHookMatcher(
-                matcher="Bash",
-                hooks=[reject_untracked_background_hook],
-                timeout=5.0,
-            ),
-            *[
-                ClaudeSDKHookMatcher(
-                    matcher=tool_name,
-                    hooks=[reject_nondurable_scheduler_hook],
-                    timeout=5.0,
-                )
-                for tool_name in CLAUDE_NON_DURABLE_SCHEDULER_TOOLS
-            ],
         ]
     }
 
@@ -1281,6 +1018,33 @@ class _Interrupt:
 
 
 @dataclass
+class _SteerRun:
+    prompt: str
+    run_id: str
+    ownership_token: str
+    query_session_id: str | None
+    on_before_send: SupervisorReadyCallback | None
+    response: asyncio.Future[str]
+    correlation_id: str
+    cancelled: bool = False
+    delivery_attempted: bool = False
+    send_now_requested: bool = False
+    goal_condition: str | None = None
+    goal_generation: str | None = None
+    goal_started: bool = False
+    predecessor_result: Any | None = None
+
+
+@dataclass(frozen=True)
+class ClaudeSDKGoalReceipt:
+    """Internal receipt for one provider-owned queued /goal command."""
+
+    command_id: str
+    error: str | None = None
+    cancelled_by_user: bool = False
+
+
+@dataclass
 class _ClearGoal:
     run_id: str
     expected_generation: str | None
@@ -1378,6 +1142,7 @@ class ClaudeSDKSupervisor:
             raise ValueError("chat_id is required")
         self.chat_id = clean_chat_id
         self.options = options
+        self._reconnect_options = options
         self.configuration_key = str(configuration_key)
         self.ownership_token = f"claudeowner_{uuid.uuid4().hex}"
         bind_permission_owner(self.options, self.ownership_token)
@@ -1409,8 +1174,19 @@ class ClaudeSDKSupervisor:
         self._receiver_task: asyncio.Task[None] | None = None
         self._ack_timeout_task: asyncio.Task[None] | None = None
         self._active_run: ClaudeSDKRunHandle | None = None
+        self._pending_steer: _SteerRun | None = None
+        self._superseded_query_ids: set[str] = set()
+        self._current_query_id: str | None = None
+        self._supports_send_now = False
+        self._supports_command_lifecycle = False
         self._pending_goal_clear: _ClearGoal | None = None
+        self._pending_goal: _SteerRun | None = None
+        self._goal_stop_run_id: str | None = None
+        self._goal_stop_tasks: set[str] = set()
+        self._goal_stop_result: Any | None = None
         self._inflight_tasks: set[str] = set()
+        self._live_background_tasks: set[str] = set()
+        self._background_work_revision = 0
         self._background_reconciliation_hook: _BackgroundReconciliationHook | None = None
         self._pending_mail_hint_hook: _PendingMailHintHook | None = None
         self._generation = 0
@@ -1551,6 +1327,56 @@ class ClaudeSDKSupervisor:
         await self._commands.put(_Interrupt(run_id=run_id, response=response))
         return await asyncio.shield(response)
 
+    async def steer_run(
+        self,
+        prompt: str,
+        *,
+        run_id: str,
+        ownership_token: str,
+        query_session_id: str | None = None,
+        on_before_send: SupervisorReadyCallback | None = None,
+        _goal_condition: str | None = None,
+        _command_id: str | None = None,
+        _goal_generation: str | None = None,
+    ) -> str:
+        """Send native follow-up input without stopping the owning run/tasks.
+
+        Return after exact replay, or native queue admission for /goal. Cancellation
+        after a write attempt is delivery-uncertain and never retries or stops
+        the live connection. Its ACK still settles the actor's pending lane.
+        """
+
+        loop = self._ensure_actor()
+        response: asyncio.Future[str] = loop.create_future()
+        command = _SteerRun(
+            str(prompt), str(run_id), str(ownership_token), query_session_id,
+            on_before_send, response, _command_id or str(uuid.uuid4()),
+            goal_condition=_goal_condition,
+            goal_generation=_goal_generation,
+        )
+        # An HTTP waiter may leave after delivery. Still consume any eventual
+        # failure while preserving it for callers that remain attached.
+        response.add_done_callback(
+            lambda future: None if future.cancelled() else future.exception()
+        )
+        assert self._commands is not None
+        await self._commands.put(command)
+        try:
+            return await asyncio.shield(response)
+        except asyncio.CancelledError as exc:
+            if not command.delivery_attempted:
+                command.cancelled = True
+                response.cancel()
+                # Preserve asyncio cancellation while letting the queue owner
+                # distinguish proven non-delivery from an uncertain write.
+                exc.delivery_uncertain = False
+                exc.safe_to_requeue = True
+                raise
+            raise ClaudeSDKQueryError(
+                f"Claude {'goal request' if _goal_condition is not None else 'Force Send'} was cancelled after delivery was attempted; "
+                "the message must not be replayed"
+            ) from exc
+
     async def clear_goal(
         self, *, run_id: str, expected_generation: str | None = None,
     ) -> tuple[dict[str, Any], str]:
@@ -1581,7 +1407,11 @@ class ClaudeSDKSupervisor:
         response: asyncio.Future[dict[str, Any] | None] = loop.create_future()
         assert self._commands is not None
         await self._commands.put(_GetContextUsage(response=response))
-        return await asyncio.shield(response)
+        try:
+            return await asyncio.shield(response)
+        except asyncio.CancelledError:
+            response.cancel()
+            raise
 
     async def get_mcp_status(self) -> tuple[dict[str, Any], str]:
         """Connect lazily and query MCP state on this chat-owned SDK actor."""
@@ -1828,6 +1658,11 @@ class ClaudeSDKSupervisor:
     async def _new_client(self) -> ClaudeSDKClientProtocol:
         client: ClaudeSDKClientProtocol | None = None
         try:
+            # A fork's saved native ID changes after its first turn. Keep the
+            # latest supplied binding for reconnects that happen inside the
+            # actor, without replacing callbacks on the still-live client.
+            self.options = self._reconnect_options
+            bind_permission_owner(self.options, self.ownership_token)
             client_options, background_hook = _connection_background_hook(self.options)
             self._background_reconciliation_hook = background_hook
             client_options, self._pending_mail_hint_hook = _connection_mail_hint_hook(client_options)
@@ -1886,6 +1721,27 @@ class ClaudeSDKSupervisor:
             client = await self._new_client()
         return client
 
+    def _query_provider_session_id(self, supplied: str | None) -> str | None:
+        if supplied is not None and supplied != "default":
+            return supplied
+        options = self._reconnect_options
+        value = options.get if isinstance(options, dict) else lambda key: getattr(options, key, None)
+        # A first fork submission runs in a newly assigned child UUID, not
+        # its resume source. The exact process/query/prompt still owns its hook.
+        return None if value("fork_session") else value("resume")
+
+    def _observe_live_background_work(self, message: Any) -> None:
+        subtype, task_id, task_type, status = _task_lifecycle_fields(message)
+        if not task_id:
+            return
+        before = task_id in self._live_background_tasks
+        if subtype == "task_started" and task_type in {*_DEFERRING_TASK_TYPES, "local_bash"}:
+            self._live_background_tasks.add(task_id)
+        elif subtype == "task_notification" or (subtype == "task_updated" and status in _TERMINAL_TASK_STATUSES):
+            self._live_background_tasks.discard(task_id)
+        if before != (task_id in self._live_background_tasks):
+            self._background_work_revision += 1
+
     async def _receive_loop(
         self,
         client: ClaudeSDKClientProtocol,
@@ -1900,6 +1756,11 @@ class ClaudeSDKSupervisor:
                 # activity, including packets arriving after side cancellation.
                 if is_native_side_question_progress(message):
                     continue
+                if self._client is client and self._generation == generation:
+                    # Native Bash may outlive the logical Result. Observe its
+                    # lifecycle on this exact connection, even with no run or
+                    # while an auxiliary actor control is awaiting a reply.
+                    self._observe_live_background_work(message)
                 commands = self._commands
                 if commands is None:
                     return
@@ -1918,6 +1779,10 @@ class ClaudeSDKSupervisor:
                 )
 
     async def _disconnect_current_client(self) -> None:
+        self._supports_send_now = False
+        self._supports_command_lifecycle = False
+        self._fail_pending_steer("Claude disconnected before confirming Force Send")
+        self._fail_pending_goal("Claude disconnected before applying the queued goal")
         pending = self._pending_goal_clear
         self._pending_goal_clear = None
         if pending is not None and not pending.response.done():
@@ -1938,23 +1803,49 @@ class ClaudeSDKSupervisor:
         self._client = None
         self._receiver_task = None
         self._connected = False
+        self._live_background_tasks.clear()
+        self._background_work_revision += 1
         if client is not None:
             await self._disconnect_client(client)
         if receiver is not None and receiver is not asyncio.current_task():
             await self._cancel_task_bounded(receiver)
 
     def _fail_active(self, error: BaseException) -> None:
+        self._fail_pending_steer("Claude ended before confirming Force Send")
+        self._fail_pending_goal("Claude ended before applying the queued goal")
         self._cancel_ack_timeout()
         active = self._active_run
         self._active_run = None
         bind_provider_tool_owner(self.options, "", "")
         self._inflight_tasks.clear()
+        self._goal_stop_run_id = None
+        self._goal_stop_tasks.clear()
+        self._goal_stop_result = None
+        self._superseded_query_ids.clear()
+        self._current_query_id = None
         if self._background_reconciliation_hook is not None:
             self._background_reconciliation_hook.retire()
         if self._pending_mail_hint_hook is not None:
             self._pending_mail_hint_hook.retire()
         if active is not None:
             active._fail(error)
+
+    def _fail_pending_steer(self, message: str) -> None:
+        pending = self._pending_steer
+        self._pending_steer = None
+        if pending is not None and not pending.response.done():
+            pending.response.set_exception(ClaudeSDKQueryError(message))
+
+    def _fail_pending_goal(self, message: str, *, cancelled_by_user: bool = False) -> None:
+        pending = self._pending_goal
+        self._pending_goal = None
+        if pending is not None:
+            if self._active_run is not None:
+                self._active_run._deliver(ClaudeSDKGoalReceipt(
+                    pending.correlation_id, message, cancelled_by_user=cancelled_by_user,
+                ))
+            if not pending.response.done():
+                pending.response.set_exception(ClaudeSDKQueryError(message))
 
     def _cancel_ack_timeout(self) -> None:
         task = self._ack_timeout_task
@@ -1986,10 +1877,10 @@ class ClaudeSDKSupervisor:
 
     async def _deliver_query_bounded(
         self,
-        query: Awaitable[None],
+        query: Awaitable[Any],
         *,
         run_id: str,
-    ) -> None:
+    ) -> Any:
         """Bound stdin delivery without awaiting cancellation-hostile SDK code."""
 
         task = asyncio.create_task(
@@ -2018,7 +1909,7 @@ class ClaudeSDKSupervisor:
                 f"Claude SDK query delivery timed out for chat {self.chat_id}; "
                 "delivery is uncertain"
             )
-        await task
+        return await task
 
     async def _handle_start(self, command: _StartRun) -> None:
         if self._pending_goal_clear is not None:
@@ -2093,6 +1984,8 @@ class ClaudeSDKSupervisor:
         )
         handle._background_task_reconciliation = command.background_task_reconciliation
         self._active_run = handle
+        self._superseded_query_ids.clear()
+        self._current_query_id = correlation_id
         self._last_used_at = time.monotonic()
         if command.on_supervisor_ready is not None:
             try:
@@ -2127,9 +2020,7 @@ class ClaudeSDKSupervisor:
         if mail_hook is not None:
             mail_hook.retire()
             if callable(command.pending_mail_hint):
-                provider_id = command.query_session_id
-                if provider_id is None or provider_id == "default":
-                    provider_id = self.options.get("resume") if isinstance(self.options, dict) else getattr(self.options, "resume", None)
+                provider_id = self._query_provider_session_id(command.query_session_id)
                 generation = self._generation
                 mail_hook.bind(
                     handle, command.pending_mail_hint, _receipt_field(provider_id),
@@ -2137,9 +2028,7 @@ class ClaudeSDKSupervisor:
                     and self._generation == generation and self._pending_mail_hint_hook is mail_hook,
                 )
         if background_hook is not None and command.background_task_reconciliation is not None:
-            provider_id = command.query_session_id
-            if provider_id is None or provider_id == "default":
-                provider_id = self.options.get("resume") if isinstance(self.options, dict) else getattr(self.options, "resume", None)
+            provider_id = self._query_provider_session_id(command.query_session_id)
             background_hook.bind(
                 handle,
                 command.prompt,
@@ -2209,6 +2098,112 @@ class ClaudeSDKSupervisor:
         if not command.response.done():
             command.response.set_result(handle)
 
+    async def _handle_steer(self, command: _SteerRun) -> None:
+        if command.cancelled:
+            return
+        active = self._active_run
+        client = self._client
+        operation = "setting the goal" if command.goal_condition is not None else "Force Send"
+        if (active is None or active.done or active.run_id != command.run_id
+                or self.ownership_token != command.ownership_token
+                or client is None or not self._connected):
+            command.response.set_exception(ClaudeSDKGenerationChanged(
+                f"The Claude run changed before {operation}"
+            ))
+            return
+        if ((not active.acknowledged and command.goal_condition is None)
+                or (self._pending_goal is not None if command.goal_condition is not None else self._pending_steer is not None)
+                or self._pending_goal_clear is not None or self._goal_stop_run_id is not None):
+            command.response.set_exception(ClaudeSDKRunActive(
+                "Claude is still confirming its previous input"
+            ))
+            return
+        send_now = getattr(client, "send_now", None)
+        if command.goal_condition is not None and not self._supports_command_lifecycle:
+            command.response.set_exception(ClaudeSDKConfigurationConflict(
+                "Update Claude Code to set a goal while it is working"
+            ))
+            return
+        if command.goal_generation is not None and command.goal_generation != self.control_generation:
+            command.response.set_exception(ClaudeSDKGenerationChanged(
+                "The Claude command inventory changed before setting the goal"
+            ))
+            return
+        if command.goal_condition is None and (not self._supports_send_now or not callable(send_now)):
+            command.response.set_exception(ClaudeSDKConfigurationConflict(
+                "This Claude CLI cannot Force Send while preserving background work; "
+                "update Claude Code or leave the message queued"
+            ))
+            return
+        try:
+            if command.on_before_send is not None:
+                await command.on_before_send(self.ownership_token)
+            if command.cancelled:
+                return
+            if self._closed:
+                raise ClaudeSDKSupervisorClosed(f"Claude closed before {operation}")
+        except Exception as exc:
+            if not command.response.done():
+                command.response.set_exception(exc)
+            return
+
+        # Keep the same run and MCP owner. Rebinding would let a delayed call
+        # from the preceding model response borrow a successor's authority.
+        # Install the receipt lane before writing: the receiver can enqueue
+        # an interrupted predecessor Result or a child completion immediately.
+        if command.goal_condition is not None:
+            self._pending_goal = command
+        else:
+            self._pending_steer = command
+        command.delivery_attempted = True
+        try:
+            kwargs = ({"session_id": command.query_session_id}
+                      if command.query_session_id is not None else {})
+            await self._deliver_query_bounded(
+                client.query(_query_message_stream(
+                    command.prompt, command.correlation_id,
+                    "goal" if command.goal_condition is not None else None,
+                    priority="now" if command.goal_condition is not None else "next",
+                ), **kwargs),
+                run_id=command.run_id,
+            )
+        except Exception as exc:
+            error = ClaudeSDKQueryError(
+                f"Claude {'goal request' if command.goal_condition is not None else 'Force Send'} delivery is uncertain: {exc}"
+            )
+            if not command.response.done():
+                command.response.set_exception(error)
+            # The transport may have accepted the frame before reporting a
+            # write failure. Keep its receipt lane and the existing tasks;
+            # only an actual receiver failure or explicit Stop retires them.
+            return
+        self._last_used_at = time.monotonic()
+
+    async def _send_pending_input_now(self, command: _SteerRun) -> None:
+        if command.send_now_requested:
+            return
+        command.send_now_requested = True
+        try:
+            # Wait for the exact queued receipt: a control sent while native
+            # admission is pending intentionally does nothing. Once queued,
+            # Send now releases the foreground tool wait while sparing native
+            # background tasks. Plain interrupt remains the hard Stop path.
+            assert self._client is not None
+            receipt = await self._deliver_query_bounded(
+                self._client.send_now(command.correlation_id), run_id=command.run_id,
+            )
+            if not isinstance(receipt, dict) or receipt.get("send_now") not in {
+                "stopped", "delivering", "nothing_waiting",
+            }:
+                raise ClaudeSDKSupervisorError("Claude returned no Send now receipt")
+        except Exception as exc:
+            if not command.response.done():
+                command.response.set_exception(ClaudeSDKQueryError(
+                    f"Claude Force Send delivery is uncertain: {exc}"
+                ))
+            # The user frame was already written. Preserve its ACK lane and
+            # live tasks; retrying or disconnecting would compound uncertainty.
+
     async def _handle_clear_goal(self, command: _ClearGoal) -> None:
         if command.cancelled or command.response.done():
             return
@@ -2222,6 +2217,11 @@ class ClaudeSDKSupervisor:
         if self._pending_goal_clear is not None:
             command.response.set_exception(ClaudeSDKRunActive(
                 "Claude is already clearing its goal"
+            ))
+            return
+        if self._pending_steer is not None:
+            command.response.set_exception(ClaudeSDKRunActive(
+                "Claude is still applying a queued input"
             ))
             return
         generation = self.control_generation
@@ -2241,6 +2241,7 @@ class ClaudeSDKSupervisor:
             }
 
         try:
+            await self._cancel_queued_goal(active.run_id)
             # Priority-now interrupts model streaming but can wait behind a
             # running tool. The SDK control channel cancels that tool first.
             # Keep the receipt lane installed before interrupting: Claude may
@@ -2259,6 +2260,23 @@ class ClaudeSDKSupervisor:
                 command.response.set_exception(ClaudeSDKQueryError(
                     f"Claude goal-clear delivery is uncertain: {exc}"
                 ))
+
+    async def _cancel_queued_goal(self, run_id: str) -> None:
+        pending = self._pending_goal
+        if pending is None:
+            return
+        # Plain interrupt deliberately keeps native queued inputs. Withdraw
+        # this exact UUID first so explicit Stop/Clear cannot resurrect it.
+        assert self._client is not None
+        cancel = getattr(self._client, "cancel_queued_input", None)
+        if not callable(cancel):
+            raise ClaudeSDKSupervisorError("Claude cannot cancel its queued goal")
+        receipt = await self._deliver_query_bounded(cancel(pending.correlation_id), run_id=run_id)
+        if not isinstance(receipt, dict) or type(receipt.get("cancelled")) is not bool:
+            raise ClaudeSDKSupervisorError("Claude did not confirm queued-goal cancellation")
+        # False means already dequeued: the following explicit interrupt owns
+        # that running command. No queued copy remains to start afterwards.
+        self._fail_pending_goal("The queued goal was cancelled", cancelled_by_user=True)
 
     async def _handle_interrupt(self, command: _Interrupt) -> None:
         active = self._active_run
@@ -2280,6 +2298,29 @@ class ClaudeSDKSupervisor:
                 )
             return
         active._background_reconciliation_aborted = True
+        stopping_queued_goal = self._pending_goal is not None or self._goal_stop_run_id == active.run_id
+        if stopping_queued_goal:
+            self._goal_stop_run_id = active.run_id
+            self._goal_stop_tasks.update(
+                item["task_id"] for item in active.background_task_receipts
+                if item["status"] == "running"
+            )
+        withdrawal_error: Exception | None = None
+        try:
+            if stopping_queued_goal and self._pending_steer is not None:
+                # Both inputs may be queued on this owner. Withdrawing only
+                # the goal could let Force Send wake while Stop drains tasks.
+                cancel = getattr(client, "cancel_queued_input", None)
+                if callable(cancel):
+                    await self._deliver_query_bounded(
+                        cancel(self._pending_steer.correlation_id), run_id=active.run_id,
+                    )
+            self._fail_pending_steer("Claude was stopped before confirming Force Send")
+            await self._cancel_queued_goal(active.run_id)
+        except Exception as exc:
+            withdrawal_error = exc
+            self._fail_pending_steer("Stop could not confirm withdrawal of the Force Send input")
+            self._fail_pending_goal("Stop could not confirm withdrawal of the queued goal")
         try:
             await client.interrupt()
         except Exception as exc:
@@ -2289,6 +2330,21 @@ class ClaudeSDKSupervisor:
                         f"Claude SDK interrupt failed for chat {self.chat_id}: {exc}"
                     )
                 )
+            return
+        if stopping_queued_goal:
+            # Priority-now can register a foreground Bash as a background
+            # task *after* interrupt returns. Keep this exact receiver alive
+            # until the native terminal receipt and stop those exact tasks as
+            # they appear. Disconnect alone does not terminate such a Bash.
+            for task_id in tuple(self._goal_stop_tasks):
+                await self._stop_goal_task(task_id, active.run_id)
+            if not command.response.done():
+                if withdrawal_error is not None:
+                    command.response.set_exception(ClaudeSDKQueryError(
+                        f"Claude Stop was sent but queued-input withdrawal is uncertain: {withdrawal_error}"
+                    ))
+                else:
+                    command.response.set_result(True)
             return
         if not active.acknowledged:
             error = ClaudeSDKQueryError(
@@ -2301,6 +2357,48 @@ class ClaudeSDKSupervisor:
         if not command.response.done():
             command.response.set_result(True)
 
+    async def _stop_goal_task(self, task_id: str, run_id: str) -> None:
+        if self._goal_stop_run_id != run_id or self._client is None:
+            return
+        try:
+            await self._deliver_query_bounded(self._client.stop_task(task_id), run_id=run_id)
+        except Exception as exc:
+            # Do not invent a stopped receipt. Retain ownership and let the
+            # existing Stop confirmation deadline/retry report the failure.
+            logger.warning("Claude task Stop was not confirmed chat=%s task=%s: %s", self.chat_id, task_id, exc)
+
+    async def _receive_goal_stop(self, message: Any, active: ClaudeSDKRunHandle) -> None:
+        if (self._is_result_message(message)
+                and str(_message_field(message, "user_message_uuid") or "") in self._superseded_query_ids):
+            return
+        subtype, task_id, _task_type, status = _task_lifecycle_fields(message)
+        active._observe_background_task(message)
+        if subtype == "task_started" and task_id:
+            self._goal_stop_tasks.add(task_id)
+            await self._stop_goal_task(task_id, active.run_id)
+        elif task_id and (subtype == "task_notification" or status in _TERMINAL_TASK_STATUSES):
+            self._goal_stop_tasks.discard(task_id)
+        if self._is_result_message(message):
+            self._goal_stop_result = message
+        elif _message_type(message) != "command_lifecycle":
+            active._deliver(message)
+        if self._goal_stop_result is None or self._goal_stop_tasks:
+            return
+        terminal = self._goal_stop_result
+        self._cancel_ack_timeout()
+        # Retire before releasing the handle: no queued input or stopping
+        # task observer can cross into a successor on this connection.
+        await self._disconnect_current_client()
+        self._closed = True
+        self._active_run = None
+        self._goal_stop_run_id = None
+        self._goal_stop_result = None
+        self._inflight_tasks.clear()
+        self._superseded_query_ids.clear()
+        self._current_query_id = None
+        active._deliver(terminal)
+        active._finish(terminal)
+
     async def _handle_get_context_usage(
         self,
         command: _GetContextUsage,
@@ -2311,8 +2409,21 @@ class ClaudeSDKSupervisor:
             if not command.response.done():
                 command.response.set_result(None)
             return
+        if command.response.cancelled():
+            return
+        operation = asyncio.create_task(getter())
         try:
-            value = await getter()
+            done, _ = await asyncio.wait(
+                {operation, command.response}, timeout=self._control_timeout_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if operation not in done:
+                if not command.response.done():
+                    command.response.set_exception(ClaudeSDKControlTimeout(
+                        f"Claude SDK context usage timed out for {self.chat_id}"
+                    ))
+                return
+            value = operation.result()
         except Exception as exc:
             if not command.response.done():
                 command.response.set_exception(
@@ -2321,6 +2432,9 @@ class ClaudeSDKSupervisor:
                     )
                 )
             return
+        finally:
+            if not operation.done():
+                await self._cancel_task_bounded(operation)
         self._last_used_at = time.monotonic()
         if not command.response.done():
             command.response.set_result(dict(value) if isinstance(value, dict) else None)
@@ -2714,6 +2828,18 @@ class ClaudeSDKSupervisor:
     async def _handle_received(self, command: _ReceivedMessage) -> None:
         if command.generation != self._generation:
             return
+        data = _message_field(command.message, "data", {})
+        if _message_field(command.message, "subtype") == "init":
+            capabilities = _message_field(command.message, "capabilities")
+            if capabilities is None and isinstance(data, dict):
+                capabilities = data.get("capabilities")
+            self._supports_send_now = isinstance(capabilities, list) and all(
+                capability in capabilities
+                for capability in ("interrupt_send_now_v1", "msg_lifecycle_v1")
+            )
+            self._supports_command_lifecycle = (
+                isinstance(capabilities, list) and "msg_lifecycle_v1" in capabilities
+            )
         if _message_type(command.message) in {"ratelimitevent", "rate_limit_event"} and self._usage_observer is not None:
             generation = self.control_generation
             if generation is not None:
@@ -2742,7 +2868,58 @@ class ClaudeSDKSupervisor:
         active = self._active_run
         if active is None or active.done:
             return
+        if self._goal_stop_run_id == active.run_id:
+            await self._receive_goal_stop(command.message, active)
+            return
         self._last_used_at = time.monotonic()
+        steer = self._pending_steer
+        goal = self._pending_goal
+        if _message_type(command.message) == "command_lifecycle":
+            goal_matches = goal is not None and _message_field(command.message, "command_uuid") == goal.correlation_id
+            queued = goal if goal_matches else steer
+            if (queued is not None
+                    and _message_field(command.message, "command_uuid") == queued.correlation_id):
+                state = _message_field(command.message, "state")
+                if state == "queued":
+                    if goal_matches:
+                        if not queued.response.done():
+                            queued.response.set_result(queued.correlation_id)
+                    else:
+                        await self._send_pending_input_now(queued)
+                elif state == "started":
+                    queued.goal_started = True
+                elif state in {"cancelled", "discarded", "refused"}:
+                    previous = queued.predecessor_result
+                    if goal_matches:
+                        self._fail_pending_goal(f"Claude {state} the queued goal before applying it")
+                    else:
+                        self._fail_pending_steer("Claude cancelled the Force Send input before confirming it")
+                    if previous is not None:
+                        await self._handle_received(_ReceivedMessage(command.generation, previous))
+            return
+        goal_matches = goal is not None and _is_matching_replay_ack(command.message, goal.correlation_id)
+        accepted = goal if goal_matches else steer
+        if accepted is not None and _is_matching_replay_ack(command.message, accepted.correlation_id):
+            if self._current_query_id is not None:
+                self._superseded_query_ids.add(self._current_query_id)
+            self._current_query_id = accepted.correlation_id
+            if goal_matches:
+                self._pending_goal = None
+                if not active.acknowledged:
+                    active._mark_acknowledged_without_replay()
+                    self._cancel_ack_timeout()
+                active._deliver(ClaudeSDKGoalReceipt(accepted.correlation_id))
+            else:
+                self._pending_steer = None
+            if not accepted.response.done():
+                accepted.response.set_result(accepted.correlation_id)
+            return
+        message_uuid = str(_message_field(command.message, "uuid") or "")
+        if (active.acknowledged and (message_uuid == self._current_query_id
+                or message_uuid in self._superseded_query_ids)
+                and _is_matching_replay_ack(command.message, message_uuid)):
+            # Duplicate receipts are protocol metadata, never user bubbles.
+            return
         if not active.acknowledged:
             if (pending is not None and self._is_result_message(command.message)
                     and _result_forces_run_end(command.message)):
@@ -2760,18 +2937,36 @@ class ClaudeSDKSupervisor:
             # before this query. Nothing owns the new run until its exact UUID
             # is replayed by the CLI.
             return
-        elif _is_matching_replay_ack(
-            command.message,
-            active.correlation_id,
-        ):
-            # A duplicate acknowledgment is protocol metadata, never a second
-            # user bubble.
-            return
 
         active._observe_reconciliation_progress(command.message)
         if self._pending_mail_hint_hook is not None:
             self._pending_mail_hint_hook.observe(command.message)
         if self._is_result_message(command.message):
+            result_query_id = str(_message_field(command.message, "user_message_uuid") or "")
+            if goal is not None:
+                if (result_query_id == goal.correlation_id
+                        or (_message_field(command.message, "local_command") == "goal"
+                            and goal.goal_started and not result_query_id)):
+                    # A successful /goal starts a model query and replays its
+                    # UUID. A text-only local result is a native refusal (even
+                    # when is_error=False), not the active parent's Result.
+                    previous = goal.predecessor_result
+                    self._fail_pending_goal(str(_message_field(command.message, "result")
+                                               or _message_field(command.message, "errors")
+                                               or "Claude did not confirm the queued goal"))
+                    if previous is not None:
+                        await self._handle_received(_ReceivedMessage(command.generation, previous))
+                    return
+                if result_query_id not in self._superseded_query_ids:
+                    goal.predecessor_result = command.message
+            if goal is not None or steer is not None or result_query_id in self._superseded_query_ids:
+                # A Send now input preempts one model response while its
+                # native Agent/workflow tasks remain alive. Before its exact
+                # ACK, Results still belong to the preceding response. Newer
+                # CLIs also identify that input explicitly, fencing delayed
+                # predecessor Results after the ACK without discarding task
+                # notification turns (which may have their own UUID).
+                return
             # A Claude Result ends one model turn, not necessarily the logical
             # run. Delegated local agents/workflows can outlive that Result;
             # their completion wakes Claude for a follow-up model turn and a
@@ -2790,6 +2985,8 @@ class ClaudeSDKSupervisor:
             self._active_run = None
             bind_provider_tool_owner(self.options, "", "")
             self._inflight_tasks.clear()
+            self._superseded_query_ids.clear()
+            self._current_query_id = None
             if had_inflight_tasks and forced_run_end:
                 # An interrupted/error response can strand provider-side task
                 # frames after this logical run has ended. Retire only this
@@ -2883,6 +3080,8 @@ class ClaudeSDKSupervisor:
                 )
                 if isinstance(command, _StartRun):
                     await self._handle_start(command)
+                elif isinstance(command, _SteerRun):
+                    await self._handle_steer(command)
                 elif isinstance(command, _Interrupt):
                     await self._handle_interrupt(command)
                 elif isinstance(command, _GetContextUsage):
@@ -2940,15 +3139,15 @@ class ClaudeSDKSupervisor:
 
 
 class ClaudeSDKSupervisorManager:
-    """Lazy, bounded registry of independent chat-scoped supervisors."""
+    """Lazy registry with optional operator limits for chat-scoped supervisors."""
 
     def __init__(
         self,
         *,
         client_factory: ClientFactory = default_claude_sdk_client_factory,
         is_result_message: ResultPredicate = default_is_result_message,
-        max_clients: int = 12,
-        idle_ttl_seconds: float | None = 15 * 60,
+        max_clients: int = 0,
+        idle_ttl_seconds: float | None = None,
         connect_timeout_seconds: float = 30.0,
         disconnect_timeout_seconds: float = 2.0,
         ack_timeout_seconds: float = 60.0,
@@ -2956,15 +3155,15 @@ class ClaudeSDKSupervisorManager:
         control_timeout_seconds: float = 15.0,
         usage_observer: Callable[[str, str, Any], Awaitable[None]] | None = None,
     ) -> None:
-        if max_clients < 1:
-            raise ValueError("max_clients must be positive")
+        if max_clients < 0:
+            raise ValueError("max_clients must be non-negative")
         if idle_ttl_seconds is not None and idle_ttl_seconds < 0:
             raise ValueError("idle_ttl_seconds must be non-negative or None")
         self._client_factory = client_factory
         self._is_result_message = is_result_message
         self._usage_observer = usage_observer
         self._max_clients = int(max_clients)
-        self._idle_ttl_seconds = idle_ttl_seconds
+        self._idle_ttl_seconds = idle_ttl_seconds or None
         if connect_timeout_seconds <= 0:
             raise ValueError("connect_timeout_seconds must be positive")
         self._connect_timeout_seconds = float(connect_timeout_seconds)
@@ -3079,6 +3278,10 @@ class ClaudeSDKSupervisorManager:
             )
             self._supervisors[chat_id] = supervisor
         else:
+            # Preserve current callbacks and owned work, but never discard a
+            # newer persisted resume/fork binding merely because this client
+            # is connected. Its actor may need to reconnect after this lookup.
+            supervisor._reconnect_options = options
             # A disconnected actor has no live provider state. Refresh its
             # lazy reconnect options so a newly persisted resume/fork binding
             # is honored after a stream failure without changing the stable
@@ -3215,6 +3418,62 @@ class ClaudeSDKSupervisorManager:
             return False
         return await supervisor.interrupt(run_id=run_id)
 
+    async def steer_run(
+        self,
+        chat_id: str,
+        prompt: str,
+        *,
+        run_id: str,
+        ownership_token: str,
+        query_session_id: str | None = None,
+        on_before_send: SupervisorReadyCallback | None = None,
+    ) -> str:
+        """Steer only the exact existing live owner, without a new authority."""
+
+        self._bind_loop()
+        assert self._lock is not None
+        async with self._lock:
+            supervisor = self._supervisors.get(str(chat_id))
+            if (supervisor is None or supervisor.closed
+                    or supervisor.ownership_token != str(ownership_token)
+                    or supervisor.active_run_id != str(run_id)):
+                raise ClaudeSDKGenerationChanged(
+                    "The Claude run changed before Force Send"
+                )
+        return await supervisor.steer_run(
+            prompt, run_id=run_id, ownership_token=ownership_token,
+            query_session_id=query_session_id, on_before_send=on_before_send,
+        )
+
+    async def queue_goal(
+        self, chat_id: str, condition: str, *, run_id: str,
+        ownership_token: str, command_id: str,
+        expected_generation: str | None = None,
+        on_before_send: SupervisorReadyCallback | None = None,
+    ) -> str:
+        """Queue native /goal on its current owner, without interrupting work.
+
+        Return its exact queued UUID. Applied/refused receipts remain on the
+        existing run stream, which stays alive across the predecessor Result.
+        """
+        condition = str(condition).strip()
+        if (not condition or len(condition) > 4000
+                or condition.lower() in {"clear", "stop", "off", "reset", "none", "cancel"}):
+            raise ValueError("Enter a completion condition for Claude")
+        self._bind_loop()
+        assert self._lock is not None
+        async with self._lock:
+            supervisor = self._supervisors.get(str(chat_id))
+            if (supervisor is None or supervisor.closed
+                    or supervisor.ownership_token != str(ownership_token)
+                    or supervisor.active_run_id != str(run_id)):
+                raise ClaudeSDKGenerationChanged("The Claude run changed before setting its goal")
+        return await asyncio.wait_for(supervisor.steer_run(
+            "/goal " + condition, run_id=run_id, ownership_token=ownership_token,
+            on_before_send=on_before_send, _goal_condition=condition,
+            _command_id=command_id, _goal_generation=expected_generation,
+        ), timeout=supervisor._control_timeout_seconds)
+
     async def clear_goal(
         self, chat_id: str, *, run_id: str,
         expected_generation: str | None = None,
@@ -3254,6 +3513,15 @@ class ClaudeSDKSupervisorManager:
                     clean_chat_id, supervisor, task_name_prefix="claude-sdk-goal-retire",
                 )
             await self._unpin_mcp_supervisor(clean_chat_id, supervisor)
+
+    def background_work_snapshot(self) -> tuple[tuple[str, str, int, int, bool], ...]:
+        """Connection-bound live work; schedules without running tasks are idle."""
+        return tuple(
+            (chat_id, supervisor.ownership_token, supervisor._generation,
+             supervisor._background_work_revision, bool(supervisor._live_background_tasks))
+            for chat_id, supervisor in self._supervisors.items()
+            if supervisor.connected and not supervisor.closed
+        )
 
     async def get_context_usage(
         self,
@@ -3712,7 +3980,7 @@ class ClaudeSDKSupervisorManager:
                 for chat_id, supervisor in idle_candidates:
                     if now - supervisor.last_used_at >= self._idle_ttl_seconds:
                         selected_ids.add(chat_id)
-            overflow = max(0, len(self._supervisors) - self._max_clients)
+            overflow = max(0, len(self._supervisors) - self._max_clients) if self._max_clients else 0
             if overflow:
                 for chat_id, _supervisor in idle_candidates:
                     if len(selected_ids) >= overflow:

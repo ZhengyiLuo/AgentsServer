@@ -4,13 +4,17 @@ Side chat uses the provider's conversation context, not a projection of the
 desktop timeline. No main turn, queue item, goal mutation, or provider-history
 import is created by a side question.
 
-- Codex: `thread/fork`, reusing that fork for follow-ups. Synchronized side
-  conversations persist their native thread; the legacy request route uses an
-  ephemeral fork. Its dedicated app-server process uses the parent's workspace,
-  tools and selected permissions. Inherited tasks and approvals are reference
-  context; mutations require a new explicit Side chat request. Subagents remain
-  unavailable. Native approval requests use the existing approval UI and belong
-  only to the side thread. The main run's internal
+- Codex: `thread/fork`, reusing that fork for follow-ups. Synced Side chat saves
+  its native fork for resumption; the legacy request-scoped API uses an
+  ephemeral fork. Native full-history subagent forks require a saved rollout
+  and therefore work in synced Side chat, not the legacy ephemeral fork.
+  Its dedicated app-server process uses the parent's workspace and selected
+  permissions. Like native Codex Side chat, it can read/search files, run
+  non-mutating checks and use configured tools. Inherited tasks and approvals
+  are reference context; mutations require a new explicit request in Side chat.
+  Native subagents remain available. Approval requests use the existing UI
+  only for the side fork and descendants whose native lineage reaches it;
+  inherited parent agents remain outside that ownership. The main run's internal
   AgentsDock helper transport and credentials are not inherited. The source
   thread is never resumed, interrupted or modified.
 - Claude: native `side_question` control (the `/btw` operation) on the exact
@@ -43,11 +47,13 @@ answers expose it too. Claude `/btw` continues using its connected parent.
 `DELETE /api/sessions/{session}/side-questions/{request}` cancels one request.
 `DELETE /api/sessions/{session}/side-chats/{side_chat}` closes the side chat.
 Both are native-operator-only and scoped to the authenticated owner and parent.
-Clear and server shutdown release owned resources. Synchronized Codex side
+Clear, profile shutdown and server shutdown release owned resources. Synchronized Codex side
 conversations resume their persisted native thread after transport cleanup;
 there is no request execution deadline. Cancellation/error closes the owned
 transport without interrupting the parent. The legacy ephemeral route cannot
 resume a closed context.
+Idle side contexts remain available while their owning runtime is active;
+elapsed idle time does not discard native context.
 
 Tests must cover real tool-result context, successive questions, cancellation
 with a running parent, unchanged parent goals/transcripts, native cold resume,

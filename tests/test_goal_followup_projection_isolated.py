@@ -8,7 +8,7 @@ import unittest
 
 from tests.test_async_chat_timeline_index_isolated import load_index
 from tests.test_codex_history_metadata_isolated import projection
-from public_chat_transcript import read_public_transcript
+from public_chat_transcript import make_public_event_projector, read_public_transcript
 
 
 def event(seq, kind, **fields):
@@ -126,3 +126,76 @@ class GoalFollowupProjectionTests(unittest.TestCase):
             self.write([self.events[0], invalid])
             result = read_public_transcript(self.path, lambda item: item)
             self.assertEqual([item["text"] for item in result["messages"]], ["Original goal request"])
+
+
+class ClaudeFollowupProjectionTests(GoalFollowupProjectionTests):
+    def setUp(self):
+        super().setUp()
+        for item in self.events:
+            item.update(backend="claude", purpose=None)
+            if item["type"] == "turn_steered":
+                item.pop("native_goal_steer")
+                item.update(native_followup=True, provider_message_id=f"claude-message-{item['seq']}")
+        self.write(self.events)
+
+    def test_unproven_steer_is_not_human_history_or_shareable_input(self):
+        for field, value in (
+            ("native_followup", False), ("native_steer", False),
+            ("provider_user_authored", False), ("provider_generated", True),
+            ("purpose", "scheduled_job"), ("backend", "codex"),
+            ("run_id", ""), ("provider_message_id", None),
+            ("provider_message_id", " "), ("provider_message_id", 42),
+        ):
+            with self.subTest(field=field, value=value):
+                invalid = {**self.events[2], field: value}
+                self.assertFalse(projection()["is_native_goal_steer_event"](invalid))
+                self.write([self.events[0], invalid])
+                result = read_public_transcript(self.path, lambda item: item)
+                self.assertEqual([item["text"] for item in result["messages"]], ["Original goal request"])
+
+    def test_scheduled_owner_keeps_user_followups_separate_on_append_and_reopen(self):
+        scheduled = [
+            item if item["type"] == "turn_steered"
+            else {**item, "purpose": "scheduled_job", "job_id": "job-one"}
+            for item in self.events
+        ]
+        self.write(scheduled[:3])
+        ns = load_index(self.path)
+        initial = ns["_build_timeline_index_locked"]("chat")
+        self.assertEqual([item["key"] for item in initial["landmarks"]], [
+            "job:job-one", "turn:goal-owner:start-3",
+        ])
+        with self.path.open("a", encoding="utf-8") as target:
+            for item in scheduled[3:]:
+                target.write(json.dumps(item) + "\n")
+        warm = deepcopy(ns["_build_timeline_index_locked"]("chat"))
+        self.assertEqual([(item["key"], item["end_seq"]) for item in warm["landmarks"]], [
+            ("job:job-one", 8), ("turn:goal-owner:start-3", 3), ("turn:goal-owner:start-6", 6),
+        ])
+        self.assertEqual([item["seq"] for item in ns["read_semantic_timeline_page"]("chat", limit=1)["events"]], [6])
+        self.assertEqual([item["seq"] for item in ns["read_semantic_timeline_page"](
+            "chat", limit=1, semantic_before=6,
+        )["events"]], [3])
+        self.assertEqual(ns["TIMELINE_INDEX_CACHE"]["chat"]["by_key"]["job:job-one"]["event_count"], 6)
+        ns["TIMELINE_INDEX_CACHE"].clear()
+        self.assertEqual(ns["_build_timeline_index_locked"]("chat"), warm)
+        self.assertEqual([item["seq"] for item in ns["read_semantic_timeline_page"]("chat", limit=1)["events"]], [6])
+
+    def test_shared_followup_preserves_authored_text_and_attachment(self):
+        video = {"id": "video_ZmlsZQ." + "a" * 64, "filename": "demo.mp4",
+                 "content_type": "video/mp4", "size": 10}
+        accepted = {**self.events[2], "prompt": "Exact human instruction", "shared_videos": [video]}
+        self.write([accepted])
+        ns = load_index(self.path)
+        projector = make_public_event_projector(
+            "chat", event_is_visible=ns["is_client_visible_event"],
+            event_files_belong=lambda event, chat: event.get("session_id") == chat,
+            project_provider_event=lambda event, _chat: event,
+            strip_user_context=lambda prompt, **_kwargs: prompt,
+            fork_internal_purposes=set(),
+        )
+        result = read_public_transcript(self.path, projector)
+        self.assertEqual([(item["role"], item["text"], item.get("videos")) for item in result["messages"]], [
+            ("user", "Exact human instruction", [video]),
+        ])
+        self.assertNotIn("provider_message_id", json.dumps(result["messages"]))

@@ -15,7 +15,7 @@ from fastapi import HTTPException
 from starlette.requests import Request
 
 import agent_server
-from claude_sdk_client import ClaudeSDKQueryError, ClaudeSDKUnavailable
+from claude_sdk_client import ClaudeSDKGoalReceipt, ClaudeSDKQueryError, ClaudeSDKUnavailable
 
 
 class FakeClaudeRun:
@@ -785,6 +785,23 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             )
         return append_event, append_finished, runtime_success, runtime_failure
 
+    async def test_goal_receipt_settles_exact_operation_without_becoming_provider_output(self) -> None:
+        receipt = ClaudeSDKGoalReceipt("queued-goal", "Hooks are restricted")
+        terminal = {"type": "result", "result": "Original work completed", "session_id": "provider"}
+        settle = AsyncMock()
+        project = AsyncMock(return_value={
+            "result_text": "Original work completed", "is_error": False,
+            "session_id": "provider", "terminal_reason": "completed",
+        })
+        with patch.object(agent_server, "settle_claude_goal_command", settle), \
+                patch.object(agent_server, "project_claude_sdk_message", project):
+            _events, finished, _success, failure = await self._run_sdk_terminal_case([receipt, terminal])
+        self.assertEqual(settle.await_args.args, ("chat-claude", "run-claude", receipt))
+        self.assertEqual(project.await_count, 1)
+        self.assertIs(project.await_args.args[2], terminal)
+        self.assertEqual(finished.await_args.args[1]["result_text"], "Original work completed")
+        failure.assert_not_called()
+
     async def _run_sdk_timeout_case(
         self,
         handle: FakeClaudeRun,
@@ -1180,6 +1197,48 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             agent_server.CLAUDE_EMPTY_TURN_ERROR,
         )
 
+    async def test_print_disabled_idle_ceiling_waits_for_native_result(self) -> None:
+        process = FakeClaudePrintProcess([])
+        process.stdout.readline = AsyncMock(side_effect=[
+            asyncio.TimeoutError(),
+            b'{"type":"result","result":"done","session_id":"provider"}\n',
+            b"",
+        ])
+        append_event = AsyncMock(return_value={})
+        finished = AsyncMock(return_value={})
+        with patch.multiple(
+            agent_server,
+            IDLE_KILL_SECONDS=0,
+            resolve_claude_resume_provider=Mock(return_value=(None, None)),
+            capture_git_baseline=AsyncMock(return_value={}),
+            build_claude_cmd=Mock(return_value=["claude", "-p"]),
+            process_group_for_pid=Mock(return_value=4242),
+            watch_manifest_artifacts=wait_forever,
+            append_event=append_event,
+            append_turn_finished_event=finished,
+            append_active_stdout=AsyncMock(),
+            mark_provider_turn_ready=AsyncMock(),
+            persist_run_provider_session=AsyncMock(),
+            terminate_process_tree=AsyncMock(),
+            clear_active_process=AsyncMock(),
+            collect_manifest=AsyncMock(),
+            collect_recent_leftover_manifests=AsyncMock(),
+            publish_turn_code_diff=AsyncMock(),
+            release_turn_slot=AsyncMock(return_value=True),
+            record_runtime_success=Mock(),
+            record_runtime_failure=Mock(),
+            should_schedule_queue_after_finish=Mock(return_value=False),
+        ), patch.object(agent_server.asyncio, "create_subprocess_exec",
+                        AsyncMock(return_value=process)):
+            await agent_server.run_claude_print(
+                "chat-claude", "run-claude", "Prompt", dict(self.session),
+                Path(self.cwd) / ".manifest.json",
+            )
+        self.assertEqual(process.stdout.readline.await_count, 3)
+        self.assertEqual(finished.await_args.args[1]["exit_code"], 0)
+        self.assertEqual(finished.await_args.args[1]["result_text"], "done")
+        self.assertFalse(any(call.args[1] == "error" for call in append_event.await_args_list))
+
     async def test_interactive_auto_never_downgrades_to_unattended_print(self) -> None:
         sdk = AsyncMock(side_effect=ClaudeSDKUnavailable("missing SDK"))
         print_runner = AsyncMock()
@@ -1419,7 +1478,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(changed.exception.status_code, 409)
         self.assertIs(self.session["context_usage_snapshot"], newer_snapshot)
 
-    async def test_manual_context_timeout_preserves_snapshot_and_resets_idle_client(self) -> None:
+    async def test_manual_context_timeout_preserves_snapshot_and_connected_client(self) -> None:
         manager = FakeClaudeManager()
         manager.get_context_usage = AsyncMock(  # type: ignore[method-assign]
             side_effect=wait_forever
@@ -1462,11 +1521,11 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertEqual(timed_out.exception.status_code, 504)
-        self.assertEqual(manager.evict_calls, [("chat-claude", True)])
+        self.assertEqual(manager.evict_calls, [])
         self.assertIs(self.session["context_usage_snapshot"], stale_snapshot)
         self.assertEqual(self.session["context_usage_state"], "available")
 
-    async def test_cancelled_manual_context_refresh_retires_only_idle_client(self) -> None:
+    async def test_cancelled_manual_context_refresh_preserves_connected_client(self) -> None:
         manager = FakeClaudeManager()
         sampling_started = asyncio.Event()
 
@@ -1517,7 +1576,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                     break
                 await asyncio.sleep(0)
 
-        self.assertEqual(manager.evict_calls, [("chat-claude", True)])
+        self.assertEqual(manager.evict_calls, [])
         self.assertIs(self.session["context_usage_snapshot"], stale_snapshot)
 
     async def test_cancelled_context_refresh_cannot_late_evict_replacement_turn(
@@ -1525,8 +1584,6 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         manager = FakeClaudeManager()
         sampling_started = asyncio.Event()
-        eviction_started = asyncio.Event()
-        release_eviction = asyncio.Event()
         replacement_running = asyncio.Event()
 
         async def blocked_sample(
@@ -1535,18 +1592,6 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         ) -> None:
             sampling_started.set()
             await asyncio.Event().wait()
-
-        async def delayed_evict(
-            chat_id: str,
-            *,
-            force: bool = False,
-        ) -> bool:
-            manager.evict_calls.append((chat_id, force))
-            eviction_started.set()
-            await release_eviction.wait()
-            manager.active_run_id = None
-            manager.loaded = False
-            return True
 
         async def replacement_runner(
             _session_id: str,
@@ -1562,9 +1607,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         manager.get_context_usage = AsyncMock(  # type: ignore[method-assign]
             side_effect=blocked_sample
         )
-        manager.evict = AsyncMock(  # type: ignore[method-assign]
-            side_effect=delayed_evict
-        )
+        manager.evict = AsyncMock(side_effect=AssertionError("Read-only context sampling must not retire its provider"))
         self.session["claude_session_id"] = "provider-manual"
         agent_server.CLAUDE_SDK_MANAGER = manager
         agent_server.ACTIVE = {}
@@ -1609,7 +1652,8 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             )
             await asyncio.wait_for(sampling_started.wait(), 0.2)
             refresh.cancel()
-            await asyncio.wait_for(eviction_started.wait(), 0.2)
+            with self.assertRaises(asyncio.CancelledError):
+                await refresh
 
             replacement = asyncio.create_task(
                 agent_server.start_turn(
@@ -1617,12 +1661,6 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                     agent_server.TurnRequest(prompt="Replacement turn"),
                 )
             )
-            await asyncio.sleep(0)
-            self.assertFalse(replacement_running.is_set())
-
-            release_eviction.set()
-            with self.assertRaises(asyncio.CancelledError):
-                await refresh
             # Provider admission now scrubs a pre-existing tmux daemon's
             # global and per-session environments before launch. Keep this
             # lifecycle assertion bounded without assuming that external
@@ -1630,7 +1668,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             started = await asyncio.wait_for(replacement, 1.0)
             await asyncio.wait_for(replacement_running.wait(), 0.2)
 
-        self.assertEqual(manager.evict_calls, [("chat-claude", True)])
+        self.assertEqual(manager.evict_calls, [])
         self.assertTrue(manager.loaded)
         self.assertEqual(manager.active_run_id, started["run_id"])
 
@@ -2259,11 +2297,8 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(captured_options["permission_mode"], "plan")
-        self.assertEqual(agent_server.CLAUDE_SDK_CONFIGURATION_VERSION, 11)
-        self.assertEqual(
-            captured_options["disallowed_tools"],
-            ["CronCreate", "Monitor", "ScheduleWakeup"],
-        )
+        self.assertEqual(agent_server.CLAUDE_SDK_CONFIGURATION_VERSION, 12)
+        self.assertNotIn("disallowed_tools", captured_options)
         self.assertEqual(
             captured_options["allowed_tools"],
             [agent_server.CLAUDE_PROVIDER_MCP_TOOL_NAME],
@@ -2293,13 +2328,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         hooks = captured_options["hooks"]
         self.assertEqual(
             [matcher.matcher for matcher in hooks["PreToolUse"]],
-            [
-                agent_server.CLAUDE_PROVIDER_MCP_TOOL_NAME,
-                "Bash",
-                "CronCreate",
-                "Monitor",
-                "ScheduleWakeup",
-            ],
+            [agent_server.CLAUDE_PROVIDER_MCP_TOOL_NAME],
         )
         self.assertEqual(result, {"behavior": "allow"})
         permission.assert_awaited_once_with(
@@ -2333,19 +2362,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                 "/usr/bin/claude",
                 system_prompt,
             )
-        with patch.object(
-            agent_server,
-            "CLAUDE_NON_DURABLE_SCHEDULER_TOOLS",
-            ("CronCreate",),
-        ):
-            previous_tools_key = agent_server.claude_sdk_configuration_key(
-                session,
-                self.cwd,
-                "/usr/bin/claude",
-                system_prompt,
-            )
         self.assertNotEqual(config_key, previous_version_key)
-        self.assertNotEqual(config_key, previous_tools_key)
 
     async def test_provider_tool_repeats_live_reads_but_replays_identical_mutations(self) -> None:
         captured_mcp: dict[str, object] = {}
@@ -2420,7 +2437,12 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             }
             first_mutation = await handler(mutation)
             second_mutation = await handler(mutation)
+            with patch.object(agent_server, "provider_tool_capability_snapshot",
+                              AsyncMock(side_effect=agent_server.ProviderToolError("owner retired"))):
+                stale_mutation = await handler(mutation)
 
+        self.assertTrue(stale_mutation["is_error"])
+        self.assertEqual(stale_mutation["content"][0]["text"], "owner retired")
         self.assertEqual(first_read["content"][0]["text"], "read-1")
         self.assertEqual(second_read["content"][0]["text"], "read-2")
         self.assertEqual(first_mutation, second_mutation)
@@ -2428,73 +2450,36 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(executor.await_count, 3)
 
         entered = 0
-        both_entered = asyncio.Event()
+        all_entered = asyncio.Event()
         release = asyncio.Event()
 
         async def gated_executor(*_args: object, **_kwargs: object):
             nonlocal entered
             entered += 1
-            if entered == agent_server.PROVIDER_TOOL_MAX_CONCURRENT_PER_CLAUDE_CHAT:
-                both_entered.set()
+            if entered == 3:
+                all_entered.set()
             await release.wait()
             return "fresh", False
 
-        with patch.object(
-            agent_server,
-            "execute_provider_tool",
-            AsyncMock(side_effect=gated_executor),
-        ):
+        concurrent_executor = AsyncMock(side_effect=gated_executor)
+        with patch.object(agent_server, "execute_provider_tool", concurrent_executor):
             running = [
-                asyncio.create_task(handler({
-                    "helper": "jobs",
-                    "arguments": ["list"],
-                }))
-                for _ in range(
-                    agent_server.PROVIDER_TOOL_MAX_CONCURRENT_PER_CLAUDE_CHAT
-                )
+                asyncio.create_task(handler({"helper": "jobs", "arguments": ["list"]}))
+                for _ in range(3)
             ]
-            await asyncio.wait_for(both_entered.wait(), 1)
-            rejected = await handler({
-                "helper": "jobs",
-                "arguments": ["list"],
-            })
-            release.set()
-            await asyncio.gather(*running)
+            try:
+                await asyncio.wait_for(all_entered.wait(), 1)
+                self.assertTrue(all(not call.done() for call in running))
+            finally:
+                release.set()
+                results = await asyncio.gather(*running)
 
-        self.assertTrue(rejected["is_error"])
-        self.assertIn(
-            "too many AgentsDock provider actions",
-            rejected["content"][0]["text"],
-        )
-
-    async def test_nondurable_scheduler_permission_never_creates_interaction(self) -> None:
-        append_event = AsyncMock(return_value={})
-        update_metadata = AsyncMock()
-        with patch.dict(sys.modules, fake_claude_sdk_modules()), patch.object(
-            agent_server,
-            "append_event",
-            append_event,
-        ), patch.object(
-            agent_server,
-            "update_claude_pending_session_metadata",
-            update_metadata,
-        ):
-            for tool_name in ("CronCreate", "Monitor", "ScheduleWakeup"):
-                with self.subTest(tool_name=tool_name):
-                    result = await agent_server.handle_claude_tool_permission(
-                        "chat-claude",
-                        tool_name,
-                        {},
-                        {"tool_use_id": f"tool-{tool_name}"},
-                    )
-                    self.assertIsInstance(result, FakePermissionResultDeny)
-                    self.assertFalse(getattr(result, "interrupt", True))
-                    self.assertIn("AgentsDock provider tool", result.message)
-                    self.assertNotIn("provider-authority block", result.message)
-
-        self.assertFalse(agent_server.CLAUDE_PENDING_INTERACTIONS)
-        append_event.assert_not_awaited()
-        update_metadata.assert_not_awaited()
+        self.assertEqual(concurrent_executor.await_count, 3)
+        self.assertTrue(all(not result["is_error"] for result in results))
+        self.assertEqual([result["content"][0]["text"] for result in results], ["fresh"] * 3)
+        for call in concurrent_executor.await_args_list:
+            self.assertEqual(call.args[:2], ("chat-claude", "run-claude"))
+            self.assertEqual(call.kwargs["claude_owner_token"], "owner")
 
     async def test_bypass_permission_mode_never_creates_approval_interaction(self) -> None:
         self.session["claude_permission_mode"] = "bypassPermissions"
@@ -2531,6 +2516,11 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             for tool_name, input_data in (
                 ("Read", {"file_path": "/tmp/read-only.txt"}),
                 ("Bash", {"command": "pwd"}),
+                ("Bash", {"command": "python worker.py", "run_in_background": True}),
+                ("Bash", {"command": "nohup ./worker > worker.log 2>&1 &"}),
+                ("CronCreate", {"cron": "* * * * *", "prompt": "Check progress"}),
+                ("Monitor", {}),
+                ("ScheduleWakeup", {}),
             ):
                 with self.subTest(tool_name=tool_name):
                     result = await agent_server.handle_claude_tool_permission(
@@ -2672,16 +2662,15 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("--permission-mode", command)
         disallowed_index = command.index("--disallowedTools")
         self.assertEqual(
-            command[disallowed_index + 1:disallowed_index + 7],
+            command[disallowed_index + 1:disallowed_index + 4],
             [
                 "AskUserQuestion",
                 "EnterPlanMode",
                 "ExitPlanMode",
-                "CronCreate",
-                "Monitor",
-                "ScheduleWakeup",
             ],
         )
+        for native_tool in ("CronCreate", "Monitor", "ScheduleWakeup"):
+            self.assertNotIn(native_tool, command)
         self.assertNotIn("CronList", command)
         self.assertNotIn("CronDelete", command)
 
@@ -4919,6 +4908,28 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         ))
         runtime_failure.assert_not_called()
 
+    async def test_disabled_execution_watchdogs_wait_for_native_result(self) -> None:
+        class DelayedTerminalClaudeRun(FakeClaudeRun):
+            async def __anext__(self) -> object:
+                await asyncio.sleep(0.06)
+                return {"type": "result", "result": "Native work completed", "session_id": "provider"}
+
+        for acknowledged in (False, True):
+            with self.subTest(acknowledged=acknowledged):
+                handle = DelayedTerminalClaudeRun(acknowledged=acknowledged)
+                manager, events, finished, failure = await self._run_sdk_timeout_case(
+                    handle, pre_ack_timeout=0, post_ack_timeout=0, turn_timeout=0,
+                    idle_warn=0.01, idle_timeout=0,
+                    project_result={"session_id": "provider", "result_text": "Native work completed",
+                                    "is_error": False, "error": "", "subtype": "success",
+                                    "terminal_reason": "end_turn", "aborted": False},
+                )
+                self.assertEqual(handle.interrupt_calls, 0)
+                self.assertEqual(manager.evict_calls, [])
+                self.assertEqual(finished.await_args.args[1]["exit_code"], 0)
+                self.assertFalse(any(call.args[1] == "error" for call in events.await_args_list))
+                failure.assert_not_called()
+
     async def test_pending_approval_pauses_idle_and_absolute_watchdogs(self) -> None:
         interaction_id = "claudereq_waiting"
 
@@ -5852,6 +5863,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         first = FakeClaudeRun()
         manager = SafeFailingCandidateStartManager([first])
+        manager.steer_run = AsyncMock(side_effect=ClaudeSDKUnavailable("pre-write rejection"))
         predecessor_run_id = "run_claude"
         agent_server.CURRENT_TURNS["chat-claude"]["run_id"] = predecessor_run_id
         predecessor_path = await agent_server.issue_cross_chat_capability(
@@ -6001,25 +6013,17 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                         "queued-safe-rejection",
                     )
                 )
-                for _ in range(100):
-                    if first.interrupt_calls:
-                        break
-                    await asyncio.sleep(0)
-                await first.messages.put({
-                    "type": "result",
-                    "result": "interrupted",
-                    "session_id": "provider",
-                    "terminal_reason": "aborted_streaming",
-                })
                 result = await asyncio.wait_for(force_send, 0.5)
-                await asyncio.wait_for(cleanup_entered.wait(), 0.5)
+                self.assertEqual(first.interrupt_calls, 0)
+                self.assertFalse(cleanup_entered.is_set())
+                self.assertFalse(runner.done())
 
                 self.assertFalse(result["ok"])
                 self.assertTrue(result["deferred"])
                 self.assertTrue(result["retryable"])
                 self.assertFalse(result["delivery_uncertain"])
-                self.assertIsNotNone(manager.candidate_authority_path)
-                self.assertFalse(manager.candidate_authority_path.exists())
+                self.assertIsNone(manager.candidate_authority_path)
+                self.assertEqual(len(manager.start_calls), 1)
                 self.assertTrue(predecessor_path.exists())
                 self.assertEqual(
                     {
@@ -6062,6 +6066,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                 )
             finally:
                 release_cleanup.set()
+                await first.messages.put({"type": "result", "result": "done", "session_id": "provider"})
                 await asyncio.wait_for(runner, 0.5)
 
         self.assertTrue(predecessor_path.exists())
@@ -7065,6 +7070,232 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(result, FakePermissionResultDeny)
         self.assertFalse(getattr(result, "interrupt", True))
         self.assertIn("skipped", str(getattr(result, "message", "")).lower())
+
+    def followup_fixture(self):
+        handle = FakeClaudeRun()
+        queue = asyncio.Queue()
+        selected = {"queued_id": "queued-followup", "prompt": "Change course", "file_ids": [], "backend": "claude", "_durable": True}
+        active = {
+            "run_id": "run-claude", "backend": "claude",
+            "transport": agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+            "claude_sdk_owner_token": "owner", "claude_sdk_run": handle,
+            "claude_followup_queue": queue, "provider_turn_ready": True,
+            "claude_permissions_open": True,
+        }
+        agent_server.ACTIVE["chat-claude"] = active
+        request = {"selected": selected, "remaining": 2}
+        manager = types.SimpleNamespace()
+        async def deliver(*args, **kwargs):
+            await kwargs["on_before_send"]("owner")
+            return "native-message-uuid"
+        manager.steer_run = AsyncMock(side_effect=deliver)
+        return handle, queue, request, manager
+
+    async def test_followup_retains_owner_authority_and_emits_one_accepted_user_message(self):
+        handle, queue, request, manager = self.followup_fixture()
+        current = agent_server.CURRENT_TURNS["chat-claude"]
+        current.update({"purpose": "scheduled_job", "chat_references": [{"session_id": "peer"}]})
+        with patch.object(agent_server, "build_user_provider_prompt", return_value="exact input with files"), patch.object(agent_server, "stop_turn", AsyncMock()) as stop:
+            result = await agent_server.send_claude_followup("chat-claude", "run-claude", manager, handle, "owner", "provider", queue, request)
+        self.assertTrue(result["native_followup"])
+        self.assertFalse(result["interrupted"])
+        self.assertEqual(result["run_id"], "run-claude")
+        self.assertEqual(handle.interrupt_calls, 0)
+        stop.assert_not_called()
+        self.assertEqual(current["prompt"], "Prompt")
+        self.assertEqual(current["purpose"], "scheduled_job")
+        self.assertEqual(current["steering_lineage"][-1]["prompt"], "Change course")
+        self.assertTrue(agent_server.ACTIVE["chat-claude"]["claude_permissions_open"])
+        manager.steer_run.assert_awaited_once()
+        self.assertEqual(manager.steer_run.await_args.args[1], "exact input with files")
+        events = self.append_durable_event_batch.await_args.args[1]
+        self.assertEqual([kind for kind, _ in events], ["turn_queue_run_now", "turn_steered"])
+        accepted = {"type": events[1][0], **events[1][1]}
+        self.assertTrue(agent_server.is_native_goal_steer_event(accepted))
+        self.assertNotIn("purpose", accepted)
+        self.assertEqual(accepted["provider_message_id"], "native-message-uuid")
+        for key in ("native_followup", "provider_user_authored", "provider_message_id"):
+            invalid = {**accepted, key: None}
+            self.assertFalse(agent_server.is_native_goal_steer_event(invalid))
+
+    async def test_followup_stop_winner_before_write_restores_queue_without_interrupt(self):
+        handle, queue, request, manager = self.followup_fixture()
+        async def race(*args, **kwargs):
+            agent_server.ACTIVE["chat-claude"]["stop_requested"] = True
+            await kwargs["on_before_send"]("owner")
+            self.fail("must not write after Stop")
+        manager.steer_run.side_effect = race
+        with self.assertRaises(agent_server.NativeSteerHandoffError) as raised:
+            await agent_server.send_claude_followup("chat-claude", "run-claude", manager, handle, "owner", "provider", queue, request)
+        self.assertTrue(raised.exception.safe_to_requeue)
+        self.assertEqual(handle.interrupt_calls, 0)
+        self.assertFalse(any(kind == "turn_steered" for call in self.append_durable_event_batch.await_args_list for kind, _ in call.args[1]))
+
+    async def test_followup_post_ack_persistence_failure_never_replays(self):
+        handle, queue, request, manager = self.followup_fixture()
+        async def persist(_session, events):
+            if any(kind == "turn_steered" for kind, _ in events):
+                raise OSError("disk unavailable")
+            return []
+        self.append_durable_event_batch.side_effect = persist
+        with self.assertRaises(agent_server.NativeSteerHandoffError) as raised:
+            await agent_server.send_claude_followup("chat-claude", "run-claude", manager, handle, "owner", "provider", queue, request)
+        self.assertFalse(raised.exception.safe_to_requeue)
+        self.assertTrue(raised.exception.delivery_uncertain)
+        self.assertEqual(handle.interrupt_calls, 0)
+
+    async def test_followup_sdk_prewrite_cancellation_is_safe_to_requeue(self):
+        handle, queue, request, manager = self.followup_fixture()
+        error = asyncio.CancelledError()
+        error.delivery_uncertain = False
+        manager.steer_run.side_effect = error
+        with self.assertRaises(agent_server.NativeSteerHandoffError) as raised:
+            await agent_server.send_claude_followup("chat-claude", "run-claude", manager, handle, "owner", "provider", queue, request)
+        self.assertTrue(request["_claude_followup_query_started"])
+        self.assertTrue(raised.exception.safe_to_requeue)
+        self.assertFalse(raised.exception.delivery_uncertain)
+        self.assertEqual(handle.interrupt_calls, 0)
+
+    async def test_followup_sdk_uncertain_failure_keeps_replay_fenced(self):
+        handle, queue, request, manager = self.followup_fixture()
+        manager.steer_run.side_effect = ClaudeSDKQueryError("unknown write")
+        with self.assertRaises(agent_server.NativeSteerHandoffError) as raised:
+            await agent_server.send_claude_followup("chat-claude", "run-claude", manager, handle, "owner", "provider", queue, request)
+        self.assertFalse(raised.exception.safe_to_requeue)
+        self.assertTrue(raised.exception.delivery_uncertain)
+        self.assertEqual(handle.interrupt_calls, 0)
+
+    async def test_followup_selection_preserves_referenced_running_owner_and_future_picker(self):
+        handle, queue, request, manager = self.followup_fixture()
+        selected = request["selected"]
+        selected["model"] = "different-next-model"
+        selected["effort"] = "low"
+        agent_server.CURRENT_TURNS["chat-claude"].update({"purpose": "scheduled_job", "chat_references": [{"session_id": "peer"}], "skill_selection": {"name": "original"}})
+        agent_server.QUEUED_TURNS["chat-claude"] = deque([selected])
+        with patch.object(agent_server, "stop_turn", AsyncMock()) as stop:
+            delivery = asyncio.create_task(agent_server._run_queued_turn_now_once("chat-claude", selected["queued_id"]))
+            actual = await asyncio.wait_for(queue.get(), .5)
+            self.assertTrue(actual["preserve_claude_run"])
+            agent_server.mark_native_steer_accepted(actual)
+            actual["future"].set_result({"ok": True, "native_followup": True})
+            result = await asyncio.wait_for(delivery, .5)
+        self.assertTrue(result["ok"])
+        stop.assert_not_called()
+        self.assertEqual(handle.interrupt_calls, 0)
+
+    async def test_followup_new_route_never_falls_back_to_destructive_stop(self):
+        handle, queue, request, manager = self.followup_fixture()
+        request["selected"]["chat_references"] = [{"session_id": "new-peer"}]
+        agent_server.QUEUED_TURNS["chat-claude"] = deque([request["selected"]])
+        with patch.object(agent_server, "stop_turn", AsyncMock()) as stop:
+            with self.assertRaises(HTTPException):
+                await agent_server._run_queued_turn_now_once("chat-claude", "queued-followup")
+        self.assertEqual(len(agent_server.QUEUED_TURNS["chat-claude"]), 1)
+        stop.assert_not_called()
+        self.assertEqual(handle.interrupt_calls, 0)
+
+    async def test_followup_runner_streams_children_during_ack_and_commits_before_terminal(self):
+        await self.followup_runner_scenario(cancel_before_delivery=False)
+
+    async def test_followup_runner_stop_before_delivery_restores_unsent_queue_row(self):
+        await self.followup_runner_scenario(cancel_before_delivery=True)
+
+    async def followup_runner_scenario(self, *, cancel_before_delivery):
+        handle = FakeClaudeRun()
+        manager = FakeClaudeManager(handle)
+        acknowledgement = asyncio.Event()
+        delivered = asyncio.Event()
+        async def steer(*args, **kwargs):
+            await kwargs["on_before_send"](manager.owner_token)
+            delivered.set()
+            await acknowledgement.wait()
+            return "real-ack-id"
+        manager.steer_run = AsyncMock(side_effect=steer)
+        events = []
+        async def record(_session, kind, data):
+            events.append((kind, data))
+            return {}
+        async def project(_session, run, message, **kwargs):
+            events.append((message["type"], {"run_id": run}))
+            return {"result_text": "done", "session_id": "provider"} if message["type"] == "result" else None
+        with ExitStack() as stack:
+            for name, value in {
+                "resolve_claude_resume_provider": Mock(return_value=("provider", None)),
+                "capture_git_baseline": AsyncMock(return_value={}),
+                "build_claude_sdk_options": Mock(return_value=(object(), "config", "/usr/bin/claude")),
+                "claude_sdk_manager": AsyncMock(return_value=manager),
+                "watch_manifest_artifacts": wait_forever,
+                "append_event": record,
+                "append_turn_finished_event": AsyncMock(return_value={}),
+                "project_claude_sdk_message": project,
+                "persist_run_provider_session": AsyncMock(),
+                "refresh_claude_goal": AsyncMock(),
+                "sample_claude_context_usage": AsyncMock(),
+                "cancel_claude_interactions": AsyncMock(),
+                "collect_manifest": AsyncMock(),
+                "collect_recent_leftover_manifests": AsyncMock(),
+                "publish_turn_code_diff": AsyncMock(),
+                "release_turn_slot": AsyncMock(return_value=True),
+                "record_runtime_success": Mock(),
+                "should_schedule_queue_after_finish": Mock(return_value=False),
+            }.items():
+                stack.enter_context(patch.object(agent_server, name, value))
+            if cancel_before_delivery:
+                real_create_task = asyncio.create_task
+                def stop_before_start(coro, *args, **kwargs):
+                    task = real_create_task(coro, *args, **kwargs)
+                    if getattr(getattr(coro, "cr_code", None), "co_name", "") == "send_claude_followup":
+                        # Stop/cancellation wins after queue acceptance but
+                        # before the follow-up coroutine can attempt delivery.
+                        task.cancel()
+                        asyncio.current_task().cancel()
+                    return task
+                stack.enter_context(patch.object(asyncio, "create_task", side_effect=stop_before_start))
+            runner = asyncio.create_task(agent_server.run_claude_sdk("chat-claude", "run-claude", "Prompt", dict(self.session), Path(self.cwd) / ".manifest.json", provider_runtime_env={"test": "authority-present"}))
+            try:
+                for _ in range(100):
+                    if (agent_server.ACTIVE.get("chat-claude") or {}).get("provider_turn_ready"):
+                        break
+                    await asyncio.sleep(0)
+                selected = {"queued_id": "followup", "backend": "claude", "prompt": "Change course", "file_ids": [], "_durable": True}
+                agent_server.QUEUED_TURNS["chat-claude"] = deque([selected])
+                send = asyncio.create_task(agent_server._run_queued_turn_now_once("chat-claude", "followup"))
+                if cancel_before_delivery:
+                    with self.assertRaises(agent_server.NativeSteerHandoffError) as raised:
+                        await asyncio.wait_for(send, .5)
+                    self.assertTrue(raised.exception.safe_to_requeue)
+                    self.assertFalse(raised.exception.delivery_uncertain)
+                    self.assertEqual(agent_server.QUEUED_TURNS["chat-claude"][0]["queued_id"], "followup")
+                    self.assertNotIn("_native_delivery_fenced", selected)
+                    manager.steer_run.assert_not_called()
+                    await asyncio.gather(runner, return_exceptions=True)
+                    return
+                await asyncio.wait_for(delivered.wait(), .5)
+                await handle.messages.put({"type": "child_progress"})
+                for _ in range(100):
+                    if any(kind == "child_progress" for kind, _ in events):
+                        break
+                    await asyncio.sleep(0)
+                self.assertTrue(any(kind == "child_progress" for kind, _ in events))
+                self.assertFalse(send.done())
+                self.assertEqual(handle.interrupt_calls, 0)
+                acknowledgement.set()
+                await handle.messages.put({"type": "result"})
+                result = await asyncio.wait_for(send, .5)
+                await asyncio.wait_for(runner, .5)
+                self.assertTrue(result["native_followup"])
+                self.assertEqual(result["run_id"], "run-claude")
+                self.assertEqual(len(manager.start_calls), 1)
+                self.assertEqual(handle.interrupt_calls, 0)
+                self.assertEqual(manager.evict_calls, [])
+                accepted = [payload for call in self.append_durable_event_batch.await_args_list for kind, payload in call.args[1] if kind == "turn_steered"]
+                self.assertEqual(len(accepted), 1)
+                self.assertEqual(accepted[0]["provider_message_id"], "real-ack-id")
+            finally:
+                acknowledgement.set()
+                if not runner.done():
+                    runner.cancel()
+                await asyncio.gather(runner, return_exceptions=True)
 
 
 if __name__ == "__main__":

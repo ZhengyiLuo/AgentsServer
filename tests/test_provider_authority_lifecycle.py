@@ -653,6 +653,7 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
         capability = self.record_for_token(token)
 
         self.assertNotIn("jobs", capability["actions"])
+        self.assertIs(capability["source_is_user_turn"], False)
         self.assertEqual(prompt, "replacement")
         self.assertNotIn("jobs", runtime_env["AGENTSDOCK_PROVIDER_AUTHORITY_ACTIONS"])
         self.assertEqual(
@@ -661,6 +662,24 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn(str(authority_path), prompt)
         self.assertNotIn(token, prompt)
+
+    async def test_native_steering_attests_only_actual_user_instruction(self) -> None:
+        user_text = "Continue the investigation with the other chat; do not deploy."
+        for index, (purpose, instruction) in enumerate((
+            (None, user_text), ("scheduled_job", user_text), ("chat_mailbox_wake", user_text), (None, ""),
+        )):
+            with self.subTest(purpose=purpose, has_user_text=bool(instruction)):
+                provider_prompt = instruction + "\n[Server-prepared attachment context]"
+                prompt, authority_path, _runtime_env = await agent_server.issue_native_steer_provider_authority(
+                    "source", f"run_user_task_{index}", {"purpose": purpose, "prompt": instruction, "file_ids": []},
+                    provider_prompt, f"{index + 1}" * 32,
+                )
+                record = self.record_for_token(self.token_for_path(authority_path))
+                self.assertEqual(prompt, provider_prompt)
+                self.assertEqual(record["source_user_instruction"], instruction)
+                self.assertIs(record["source_is_user_turn"], purpose is None)
+                self.assertEqual(record["user_delegation_grants"], set())
+                self.assertNotIn("source_is_user_turn", authority_path.read_text())
 
     async def test_revoke_never_unlinks_an_unregistered_or_outside_path(self) -> None:
         authority_path, token = await self.issue("run_exact")

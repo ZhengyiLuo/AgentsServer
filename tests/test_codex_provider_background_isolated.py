@@ -17,6 +17,7 @@ NAMES = {
     "codex_subagent_native_turn_candidates", "codex_subagent_native_turn_scopes",
     "cached_codex_subagent_native_statuses", "cache_codex_subagent_native_statuses",
     "prepare_codex_subagent_terminal_snapshot", "provider_background_work_labels_from_snapshot",
+    "claude_native_background_work_state", "claude_native_background_work_labels",
 }
 TREE = ast.parse((Path(__file__).resolve().parents[1] / "agent_server.py").read_text())
 NODES = [node for node in TREE.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -52,7 +53,10 @@ class ProviderBackgroundTests(unittest.IsolatedAsyncioTestCase):
             "CODEX_PENDING_INTERACTIONS": {}, "SERVER_UPDATE_CODEX_SUBAGENT_SCAN_LIMIT": 2,
             "SERVER_UPDATE_CODEX_SUBAGENT_SCAN_TIMEOUT_SECONDS": 1,
             "SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT": 32, "GENERATED_TITLE_TASKS": {},
-            "SIDE_QUESTIONS": SimpleNamespace(active_work_labels=lambda: []),
+            "SIDE_QUESTIONS": SimpleNamespace(
+                active_work_labels=lambda: [],
+                background_work_labels_from_snapshot=lambda snapshot: [],
+            ),
             "durable_event_seq": lambda state: state.get("seq"),
             "loaded_claude_background_session_state": lambda manager: ((), ()),
             "claude_event_file_fingerprints": lambda sessions: (),
@@ -81,9 +85,9 @@ class ProviderBackgroundTests(unittest.IsolatedAsyncioTestCase):
         })
 
     async def test_active_side_answers_block_idle_update_until_they_finish(self):
-        self.ns["SIDE_QUESTIONS"] = SimpleNamespace(active_work_labels=lambda: ["Side chat in active"])
+        self.ns["SIDE_QUESTIONS"].active_work_labels = lambda: ["Side chat in active"]
         self.assertEqual(self.labels({}), ["Side chat in active"])
-        self.ns["SIDE_QUESTIONS"] = SimpleNamespace(active_work_labels=lambda: [])
+        self.ns["SIDE_QUESTIONS"].active_work_labels = lambda: []
         self.assertEqual(self.labels({}), [])
 
     async def test_custom_children_are_checked_only_in_their_own_process(self):

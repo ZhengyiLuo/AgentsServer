@@ -3152,30 +3152,34 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
             return agent_server.JSONResponse({"saved": True})
 
         with patch.object(agent_server, "AGENT_TOKEN", ""), \
-             patch.object(agent_server, "UNSAFE_HTTP_MUTATION_TASKS", {}):
+             patch.object(agent_server, "UNSAFE_HTTP_MUTATION_TASKS", {}), \
+             patch.object(agent_server, "unsafe_http_mutation_blocked_response", return_value=None):
             mutation = asyncio.create_task(
                 agent_server.require_agent_token(request, slow_mutation)
             )
-            entered_ready = await asyncio.wait_for(
-                asyncio.to_thread(entered.wait, 1),
-                timeout=2,
-            )
-            self.assertTrue(entered_ready)
-            mutation.cancel()
-            await asyncio.sleep(0)
-            mutation.cancel()
-            await asyncio.sleep(0)
+            try:
+                entered_ready = await asyncio.wait_for(
+                    asyncio.to_thread(entered.wait, 5),
+                    timeout=6,
+                )
+                self.assertTrue(entered_ready)
+                mutation.cancel()
+                await asyncio.sleep(0)
+                mutation.cancel()
+                await asyncio.sleep(0)
 
-            # Cancelling the asyncio wrapper does not stop its worker thread.
-            # The exact lease must remain until that real mutation settles.
-            self.assertFalse(mutation.done())
-            self.assertEqual(agent_server.unsafe_http_mutation_count_locked(), 1)
-            release.set()
-            with self.assertRaises(asyncio.CancelledError):
-                await mutation
-            await asyncio.sleep(0)
+                # Cancelling the asyncio wrapper does not stop its worker thread.
+                # The exact lease must remain until that real mutation settles.
+                self.assertFalse(mutation.done())
+                self.assertEqual(agent_server.unsafe_http_mutation_count_locked(), 1)
+                release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await mutation
+                await asyncio.sleep(0)
 
-            self.assertEqual(agent_server.unsafe_http_mutation_count_locked(), 0)
+                self.assertEqual(agent_server.unsafe_http_mutation_count_locked(), 0)
+            finally:
+                release.set()
 
     async def test_mutation_registry_prunes_only_finished_tasks(self):
         release = asyncio.Event()

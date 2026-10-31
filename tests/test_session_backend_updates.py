@@ -739,7 +739,10 @@ class SessionBackendUpdateFenceTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             try:
-                await asyncio.wait_for(revoke_started.wait(), 1)
+                # This test asserts cancellation ownership, not startup latency.
+                # A busy CI worker can spend several seconds before scheduling
+                # the cleanup task; keep the barrier bounded without racing it.
+                await asyncio.wait_for(revoke_started.wait(), 10)
                 start.cancel()
                 await asyncio.sleep(0)
                 self.assertFalse(start.done())

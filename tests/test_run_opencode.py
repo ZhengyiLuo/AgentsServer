@@ -1370,6 +1370,21 @@ while True:
         terminal = [e for e in events if e["type"] == "turn_finished"][-1]
         self.assertTrue(terminal["is_error"])
 
+    async def test_disabled_deadlines_allow_silence_before_and_after_init(self) -> None:
+        with patch.object(agent_server, "OPENCODE_STARTUP_TIMEOUT_SECONDS", 0), \
+             patch.object(agent_server, "OPENCODE_TURN_TIMEOUT_SECONDS", 0), \
+             patch.object(agent_server, "OPENCODE_IDLE_TIMEOUT_SECONDS", 0), \
+             patch.object(agent_server, "OPENCODE_IDLE_WARN_SECONDS", 0.02):
+            script = _event_script([_step_start(), _text_event(), _step_finish("stop")])
+            script = script.replace("import json, os, sys", "import json, os, sys, time")
+            script = script.replace("for event in json.loads(", "time.sleep(0.12)\nfor event in json.loads(")
+            script = script.replace("    print(json.dumps(event)", "    time.sleep(0.12)\n    print(json.dumps(event)")
+            events = await self._run(script)
+        terminal = [e for e in events if e["type"] == "turn_finished"][-1]
+        self.assertFalse(terminal["is_error"])
+        self.assertTrue(any(e["type"] == "idle_warning" for e in events))
+        self.assertFalse(any(e["type"] == "error" for e in events))
+
     async def test_active_stop_kills_children_and_releases_ownership(self) -> None:
         await self._assert_active_stop_quarantines_resume()
 

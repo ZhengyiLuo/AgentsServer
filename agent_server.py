@@ -46913,7 +46913,8 @@ def bounded_jsonl_paths(
 
 
 
-def bounded_jsonl_events(path: Path, *, preserve_invalid: bool = False) -> Iterator[dict[str, Any] | None]:
+def bounded_jsonl_events(path: Path, *, preserve_invalid: bool = False,
+                         allow_nul_padding: bool = False) -> Iterator[dict[str, Any] | None]:
     """Project native records with bounded memory, not a source-byte cap."""
     initial = path.stat()
     expected = {field: int(getattr(initial, field)) for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns")}
@@ -46923,7 +46924,8 @@ def bounded_jsonl_events(path: Path, *, preserve_invalid: bool = False) -> Itera
             raise ValueError("transcript changed before parsing")
         for event, _end, raw in jsonl_records(stream, end=initial.st_size,
                 require_newline=False, max_records=MAX_LOCAL_TRANSCRIPT_SCAN_LINES,
-                max_retained_bytes=MAX_LOCAL_TRANSCRIPT_LINE_BYTES):
+                max_retained_bytes=MAX_LOCAL_TRANSCRIPT_LINE_BYTES,
+                allow_nul_padding=allow_nul_padding):
             if not raw.blank and (event is not None or preserve_invalid):
                 yield event
         finished = os.fstat(stream.fileno())
@@ -46933,7 +46935,7 @@ def bounded_jsonl_events(path: Path, *, preserve_invalid: bool = False) -> Itera
 
 def bounded_jsonl_records_range(
     path: Path, start: int, end: int, *, expected_stat: dict[str, int],
-    require_newline: bool = True, allow_partial: bool = False,
+    require_newline: bool = True, allow_partial: bool = False, allow_nul_padding: bool = False,
 ) -> Iterator[tuple[dict[str, Any] | None, int]]:
     """Read every record and ending offset in one immutable JSONL range."""
     if start < 0 or end < start or end > expected_stat["st_size"]:
@@ -46945,7 +46947,8 @@ def bounded_jsonl_records_range(
         stream.seek(start)
         for count, (event, offset, _raw) in enumerate(jsonl_records(stream, end=end,
                 require_newline=require_newline, max_records=MAX_LOCAL_TRANSCRIPT_SCAN_LINES,
-                max_retained_bytes=MAX_LOCAL_TRANSCRIPT_LINE_BYTES), 1):
+                max_retained_bytes=MAX_LOCAL_TRANSCRIPT_LINE_BYTES,
+                allow_nul_padding=allow_nul_padding), 1):
             yield event, offset
             if allow_partial and count >= MAX_LOCAL_TRANSCRIPT_SCAN_LINES:
                 break
@@ -47754,7 +47757,7 @@ def parse_claude_history(
     expected_session_id: str | None = None,
 ) -> list[dict[str, str]]:
     return parse_claude_history_events(
-        bounded_jsonl_events(path, preserve_invalid=True),
+        bounded_jsonl_events(path, preserve_invalid=True, allow_nul_padding=True),
         limit,
         expected_session_id=expected_session_id,
     )
@@ -49874,6 +49877,7 @@ def parse_provider_history_delta(
         end,
         expected_stat=expected_stat,
         allow_partial=True,
+        allow_nul_padding=(backend == BACKEND_CLAUDE),
     ):
         if blocked_on_unseen_message:
             # Exhaust the fixed range so its final fstat validation still

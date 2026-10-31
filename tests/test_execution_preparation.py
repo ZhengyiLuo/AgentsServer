@@ -77,13 +77,20 @@ class PreparationTests(unittest.TestCase):
         current.symlink_to("releases/existing-runtime")
         marker = self.root / "execution-layout.json"
         marker.write_text("existing layout must be untouched")
-        before = marker.read_bytes(), marker.stat(), current.lstat(), os.readlink(current)
+        def metadata(path):
+            info = path.lstat()
+            # Our read_bytes/readlink observations can advance atime under
+            # relatime. Preserve every identity, ownership and write indicator.
+            return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+                    info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+        before = marker.read_bytes(), metadata(marker), metadata(current), os.readlink(current)
         written = self.write()
         self.assertEqual(self.validate(), written)
         self.assertEqual(stat.S_IMODE(self.receipt.stat().st_mode), 0o600)
         self.assertEqual(self.receipt.stat().st_nlink, 1)
         self.assertEqual(stat.S_IMODE(self.receipt.parent.stat().st_mode), 0o700)
-        self.assertEqual((marker.read_bytes(), marker.stat(), current.lstat(), os.readlink(current)), before)
+        self.assertEqual((marker.read_bytes(), metadata(marker), metadata(current), os.readlink(current)), before)
         self.assertEqual(set(written["runtime_inventory"]), {
             *self.source, "agentsdock_team_hub", ".venv", ".venv/bin", ".venv/bin/python",
             ".venv/bin/python3", ".venv/lib", ".venv/lib64", ".venv/lib/site-packages",

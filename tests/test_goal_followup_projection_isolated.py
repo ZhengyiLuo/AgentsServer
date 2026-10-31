@@ -9,6 +9,7 @@ import unittest
 from tests.test_async_chat_timeline_index_isolated import load_index
 from tests.test_codex_history_metadata_isolated import projection
 from public_chat_transcript import make_public_event_projector, read_public_transcript
+from codex_history_repair import filter_native_codex_history_items
 
 
 def event(seq, kind, **fields):
@@ -63,6 +64,18 @@ class GoalFollowupProjectionTests(unittest.TestCase):
                          "turn:goal-owner:start-3")
 
     def test_history_reconcile_credits_prevent_reimporting_the_followup(self):
+        provider = "11111111-2222-3333-4444-555555555555"
+        # A dedicated resume records a promptless lifecycle start. Public
+        # output carries the exact thread/turn/item receipt from its consumer.
+        self.events[0] = event(1, "turn_started", thread_id=provider)
+        for item in self.events[1:7]:
+            item["provider_turn_id"] = "goal-turn-1" if item["seq"] == 2 else (
+                "goal-turn-2" if item["seq"] <= 5 else "goal-turn-3"
+            )
+            if item["type"] != "turn_steered":
+                item.update(provider_thread_id=provider, item_id=f"provider-item-{item['seq']}")
+        self.events[7] = event(8, "turn_finished", status="completed", turn_id="goal-turn-3")
+        self.write(self.events)
         ns = projection()
         ns["events_path"] = lambda _: self.path
         keys, present, truncated = ns["history_timeline_message_keys"](
@@ -86,11 +99,21 @@ class GoalFollowupProjectionTests(unittest.TestCase):
             # The same text sent again is a new occurrence, not another credit.
             {"kind": "user", "text": followup_texts[0]},
         ]
+        for item, native in zip(provider_items[:-1], self.events[2:7]):
+            item["provider_origin"] = {
+                "provider": "codex", "session_id": provider, "kind": item["kind"],
+                "event_id": f"provider-item-{native['seq']}",
+                "turn_id": native["provider_turn_id"], "timestamp": native["ts"],
+            }
         fresh, consumed_seq = ns["reconcile_cursor_history_items"](
             "chat", provider_items, timeline_after_seq=2, timeline_through_seq=8,
         )
-        self.assertEqual(fresh, provider_items[-1:])
+        # Human follow-ups still consume one credit each; goal replies reach
+        # the second stage so another same-text native item cannot consume them.
+        self.assertEqual(fresh, [provider_items[index] for index in (1, 2, 4, 5)])
         self.assertEqual(consumed_seq, 8)
+        self.assertEqual(filter_native_codex_history_items("chat", provider, self.path, fresh),
+                         provider_items[-1:])
 
     def test_append_to_warm_index_matches_cold_reopen(self):
         self.write(self.events[:2])

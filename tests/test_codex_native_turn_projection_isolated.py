@@ -327,12 +327,29 @@ class NativeTurnProjectionTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertTrue(all(data["run_id"] == "operation" and
                             data["purpose"] == "codex_goal_resume" for data in rows))
+        self.assertTrue(all(data["backend"] == "codex" and data["provider_thread_id"] == "thread"
+                            for data in rows))
         self.assertEqual(self.events("assistant_text"), [])
         self.assertEqual(self.events("error"), [])
         self.assertEqual(self.events("turn_finished")[0]["status"], "completed")
         self.assertTrue(self.namespace["ACTIVE"]["chat"]["codex_goal_handoff_closed"])
         self.namespace["stop_codex_goal_resume"].assert_not_awaited()
         self.assert_clean_release()
+
+    async def test_goal_final_answers_keep_thread_and_item_provenance_after_interruption(self):
+        await self.run_projection([
+            started(), item("answer-1", "agentMessage", text="First final.", phase="final_answer"),
+            completed(), started("turn-2"),
+            item("answer-2", "agentMessage", turn="turn-2", text="Second final.", phase="final_answer"),
+            completed("turn-2", status="interrupted"),
+        ], goal=True)
+        rows = self.events("assistant_text")
+        self.assertEqual([(row["provider_turn_id"], row["item_id"], row["text"]) for row in rows], [
+            ("turn-1", "answer-1", "First final."), ("turn-2", "answer-2", "Second final."),
+        ])
+        self.assertTrue(all(row["backend"] == "codex" and row["provider_thread_id"] == "thread"
+                            for row in rows))
+        self.assertEqual(self.events("turn_finished")[0]["status"], "interrupted")
 
     async def test_new_goal_turn_resets_error_before_a_real_failed_terminal(self):
         await self.run_projection([

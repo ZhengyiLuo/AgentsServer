@@ -1,4 +1,5 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 from pathlib import Path
@@ -660,9 +661,13 @@ class ManagedTeamHubHostTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(store)
             original_snapshot = store.maintenance_snapshot_and_fence  # type: ignore[union-attr]
             original_clear = store.clear_maintenance_fence  # type: ignore[union-attr]
-            snapshot_started = threading.Event()
+            loop = asyncio.get_running_loop()
+            # Exercise cancellation even with no spare worker for observers.
+            # IsolatedAsyncioTestCase shuts this executor down with its loop.
+            loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+            snapshot_started = asyncio.Event()
             release_snapshot = threading.Event()
-            clear_started = threading.Event()
+            clear_started = asyncio.Event()
             release_clear = threading.Event()
             snapshot_join_entered = asyncio.Event()
             original_join = (
@@ -670,9 +675,11 @@ class ManagedTeamHubHostTests(unittest.IsolatedAsyncioTestCase):
             )
 
             def delayed(reason: str, *, operation_id: str, keep: int = 3):
-                snapshot_started.set()
-                if not release_snapshot.wait(timeout=5):
-                    raise RuntimeError("test snapshot release timed out")
+                loop.call_soon_threadsafe(snapshot_started.set)
+                # Only the test releases these gates, including on failure in
+                # finally. A worker-side timeout would silently change the
+                # cancellation scenario when the CI runner is busy.
+                release_snapshot.wait()
                 return original_snapshot(
                     reason,
                     operation_id=operation_id,
@@ -680,9 +687,8 @@ class ManagedTeamHubHostTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             def delayed_clear(**kwargs):
-                clear_started.set()
-                if not release_clear.wait(timeout=5):
-                    raise RuntimeError("test fence-clear release timed out")
+                loop.call_soon_threadsafe(clear_started.set)
+                release_clear.wait()
                 return original_clear(**kwargs)
 
             async def observed_join(task):
@@ -703,19 +709,20 @@ class ManagedTeamHubHostTests(unittest.IsolatedAsyncioTestCase):
                     )
                 )
                 try:
-                    self.assertTrue(
-                        await asyncio.to_thread(snapshot_started.wait, 5)
-                    )
+                    # Notifications must not occupy the same executor whose
+                    # snapshot/clear workers they observe. Keep a bounded
+                    # watchdog, allowing real SQLite backup/fsync work on CI;
+                    # correctness is asserted at the explicit gates, not by
+                    # requiring the filesystem to finish within five seconds.
+                    await asyncio.wait_for(snapshot_started.wait(), 30)
                     maintenance.cancel()
-                    await asyncio.wait_for(snapshot_join_entered.wait(), 1)
+                    await asyncio.wait_for(snapshot_join_entered.wait(), 30)
                     maintenance.cancel()
                     await asyncio.sleep(0)
                     self.assertFalse(maintenance.done())
 
                     release_snapshot.set()
-                    self.assertTrue(
-                        await asyncio.to_thread(clear_started.wait, 5)
-                    )
+                    await asyncio.wait_for(clear_started.wait(), 30)
                     self.assertIsNotNone(store.maintenance_fence())  # type: ignore[union-attr]
                     maintenance.cancel()
                     await asyncio.sleep(0)

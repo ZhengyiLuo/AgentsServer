@@ -373,24 +373,48 @@ class RuntimeCatalogConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(self.ns["runtime_catalog_scope"](), before)
 
     async def test_concurrent_diagnostics_share_probe_but_not_other_backend(self):
-        entered = threading.Event()
+        loop = asyncio.get_running_loop()
+        # Each synchronous diagnostic occupies a worker, including joiners.
+        # Thirteen overlapping calls must not depend on CI's CPU-sized default
+        # executor (often only six workers). Observe entry from the event loop,
+        # without spending another worker waiting for the probes to start.
+        executor = self.enterContext(ThreadPoolExecutor(max_workers=13))
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+        entered = asyncio.Event()
+        joined = asyncio.Event()
         calls = []
         lock = threading.Lock()
+        joiners = 0
+
+        class ObservedFuture(Future):
+            def result(future, timeout=None):
+                nonlocal joiners
+                with lock:
+                    joiners += 1
+                    if joiners == 11:
+                        loop.call_soon_threadsafe(joined.set)
+                return super().result(timeout=timeout)
+
+        self.ns["Future"] = ObservedFuture
 
         def probe(backend):
             with lock:
                 calls.append(backend)
                 if set(calls) == {"codex", "claude"}:
-                    entered.set()
+                    loop.call_soon_threadsafe(entered.set)
             self.block()
             return self.diagnostic(backend)
 
         self.ns["probe_runtime"] = probe
-        requests = [self.task(asyncio.to_thread(self.ns["runtime_diagnostic"], "codex", force=True)) for _ in range(12)]
-        requests.append(self.task(asyncio.to_thread(self.ns["runtime_diagnostic"], "claude", force=True)))
-        await self.started(entered)
-        # All submitted calls have reached their pending future before release.
-        await asyncio.sleep(0.05)
+        async def diagnostic(backend):
+            return await loop.run_in_executor(
+                executor, lambda: self.ns["runtime_diagnostic"](backend, force=True),
+            )
+
+        requests = [self.task(diagnostic("codex")) for _ in range(12)]
+        requests.append(self.task(diagnostic("claude")))
+        await asyncio.wait_for(entered.wait(), 5)
+        await asyncio.wait_for(joined.wait(), 5)
         self.assertCountEqual(calls, ["codex", "claude"])
         self.release.set()
         results = await asyncio.gather(*requests)

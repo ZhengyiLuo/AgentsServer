@@ -548,11 +548,40 @@ class InterpreterTrustDetailTests(unittest.TestCase):
 
         return recovery._interpreter_digest(path)
 
+    def test_foreign_owner_is_rejected_with_uid_and_path(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temporary:
+            interpreter = Path(temporary).resolve() / "python"
+            interpreter.write_bytes(b"#!/bin/sh\n")
+            interpreter.chmod(0o755)
+            info = interpreter.stat()
+            foreign_uid = os.getuid() + 1
+            with mock.patch.object(recovery.os, "fstat", return_value=SimpleNamespace(
+                st_mode=info.st_mode, st_uid=foreign_uid,
+            )), self.assertRaises(PermissionError) as caught:
+                self._digest(interpreter)
+            self.assertIn(str(interpreter), str(caught.exception))
+            self.assertIn(f"owned by uid {foreign_uid}", str(caught.exception))
+
+    def test_unresolved_symlink_is_still_rejected(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            interpreter = root / "python"
+            interpreter.write_bytes(b"#!/bin/sh\n")
+            interpreter.chmod(0o755)
+            alias = root / "alias"
+            alias.symlink_to(interpreter)
+            with self.assertRaisesRegex(ValueError, "resolved executable"):
+                self._digest(alias)
+
     def test_writable_interpreter_is_rejected_with_mode_and_path(self) -> None:
         import tempfile
 
         with tempfile.TemporaryDirectory() as temporary:
-            interpreter = Path(temporary) / "python"
+            interpreter = Path(temporary).resolve() / "python"
             interpreter.write_bytes(b"#!/bin/sh\n")
             interpreter.chmod(0o777)
             with self.assertRaises(PermissionError) as caught:
@@ -567,7 +596,7 @@ class InterpreterTrustDetailTests(unittest.TestCase):
         import tempfile
 
         with tempfile.TemporaryDirectory() as temporary:
-            interpreter = Path(temporary) / "python"
+            interpreter = Path(temporary).resolve() / "python"
             interpreter.write_bytes(b"#!/bin/sh\n")
             interpreter.chmod(0o644)
             with self.assertRaises(PermissionError) as caught:
@@ -582,7 +611,7 @@ class InterpreterTrustDetailTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             with self.assertRaises(PermissionError) as caught:
-                self._digest(Path(temporary))
+                self._digest(Path(temporary).resolve())
             self.assertIn("not a regular file", str(caught.exception))
 
     def test_trusted_interpreter_is_accepted(self) -> None:
@@ -590,7 +619,7 @@ class InterpreterTrustDetailTests(unittest.TestCase):
         import tempfile
 
         with tempfile.TemporaryDirectory() as temporary:
-            interpreter = Path(temporary) / "python"
+            interpreter = Path(temporary).resolve() / "python"
             interpreter.write_bytes(b"#!/bin/sh\n")
             interpreter.chmod(0o755)
             self.assertEqual(

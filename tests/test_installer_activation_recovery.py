@@ -567,8 +567,10 @@ test "$(grep -c '^finish$' "$LOG")" = 1
 
     def test_durability_failure_rollback_uses_real_controls_with_live_hub_lease(self) -> None:
         from agentsdock_team_hub.store import HubStore
-        begin = self.installer_source.index('if [[ "${EXECUTION_MODE:-legacy}" == "split" ]]; then\n  if ! execution_activation_command durability')
-        end = self.installer_source.index('\nfi\n', begin) + len('\nfi\n')
+        end = self.installer_source.index('# Materialize and link the new runtime')
+        begin = self.installer_source.rindex(
+            'if [[ "${EXECUTION_MODE:-legacy}" == "split" ]]; then', 0, end,
+        )
         controls = _between(self.installer_source, "clear_team_hub_operation_fence() {",
                             "clear_team_hub_reactivation_fence() {")
         controls += _between(self.installer_source, "restore_team_hub_snapshot() {", "port_has_listener() {")
@@ -1163,6 +1165,7 @@ class ActivationQuiesceBoundaryTests(unittest.TestCase):
                 "FAIL=\"${FAIL:-}\"\n"
                 "TRACE=\"${TRACE:-/dev/null}\"\n"
                 "execution_activation_command() {\n"
+                '  echo "$1" >>"$TRACE"\n'
                 "  case \"$1 $FAIL\" in\n"
                 '    "durability durability") return 1 ;;\n'
                 '    "suppress suppress") return 1 ;;\n'
@@ -1170,10 +1173,12 @@ class ActivationQuiesceBoundaryTests(unittest.TestCase):
                 "  return 0\n"
                 "}\n"
                 "execution_recovery_arm() {\n"
+                '  echo recovery_arm >>"$TRACE"\n'
                 '  [[ "$FAIL" == "recovery_arm" ]] && return 1\n'
                 "  return 0\n"
                 "}\n"
                 "record_activation_phase() {\n"
+                '  echo "$1" >>"$TRACE"\n'
                 "  case \"$1 $FAIL\" in\n"
                 '    "quiescing quiescing") return 1 ;;\n'
                 '    "quiesced quiesced") return 1 ;;\n'
@@ -1181,6 +1186,7 @@ class ActivationQuiesceBoundaryTests(unittest.TestCase):
                 "  return 0\n"
                 "}\n"
                 "execution_stop_services() {\n"
+                '  echo "$2" >>"$TRACE"\n'
                 "  case \"$2 $FAIL\" in\n"
                 '    "preflight preflight") return 1 ;;\n'
                 '    "stop stop") return 1 ;;\n'
@@ -1200,13 +1206,20 @@ class ActivationQuiesceBoundaryTests(unittest.TestCase):
                     "TRACE": str(Path(temporary) / "trace"),
                 }
             )
-            return subprocess.run(
+            result = subprocess.run(
                 ["bash", str(harness)],
                 capture_output=True,
                 text=True,
                 env=environment,
                 timeout=60,
             )
+            trace = (Path(temporary) / "trace").read_text().splitlines()
+            boundaries = ["durability", "recovery_arm", "quiescing", "preflight", "suppress", "stop", "quiesced"]
+            expected = boundaries[:boundaries.index(failing) + 1] if failing else boundaries
+            if failing and handoff == "true":
+                expected = [*expected, "resumed"]
+            self.assertEqual(trace, expected, "Quiesce must short-circuit at the failing boundary")
+            return result
 
     def test_recovery_arm_failure_is_distinguished_from_service_stop(self) -> None:
         result = self._run("recovery_arm")

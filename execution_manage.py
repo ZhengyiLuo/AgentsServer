@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import ExitStack
 import errno
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -25,6 +27,7 @@ import sys
 import time
 from typing import Any, Callable
 import urllib.parse
+import uuid
 
 import execution_install as files
 from execution_transport import _read_secret
@@ -215,6 +218,35 @@ class NativeServices:
         if any(item["state"] == "transitioning" for item in states.values()):
             raise RuntimeError("native service is transitioning; retry after it settles")
         return states
+
+    def validate_registered_bindings(self) -> None:
+        """Reject foreign or stale manager-loaded jobs without exposing output."""
+        for role in ("worker", "gateway"):
+            path = str(self.layout.service_path(role))
+            if self.layout.platform == "Linux":
+                result = self._command(["systemctl", "--user", "show", self._unit(role), "--no-pager",
+                    "--property=FragmentPath,DropInPaths,NeedDaemonReload"])
+                values = {}
+                for line in result.stdout.splitlines():
+                    key, separator, value = line.partition("=")
+                    if not separator or key in values:
+                        raise RuntimeError("systemd returned ambiguous registered bindings")
+                    values[key] = value
+                if values != {"FragmentPath": path, "DropInPaths": "", "NeedDaemonReload": "no"}:
+                    raise RuntimeError("native unit registration is foreign, overridden, or stale")
+            else:
+                result = self._command(["/bin/launchctl", "print", self._target(role)], allow_failure=True)
+                if result.returncode:
+                    if "Could not find service" in result.stderr:
+                        continue  # bootout removed the job; exact plist is checked separately.
+                    raise RuntimeError("launchd registration ownership is unknown")
+                paths = re.findall(r"(?m)^\s*path = (.+)$", result.stdout)
+                programs = re.findall(r"(?m)^\s*program = (.+)$", result.stdout)
+                arguments = re.findall(r"(?ms)^\s*arguments = \{\n(.*?)^\s*\}", result.stdout)
+                expected = files.service_arguments(self.layout, role)
+                if (paths != [path] or programs != [expected[0]] or len(arguments) != 1
+                        or [line.strip() for line in arguments[0].splitlines() if line.strip()] != expected):
+                    raise RuntimeError("native launchd registration does not match the installed service")
 
     def stop(self, role: str) -> None:
         state = self._observe(role)
@@ -424,6 +456,278 @@ class WorkerControl:
                 "server_identity": health.get("server_identity"), "gateway_pid": gateway.get("pid"),
                 "worker_pid": worker.get("pid"), "worker_instance_id": worker.get("instance_id"),
                 "maintenance_held": worker.get("maintenance_held")}
+
+
+LIFECYCLE_NAME = ".execution-lifecycle.json"
+
+
+def read_lifecycle_intent(layout: files.ExecutionLayout) -> dict | None:
+    """Read owned stop/restart evidence; never repair or normalize user state."""
+    from execution_preparation import _check_binding
+    try:
+        data, _mode = files._read_file(layout.install_root / LIFECYCLE_NAME, private=True)
+    except FileNotFoundError:
+        return None
+    value = json.loads(data)
+    expected = {"format", "operation_id", "layout_sha256", "identities", "server_identity",
+                "worker_pid", "gateway_pid", "worker_instance_id", "lease_id", "phase", "started"}
+    if (not isinstance(value, dict) or set(value) != expected or type(value["format"]) is not int
+            or value["format"] != 1 or value["phase"] not in {"prepared", "sealed", "stopped", "starting", "releasing"}
+            or not isinstance(value["operation_id"], str)
+            or str(uuid.UUID(value["operation_id"])) != value["operation_id"]
+            or any(type(value[key]) is not int or value[key] <= 0 for key in ("worker_pid", "gateway_pid"))
+            or any(not isinstance(value[key], str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value[key]) is None
+                   for key in ("server_identity", "worker_instance_id"))
+            or (value["lease_id"] is not None and (not isinstance(value["lease_id"], str)
+                or str(uuid.UUID(value["lease_id"])) != value["lease_id"]))):
+        raise ValueError("native lifecycle intent is invalid")
+    started = value["started"]
+    if started is not None and (not isinstance(started, dict) or set(started) != {"pid", "instance_id"}
+            or type(started["pid"]) is not int or started["pid"] <= 0
+            or not isinstance(started["instance_id"], str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", started["instance_id"]) is None):
+        raise ValueError("native lifecycle startup identity is invalid")
+    if (value["phase"] == "releasing" and started is None
+            or value["phase"] not in {"starting", "releasing"} and started is not None
+            or value["phase"] != "prepared" and value["lease_id"] is None):
+        raise ValueError("native lifecycle phase lacks its admission evidence")
+    paths = {"root": layout.install_root, "worker": layout.worker_release,
+             "gateway": layout.gateway_release, "config": layout.config_root, "state": layout.state_root}
+    if not isinstance(value["identities"], dict) or set(value["identities"]) != set(paths):
+        raise ValueError("native lifecycle directory identities are invalid")
+    for name, path in paths.items():
+        _check_binding(path, value["identities"][name])
+    manifest, _mode = files._read_file(layout.manifest_path, private=True)
+    if hashlib.sha256(manifest).hexdigest() != value["layout_sha256"]:
+        raise RuntimeError("installed layout changed after lifecycle admission")
+    return value
+
+
+def pending_lifecycle_operation(root: Path, runtime_root: Path) -> str:
+    layout = files.installed_layout(root)
+    intent = read_lifecycle_intent(layout)
+    if intent is None or files._path(runtime_root) != layout.worker_release:
+        raise RuntimeError("worker is outside the retained lifecycle operation")
+    marker = root / ".execution-uninstall.json"
+    if marker.exists() or marker.is_symlink():
+        from execution_uninstall import _read_intent
+        removal = _read_intent(root, layout)
+        if (intent["phase"] != "stopped" or removal is None
+                or removal["operation_id"] != intent["operation_id"]
+                or removal["server_identity"] != intent["server_identity"]):
+            raise RuntimeError("uninstall and lifecycle ownership conflict")
+    return intent["operation_id"]
+
+
+def retire_lifecycle_intent(layout: files.ExecutionLayout, intent: dict) -> None:
+    if read_lifecycle_intent(layout) != intent:
+        raise RuntimeError("native lifecycle intent changed before retirement")
+    (layout.install_root / LIFECYCLE_NAME).unlink()
+    files._fsync_directory(layout.install_root)
+
+
+class LifecycleController:
+    """Idle-only control of an installed pair, not an installer or force repair.
+
+    Failures retain an exact operation journal and any sealed admission hold.
+    Retry may finish that operation; an unjournaled broken/stopped installation
+    or a changed worker epoch is never guessed safe. Explicit start releases
+    startup admission only after both components have authenticated health.
+    """
+
+    def __init__(self, layout: files.ExecutionLayout, *, services: NativeServices | None = None,
+                 control: WorkerControl | None = None, health_timeout: float = 30.0):
+        self.layout = layout
+        self.services = services or NativeServices(layout)
+        self.control = control or WorkerControl(services=self.services)
+        self.health_timeout = health_timeout
+
+    def _save(self, intent: dict, **changes) -> dict:
+        if read_lifecycle_intent(self.layout) != intent:
+            raise RuntimeError("native lifecycle intent changed")
+        updated = {**intent, **changes}
+        files._atomic_write(self.layout.install_root / LIFECYCLE_NAME, files._json_bytes(updated))
+        return updated
+
+    def _unchanged(self, originals: dict) -> None:
+        from execution_uninstall import _service_files, _no_pending_update
+        from update_handoff import _no_activation
+        _no_activation(self.layout.install_root)
+        marker = self.layout.install_root / ".execution-uninstall.json"
+        if marker.exists() or marker.is_symlink():
+            raise RuntimeError("uninstall owns this native lifecycle")
+        _no_pending_update(self.layout)
+        if _service_files(self.layout) != originals:
+            raise RuntimeError("native service bindings changed during lifecycle operation")
+        self.services.validate_registered_bindings()
+
+    def _new_intent(self, prior: dict) -> dict:
+        from execution_preparation import _binding
+        receipt = self.control.receipt(self.layout, self.services)
+        record, status = self.control.status(self.layout)
+        if type(status.get("native_lifecycle_protocol")) is not int or status["native_lifecycle_protocol"] != 1:
+            raise RuntimeError("installed worker does not support safe paired lifecycle commands; update the installed server through its signed managed update first")
+        if (receipt.get("worker_pid") != prior["worker"].get("pid")
+                or receipt.get("gateway_pid") != prior["gateway"].get("pid")
+                or receipt.get("worker_release") != str(self.layout.worker_release)
+                or record.get("pid") != receipt.get("worker_pid")
+                or record.get("instance_id") != receipt.get("worker_instance_id")
+                or status.get("idle") is not True or status.get("lease") is not None):
+            raise RuntimeError("execution is busy, changed, or another operation owns admission; no services stopped")
+        manifest, _mode = files._read_file(self.layout.manifest_path, private=True)
+        intent = {"format": 1, "operation_id": str(uuid.uuid4()), "phase": "prepared", "lease_id": None,
+                  "started": None, "server_identity": receipt.get("server_identity"),
+                  "worker_pid": receipt["worker_pid"], "gateway_pid": receipt["gateway_pid"],
+                  "worker_instance_id": receipt["worker_instance_id"],
+                  "layout_sha256": hashlib.sha256(manifest).hexdigest(),
+                  "identities": {name: _binding(path) for name, path in {
+                      "root": self.layout.install_root, "worker": self.layout.worker_release,
+                      "gateway": self.layout.gateway_release, "config": self.layout.config_root,
+                      "state": self.layout.state_root}.items()}}
+        if not isinstance(intent["server_identity"], str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", intent["server_identity"]) is None:
+            raise RuntimeError("authenticated server identity is unavailable")
+        if self.services.snapshot() != prior or read_lifecycle_intent(self.layout) is not None:
+            raise RuntimeError("native ownership changed before lifecycle admission")
+        files._atomic_write(self.layout.install_root / LIFECYCLE_NAME, files._json_bytes(intent))
+        return intent
+
+    def _stop(self, intent: dict, originals: dict) -> dict:
+        from execution_uninstall import _owned_lease, _no_provider_children
+        if intent["phase"] in {"starting", "releasing"}:
+            raise RuntimeError("an owned start must finish before another stop")
+        self._unchanged(originals)
+        prior = self.services.snapshot()
+        if any(prior[role].get("state") not in {"running", "stopped", "absent"} for role in ("worker", "gateway")):
+            raise RuntimeError("native lifecycle state is uncertain")
+        if prior["worker"].get("state") == "running":
+            record, status = self.control.status(self.layout)
+            if (record.get("pid") != intent["worker_pid"] or prior["worker"].get("pid") != intent["worker_pid"]
+                    or record.get("instance_id") != intent["worker_instance_id"]
+                    or record.get("release_root") != str(self.layout.worker_release)):
+                raise RuntimeError("worker epoch changed after lifecycle admission")
+            if intent["lease_id"] is not None and (status.get("lease") or {}).get("lease_id") != intent["lease_id"]:
+                raise RuntimeError("owned lifecycle admission changed")
+            try:
+                sealed = self.control.seal_for_stop(self.layout, intent["operation_id"], intent["worker_pid"])
+            except (OSError, ValueError, RuntimeError) as error:
+                raise RuntimeError("lifecycle admission was not confirmed; its owned retry evidence was retained and no service was stopped by this attempt; retry the same command when work is idle (a changed worker requires ownership recovery)") from error
+            if sealed["record"] != record:
+                raise RuntimeError("worker changed while lifecycle admission was sealed")
+            intent = self._save(intent, phase="sealed", lease_id=sealed["lease"]["lease_id"])
+            self._unchanged(originals)
+            if self.services.snapshot() != prior:
+                raise RuntimeError("native jobs changed after lifecycle admission")
+            for role in ("gateway", "worker"):
+                current = self.services.snapshot()[role]
+                if current.get("state") in {"stopped", "absent"}:
+                    self.services.set_enabled(role, False)
+                    continue
+                if current.get("state") != "running" or current.get("pid") != intent[role + "_pid"]:
+                    raise RuntimeError("native process changed before its authorized stop")
+                if role == "worker":
+                    now_record, now_status = self.control.status(self.layout)
+                    if (now_record != sealed["record"] or now_status.get("lease") != sealed["lease"]
+                            or now_status.get("idle") is not True):
+                        raise RuntimeError("worker admission changed before its authorized stop")
+                self._unchanged(originals)
+                self.services.set_enabled(role, False)
+                self.services.stop(role)
+        elif intent["lease_id"] is None or prior["gateway"].get("state") == "running":
+            raise RuntimeError("stopped worker lacks an owned completed shutdown")
+        else:
+            for role in ("gateway", "worker"):
+                self.services.set_enabled(role, False)
+        if any(self.services.snapshot()[role].get("state") not in {"stopped", "absent"} for role in ("worker", "gateway")):
+            raise RuntimeError("both native services must stop before lifecycle completion")
+        with _owned_lease(self.layout.state_root / "admin/state-owner.lock"):
+            _no_provider_children(self.layout.state_root)
+            self._unchanged(originals)
+            return self._save(intent, phase="stopped")
+
+    def _wait_worker(self, intent: dict) -> dict:
+        deadline = time.monotonic() + self.health_timeout
+        while True:
+            try:
+                record, status = self.control.status(self.layout)
+                native = self.services.snapshot()["worker"]
+                if (native.get("state") != "running" or native.get("pid") != record.get("pid")
+                        or record.get("release_root") != str(self.layout.worker_release)):
+                    raise RuntimeError("native worker does not own startup admission")
+                started = {"pid": record["pid"], "instance_id": record["instance_id"]}
+                if intent["started"] is not None and started != intent["started"]:
+                    raise RuntimeError("worker epoch changed during lifecycle startup")
+                if intent["phase"] != "releasing" or status.get("lease") is not None:
+                    self.control.require_startup_hold(self.layout, intent["operation_id"])
+                return started
+            except (OSError, ValueError, RuntimeError) as error:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("owned native worker did not reach held startup; retry start after recovery") from error
+                time.sleep(0.1)
+
+    def _start(self, intent: dict, originals: dict) -> dict:
+        from execution_uninstall import _owned_lease, _no_provider_children
+        if intent["phase"] == "stopped":
+            with _owned_lease(self.layout.state_root / "admin/state-owner.lock"):
+                _no_provider_children(self.layout.state_root)
+                self._unchanged(originals)
+                if any(self.services.snapshot()[role].get("state") not in {"stopped", "absent"} for role in ("worker", "gateway")):
+                    raise RuntimeError("stopped native jobs changed before authorized start")
+                intent = self._save(intent, phase="starting")
+        if intent["phase"] not in {"starting", "releasing"}:
+            raise RuntimeError("native shutdown must complete before starting")
+        self._unchanged(originals)
+        native = self.services.snapshot()
+        if native["worker"].get("state") in {"stopped", "absent"}:
+            if intent["started"] is not None or native["gateway"].get("state") == "running":
+                raise RuntimeError("owned startup process disappeared; automatic replacement is refused")
+            self.services.start("worker")
+        started = self._wait_worker(intent)
+        if intent["started"] is None:
+            intent = self._save(intent, started=started)
+        self._unchanged(originals)
+        gateway = self.services.snapshot()["gateway"]
+        if gateway.get("state") in {"stopped", "absent"}:
+            self.services.start("gateway")
+        receipt = ActivationController(self.layout, services=self.services, control=self.control,
+                                       health_timeout=self.health_timeout)._wait_receipt(self.layout)
+        if (receipt.get("server_identity") != intent["server_identity"]
+                or receipt.get("worker_pid") != intent["started"]["pid"]
+                or receipt.get("worker_instance_id") != intent["started"]["instance_id"]):
+            raise RuntimeError("authenticated lifecycle identity changed")
+        self._wait_worker(intent)
+        self._unchanged(originals)
+        intent = self._save(intent, phase="releasing")
+        self.control.release(self.layout, intent["operation_id"])
+        retire_lifecycle_intent(self.layout, intent)
+        return {"ok": True, "status": "running", "receipt": receipt}
+
+    def run(self, action: str) -> dict:
+        if action not in {"start", "stop", "restart"}:
+            raise ValueError("unknown native lifecycle action")
+        from execution_uninstall import _service_files, _hold_preparation_leases
+        from execution_recovery import require_retired_owners
+        with InstallationLock(self.layout.install_root), ExitStack() as leases:
+            if files.installed_layout(self.layout.install_root) != self.layout:
+                raise RuntimeError("native lifecycle layout changed")
+            originals = _service_files(self.layout)
+            self._unchanged(originals)
+            require_retired_owners(self.layout.install_root)
+            _hold_preparation_leases(self.layout.install_root, leases)
+            intent = read_lifecycle_intent(self.layout)
+            if intent is None:
+                prior = self.services.snapshot()
+                if any(prior[role].get("state") != "running" for role in ("worker", "gateway")):
+                    raise RuntimeError("unjournaled stopped or broken services require ownership recovery")
+                if action == "start":
+                    return {"ok": True, "status": "running", "receipt": self.control.receipt(self.layout, self.services)}
+                intent = self._new_intent(prior)
+            if intent["phase"] not in {"starting", "releasing"}:
+                intent = self._stop(intent, originals)
+            if action == "stop":
+                if intent["phase"] != "stopped":
+                    raise RuntimeError("retry start to finish the pending owned startup")
+                return {"ok": True, "status": "stopped"}
+            return self._start(intent, originals)
 
 
 class ActivationController:

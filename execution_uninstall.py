@@ -205,6 +205,7 @@ def uninstall(root: Path, *, config_root: Path, state_root: Path, home: Path,
         native = services or NativeServices(layout)
         control = control or WorkerControl()
         originals = _service_files(layout)
+        native.validate_registered_bindings()
         _no_pending_update(layout)
         _hold_preparation_leases(root, leases)
         _removable_tree(root)
@@ -216,6 +217,24 @@ def uninstall(root: Path, *, config_root: Path, state_root: Path, home: Path,
         if intent is not None and intent["purge_state"] != purge_state:
             raise RuntimeError("retry must preserve the existing uninstall data-removal choice")
         prior = native.snapshot()
+        from execution_manage import read_lifecycle_intent, retire_lifecycle_intent
+        lifecycle = read_lifecycle_intent(layout)
+        if lifecycle is not None:
+            # Adopt only a proven completed owned stop. Never start a worker
+            # merely to remove it: that could run saved scheduled/queued work.
+            if (lifecycle["phase"] != "stopped"
+                    or any(prior[role].get("state") not in {"stopped", "absent"} for role in ("worker", "gateway"))):
+                raise RuntimeError("finish the owned lifecycle stop before uninstalling")
+            native.validate_registered_bindings()
+            with _owned_lease(state_root / "admin/state-owner.lock"):
+                _no_provider_children(state_root)
+                if intent is None:
+                    intent = _write_intent(root, layout, lifecycle["operation_id"], purge_state,
+                                           lifecycle["server_identity"])
+                elif (intent["operation_id"] != lifecycle["operation_id"]
+                        or intent["server_identity"] != lifecycle["server_identity"]):
+                    raise RuntimeError("uninstall and lifecycle journal ownership conflict")
+                retire_lifecycle_intent(layout, lifecycle)
         # An interrupted graceful stop can precede the stopped-phase write.
         # The exact intent, empty child registry and exclusive state lease
         # below supply the missing proof; an unjournaled stopped install fails.

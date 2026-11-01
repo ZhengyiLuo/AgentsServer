@@ -139,3 +139,38 @@ checks both new-import filtering and old cron/wake projection, and preserves a
 genuine identical user message. It also covers cancellation, work/key-budget
 exhaustion, concurrent source/ledger mutation, malformed sequence, unchanged
 original ownership, and a later source tail outside the frozen checkpoint.
+
+## Display-trimmed scheduled inputs
+
+Long prompts can exceed the imported-message display limit while their full
+native input remains in the ledger and provider rollout. Such imports carry a
+normalized full-text hash and an `[import trimmed]` preview. Previously that
+hash excluded them from native replay matching, exposing cron input as a new
+human message even when native turn ownership was known.
+
+Both forward import and existing-history projection now compare the complete
+source input with the original native prompt after verifying the source
+checkpoint, parsed preview/hash, message identity and native turn owner. The
+preview is never a matching key by itself. Different full-text tails, unknown
+turns, forged hashes and missing checkpoints retain the message. This path
+supports plain user-message records and single-text-block user response items;
+it does not infer equality for other truncated content shapes. Original events
+and provider transcripts remain unchanged.
+
+## Accepted goal follow-ups
+
+Codex goal follow-ups are recorded as `turn_steered`, rather than a new
+`turn_started`. Their accepted native-goal, native-steer and user-authored
+markers identify an existing public input. Native replay reconciliation keeps
+their exact provider turn alongside the input hash; a logical goal run alone
+cannot identify a follow-up because it can span multiple native turns.
+
+Forward import and read-time repair both recognize these inputs. A checkpoint
+scan can recover earlier turn ownership from already-delivered public assistant
+item identities even when the import contains only user messages and the final
+run receipt names a later turn. Distinct source occurrences with the same text
+remain visible when their identity is ambiguous. Original events stay intact.
+Forward steer suppression always uses the verified source prefix, including
+records before the previous checkpoint. Uniqueness in the current delta alone
+cannot prove that a later equal user message is a replay. Without source
+occurrence proof, the message remains visible.

@@ -177,6 +177,7 @@ class NativeCodexSideChat:
         self._cleaning: asyncio.Task | None = None
         self._process_started = asyncio.Event()
         self._active: asyncio.Task | None = None
+        self._progress = None
         self._lock = asyncio.Lock()
         self._closed = False
         self._thread_parents: dict[str, str] = {}
@@ -186,6 +187,12 @@ class NativeCodexSideChat:
     @property
     def closed(self) -> bool:
         return self._closed
+
+    def snapshot_progress(self, task):
+        """Copy exposed native items at Stop without flushing or awaiting IO."""
+        if task is None or task.done() or self._active is not task or self._progress is None:
+            return None
+        return deepcopy(list(self._progress.items.values()))
 
     def owns_thread(self, thread_id: str) -> bool:
         """Only the side fork and provider-verified descendants own approvals."""
@@ -362,7 +369,7 @@ class NativeCodexSideChat:
         elif metadata.get("ephemeral") is not True or metadata.get("path") is not None:
             raise SideQuestionError(503, "Codex did not confirm an ephemeral side chat")
 
-    async def ask(self, question: str) -> str:
+    async def ask(self, question: str, *, runtime_settings: dict | None = None, on_progress=None) -> str:
         if self._closed:
             raise SideQuestionError(409, "Side chat was closed; open a new side chat")
         if self._lock.locked():
@@ -370,6 +377,7 @@ class NativeCodexSideChat:
         async with self._lock:
             self._active = asyncio.current_task()
             turn = None
+            progress = None
             try:
                 if self._opening is None:
                     self._opening = asyncio.create_task(self._open())
@@ -378,14 +386,37 @@ class NativeCodexSideChat:
                 await asyncio.shield(self._opening)
                 if self._closed:
                     raise SideQuestionError(409, "Side chat was closed; open a new side chat")
+                overrides = {**self.turn_overrides, **self.provider_turn_overrides}
+                if runtime_settings is not None:
+                    model = runtime_settings["model"]
+                    effort = runtime_settings.get("effort") or ""
+                    # Explicit default must clear a previous turn's effort;
+                    # null effort alone would inherit it from the thread.
+                    overrides.pop("effort", None)
+                    overrides.update({"model": model, "collaborationMode": {"mode": "default", "settings": {
+                        "model": model, "reasoning_effort": effort or None, "developer_instructions": None}}})
+                    if effort:
+                        overrides["effort"] = effort
+                    if self.provider_config:
+                        from codex_provider import turn_overrides
+                        overrides.update(turn_overrides(model, effort,
+                            summary=runtime_settings.get("reasoning_summary") or "none"))
                 turn = await self._client.start_turn(
                     self.thread_id, [{"type": "text", "text": question}],
-                    overrides={**self.turn_overrides, **self.provider_turn_overrides},
+                    overrides=overrides,
                 )
+                if on_progress is not None:
+                    from codex_side_chat_progress import CodexSideChatProgress
+                    progress = CodexSideChatProgress(on_progress, thread_id=self.thread_id)
+                    self._progress = progress
                 answers: dict[str, str] = {}
                 while True:
                     packet = await turn.next_notification()
                     method, data = packet.get("method"), packet.get("params", {})
+                    if data.get("threadId") not in (None, self.thread_id):
+                        continue
+                    if progress is not None:
+                        progress.receive(packet)
                     if method == "item/completed":
                         item = data.get("item", {})
                         if item.get("type") == "agentMessage" and item.get("phase") in (None, "", "final_answer"):
@@ -401,6 +432,8 @@ class NativeCodexSideChat:
                         answer = "\n\n".join(answers.values()).strip()
                         if not answer:
                             raise SideQuestionError(502, "Codex did not return a side question answer")
+                        if progress is not None:
+                            await progress.flush()
                         return answer
             except CodexAppServerError:
                 await self.close()
@@ -409,9 +442,16 @@ class NativeCodexSideChat:
                 await self.close()
                 raise
             finally:
-                if turn is not None:
-                    await turn.close()
-                self._active = None
+                try:
+                    if progress is not None:
+                        await progress.flush()
+                finally:
+                    try:
+                        if turn is not None:
+                            await turn.close()
+                    finally:
+                        self._progress = None
+                        self._active = None
 
     async def close(self):
         self._closed = True

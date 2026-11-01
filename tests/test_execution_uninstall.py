@@ -27,6 +27,9 @@ class Services:
     def snapshot(self):
         return deepcopy(self.states)
 
+    def validate_registered_bindings(self):
+        pass  # fixture native manager; never probes the developer's services
+
     def set_enabled(self, role, enabled):
         self.events.append(("enabled", role, enabled))
         self.states[role]["enabled"] = enabled

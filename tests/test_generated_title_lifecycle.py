@@ -29,7 +29,7 @@ class GeneratedTitleLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.store.sessions = {'title-chat': self.sess}
         self.tasks = {}
         self.generator = AsyncMock(return_value='Song About Two Cats')
-        self.provider_store = SimpleNamespace(for_session=Mock(return_value=None), require_thread=Mock())
+        self.provider_store = SimpleNamespace(for_session=Mock(return_value=None), require_thread=Mock(), control=Mock(return_value={}))
         for target, value in (
             ('STORE', self.store), ('GENERATED_TITLE_TASKS', self.tasks),
             ('GENERATED_TITLE_SLOTS', asyncio.Semaphore(2)), ('SERVER_SHUTTING_DOWN', False),

@@ -119,6 +119,21 @@ class InteractiveChatNativeGlueTests(unittest.IsolatedAsyncioTestCase):
         self.native["runtime_catalog"].assert_not_awaited()
         self.native["list_session_jobs"].assert_awaited_once_with("chat-one")
 
+    async def test_pending_provider_picker_metadata_is_omitted_from_shared_session(self):
+        session = self.native["STORE"].sessions["chat-one"]
+        session.update(model="active-model", effort="high", codex_provider_control={
+            "pending": True, "active_provider": "default", "requested_provider": "custom",
+            "requested_model": "next-model", "requested_effort": "low",
+            "requested_catalog": {"configured": True, "available": True, "base_url": "https://private-endpoint.invalid",
+                "models": [{"value": "next-model", "label": "Next"}], "credential_id": "private-credential-reference"}})
+        result = await self.native["interactive_chat_native_snapshot"]("chat-one")
+        self.assertEqual((result["session"]["model"], result["session"]["effort"]), ("active-model", "high"))
+        self.assertNotIn("codex_provider_control", result["session"])
+        encoded = json.dumps(result)
+        self.assertNotIn("private-endpoint.invalid", encoded)
+        self.assertNotIn("private-credential-reference", encoded)
+        self.assertEqual(result["events"], [self.row])
+
     async def test_native_snapshot_preserves_jobs_policy_and_actual_capability(self):
         for policy in ("full", "read_only", "blocked"):
             with self.subTest(policy=policy):

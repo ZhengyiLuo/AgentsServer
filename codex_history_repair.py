@@ -208,8 +208,24 @@ def _native_records(path: Path, expected: tuple[int, int, int, int], budget: _Na
 
 def _native_event_identity(event: dict) -> dict:
     """Keep bounded public identity, never retain tool bodies or message text."""
-    return {key: event[key] for key in ("id", "seq", "type", "phase", "item_id", "provider_thread_id")
+    return {key: event[key] for key in ("id", "seq", "type", "phase", "item_id", "provider_thread_id", "provider_turn_id")
             if key in event and (type(event[key]) is int or isinstance(event[key], str) and len(event[key]) <= 256)}
+
+
+def _native_goal_steer_turn(event: dict) -> str | None:
+    """Accepted goal follow-ups already have a user bubble in this chat.
+
+    Keep their exact native turn: one goal run can span many provider turns,
+    including later genuine messages with identical text.
+    """
+    turn = event.get("provider_turn_id")
+    if (event.get("type") == "turn_steered" and event.get("backend") == "codex"
+        and event.get("purpose") == "codex_goal_resume"
+        and event.get("native_goal_steer") is True and event.get("native_steer") is True
+        and event.get("provider_user_authored") is True
+        and isinstance(turn, str) and 0 < len(turn) <= 256):
+        return turn
+    return None
 
 
 def _native_import_batch(event: dict) -> dict:
@@ -805,18 +821,38 @@ class _AsyncDeliveryIndex:
     starts: dict = field(default_factory=dict)
     ends: dict = field(default_factory=dict)
     receipts: dict = field(default_factory=dict)
+    status_queues: dict = field(default_factory=dict)
+    status_body_keys: set = field(default_factory=set)
     exchange_receipts: dict = field(default_factory=dict)
     steered: set = field(default_factory=set)
     count: int = 0
 
     def observe(self, event: dict) -> None:
         event_type = event.get("type")
-        if (event_type not in {"turn_started", "turn_finished", "turn_steered", "turn_stopped", "turn_queue_run_now",
+        if (event_type not in {"turn_queued", "turn_started", "turn_finished", "turn_steered", "turn_stopped", "turn_queue_run_now",
                               "chat_conversation_message_received", "chat_conversation_message_started", "chat_conversation_message_delivered",
                               "cross_chat_exchange_leg_registered", "cross_chat_exchange_leg_received",
                               "cross_chat_exchange_leg_started", "cross_chat_exchange_leg_delivered", "cross_chat_exchange_leg_failed"}
             or event.get("imported") is True or event.get("forked") is True
             or event.get("backend") not in (None, "codex")):
+            return
+        if event_type == "turn_queued":
+            # The private durable request is exact provider input. Public display
+            # labels and wrapper-looking text are never evidence by themselves.
+            queued_id, body = event.get("queued_id"), event.get("request_prompt")
+            if (event.get("purpose") == "cross_chat_handoff_delivery"
+                and event.get("cross_chat_exchange_status") is True
+                and not _runtime_human_provenance(event)
+                and isinstance(queued_id, str) and 0 < len(queued_id) <= 256
+                and isinstance(body, str) and 0 < len(body) <= NATIVE_PROOF_LINE_BYTES):
+                record = {key: event.get(key) for key in ("seq", "cross_chat_exchange_id",
+                    "cross_chat_exchange_leg_id", "source_session_id", "target_session_id")}
+                record["body_key"] = _text_key(body)
+                self.status_queues.setdefault(queued_id, []).append(record)
+                self.status_body_keys.add(record["body_key"])
+                self.count += 1
+                if self.count > MAX_KEYS:
+                    raise _Unproven()
             return
         run = (event.get("interrupted_run_id") or event.get("run_id")) if event_type == "turn_queue_run_now" else event.get("run_id")
         if (event_type in {"turn_steered", "turn_stopped"} or event.get("native_steer") is True):
@@ -836,7 +872,7 @@ class _AsyncDeliveryIndex:
             "source_session_id", "target_session_id", "source_title", "target_run_id", "conversation_mode",
             "kind", "action", "handoff_action", "handoff_body_chars", "handoff_body_sha256",
             "message_revision", "message_edited_by_user", "exchange_id", "cross_chat_exchange_id",
-            "exchange_leg_id", "cross_chat_exchange_leg_id", "exchange_leg_kind", "exchange_ordinal", "exchange_max_legs")
+            "exchange_leg_id", "cross_chat_exchange_leg_id", "exchange_leg_kind", "exchange_ordinal", "exchange_max_legs", "cross_chat_exchange_status", "queued_id")
         record = {key: event.get(key) for key in fields
                   if event.get(key) is None or type(event.get(key)) in (int, bool)
                   or isinstance(event.get(key), str) and len(event[key]) <= 512}
@@ -866,11 +902,36 @@ class _AsyncDeliveryIndex:
             raise _Unproven()
 
     def match(self, session_id: str, provider_id: str, run: str, origin: dict,
-              body: tuple[str, str, int] | _ExchangeDeliveryBody | None, source_ids: set) -> dict | None:
+              body: tuple[str, str, int] | _ExchangeDeliveryBody | None, source_ids: set, body_key: str = "") -> dict | None:
         starts, ends = self.starts.get(run, []), self.ends.get(run, [])
-        if body is None or len(starts) != 1 or len(ends) != 1 or run in self.steered:
+        if len(starts) != 1 or len(ends) != 1 or run in self.steered:
             return None
         start, end = starts[0], ends[0]
+        if start.get("cross_chat_exchange_status") is True:
+            queued = self.status_queues.get(start.get("queued_id"), [])
+            if len(queued) != 1:
+                return None
+            receipt = queued[0]
+            identity = ("cross_chat_exchange_id", "cross_chat_exchange_leg_id",
+                        "source_session_id", "target_session_id")
+            if (start.get("malformed") or end.get("malformed") or not start.get("body_key")
+                or any(not isinstance(start.get(key), str) or not start[key]
+                       or receipt.get(key) != start[key] or end.get(key) != start[key] for key in identity)
+                or start.get("target_session_id") != session_id or start.get("source_session_id") == session_id
+                or start.get("backend") != "codex" or end.get("backend") != "codex"
+                or end.get("cross_chat_exchange_status") is not True or end.get("transport") != "app-server"
+                or end.get("provider_thread_id") != provider_id or end.get("provider_turn_id") != origin.get("turn_id")
+                or receipt["body_key"] != body_key or source_ids != {origin.get("event_id")} or not origin.get("event_id")
+                or any(type(record.get("seq")) is not int for record in (receipt, start, end))
+                or not receipt["seq"] < start["seq"] < end["seq"]
+                or not isinstance(start.get("id"), str) or not start["id"]):
+                return None
+            times = [_delivery_timestamp(value) for value in (start.get("ts"), origin.get("timestamp"), end.get("ts"))]
+            if any(value is None for value in times) or not times[0] <= times[1] <= times[2]:
+                return None
+            return _native_event_identity(start)
+        if body is None:
+            return None
         if isinstance(body, _ExchangeDeliveryBody):
             return self.match_exchange(session_id, provider_id, run, origin, body, source_ids, start, end)
         envelope = start.get("cross_chat_envelope_id")
@@ -1015,10 +1076,6 @@ def _prove_native_replays(session_id: str, provider_id: str, events: Path, sourc
                 if target:
                     candidates.append(target)
         elif event.get("imported") is not True and event.get("backend") in (None, "codex"):
-            if event.get("purpose") == "codex_goal_resume":
-                # Goal replies use exact item/turn proof, never a run-wide
-                # matching-text credit for another native message.
-                continue
             if event.get("type") == "turn_finished" and event.get("backend") == "codex" and event.get("transport") == "app-server":
                 thread = event.get("provider_thread_id")
                 if isinstance(thread, str) and _PROVIDER_ID.fullmatch(thread):
@@ -1026,7 +1083,11 @@ def _prove_native_replays(session_id: str, provider_id: str, events: Path, sourc
                         owned = owners.setdefault((thread, turn), set())
                         retained += run not in owned
                         owned.add(run)
-            kind = "user" if event.get("type") == "turn_started" else "assistant" if event.get("type") in ("assistant_text", "reasoning_summary", "turn_finished") else None
+            if event.get("purpose") == "codex_goal_resume" and not _native_goal_steer_turn(event):
+                # Goal replies use exact item/turn proof, never run-wide text
+                # credit. Accepted user steers still need source-occurrence proof.
+                continue
+            kind = "user" if event.get("type") == "turn_started" or _native_goal_steer_turn(event) else "assistant" if event.get("type") in ("assistant_text", "reasoning_summary", "turn_finished") else None
             body = event.get("prompt") if kind == "user" else event.get("result_text") if event.get("type") == "turn_finished" else event.get("text")
             if kind and isinstance(body, str) and body and len(body) <= 4 * 1024 * 1024:
                 native.setdefault((run, kind, _text_key(body)), []).append(_native_event_identity(event))
@@ -1106,7 +1167,7 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
     assistant_native_keys = {}
     compactions, candidate_assistants = {}, set()
     compaction_tracker = CodexCompactionSummaryTracker(thread)
-    delivery_bodies, delivery_source_ids = {}, {}
+    delivery_bodies, delivery_source_ids, full_user_keys = {}, {}, {}
     completed_runs = {run for (owner_thread, _turn), runs in owners.items()
                       if owner_thread == thread for run in runs}
     assistant_item_owners = _native_assistant_item_owners({
@@ -1187,6 +1248,21 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
                 raise _Unproven()
         if (item["kind"], key[2], key[3]) not in candidate_keys:
             continue
+        if item["kind"] == "user" and key[3] is not None:
+            # A display-trimmed input still has its complete source in this
+            # checkpoint-verified record. Compare those bytes to the original
+            # native input, never a shared preview or an unverified hash.
+            full_text = None
+            if record.get("type") == "event_msg" and payload.get("type") == "user_message":
+                full_text = payload.get("message")
+            elif record.get("type") == "response_item" and payload.get("role") == "user":
+                blocks = payload.get("content")
+                if (isinstance(blocks, list) and len(blocks) == 1 and isinstance(blocks[0], dict)
+                    and blocks[0].get("type") == "input_text"):
+                    full_text = blocks[0].get("text")
+            if (isinstance(full_text, str) and full_text
+                and _text_key(" ".join(full_text.split())) == key[3]):
+                full_user_keys[key] = _text_key(full_text)
         if item["kind"] == "user" and (body := _cross_chat_delivery_body(item["text"])):
             delivery_bodies[key] = body
         if item["kind"] == "assistant":
@@ -1253,9 +1329,7 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
             if len(proofs) > MAX_TARGETS:
                 raise _Unproven()
             continue
-        if len(source_ids) != 1 or source_hash is not None:
-            # Truncated source hashes need a separately retained native full-body
-            # hash. Until one exists, the bounded preview cannot prove equality.
+        if len(source_ids) != 1 or source_hash is not None and key not in full_user_keys:
             continue
         source_origin = next(iter(source_ids.values()))
         if source_origin.get("kind") in ("subagent_notification", "turn_aborted", "provider_notice"):
@@ -1267,10 +1341,12 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
         if len(owned_runs) != 1:
             continue
         native_run = next(iter(owned_runs))
-        native_matches = native.get((native_run, kind, body_key), [])
-        if not native_matches and kind == "user":
+        native_body_key = full_user_keys.get(key, body_key)
+        native_matches = [event for event in native.get((native_run, kind, native_body_key), [])
+                          if event.get("type") != "turn_steered" or event.get("provider_turn_id") == key[0]]
+        if not native_matches and kind == "user" and source_hash is None:
             delivery = deliveries.match(session_id, thread, native_run, source_origin,
-                                        delivery_bodies.get(key), delivery_source_ids.get(key[0], set()))
+                                        delivery_bodies.get(key), delivery_source_ids.get(key[0], set()), body_key)
             if delivery is not None:
                 native_matches = [delivery]
         if not native_matches and kind == "assistant":
@@ -1285,7 +1361,7 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
         if not native_matches:
             continue
         representative = min(native_matches, key=lambda event: event["seq"])
-        proofs[target] = {**next(iter(source_ids.values())), "native_event_id": representative["id"], "source_text_sha256": body_key}
+        proofs[target] = {**next(iter(source_ids.values())), "native_event_id": representative["id"], "source_text_sha256": native_body_key}
         if len(proofs) > MAX_TARGETS:
             raise _Unproven()
     budget.check()
@@ -1380,10 +1456,10 @@ class CodexNativeHistoryRepairCache(CodexGoalHistoryRepairCache):
                 **({"_agentsdock_imported_prompt_hidden": True} if event["type"] == "turn_started" else {})}
 
 
-def _prove_pending_async_deliveries(session_id: str, provider_id: str, items: list[dict],
+def _prove_pending_native_inputs(session_id: str, provider_id: str, items: list[dict],
                                     source: Path, root: Path, checkpoint: dict, parse_item: Callable,
                                     previous_seq: int, owners: dict, deliveries: _AsyncDeliveryIndex,
-                                    budget: _NativeReadBudget) -> dict:
+                                    budget: _NativeReadBudget, native_inputs: dict | None = None) -> dict:
     """Reuse pinned-prefix proof before broadcast; the synthetic batch is never stored."""
     cursor = checkpoint.get("cursor")
     if (checkpoint.get("version") != 1 or not isinstance(cursor, dict) or cursor.get("version") != 1
@@ -1392,16 +1468,21 @@ def _prove_pending_async_deliveries(session_id: str, provider_id: str, items: li
         raise _Unproven()
     run = "import_pending_native_delivery_proof"
     candidates, indexes = [], {}
+    steer_keys = {key[2] for key, events in (native_inputs or {}).items()
+                  if key[1] == "user" and any(event.get("type") == "turn_steered" for event in events)}
     for index, item in enumerate(items):
         budget.check()
         origin = item.get("provider_origin")
         if (item.get("kind") != "user" or not isinstance(item.get("text"), str)
             or not isinstance(origin, dict) or origin.get("provider") != "codex" or origin.get("kind") != "user"
-            or origin.get("session_id", provider_id) != provider_id or item.get("source_text_sha256") is not None
-            or not _cross_chat_delivery_body(item["text"])):
+            or origin.get("session_id", provider_id) != provider_id
+            or not (item.get("source_text_sha256") is not None
+                    or _cross_chat_delivery_body(item["text"]) or _text_key(item["text"]) in deliveries.status_body_keys
+                    or _text_key(item["text"]) in steer_keys)):
             continue
         candidate = _replay_target({"seq": previous_seq + index + 2, "id": f"pending:{index}", "run_id": run,
             "type": "turn_started", "backend": "codex", "imported": True, "prompt": item["text"],
+            "source_text_sha256": item.get("source_text_sha256"),
             "ts": origin.get("timestamp"), "provider_user_authored": _runtime_human_provenance(item)})
         if candidate is not None:
             candidates.append(candidate)
@@ -1411,7 +1492,7 @@ def _prove_pending_async_deliveries(session_id: str, provider_id: str, items: li
     if not candidates:
         return {}
     proof = _prove_native_source(provider_id, source, root,
-        {run: (previous_seq + 1, previous_seq + len(items) + 2, checkpoint)}, candidates, {},
+        {run: (previous_seq + 1, previous_seq + len(items) + 2, checkpoint)}, candidates, native_inputs or {},
         {(provider_id, turn): runs for turn, runs in owners.items()}, parse_item, budget,
         session_id=session_id, deliveries=deliveries, require_verified_checkpoint=True)
     result = {}
@@ -1431,10 +1512,10 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
                                       parse_item: Callable[[dict], dict | None] | None = None) -> list[dict]:
     """An existing verified import boundary can omit exact completed native copies.
 
-    Exact native bodies need only the ledger. Cross-chat wrappers additionally
-    require the caller's source/checkpoint/parser and one verified source-prefix
-    scan: a delta range alone cannot disambiguate a later same-turn human quote.
-    Missing source context leaves those wrappers visible for later read repair.
+    Exact native bodies need only the ledger. Cross-chat wrappers and trimmed
+    user inputs additionally require the caller's source/checkpoint/parser and
+    one verified source-prefix scan. A preview alone never proves equality.
+    Missing source context leaves those inputs visible for later read repair.
     Incomplete proof raises; the caller must defer import and its cursor commit.
     """
     if not items:
@@ -1455,12 +1536,12 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
                               for item in items if item.get("kind") == "assistant"
                               and isinstance(item.get("text"), str))
         owners, native, assistant_items, wake_keys, native_count = {}, {}, {}, set(), 0
+        native_inputs, steered_inputs = {}, {}
         deliveries = _AsyncDeliveryIndex()
         goal_assistants = _NativeGoalAssistantReplays(provider_id)
         prove_deliveries = (source_path is not None and root is not None
             and isinstance(sync_checkpoint, dict) and callable(parse_item)
-            and any(item.get("kind") == "user" and isinstance(item.get("text"), str)
-                    and _cross_chat_delivery_body(item["text"]) for item in items))
+            and any(item.get("kind") == "user" and isinstance(item.get("text"), str) for item in items))
         previous_seq, owner_count = 0, 0
         for event, _offset, _line in _native_records(events, stamp, budget):
             seq = event.get("seq")
@@ -1480,24 +1561,39 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
                 or event.get("backend") not in (None, "codex") or not isinstance(run, str)
                 or not 0 < len(run) <= 256 or run.startswith("import_")):
                 continue
-            if event.get("purpose") == "codex_goal_resume":
-                continue
             if (event.get("type") == "turn_finished" and event.get("backend") == "codex"
                 and event.get("transport") == "app-server" and event.get("provider_thread_id") == provider_id):
                 for turn_id in _native_owned_turn_ids(event):
                     owned = owners.setdefault(turn_id, set())
                     owner_count += run not in owned
                     owned.add(run)
-            kind = "user" if event.get("type") == "turn_started" else "assistant" if event.get("type") in ("assistant_text", "reasoning_summary", "turn_finished") else None
+            steer_turn = _native_goal_steer_turn(event)
+            if event.get("purpose") == "codex_goal_resume" and not steer_turn:
+                # Keep exact public reply identity for source-prefix ownership,
+                # without granting equal-text credit to every reply in the goal.
+                item_id = _public_assistant_item_id(event)
+                body = event.get("text")
+                if item_id is not None and isinstance(body, str) and body:
+                    assistant_items[(run, item_id, _text_key(body))] = _native_event_identity(event)
+                if native_count + owner_count + len(assistant_items) + deliveries.count + goal_assistants.count > MAX_KEYS:
+                    raise _Unproven()
+                continue
+            kind = "user" if event.get("type") == "turn_started" or steer_turn else "assistant" if event.get("type") in ("assistant_text", "reasoning_summary", "turn_finished") else None
             body = event.get("prompt") if kind == "user" else event.get("result_text") if event.get("type") == "turn_finished" else event.get("text")
             wake_hash = _native_mailbox_wake_hash(event) if kind == "user" else None
             key = (kind, wake_hash or _text_key(body)) if kind and (isinstance(body, str) and body or wake_hash) else None
             if key in candidate_keys or (isinstance(body, str) and
                     (kind, _text_key(" ".join(body.split()))) in source_keys):
-                keys = native.setdefault(run, {})
+                keys = steered_inputs.setdefault((run, steer_turn), {}) if steer_turn else native.setdefault(run, {})
                 native_count += key not in keys
                 if isinstance(event.get("id"), str) and 0 < len(event["id"]) <= 256:
                     keys.setdefault(key, event["id"])
+                    if prove_deliveries and kind == "user" and isinstance(body, str) and body:
+                        inputs = native_inputs.setdefault((run, kind, key[1]), [])
+                        if not any(prior.get("type") == event.get("type")
+                                   and prior.get("provider_turn_id") == event.get("provider_turn_id") for prior in inputs):
+                            inputs.append(_native_event_identity(event))
+                            native_count += 1
                     if wake_hash:
                         wake_keys.add((run, wake_hash))
             # Public assistant identities can prove an earlier goal turn
@@ -1527,10 +1623,17 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
         for item_key, turns in assistant_source_turns.items():
             if len(turns) == 1:
                 owners.setdefault(next(iter(turns)), set()).update(assistant_item_owners[item_key])
-        delivery_proofs = _prove_pending_async_deliveries(
+        if prove_deliveries and steered_inputs:
+            # The unmatched import can contain only follow-ups: its assistant
+            # messages were already reconciled. Preserve public item identities
+            # for the source scan to recover earlier turns of a long goal run.
+            for (run, _item_id, body_key), event in assistant_items.items():
+                native_inputs.setdefault((run, "assistant", body_key), []).append(event)
+        delivery_proofs = _prove_pending_native_inputs(
             session_id, provider_id, items, source_path, root, sync_checkpoint, parse_item,
-            previous_seq, owners, deliveries, budget,
-        ) if prove_deliveries and deliveries.starts else {}
+            previous_seq, owners, deliveries, budget, native_inputs,
+        ) if prove_deliveries and (deliveries.starts or steered_inputs or any(
+            item.get("kind") == "user" and item.get("source_text_sha256") is not None for item in items)) else {}
         # A hidden wake has no public prompt body. Require a single exact source
         # item in this verified import range, in addition to native turn ownership.
         wake_source_ids = {}
@@ -1555,9 +1658,15 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
                      and origin.get("session_id", provider_id) == provider_id and len(runs) == 1
                      and item.get("source_text_sha256") is None and isinstance(item.get("text"), str))
             known = owned and (item["kind"], _text_key(item["text"])) in native.get(next(iter(runs)), {})
-            delivery = delivery_proofs.get(index) if owned else None
+            # Steers never use delta-local text equality as proof. An equal
+            # source item can precede this delta's checkpoint in the same
+            # native turn. Only the full verified prefix can establish that
+            # this source occurrence is the already-shown follow-up.
+            # This proof already established exact source bytes, native owner,
+            # original event and checkpoint even when the display is trimmed.
+            delivery = delivery_proofs.get(index)
             known = known or delivery is not None
-            if known and (next(iter(runs)), _text_key(item["text"])) in wake_keys:
+            if known and runs and (next(iter(runs)), _text_key(item["text"])) in wake_keys:
                 known = (bool(origin.get("event_id")) and bool(origin.get("timestamp"))
                          and len(wake_source_ids.get((origin.get("turn_id"), _text_key(item["text"])), set())) == 1)
             if owned and not known and item["kind"] == "assistant":
@@ -1573,7 +1682,7 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
                     "provider_history_repair": "source_proven_native_replay",
                     "provider_origin": {**origin, "session_id": provider_id,
                         "native_event_id": delivery["native_event_id"] if delivery else native[next(iter(runs))][key],
-                        "source_text_sha256": key[1]}})
+                        "source_text_sha256": delivery["source_text_sha256"] if delivery else key[1]}})
         budget.check()
         return result
     except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:

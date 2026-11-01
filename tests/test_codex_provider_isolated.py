@@ -341,6 +341,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         self.manager.close = AsyncMock()
         self.ns.update({"codex_provider": provider, "CODEX_PROVIDER_STORE": self.store,
             "CODEX_PROVIDER_SETTINGS_LOCK": asyncio.Lock(),
+            "schedule_codex_subagent_limit_application": Mock(), "broadcast_codex_provider_changed": AsyncMock(),
             "STORE": SimpleNamespace(_lock=asyncio.Lock(), sessions={}, save=AsyncMock()),
             "session_codex_thread_id": lambda session: session.get("codex_thread_id", ""),
             "CODEX_APP_SERVER_MANAGER": self.manager, "CODEX_APP_SERVER_MANAGER_EPOCH": 1,
@@ -469,6 +470,48 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.discover.call_count, 2)
         self.store.save({**selected, "api_key": "different-synthetic"})
         self.assertEqual(self.store.catalog(available=True)["models"], [])
+
+    def test_pending_picker_discovery_and_model_check_use_requested_endpoint_without_reloading(self):
+        self.store.save(SELECTION)
+        active_revision = self.store.revision()
+        pending_selection = {"base_url": "https://next.synthetic.invalid/v1", "api_key": "pending-synthetic-key", "model": "pending/model"}
+        self.store.save(pending_selection)
+        pending_revision = self.store.revision()
+        # Discovery must follow the chat's requested immutable endpoint, not
+        # either the old live owner or the current global settings pointer.
+        self.store.save({"base_url": "https://third.synthetic.invalid/v1", "api_key": "third-synthetic-key", "model": "third/model"})
+        discovered, checked = [], []
+        def discover(selected):
+            discovered.append(dict(selected))
+            return {"ok": True, "status": "ready", "models": [{"value": "pending/model", "label": "Pending"}]}
+        async def probe(selected):
+            checked.append(dict(selected))
+            return {**provider.test_result("ready"), "compatibility": "verified"}
+        self.discover.side_effect = discover
+        self.probe.side_effect = probe
+        for active_provider in ("default", "custom"):
+            with self.subTest(active_provider=active_provider):
+                session = {"codex_provider": active_provider, "model": "active/model", "effort": "high",
+                    "codex_provider_revision": active_revision if active_provider == "custom" else None,
+                    "_codex_provider_pending": {"codex_provider": "custom", "model": "pending/model", "effort": "low",
+                        "codex_provider_revision": pending_revision}}
+                self.ns["STORE"].sessions["chat"] = session
+                before = json.dumps(session, sort_keys=True)
+                response = self.client.get("/api/admin/codex/provider/models?session_id=chat", headers=NATIVE)
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual((discovered[-1]["base_url"], discovered[-1]["api_key"]),
+                                 (pending_selection["base_url"], pending_selection["api_key"]))
+                response = self.client.post("/api/admin/codex/provider/test", headers=NATIVE,
+                    json={"model": "checked/model", "session_id": "chat", "credential_id": pending_revision})
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual((checked[-1]["api_key"], checked[-1]["model"]), (pending_selection["api_key"], "checked/model"))
+                stale = self.client.post("/api/admin/codex/provider/test", headers=NATIVE,
+                    json={"model": "checked/model", "session_id": "chat", "credential_id": active_revision})
+                self.assertEqual(stale.status_code, 409)
+                self.assertEqual(json.dumps(session, sort_keys=True), before)
+                self.assertNotIn(pending_selection["api_key"], response.text)
+        self.manager.close.assert_not_awaited()
+        self.ns["STORE"].save.assert_not_awaited()
 
     def test_model_refresh_rejects_retained_chat_credentials_after_reset(self):
         self.store.save(SELECTION)
@@ -694,7 +737,7 @@ class ManagerGenerationTests(unittest.IsolatedAsyncioTestCase):
                 "CODEX_APP_SERVER_MANAGER_EPOCH": 0, "CODEX_GOALS_CONFIG_LOCK": asyncio.Lock(),
                 "CODEX_APP_SERVER_MANAGER_LOCK": asyncio.Lock(), "CODEX_GOALS_ENABLED": True,
                 "ensure_provider_manager_factory_admission": lambda **kwargs: None,
-                "CodexAppServerManager": factory, "CODEX_BIN": "unused", "existing_cwd": lambda value: value,
+                "CodexAppServerManager": factory, "CustomCodexAppServerManager": factory, "CODEX_BIN": "unused", "existing_cwd": lambda value: value,
                 "DEFAULT_CWD": temporary, "SERVER_VERSION": "test", "HTTPException": HTTPException,
                 "codex_app_server_env": lambda selected=None: provider.native_environment(normal_env, selected) if selected else dict(normal_env)}
             for name in ("CODEX_APP_SERVER_TIMEOUT_SECONDS", "CODEX_APP_SERVER_LIFECYCLE_TIMEOUT_SECONDS", "CODEX_APP_SERVER_JSONL_LIMIT_BYTES", "CODEX_APP_SERVER_NOTIFICATION_QUEUE_LIMIT"):

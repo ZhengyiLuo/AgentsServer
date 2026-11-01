@@ -20,6 +20,12 @@ the same prerequisites as the source installer: a trusted `uv`, Linux with a
 working user systemd session or Apple silicon macOS with a GUI launchd session,
 and the desired provider CLIs. It runs as the current user without `sudo`.
 
+Installation and recovery exclude temporary npm lifecycle `.bin` paths, npm
+`_npx` cache paths and npm node-gyp shims from the inherited PATH. Stable absolute
+user/provider/Node locations remain ordered; empty and relative entries are
+excluded. This lexical filter is not executable or symlink authorization and
+does not repair the persisted PATH of an existing installation.
+
 The npm entrypoint only permits a fresh default installation. It refuses an
 existing managed installation, legacy service, or custom installation roots;
 changing directories does not create a second service. Use AgentsDock's managed

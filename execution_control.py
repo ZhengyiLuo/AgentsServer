@@ -186,6 +186,10 @@ class ExecutionControl:
                 if length not in {None, 0}:
                     raise ExecutionControlError(400, "Status requests do not accept a body")
                 result = await self.status_callback()
+                # This running worker understands execution-lifecycle startup
+                # holds. New CLIs must not stop an older retained worker and
+                # discover only after restart that its queue was not held.
+                result = {**result, "native_lifecycle_protocol": 1}
             else:
                 content_types = _header_values(headers, b"content-type")
                 if (len(content_types) != 1 or content_types[0].lower()

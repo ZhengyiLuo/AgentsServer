@@ -65,6 +65,117 @@ class CodexNativeHistoryRepairTests(unittest.TestCase):
     def prepare(self):
         self.cache.prepare("chat", PROVIDER, self.events, self.source, self.root, self.parse)
 
+    def goal_steer_fixture(self):
+        self.native[0].update(type="turn_steered", backend="codex",
+            purpose="codex_goal_resume", native_goal_steer=True, native_steer=True,
+            provider_user_authored=True, provider_turn_id="turn-1")
+        self.fixture()
+
+    def filter_with_source(self, items, checkpoint=None):
+        if checkpoint is None:
+            checkpoint = next(json.loads(line)["_history_sync_checkpoint"]
+                for line in self.events.read_text().splitlines() if json.loads(line).get("type") == "history_imported")
+        return filter_native_codex_history_items("chat", PROVIDER, self.events, items,
+            source_path=self.source, root=self.root, sync_checkpoint=checkpoint, parse_item=self.parse)
+
+    def test_repeated_goal_followup_across_checkpoints_stays_visible(self):
+        self.goal_steer_fixture()
+        previous = self.source.read_bytes()
+        self.raw.append({**self.raw[0], "timestamp": "2026-09-11T12:01:30.000Z",
+            "payload": {**self.raw[0]["payload"], "id": "later-identical-user-item"}})
+        self.fixture()
+        checkpoint = next(json.loads(line)["_history_sync_checkpoint"]
+            for line in self.events.read_text().splitlines() if json.loads(line).get("type") == "history_imported")
+        checkpoint.update(previous_present=True, previous_source_offset=len(previous),
+            previous_source_digest=hashlib.sha256(previous).hexdigest())
+        self.assertEqual(self.source.read_bytes()[:len(previous)], previous)
+        # Only the new occurrence reaches this delta; the first equal input
+        # is before the committed checkpoint, in the same native turn.
+        item = self.parse(self.raw[-1])
+        self.assertEqual(self.filter_with_source([item], checkpoint), [item])
+
+    def test_goal_followup_without_source_occurrence_proof_stays_visible(self):
+        self.goal_steer_fixture()
+        item = self.parse(self.raw[0])
+        self.assertEqual(filter_native_codex_history_items("chat", PROVIDER, self.events, [item]), [item])
+
+    def test_goal_followup_replay_is_hidden_before_import_and_on_history_read(self):
+        self.goal_steer_fixture()
+        before = self.events.read_bytes(), self.source.read_bytes()
+        items = [self.parse(row) for row in self.raw]
+        filtered = self.filter_with_source(items)
+        self.assertEqual(filtered[0]["text"], "")
+        self.assertEqual(filtered[0]["provider_origin"]["native_event_id"], "native-input-1")
+        self.prepare()
+        self.assertEqual(self.cache.project_event("chat", self.imports[0])["prompt"], "")
+        self.assertIsNone(self.cache.project_event("chat", self.native[0]))
+        self.assertEqual(before, (self.events.read_bytes(), self.source.read_bytes()))
+
+    def test_goal_owned_followup_keeps_source_proof_without_run_wide_reply_credit(self):
+        self.goal_steer_fixture()
+        for event in self.native[:3]:
+            event.update(purpose="codex_goal_resume", backend="codex")
+        self.native[1].update(item_id="item-1-assistant", provider_thread_id=PROVIDER,
+                              provider_turn_id="turn-1")
+        self.fixture()
+        before = self.events.read_bytes(), self.source.read_bytes()
+        filtered = self.filter_with_source([self.parse(row) for row in self.raw])
+        self.assertEqual(filtered[0]["text"], "")
+        self.assertEqual(filtered[0]["provider_origin"]["native_event_id"], "native-input-1")
+        self.prepare()
+        self.assertEqual(self.cache.project_event("chat", self.imports[0])["prompt"], "")
+        self.assertEqual(before, (self.events.read_bytes(), self.source.read_bytes()))
+
+    def test_goal_followup_requires_accepted_steer_and_exact_native_turn(self):
+        for changes in ({"native_goal_steer": False}, {"native_steer": False},
+                        {"provider_user_authored": False}, {"provider_turn_id": "other-turn"},
+                        {"purpose": "scheduled_job"}):
+            with self.subTest(changes=changes):
+                self.goal_steer_fixture()
+                self.native[0].update(changes)
+                self.fixture()
+                self.cache = CodexNativeHistoryRepairCache()
+                self.prepare()
+                self.assertIsNone(self.cache.project_event("chat", self.imports[0]))
+                result = self.filter_with_source([self.parse(row) for row in self.raw])
+                self.assertEqual(result[0]["text"], "Genuine human request")
+
+    def test_same_goal_followup_text_in_another_turn_stays_visible(self):
+        self.goal_steer_fixture()
+        self.raw[2]["payload"]["content"][0]["text"] = "Genuine human request"
+        # Both native turns belong to one logical goal run. A turn-1 steer
+        # must not suppress a later genuine input in turn-2 of that same run.
+        for event in self.native[3:]:
+            event["run_id"] = "native-1"
+        self.fixture(); self.prepare()
+        self.assertIsNone(self.cache.project_event("chat", self.imports[2]))
+        result = self.filter_with_source([self.parse(row) for row in self.raw])
+        self.assertEqual(result[0]["text"], "")
+        self.assertEqual(result[1]["text"], "Genuine human request")
+
+    def test_ambiguous_repeated_followup_in_same_turn_is_retained(self):
+        self.goal_steer_fixture()
+        self.raw.append({**self.raw[0], "timestamp": "2026-09-11T12:01:30.000Z",
+            "payload": {**self.raw[0]["payload"], "id": "another-user-item"}})
+        self.fixture(); self.prepare()
+        self.assertIsNone(self.cache.project_event("chat", self.imports[0]))
+        self.assertIsNone(self.cache.project_event("chat", self.imports[-1]))
+        result = self.filter_with_source([self.parse(row) for row in self.raw])
+        self.assertEqual([item["text"] for item in result].count("Genuine human request"), 2)
+
+    def test_goal_followup_only_import_recovers_earlier_turn_from_public_item(self):
+        self.goal_steer_fixture()
+        self.native[1].update(item_id="item-1-assistant", provider_thread_id=PROVIDER)
+        self.native[2]["provider_turn_id"] = "later-goal-turn"
+        self.fixture()
+        checkpoint = next(json.loads(line)["_history_sync_checkpoint"]
+            for line in self.events.read_text().splitlines() if json.loads(line).get("type") == "history_imported")
+        item = self.parse(self.raw[0])
+        result = filter_native_codex_history_items("chat", PROVIDER, self.events, [item],
+            source_path=self.source, root=self.root, sync_checkpoint=checkpoint, parse_item=self.parse)
+        self.assertEqual(result[0]["text"], "")
+        self.assertEqual(result[0]["provider_origin"]["native_event_id"], "native-input-1")
+
     def test_exact_human_and_scheduled_copies_are_hidden_originals_unchanged(self):
         before = self.events.read_bytes(), self.source.read_bytes()
         self.prepare()
@@ -301,6 +412,61 @@ class CodexNativeHistoryRepairTests(unittest.TestCase):
         self.prepare()
         self.assertEqual(len(self.cache.signature("chat")), 4)
 
+    def trimmed_scheduled_fixture(self):
+        namespace = load_projection()
+        namespace["MAX_IMPORTED_TEXT_CHARS"] = 12000
+        self.parse = namespace["codex_history_event_item"]
+        prompt = "Scheduled monitoring request.\n\n" + "Long task detail. " * 750 + "Complete tail A."
+        self.raw[2]["payload"]["content"][0]["text"] = prompt
+        self.native[3]["prompt"] = prompt
+        self.fixture()
+        item = self.parse(self.raw[2])
+        self.assertIn("[import trimmed]", item["text"])
+        self.imports[2].update(prompt=item["text"], source_text_sha256=item["source_text_sha256"])
+        rows = [json.loads(line) for line in self.events.read_text().splitlines()]
+        for index, row in enumerate(rows):
+            if row.get("id") == self.imports[2]["id"]:
+                rows[index] = {"session_id": "chat", **self.imports[2]}
+        self.events.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        checkpoint = next(row["_history_sync_checkpoint"] for row in rows if row["type"] == "history_imported")
+        return item, checkpoint
+
+    def test_trimmed_cron_input_uses_full_source_for_replay_and_old_projection(self):
+        item, checkpoint = self.trimmed_scheduled_fixture()
+        before = self.events.read_bytes(), self.source.read_bytes()
+        self.prepare()
+        projected = self.cache.project_event("chat", self.imports[2])
+        self.assertIsNotNone(projected)
+        self.assertEqual(projected["prompt"], "")
+        self.assertEqual(projected["provider_origin"]["native_event_id"], self.native[3]["id"])
+        result = filter_native_codex_history_items("chat", PROVIDER, self.events, [item],
+            source_path=self.source, root=self.root, sync_checkpoint=checkpoint, parse_item=self.parse)
+        self.assertEqual(result[0]["text"], "")
+        self.assertTrue(result[0]["metadata_only"])
+        self.assertEqual(result[0]["provider_origin"]["source_text_sha256"],
+                         hashlib.sha256(self.native[3]["prompt"].encode()).hexdigest())
+        self.assertEqual(before, (self.events.read_bytes(), self.source.read_bytes()))
+
+    def test_trimmed_input_never_matches_preview_alone_or_unowned_turn(self):
+        item, checkpoint = self.trimmed_scheduled_fixture()
+        self.assertEqual(filter_native_codex_history_items("chat", PROVIDER, self.events, [item]), [item])
+        for alteration in ("different-tail", "different-turn", "forged-hash"):
+            with self.subTest(alteration=alteration):
+                item, checkpoint = self.trimmed_scheduled_fixture()
+                if alteration == "different-tail":
+                    rows = [json.loads(line) for line in self.events.read_text().splitlines()]
+                    rows[3]["prompt"] = rows[3]["prompt"].replace("tail A.", "tail B.")
+                    self.events.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                elif alteration == "different-turn":
+                    item = {**item, "provider_origin": {**item["provider_origin"], "turn_id": "unowned"}}
+                else:
+                    item = {**item, "source_text_sha256": "f" * 64}
+                result = filter_native_codex_history_items("chat", PROVIDER, self.events, [item],
+                    source_path=self.source, root=self.root, sync_checkpoint=checkpoint, parse_item=self.parse)
+                self.assertEqual(result, [item])
+                if alteration == "different-tail":
+                    self.prepare()
+                    self.assertIsNone(self.cache.project_event("chat", self.imports[2]))
     def test_import_proof_does_not_retain_unrelated_native_text_keys(self):
         # A large chat can have more text keys than the proof's memory budget;
         # only exact candidate bodies need retention, while sequence validation
@@ -426,6 +592,72 @@ class CodexNativeHistoryRepairTests(unittest.TestCase):
                 if json.loads(line).get("type") == "history_imported")
         return filter_native_codex_history_items("chat", PROVIDER, self.events, items,
             source_path=self.source, root=self.root, sync_checkpoint=checkpoint, parse_item=self.parse)
+
+    def queued_status_fixture(self):
+        wrapper = ('[AgentsDock delivery kind=status leg=0/2 origin=route from=Other chat]\n'
+                   '[Source user instruction — verbatim, user-authored]\nOriginal user request\n'
+                   '[End source user instruction]\n[Server-generated exchange status]\n'
+                   'The queued request was skipped.\n[End server-generated exchange status]\n'
+                   'reply: none (terminal status notice; do not respond to the exchange)\n[End delivery]')
+        self.raw = self.raw[:2]
+        self.raw[0]['payload']['content'][0]['text'] = wrapper
+        fields = {'purpose': 'cross_chat_handoff_delivery', 'backend': 'codex',
+                  'cross_chat_exchange_status': True, 'cross_chat_exchange_id': 'exchange-status',
+                  'cross_chat_exchange_leg_id': 'leg-status', 'source_session_id': 'sender',
+                  'target_session_id': 'chat'}
+        self.native = [
+            {**fields, 'seq': 1, 'id': 'status-queue', 'type': 'turn_queued',
+             'queued_id': 'queue-status', 'prompt': 'Cross-chat exchange status', 'request_prompt': wrapper},
+            {**fields, 'seq': 2, 'id': 'native-input-1', 'run_id': 'native-1', 'type': 'turn_started',
+             'prompt': 'Cross-chat exchange status', 'queued_id': 'queue-status', 'ts': '2026-09-11T12:01:00Z'},
+            {'seq': 3, 'id': 'native-answer-1', 'run_id': 'native-1', 'type': 'assistant_text', 'text': 'Original answer'},
+            {**fields, 'seq': 4, 'id': 'native-end-1', 'run_id': 'native-1', 'type': 'turn_finished',
+             'transport': 'app-server', 'provider_thread_id': PROVIDER, 'provider_turn_id': 'turn-1',
+             'result_text': 'Original answer', 'ts': '2026-09-11T12:01:02Z'},
+        ]
+        self.fixture()
+        return wrapper
+
+    def test_queued_status_replay_uses_exact_private_receipt_and_keeps_source_files(self):
+        self.queued_status_fixture()
+        before = self.events.read_bytes(), self.source.read_bytes()
+        self.prepare()
+        projected = self.cache.project_event('chat', self.imports[0])
+        self.assertEqual(projected['prompt'], '')
+        self.assertTrue(projected['metadata_only'])
+        self.assertEqual(projected['provider_origin']['native_event_id'], 'native-input-1')
+        item = self.parse(self.raw[0])
+        self.assertEqual(self.filter_async_delivery([item])[0]['text'], '')
+        # A delta without a verified source checkpoint cannot establish uniqueness.
+        self.assertEqual(filter_native_codex_history_items('chat', PROVIDER, self.events, [item]), [item])
+        self.assertEqual(before, (self.events.read_bytes(), self.source.read_bytes()))
+        self.assertIsNone(self.cache.project_event('chat', self.native[1]))
+
+    def test_status_repair_requires_exact_queue_leg_input_and_nonhuman_receipt(self):
+        for changes in ({'cross_chat_exchange_leg_id': 'different-leg'}, {'queued_id': 'other-queue'},
+                        {'request_prompt': 'Different input'}, {'provider_user_authored': True},
+                        {'cross_chat_exchange_status': False}):
+            with self.subTest(changes=changes):
+                self.cache.forget('chat')
+                self.queued_status_fixture()
+                self.native[0].update(changes)
+                self.fixture(); self.prepare()
+                self.assertIsNone(self.cache.project_event('chat', self.imports[0]))
+                item = self.parse(self.raw[0])
+                self.assertEqual(self.filter_async_delivery([item]), [item])
+
+    def test_identical_user_quote_is_not_hidden_by_a_status_receipt(self):
+        self.queued_status_fixture()
+        # Two native source user items in one turn are ambiguous; neither may
+        # be erased just because one server delivery has the same wording.
+        self.raw.append({**self.raw[0], 'timestamp': '2026-09-11T12:01:01.500Z',
+                         'payload': {**self.raw[0]['payload'], 'id': 'genuine-user-quote'}})
+        self.fixture(); self.prepare()
+        self.assertIsNone(self.cache.project_event('chat', self.imports[0]))
+        self.assertIsNone(self.cache.project_event('chat', self.imports[-1]))
+        # Even a later import containing only the quote checks the full prefix.
+        quote = self.parse(self.raw[-1])
+        self.assertEqual(self.filter_async_delivery([quote]), [quote])
 
     def assert_async_delivery_visible(self):
         self.fixture(); self.cache.forget("chat"); self.prepare()

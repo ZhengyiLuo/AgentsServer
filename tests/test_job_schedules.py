@@ -1092,7 +1092,8 @@ class JobStoreTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(turn_request.chat_references, [reference])
                     self.assertEqual(
                         turn_request.client_capabilities,
-                        [agent_server.CROSS_CHAT_HANDOFFS_V2_CLIENT_CAPABILITY],
+                        [agent_server.ASYNC_ROUTE_V1_CLIENT_CAPABILITY,
+                         agent_server.CROSS_CHAT_HANDOFFS_V2_CLIENT_CAPABILITY],
                     )
                     self.assertEqual(turn_request.purpose, "scheduled_job")
                     self.assertFalse(start_turn.await_args.kwargs["queue_if_busy"])

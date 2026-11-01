@@ -89,6 +89,29 @@ class ClaudeGoalProjectionTests(unittest.TestCase):
         self.assertTrue(is_claude_synthetic_no_response({"type": "assistant", "message": message}))
         self.assertFalse(is_claude_synthetic_no_response({"type": "assistant", "message": {**message, "model": "claude"}}))
 
+    def test_native_continuation_cap_is_visible_without_completing_the_goal(self):
+        projection = ClaudeGoalProjection(SESSION)
+        projection.consume(record(sentinel=True))
+        warning = {"type": "system", "subtype": "informational", "level": "warning",
+                   "sessionId": SESSION, "isSidechain": False, "uuid": str(uuid4()),
+                   "timestamp": "2026-09-22T23:45:01.051Z",
+                   "content": "A hook blocked the turn from ending 9 consecutive times — overriding and ending turn. For Stop/SubagentStop hooks, check stop_hook_active."}
+        for change in ({"type": "assistant"}, {"sessionId": FORK}, {"isSidechain": True}, {"level": "info"}):
+            self.assertFalse(projection.consume({**warning, **change}))
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / 'native.jsonl'
+            path.write_bytes(encode(record(sentinel=True)) + encode(warning))
+            projection.refresh(path)
+        self.assertEqual(projection.goal["status"], "active")
+        self.assertEqual(projection.goal["execution_stop_reason"], "continuation_limit")
+        self.assertIn("execution_stopped_at", projection.goal)
+        self.assertFalse(projection.consume(warning))
+        projection.consume(record(second=2, reason="Making progress again"))
+        self.assertNotIn("execution_stop_reason", projection.goal)
+        self.assertNotIn("execution_stopped_at", projection.goal)
+        projection.consume(record(second=3, sentinel=True, met=True))
+        self.assertEqual(projection.goal["status"], "cleared")
+
     def test_native_evaluator_completion_and_clear_are_distinct(self):
         projection = ClaudeGoalProjection(SESSION)
         projection.consume(record(sentinel=True))

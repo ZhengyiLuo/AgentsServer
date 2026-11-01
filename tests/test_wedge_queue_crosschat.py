@@ -120,6 +120,7 @@ class RebuiltDeliveryRowTests(unittest.IsolatedAsyncioTestCase):
                     "target": dict(TARGET_SESSION),
                 },
             ),
+            patch.object(agent_server, "submit_cross_chat_delivery", AsyncMock()),
             patch.object(agent_server, "DELETING_SESSIONS", set()),
             patch.object(agent_server, "DELETED_SESSION_TOMBSTONES", set()),
             patch.object(
@@ -146,70 +147,17 @@ class RebuiltDeliveryRowTests(unittest.IsolatedAsyncioTestCase):
                 accepted_provider_route_snapshot=[],
             )
 
-    async def test_rebuilt_delivery_row_passes_the_immutability_check(self) -> None:
-        item = agent_server.queued_turn_from_event(
-            delivery_event(), dict(TARGET_SESSION), 1
-        )
-        with self.assertRaises(AdmissionReached):
-            await self.start_delivery(delivery_request(item))
-
-    async def test_runtime_equal_to_the_target_is_not_a_mutation(self) -> None:
-        # Rows persisted by older builds echo the target chat's own runtime.
-        item = agent_server.queued_turn_from_event(
-            delivery_event(), dict(TARGET_SESSION), 1
-        )
-        with self.assertRaises(AdmissionReached):
-            await self.start_delivery(
-                delivery_request(
-                    item, backend="claude", model="opus", effort="high"
-                )
-            )
-
-    async def test_user_selected_backend_mismatch_still_rejects(self) -> None:
-        item = agent_server.queued_turn_from_event(
-            delivery_event(), dict(TARGET_SESSION), 1
-        )
-        for overrides in (
-            {"backend": "codex"},
-            {"model": "sonnet"},
-            {"effort": "low"},
-        ):
+    async def test_all_legacy_delivery_variants_retire_before_provider_admission(self) -> None:
+        for overrides in ({}, {"backend": "claude", "model": "opus", "effort": "high"},
+                          {"backend": "codex"}, {"model": "sonnet"}, {"effort": "low"},
+                          {"client_capabilities": list(CODEX_CAPS)},
+                          {"client_capabilities": ["forged_capability"]}):
             with self.subTest(overrides=overrides):
+                item = agent_server.queued_turn_from_event(delivery_event(), dict(TARGET_SESSION), 1)
                 with self.assertRaises(HTTPException) as raised:
                     await self.start_delivery(delivery_request(item, **overrides))
-                self.assertEqual(raised.exception.status_code, 400)
-                self.assertEqual(
-                    raised.exception.detail,
-                    "cross-chat delivery runtime is immutable",
-                )
-
-    async def test_capability_set_of_another_backend_is_a_target_change(self) -> None:
-        item = agent_server.queued_turn_from_event(
-            delivery_event(client_capabilities=list(CODEX_CAPS)),
-            dict(TARGET_SESSION),
-            1,
-        )
-        with self.assertRaises(HTTPException) as raised:
-            await self.start_delivery(delivery_request(item))
-        self.assertEqual(raised.exception.status_code, 410)
-        self.assertEqual(
-            raised.exception.detail,
-            "cross-chat delivery target runtime changed",
-        )
-
-    async def test_unknown_capability_set_is_still_immutable_violation(self) -> None:
-        item = agent_server.queued_turn_from_event(
-            delivery_event(client_capabilities=["forged_capability"]),
-            dict(TARGET_SESSION),
-            1,
-        )
-        with self.assertRaises(HTTPException) as raised:
-            await self.start_delivery(delivery_request(item))
-        self.assertEqual(raised.exception.status_code, 400)
-        self.assertEqual(
-            raised.exception.detail,
-            "cross-chat delivery runtime is immutable",
-        )
+                self.assertEqual(raised.exception.status_code, 410)
+                self.assertIn("disabled", raised.exception.detail)
 
 
 def queued_delivery_item(**overrides) -> dict:

@@ -19,7 +19,7 @@ Client-only devices do not need these prerequisites. The npm server installer
 does not run natively on Windows.
 
 ```sh
-npm install -g agentsdock
+npm install -g agentsdock@beta
 agentsdock list
 agentsdock token default
 ```
@@ -43,8 +43,8 @@ Install and sign in to your preferred provider CLI on the server before
 starting a chat. npm setup does not install provider CLIs or authenticate them.
 
 For a beta, select `npm install -g agentsdock@beta`. Stable and beta packages are
-published on npm. Features explicitly marked as source-only below may require a
-later package release.
+published on npm. This checkout prepares the matched 1.0.11-beta.12 CLI/runtime;
+its publication and native candidate acceptance are pending.
 
 `-g` makes the command available outside the current project when npm's global
 bin directory is on your PATH. A local `npm install agentsdock` is also supported;
@@ -59,10 +59,10 @@ uv, Homebrew, provider CLIs or Tailscale automatically. If a prerequisite is
 missing, install it and check it in the same terminal before retrying
 `agentsdock setup`; if the CLI was not installed, rerun the npm install command.
 
-The connection-output improvements in the next paragraph are source-only and
-are not included in the published 1.0.10 or 1.0.11-beta.1 packages. With those
-packages, use `agentsdock list` and `agentsdock token default` even if npm's
-installation output does not show connection details.
+The connection-output improvements below are included starting in
+1.0.11-beta.2. With 1.0.10 or 1.0.11-beta.1, use `agentsdock list` and
+`agentsdock token default` even if npm's installation output does not show
+connection details.
 
 With the improved output, a successful first setup shows the default server URL,
 access token and a scannable terminal QR together, even when npm hides successful
@@ -77,12 +77,20 @@ A failed auto setup makes npm report failure instead of claiming the server is
 ready. To obtain interactive diagnostics or choose a custom port/bind:
 
 ```sh
-AGENTSDOCK_SKIP_SETUP=1 npm install -g agentsdock
+AGENTSDOCK_SKIP_SETUP=1 npm install -g agentsdock@beta
 agentsdock setup --port 7854 --bind 127.0.0.1
 ```
 
 `--ignore-scripts` also disables auto setup, as required by npm; this package does
 not bypass that setting. `setup` remains the explicit retry/custom-install path.
+
+Before a new setup or local instance-management helper runs, npm lifecycle
+`node_modules/.bin` paths, npm's disposable `_npx` cache paths and npm node-gyp
+shims are removed from the inherited PATH. Ordered absolute user, provider and
+Node locations remain available; empty/relative entries are not persisted.
+This lexical filter does not resolve symlink aliases or authenticate executables.
+It prevents new temporary npm-path dependencies; it does not rewrite the saved
+PATH of an already-installed server or change managed-update policy.
 
 To show the connection details again, run `agentsdock token`: choose the server
 and its URLs, token and QR appear together. Use `agentsdock token default` to skip
@@ -110,8 +118,10 @@ agentsdock remove work
 Flat commands are the primary interface. `servers ACTION` and `instances ACTION`
 remain aliases, as do `new --name NAME` and `token/status --instance NAME`.
 Start/stop/restart/remove require an
-explicit instance or the native helper's explicit `--all` selector. Stop/restart
-interrupt running work; wait for chats to finish first. Remove retains the
+explicit instance or the native helper's explicit `--all` selector. Legacy and
+named-instance stop/restart can interrupt running work; wait for chats to finish
+first. The split default server requires verified idle admission before stopping
+either component. Remove retains the
 existing confirmation and history-preservation behavior. Tokens are private;
 `token` only reads an existing token and does not reinstall or restart a server.
 Without a name, `agentsdock token` lists this OS user's existing servers on the
@@ -140,26 +150,23 @@ the version comes from that instance's installed runtime, not the npm CLI packag
 installation, it leaves it unchanged and points to `agentsdock new` for another
 instance (or `agentsdock new work --port 7854` for an explicit name and port).
 
-Current acceptance gap: the native instance manager still validates the older
-single-service layout. `remove default --yes` was observed refusing a current
-split gateway/execution installation before making changes. Start/stop/restart
-and removal for split layouts need guarded lifecycle integration and native
-acceptance before this CLI can be advertised as complete instance management.
-Do not bypass the binding check or stop only one process. Fresh auto setup and
-safe repeated npm installation have been verified independently on Linux;
-macOS first-service creation still needs disposable native acceptance.
+Beta.5 preparation adds guarded control of both default-server components.
+Stop/restart requires an installed worker that supports the paired lifecycle
+protocol; installing a newer CLI alone does not update an older server. If the
+command reports that requirement, update the installed server through the app's
+signed managed-update path first. It leaves unsupported running services intact.
+Busy work, pending updates, changed native registrations or uncertain ownership
+prevent a forced stop. Interrupted operations retain an owned retry journal;
+follow the command's retry guidance rather than deleting it manually.
 
-The packaged CLI has also been installed and reinstalled on Apple silicon
-macOS with existing services. Disposable named launchd instances passed real
-creation (explicit and automatic name/port), token/authenticated-health,
-start/stop/restart, uninstall cancellation and removal/name-release checks.
-Saved test data remained in its private backup. This does not close the
-fresh-default or split-service acceptance gaps above.
+See the repository's [release validation record](../../../docs/NPM_CLI_RELEASES.md)
+for exact-package native setup, lifecycle and removal acceptance. Source tests
+alone do not establish native service operation.
 
 ## Read service logs
 
-This command is new in source and is not included in the published 1.0.10 or
-1.0.11-beta.1 packages yet.
+Service logs are available starting in 1.0.11-beta.2, not in 1.0.10 or
+1.0.11-beta.1.
 
 ```sh
 agentsdock logs                       # Default server: recent entries, then exit

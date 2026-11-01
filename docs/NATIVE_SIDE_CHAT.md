@@ -29,21 +29,55 @@ The desktop requires `side_questions.version: 2` and `native_context: true`.
 Each request supplies `request_id`, `side_chat_id`, `question`, and, for a
 follow-up, `after_request_id`. The server deduplicates receipts and verifies
 the predecessor before asking the provider. Client-authored history is refused.
-Claude receives its native maximum of twenty server-owned side exchanges;
-Codex retains its own ephemeral transcript. No parent text budget is applied.
+Claude receives up to twenty server-owned side exchanges; Codex retains its
+own native transcript. Existing Side chat question, request, response and
+legacy follow-up-history limits remain unchanged in this release.
 Codex captures the main context on its first question; Clear starts a new fork
 with the latest main context. Its workspace tools can inspect current files
 even when the inherited conversation predates those files.
 
+Servers advertising `side_questions.runtime_settings` accept optional Codex
+`model` and `effort` on both submission routes. Selection changes apply to the
+next turn in the existing child; they do not clear history or change the main
+chat. Empty effort requests the normal Codex server default or the custom
+endpoint default, while omitted fields preserve the side selection. Synchronized side chats persist their effective selection
+alongside the native thread reference, and expose it in snapshots; legacy
+answers expose it too. Claude `/btw` continues using its connected parent.
+
 `DELETE /api/sessions/{session}/side-questions/{request}` cancels one request.
 `DELETE /api/sessions/{session}/side-chats/{side_chat}` closes the side chat.
 Both are native-operator-only and scoped to the authenticated owner and parent.
-Clear, profile shutdown and server shutdown release owned resources. Idle side
-contexts remain available until explicitly closed or their owning runtime shuts
-down; elapsed idle time does not discard native context. Cancellation/error
-also closes the side conversation; the user can Clear to start again.
+Clear, profile shutdown and server shutdown release owned resources. Synchronized Codex side
+conversations resume their persisted native thread after transport cleanup;
+there is no request execution deadline. Cancellation/error closes the owned
+transport without interrupting the parent. The legacy ephemeral route cannot
+resume a closed context.
+Idle side contexts remain available while their owning runtime is active;
+elapsed idle time does not discard native context.
 
 Tests must cover real tool-result context, successive questions, cancellation
 with a running parent, unchanged parent goals/transcripts, native cold resume,
 HTTP ownership, request deduplication and Clear arriving before a delayed POST.
 Never import the production server or use a real user chat in test setup.
+
+## Live Codex activity
+
+Synchronized exchanges expose additive `activity` items with stable `id`,
+`kind` (`reasoning_summary`, `reasoning`, `commentary`, `tool`, `answer`),
+`text` and `status`. Tool items can include their native `tool` type. Items
+retain native order; completed aggregates replace streamed deltas without
+duplication. Only user-visible native items from the side thread are projected.
+Parent/descendant messages, user input, internal notifications and encrypted
+reasoning payloads never become side assistant text. Reasoning availability
+depends on what the selected provider actually exposes.
+
+Updates coalesce token bursts, persist through the existing side-chat store,
+and use revision invalidations rather than polling. Cancellation, failures and
+reopening retain partial activity. The existing owner/conversation/request
+checks prevent late progress from resurrecting a cleared exchange.
+
+The desktop defaults to a single pulsing current-activity line, streams
+commentary and answer text, and applies the shared Show reasoning traces
+preference while reasoning is live. Completed/stopped activity is collapsed
+under either preference and remains explicitly expandable. Claude native
+`/btw` is unchanged; Codex streaming does not imply Claude streaming parity.

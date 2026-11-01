@@ -20,7 +20,7 @@ class AgentPromptFormatTests(unittest.TestCase):
             self.assertIn("`$...$`", prompt)
             self.assertIn("`$$...$$`", prompt)
 
-    def test_all_provider_prompts_require_separate_resumable_wait_slices(self) -> None:
+    def test_all_provider_prompts_explain_mailbox_only_local_delivery(self) -> None:
         claude_prompt = agent_server.CLAUDE_PROMPT_PRELUDE.format()
         codex_prompt = agent_server.CODEX_PROMPT_PRELUDE.format(
             manifest_path="/tmp/manifest.json",
@@ -36,27 +36,25 @@ class AgentPromptFormatTests(unittest.TestCase):
                 "route_id": "route_" + "a" * 32,
                 "target_session_id": "sess_target",
                 "alias": "review",
+                "pair_id": "pair_" + "b" * 32,
                 "actions": ["request_reply"],
                 "enabled": True,
             }],
         )
 
-        for prompt in (claude_prompt, codex_prompt):
+        for prompt in (claude_prompt, codex_prompt, cursor_prompt):
             compact = " ".join(prompt.split())
-            self.assertIn("pending=true", compact)
-            self.assertIn("call Chats `wait`", compact)
-            self.assertIn("exchange/inbound-leg/lease values", compact)
-            self.assertIn("one foreground call at a time", compact)
-            self.assertIn("Never finish", compact)
-            self.assertIn("never loop", compact)
+            self.assertIn("mailbox", compact)
+            self.assertIn("return after acceptance", compact)
+            self.assertIn("old same-server request/reply and direct-turn delivery routes are disabled", compact)
+            self.assertIn("final-answer forwarding, reply obligation, or live wait lease", compact)
+            self.assertNotIn("pending=true", compact)
+            self.assertNotIn("call Chats `wait`", compact)
+            self.assertNotIn("wait --exchange", compact)
+            self.assertNotIn("commits a two-leg request", compact)
+            self.assertNotIn("keeps this turn waiting", compact)
+            self.assertNotIn("grants that recipient one durable route back", compact)
 
-        cursor_compact = " ".join(cursor_prompt.split())
-        self.assertIn("pending=true", cursor_compact)
-        self.assertIn("wait --exchange EXCHANGE_ID", cursor_compact)
-        self.assertIn("--lease LIVE_RESPONSE_LEASE_ID", cursor_compact)
-        self.assertIn("foreground `wait` tool call", cursor_compact)
-        self.assertIn("Never finish", cursor_compact)
-        self.assertIn("shell loop", cursor_compact)
 
 
 if __name__ == "__main__":

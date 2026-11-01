@@ -130,6 +130,36 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 "approvalPolicy": "on-request", "sandbox": "workspace-write"},
             turn_overrides={"approvalPolicy": "on-request", "sandboxPolicy": {"type": "workspaceWrite"}})
 
+    async def test_next_turn_changes_model_and_effort_on_same_child_and_clears_previous(self):
+        for custom in (False, True):
+            with self.subTest(custom=custom):
+                self.client.fork_thread.reset_mock()
+                self.client.start_turn.reset_mock()
+                selection = ({"base_url": "https://example.invalid/v1", "model": "first-model",
+                              "api_key": "synthetic-key", "effort": "high", "reasoning_summary": "auto"}
+                             if custom else None)
+                chat = adapter.NativeCodexSideChat("parent-thread", executable="synthetic-codex",
+                    model="first-model", env={}, turn_overrides={"effort": "high"}, provider_selection=selection)
+                try:
+                    for settings in ({"model": "first-model", "effort": "high"},
+                                     {"model": "second-model", "effort": "low"},
+                                     {"model": "second-model", "effort": ""}):
+                        self.turn.next_notification.side_effect = [message(), completed()]
+                        await chat.ask("question", runtime_settings={**settings, "reasoning_summary": "auto"})
+                        call = self.client.start_turn.await_args
+                        self.assertEqual(call.args[0], "temporary-thread")
+                        self.assertEqual(call.kwargs["overrides"]["model"], settings["model"])
+                        self.assertEqual(call.kwargs["overrides"].get("effort"), settings["effort"] or None)
+                        self.assertEqual(call.kwargs["overrides"]["collaborationMode"]["settings"]["reasoning_effort"], settings["effort"] or None)
+                        if custom:
+                            self.assertEqual(call.kwargs["overrides"]["summary"], "auto")
+                        else:
+                            self.assertNotIn("summary", call.kwargs["overrides"])
+                    self.client.fork_thread.assert_awaited_once()
+                    self.assertEqual(self.client.start_turn.await_count, 3)
+                finally:
+                    await chat.close()
+
     async def test_retained_child_liveness_uses_native_descendants_after_parent_result(self):
         self.client.ready = True
         self.client.generation = 7

@@ -30,9 +30,11 @@ def _no_activation(root: Path) -> None:
 
 def _no_handoff_recovery_overlap(root: Path) -> None:
     _no_activation(root)
-    marker = root / ".execution-uninstall.json"
-    if marker.exists() or marker.is_symlink():
-        raise RuntimeError("uninstall already owns execution recovery")
+    for name in (".execution-uninstall.json", ".execution-lifecycle.json"):
+        marker = root / name
+        if marker.exists() or marker.is_symlink():
+            owner = "uninstall" if name == ".execution-uninstall.json" else "native lifecycle"
+            raise RuntimeError(owner + " already owns execution recovery")
 
 
 def _read_handoff(root: Path, path: Path) -> dict[str, Any]:

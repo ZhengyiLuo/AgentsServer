@@ -417,6 +417,50 @@ class InstanceTests(unittest.TestCase):
         self.assertEqual(run.call_args_list[0].args[0], ["launchctl", "bootout", f"gui/{os.getuid()}/com.agentsdock.server.work"])
         self.assertEqual(run.call_args_list[1].args[0][-1], str(self.work.service_file("darwin")))
 
+    def test_mac_stop_waits_for_unload_before_immediate_start(self):
+        self.configured(self.work, platform="darwin")
+        with patch.object(instances, "service_status", side_effect=["running", "running", "loaded", "stopped", "stopped"]), \
+                patch.object(instances, "run") as run, patch.object(instances.time, "sleep") as sleep:
+            instances.control(self.work, "stop", "darwin")
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(sleep.call_count, 2)
+            instances.control(self.work, "start", "darwin")
+        self.assertEqual([call.args[0][1] for call in run.call_args_list], ["bootout", "bootstrap"])
+        self.assertEqual(run.call_args_list[0].args[0][-1], f"gui/{os.getuid()}/com.agentsdock.server.work")
+        self.assertEqual(run.call_args_list[1].args[0][-1], str(self.work.service_file("darwin")))
+
+    def test_mac_stop_and_restart_refuse_unknown_unload_state(self):
+        self.configured(self.work, platform="darwin")
+        for action in ("stop", "restart"):
+            with self.subTest(action=action), patch.object(instances, "service_status", side_effect=["running", "unknown"]), \
+                    patch.object(instances, "run") as run:
+                with self.assertRaisesRegex(ValueError, "Cannot confirm service stopped"):
+                    instances.control(self.work, action, "darwin")
+                self.assertEqual([call.args[0][1] for call in run.call_args_list], ["bootout"])
+
+    def test_mac_stop_and_restart_have_bounded_unload_wait(self):
+        self.configured(self.work, platform="darwin")
+        for action in ("stop", "restart"):
+            with self.subTest(action=action), patch.object(instances, "service_status", return_value="running"), \
+                    patch.object(instances.time, "monotonic", side_effect=[0, 181]), patch.object(instances, "run") as run:
+                with self.assertRaisesRegex(ValueError, "Service did not stop"):
+                    instances.control(self.work, action, "darwin")
+                self.assertEqual([call.args[0][1] for call in run.call_args_list], ["bootout"])
+
+    def test_mac_stop_failure_is_not_reported_as_success(self):
+        self.configured(self.work, platform="darwin")
+        with patch.object(instances, "service_status", return_value="running") as status, \
+                patch.object(instances, "run", side_effect=subprocess.CalledProcessError(5, ["launchctl", "bootout"])):
+            with self.assertRaises(subprocess.CalledProcessError):
+                instances.control(self.work, "stop", "darwin")
+            self.assertEqual(status.call_count, 1)
+
+    def test_mac_already_stopped_stop_is_a_noop(self):
+        self.configured(self.work, platform="darwin")
+        with patch.object(instances, "service_status", return_value="stopped"), patch.object(instances, "run") as run:
+            instances.control(self.work, "stop", "darwin")
+        run.assert_not_called()
+
     def test_auto_port_skips_registered_and_occupied_ports(self):
         self.configured(self.default, 7850)
         self.configured(self.work, 7851)

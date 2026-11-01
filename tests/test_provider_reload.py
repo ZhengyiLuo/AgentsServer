@@ -14,6 +14,21 @@ class FakeCodexManager:
         self.generation = 7
         self.unsubscribe_calls: list[str] = []
         self.background_terminals: list[dict[str, object]] = []
+        self.native_requests: list[tuple[str, dict[str, object]]] = []
+        self.goal: dict[str, object] | None = None
+
+    async def list_descendant_threads(self, _thread_id):
+        return []
+
+    async def get_thread_goal(self, _thread_id: str) -> dict[str, object] | None:
+        return self.goal
+
+    async def list_descendant_threads(self, _thread_id: str) -> list:
+        return []
+
+    async def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+        self.native_requests.append((method, params))
+        return {}
 
     def is_thread_loaded(self, thread_id: str) -> bool:
         return self.loaded and thread_id == "codex-thread"
@@ -53,6 +68,8 @@ class FakeClaudeManager:
 
 class ProviderReloadEndpointTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
+        self.enterContext(patch.object(agent_server.STORE, "save", new=AsyncMock()))
+        self.login_refresh = self.enterContext(patch.object(agent_server, "refresh_codex_app_server_login", new=AsyncMock()))
         names = (
             "ACTIVE",
             "BUSY_SESSIONS",
@@ -156,13 +173,33 @@ class ProviderReloadEndpointTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await agent_server.post_session_provider_reload("chat")
 
+        self.login_refresh.assert_awaited_once_with(request_handoff=True)
         self.assertEqual(manager.unsubscribe_calls, ["codex-thread"])
+        self.assertEqual(manager.native_requests, [
+            ("thread/archive", {"threadId": "codex-thread"}),
+            ("thread/unarchive", {"threadId": "codex-thread"}),
+        ])
         self.assertEqual(session["codex_thread_id"], "codex-thread")
         self.assertEqual(result["action"], "unloaded")
         self.assertEqual(result["provider_id"], "codex-thread")
         self.assertFalse(result["runtime"]["thread_loaded"])
         self.assertEqual(result["runtime"]["status"], {"type": "notLoaded"})
         self.assertIs(agent_server.CODEX_APP_SERVER_MANAGER, manager)
+        self.assertFalse(agent_server.SERVER_MAINTENANCE_SESSIONS)
+
+    async def test_codex_reload_preserves_active_native_goal_missing_from_cache(self) -> None:
+        manager = FakeCodexManager()
+        session = self.install_codex(manager)
+        self.assertNotIn("codex_goal", session)
+        manager.goal = {"status": "active", "objective": "Keep native work running"}
+        with patch.object(agent_server, "CODEX_TRANSPORT", agent_server.CODEX_TRANSPORT_APP_SERVER):
+            with self.assertRaises(HTTPException) as error:
+                await agent_server.post_session_provider_reload("chat")
+        self.assertEqual(error.exception.status_code, 409)
+        self.assertIn("active Codex goal", error.exception.detail)
+        self.assertTrue(manager.loaded)
+        self.assertFalse(manager.unsubscribe_calls)
+        self.assertFalse(manager.native_requests)
         self.assertFalse(agent_server.SERVER_MAINTENANCE_SESSIONS)
 
     async def test_claude_reload_evicts_idle_chat_without_force(self) -> None:

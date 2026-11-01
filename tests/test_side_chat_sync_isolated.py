@@ -4,6 +4,8 @@ import ast
 from copy import deepcopy
 from contextlib import suppress
 import json
+import hashlib
+import sqlite3
 from pathlib import Path
 import tempfile
 import unittest
@@ -14,6 +16,7 @@ import httpx
 from fastapi import FastAPI, HTTPException
 
 import side_questions as side
+from codex_side_question import NativeCodexSideChat
 
 
 class SyncTests(unittest.IsolatedAsyncioTestCase):
@@ -30,8 +33,9 @@ class SyncTests(unittest.IsolatedAsyncioTestCase):
         test = self
 
         class Handle:
-            async def ask(self, question, *, history):
+            async def ask(self, question, *, history, on_progress=None):
                 test.calls.append((question, deepcopy(history)))
+                test.progress = on_progress
                 test.started.set()
                 await test.release.wait()
                 return {"answer": "answer: " + question, "backend": "claude", "context_note": "native"}
@@ -79,6 +83,158 @@ class SyncTests(unittest.IsolatedAsyncioTestCase):
         tasks = tuple(self.runtime.synced.tasks.values())
         self.release.set()
         await asyncio.gather(*tasks)
+
+    async def test_progress_is_visible_before_answer_persisted_and_cannot_resurrect_cancel_or_clear(self):
+        await self.send()
+        await self.started.wait()
+        activity = [{"id": "reason:reasoning_summary", "kind": "reasoning_summary", "text": "Inspecting files", "status": "running"}]
+        await self.progress(activity)
+        running = await self.snapshot()
+        self.assertEqual(running["exchanges"][0]["activity"], activity)
+        self.assertEqual(running["exchanges"][0]["status"], "running")
+        owner = hashlib.sha256(b"owner-secret").hexdigest()
+        # Read storage without opening a second service (which performs startup recovery).
+        with sqlite3.connect(self.path) as persisted:
+            raw = persisted.execute("SELECT document FROM chats WHERE owner=? AND session=?", (owner, "main")).fetchone()[0]
+            self.assertEqual(json.loads(raw)["exchanges"][0]["activity"], activity)
+        cancelled = await self.client.delete(self.url + "/requests/request1")
+        self.assertEqual(cancelled.status_code, 200)
+        await self.progress([{**activity[0], "text": "too late"}])
+        terminal = await self.snapshot()
+        self.assertEqual(terminal["exchanges"][0]["status"], "cancelled")
+        self.assertEqual(terminal["exchanges"][0]["activity"], activity)
+        await self.runtime.synced.clear(owner, "main", terminal["side_chat_id"])
+        await self.progress(activity)
+        self.assertEqual((await self.snapshot())["exchanges"], [])
+
+    async def test_progress_write_failure_keeps_native_answer_and_recovers_without_resending(self):
+        await self.send()
+        await self.started.wait()
+        activity = [{"id": "a", "kind": "answer", "text": "Partial", "status": "running"}]
+        with patch.object(self.runtime.synced.store, "save", side_effect=OSError("disk unavailable")):
+            await self.progress(activity)
+            await self.settle()
+        restored = await self.snapshot()
+        self.assertEqual(restored["exchanges"][0]["status"], "completed")
+        self.assertEqual(restored["exchanges"][0]["answer"], "answer: question")
+        self.assertEqual(restored["exchanges"][0]["activity"], activity)
+        self.assertEqual(len(self.calls), 1)
+
+    def use_buffered_native_adapter(self):
+        """Real native item adapter and store; only provider transport is fake."""
+        ready = asyncio.Event()
+        natives = []
+        async def factory(session, **options):
+            native = NativeCodexSideChat("parent", executable="unused", model=None, env={})
+            native.thread_id = "side"
+            native._open = AsyncMock()
+            packets = [
+                {"method": "item/reasoning/summaryTextDelta", "params": {"threadId": "side", "itemId": "r", "delta": "Received partial"}},
+                {"method": "item/reasoning/summaryTextDelta", "params": {"threadId": "parent", "itemId": "parent", "delta": "Wrong parent"}},
+                {"method": "item/completed", "params": {"threadId": "side", "item": {"type": "userMessage", "id": "user", "text": "Private input"}}},
+                {"method": "item/completed", "params": {"threadId": "side", "item": {"type": "reasoning", "id": "hidden", "encryptedContent": "Private reasoning"}}},
+            ]
+            async def next_notification():
+                if packets:
+                    return packets.pop(0)
+                ready.set()
+                await asyncio.Event().wait()
+            turn = SimpleNamespace(next_notification=next_notification, close=AsyncMock())
+            native._client = SimpleNamespace(start_turn=AsyncMock(return_value=turn), close=AsyncMock())
+            natives.append(native)
+            class Handle:
+                async def ask(self, question, *, history, on_progress=None):
+                    return {"backend": "codex", "answer": await native.ask(question, on_progress=on_progress)}
+                def snapshot_progress(self, task):
+                    return native.snapshot_progress(task)
+                async def close(self):
+                    await native.close()
+            return Handle()
+        self.runtime.synced.native_factory = factory
+        return ready, natives
+
+    async def test_stop_snapshots_received_native_partials_before_coalesced_publish(self):
+        ready, natives = self.use_buffered_native_adapter()
+        await self.send()
+        await ready.wait()
+        native = natives[0]
+        buffered = native._progress
+        self.assertEqual((await self.snapshot())["exchanges"][0].get("activity", []), [])
+        task = next(iter(self.runtime.synced.tasks.values()))
+        self.assertIsNone(native.snapshot_progress(asyncio.current_task()))
+        copied = native.snapshot_progress(task)
+        copied[0]["text"] = "Mutation of copied snapshot"
+        self.assertEqual(native.snapshot_progress(task)[0]["text"], "Received partial")
+        # Another authenticated owner's same opaque request has no authority.
+        await self.runtime.synced.cancel("different-owner", "main", "request1")
+        self.assertFalse(task.done())
+        stopped = await self.client.delete(self.url + "/requests/request1")
+        self.assertEqual(stopped.status_code, 200)
+        exchange = stopped.json()["exchanges"][0]
+        self.assertEqual(exchange["status"], "cancelled")
+        self.assertEqual([item["text"] for item in exchange["activity"]], ["Received partial"])
+        self.assertIsNone(native.snapshot_progress(task))
+        buffered.receive({"method": "item/reasoning/summaryTextDelta", "params": {"threadId": "side", "itemId": "r", "delta": " Too late"}})
+        await buffered.flush()
+        self.assertEqual((await self.snapshot())["exchanges"][0], exchange)
+        ready.clear()
+        await self.send("next")
+        await ready.wait()
+        next_task = next(iter(self.runtime.synced.tasks.values()))
+        self.assertIsNone(native.snapshot_progress(next_task))
+        await self.client.delete(self.url + "/requests/request1")
+        self.assertFalse(next_task.done())
+        stopped_next = await self.client.delete(self.url + "/requests/next")
+        self.assertEqual([item["text"] for item in stopped_next.json()["exchanges"][-1]["activity"]], ["Received partial"])
+
+    async def _check_clear_stop_race(self, *, clear_first):
+        ready, natives = self.use_buffered_native_adapter()
+        initial = await self.snapshot()
+        await self.send(snapshot=initial)
+        await ready.wait()
+        buffered = natives[0]._progress
+        paths = ["requests/request1", initial["side_chat_id"]]
+        results = await asyncio.gather(*(self.client.delete(self.url + "/" + path)
+                                        for path in (reversed(paths) if clear_first else paths)))
+        self.assertEqual([result.status_code for result in results], [200, 200])
+        snapshot = await self.snapshot()
+        self.assertNotEqual(snapshot["side_chat_id"], initial["side_chat_id"])
+        self.assertEqual(snapshot["exchanges"], [])
+        ready.clear()
+        await self.send("next", snapshot=snapshot)
+        await ready.wait()
+        next_task = next(iter(self.runtime.synced.tasks.values()))
+        buffered.receive({"method": "item/agentMessage/delta", "params": {"threadId": "side", "itemId": "old", "delta": "Old answer"}})
+        await buffered.flush()
+        await self.client.delete(self.url + "/" + initial["side_chat_id"])
+        await self.client.delete(self.url + "/requests/request1")
+        self.assertFalse(next_task.done())
+        current = await self.snapshot()
+        self.assertEqual([item["request_id"] for item in current["exchanges"]], ["next"])
+        self.assertNotIn("Old answer", json.dumps(current))
+
+    async def test_clear_racing_stop_discards_buffer_and_fences_next_native_request(self):
+        await self._check_clear_stop_race(clear_first=False)
+
+    async def test_stop_racing_clear_cannot_restore_deleted_native_buffer(self):
+        await self._check_clear_stop_race(clear_first=True)
+
+    async def test_stop_keeps_latest_buffer_even_when_prior_progress_cannot_be_saved(self):
+        ready, natives = self.use_buffered_native_adapter()
+        await self.send()
+        await ready.wait()
+        buffered = natives[0]._progress
+        with patch.object(self.runtime.synced.store, "save", side_effect=sqlite3.OperationalError("storage unavailable")):
+            await buffered.flush()
+            buffered.receive({"method": "item/reasoning/summaryTextDelta", "params": {"threadId": "side", "itemId": "r", "delta": " before Stop"}})
+            stopped = await self.client.delete(self.url + "/requests/request1")
+            self.assertEqual(stopped.status_code, 503)
+            self.assertFalse(self.runtime.active_work_labels())
+            # A retry cannot claim durable success while the terminal write fails.
+            self.assertEqual((await self.client.delete(self.url + "/requests/request1")).status_code, 503)
+        snapshot = await self.snapshot()
+        self.assertEqual(snapshot["exchanges"][0]["status"], "cancelled")
+        self.assertEqual(snapshot["exchanges"][0]["activity"][0]["text"], "Received partial before Stop")
 
     async def test_two_clients_share_ordered_answers_and_native_history(self):
         first = await self.send()
@@ -264,6 +420,63 @@ class SyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(self.closed)
         self.assertEqual((await self.snapshot())["exchanges"][0]["status"], "cancelled")
 
+    async def _check_control_after_progress_write_failure(self, *, clear, recover):
+        initial = await self.snapshot()
+        await self.send(snapshot=initial)
+        await self.started.wait()
+        activity = [{"id": "partial", "kind": "reasoning_summary", "text": "Retained partial", "status": "running"}]
+        key = (hashlib.sha256(b"owner-secret").hexdigest(), "main")
+        store = self.runtime.synced.store
+        save = store.save
+        failed = True
+        def controlled_save(*args, **kwargs):
+            if failed:
+                raise OSError("disk full")
+            return save(*args, **kwargs)
+        with patch.object(store, "save", side_effect=controlled_save):
+            await self.progress(activity)
+            self.assertIn(key, self.runtime.synced.pending_writes)
+            failed = not recover
+            target = initial["side_chat_id"] if clear else "requests/request1"
+            result = await self.client.delete(f"{self.url}/{target}")
+            self.assertEqual(result.status_code, 200 if recover else 503)
+            self.assertFalse(self.runtime.active_work_labels())
+            self.assertTrue(self.closed)
+            pending = self.runtime.synced.pending_writes.get(key)
+            if recover:
+                self.assertIsNone(pending)
+            elif clear:
+                self.assertNotEqual(pending["side_chat_id"], initial["side_chat_id"])
+                self.assertEqual(pending["exchanges"], [])
+                self.assertEqual((await self.client.delete(f"{self.url}/{target}")).status_code, 503)
+            else:
+                self.assertEqual(pending["exchanges"][0]["status"], "cancelled")
+                self.assertEqual(pending["exchanges"][0]["activity"], activity)
+        recovered = await self.snapshot()
+        self.assertNotIn(key, self.runtime.synced.pending_writes)
+        if clear:
+            self.assertEqual(recovered["exchanges"], [])
+            self.assertNotEqual(recovered["side_chat_id"], initial["side_chat_id"])
+            self.assertEqual((await self.send(snapshot=initial)).status_code, 409)
+        else:
+            self.assertEqual(recovered["exchanges"][0]["status"], "cancelled")
+            self.assertEqual(recovered["exchanges"][0]["activity"], activity)
+        await self.progress([{**activity[0], "text": "late update"}])
+        self.assertEqual(await self.snapshot(), recovered)
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_pending_progress_write_failure_cannot_prevent_stop(self):
+        await self._check_control_after_progress_write_failure(clear=False, recover=False)
+
+    async def test_pending_progress_write_failure_cannot_prevent_clear(self):
+        await self._check_control_after_progress_write_failure(clear=True, recover=False)
+
+    async def test_stop_discards_superseded_pending_progress_after_storage_recovers(self):
+        await self._check_control_after_progress_write_failure(clear=False, recover=True)
+
+    async def test_clear_discards_superseded_pending_progress_after_storage_recovers(self):
+        await self._check_control_after_progress_write_failure(clear=True, recover=True)
+
     async def test_retirement_closes_idle_provider_without_erasing_history(self):
         await self.send()
         await self.settle()
@@ -319,6 +532,60 @@ class SyncTests(unittest.IsolatedAsyncioTestCase):
         exec(compile(ast.Module(body=[node], type_ignores=[]), "<local-history>", "exec"), namespace)
         candidates = await asyncio.to_thread(namespace["local_codex_session_candidates"], set())
         self.assertEqual([row["provider_session_id"] for row in candidates], ["normal-thread"])
+
+    async def test_unavailable_runtime_defaults_never_block_retained_history(self):
+        await self.send()
+        await self.settle()
+        before = await self.snapshot()
+        def unavailable(session):
+            raise HTTPException(409, "Custom endpoint is temporarily unavailable")
+        self.runtime.synced.runtime_settings_for_session = unavailable
+        self.assertEqual(await self.snapshot(), before)
+        self.assertEqual(len(before["exchanges"]), 1)
+
+    async def test_runtime_choices_roundtrip_idempotency_defaults_and_reconnect(self):
+        self.runtime.synced.runtime_settings_for_session = lambda session: {"model": "parent-model", "effort": "high"}
+        initial = await self.snapshot()
+        self.assertEqual((initial["model"], initial["effort"]), ("parent-model", "high"))
+        self.runtime.synced.runtime_settings_for_session = lambda session: {"model": "parent-changed", "effort": "ultra"}
+        self.assertEqual(await self.snapshot(), initial)
+        calls = []
+        async def factory(session, **options):
+            settings = dict((options.get("persisted_state") or {}).get("runtime_settings") or options["initial_runtime_settings"])
+            class Handle:
+                async def ask(self, question, *, history, runtime_settings=None, on_progress=None):
+                    settings.update(runtime_settings or {})
+                    calls.append((question, deepcopy(history), dict(settings)))
+                    await options["persist_state"]({"runtime_settings": dict(settings),
+                        "codex": {"thread_id": "same-native-side", "path": "/native-side.jsonl"}})
+                    return {"answer": "answer " + question, "backend": "codex", **settings}
+                async def close(self):
+                    pass
+            return Handle()
+        self.runtime.synced.native_factory = factory
+        payload = {"request_id": "runtime-1", "question": "first", "side_chat_id": initial["side_chat_id"],
+                   "model": "side-model", "effort": "low"}
+        accepted = await self.client.post(self.url, json=payload)
+        self.assertEqual(accepted.status_code, 202, accepted.text)
+        await self.settle()
+        completed = await self.snapshot()
+        self.assertEqual((completed["model"], completed["effort"]), ("side-model", "low"))
+        self.assertEqual((await self.client.post(self.url, json=payload)).status_code, 202)
+        self.assertEqual((await self.client.post(self.url, json={**payload, "effort": "high"})).status_code, 409)
+        self.assertEqual((await self.client.post(self.url, json={**payload, "model": "other-model"})).status_code, 409)
+        self.runtime.synced._expire((next(iter(self.runtime.synced.handles))[0], "main"))
+        followup = {"request_id": "runtime-2", "question": "followup", "side_chat_id": initial["side_chat_id"], "after_request_id": "runtime-1"}
+        self.assertEqual((await self.client.post(self.url, json=followup)).status_code, 202)
+        await self.settle()
+        restored = await self.snapshot()
+        self.assertEqual(restored["side_chat_id"], initial["side_chat_id"])
+        self.assertEqual((restored["model"], restored["effort"]), ("side-model", "low"))
+        self.assertEqual(len(restored["exchanges"]), 2)
+        self.assertEqual(calls[1][1], [{"question": "first", "response": "answer first"}])
+        self.assertEqual(calls[1][2], {"model": "side-model", "effort": "low"})
+        self.assertEqual((await self.client.post(self.url, json={**followup, "request_id": "bad-model", "model": ""})).status_code, 400)
+        self.assertEqual((await self.client.post(self.url, json={**followup, "request_id": "bad-effort", "effort": 3})).status_code, 400)
+
 
 
 class ManagedUpdateTests(unittest.IsolatedAsyncioTestCase):

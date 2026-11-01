@@ -28,6 +28,7 @@ from collections import OrderedDict
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
+from pathlib import Path
 from types import MappingProxyType
 from typing import (
     Any,
@@ -38,6 +39,7 @@ from typing import (
     Protocol,
     runtime_checkable,
 )
+from claude_chat_routing import ClaudeChatRouting, NATIVE_CHAT_TOOL_MATCHER
 
 
 logger = logging.getLogger(__name__)
@@ -747,11 +749,17 @@ async def reject_subagent_provider_tool_hook(
     }
 
 
-def claude_background_tracking_hooks() -> dict[str, list[ClaudeSDKHookMatcher]]:
+def claude_background_tracking_hooks(
+    child_registry: Path | None = None,
+) -> dict[str, list[ClaudeSDKHookMatcher]]:
     """Keep native task receipts and exact AgentsDock tool ownership."""
 
     mail_hint = _PendingMailHintHook()
+    chat_routing = ClaudeChatRouting(child_registry)
     return {
+        "SubagentStart": [ClaudeSDKHookMatcher(
+            matcher=None, hooks=[chat_routing.subagent_start], timeout=5.0,
+        )],
         "PostToolUse": [ClaudeSDKHookMatcher(matcher=None, hooks=[mail_hint], timeout=5.0)],
         "PostToolUseFailure": [ClaudeSDKHookMatcher(matcher=None, hooks=[mail_hint], timeout=5.0)],
         "UserPromptSubmit": [ClaudeSDKHookMatcher(
@@ -761,6 +769,11 @@ def claude_background_tracking_hooks() -> dict[str, list[ClaudeSDKHookMatcher]]:
             ClaudeSDKHookMatcher(
                 matcher=CLAUDE_PROVIDER_MCP_TOOL_NAME,
                 hooks=[reject_subagent_provider_tool_hook],
+                timeout=5.0,
+            ),
+            ClaudeSDKHookMatcher(
+                matcher=NATIVE_CHAT_TOOL_MATCHER,
+                hooks=[chat_routing.pre_tool_use],
                 timeout=5.0,
             ),
         ]

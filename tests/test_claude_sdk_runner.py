@@ -16,6 +16,7 @@ from starlette.requests import Request
 
 import agent_server
 from claude_sdk_client import ClaudeSDKGoalReceipt, ClaudeSDKQueryError, ClaudeSDKUnavailable
+from claude_chat_routing import NATIVE_CHAT_TOOL_MATCHER, print_routing_settings
 
 
 class FakeClaudeRun:
@@ -2257,9 +2258,10 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(sibling["settings"]), {"env": {cap_name: "5"}})
         self.assertEqual(
             json.loads(command[command.index("--settings") + 1]),
-            {"env": {cap_name: "3"}},
+            {**print_routing_settings(manifest), "env": {cap_name: "3"}},
         )
-        self.assertNotIn("--settings", inherited_command)
+        self.assertEqual(json.loads(inherited_command[inherited_command.index("--settings") + 1]),
+                         print_routing_settings(manifest))
         self.assertEqual(limited["setting_sources"], ["user", "project", "local"])
         self.assertEqual(limited["thinking"], inherited["thinking"])
         self.assertEqual(limited["permission_mode"], inherited["permission_mode"])
@@ -2303,7 +2305,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(captured_options["permission_mode"], "plan")
-        self.assertEqual(agent_server.CLAUDE_SDK_CONFIGURATION_VERSION, 10)
+        self.assertEqual(agent_server.CLAUDE_SDK_CONFIGURATION_VERSION, 11)
         self.assertNotIn("disallowed_tools", captured_options)
         self.assertEqual(
             captured_options["allowed_tools"],
@@ -2319,6 +2321,9 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             system_prompt,
         )
         self.assertNotIn("Use the `agentsdock` provider tool", system_prompt)
+        self.assertIn("An AgentsDock @Chat is not a native Claude session", system_prompt)
+        self.assertIn("A native success receipt is not AgentsDock delivery", system_prompt)
+        self.assertIn("Do not assume a selected mention is a one-use --target-index handle", system_prompt)
         self.assertEqual(
             captured_options["thinking"],
             {"type": "adaptive", "display": "summarized"},
@@ -2334,7 +2339,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         hooks = captured_options["hooks"]
         self.assertEqual(
             [matcher.matcher for matcher in hooks["PreToolUse"]],
-            [agent_server.CLAUDE_PROVIDER_MCP_TOOL_NAME],
+            [agent_server.CLAUDE_PROVIDER_MCP_TOOL_NAME, NATIVE_CHAT_TOOL_MATCHER],
         )
         self.assertEqual(result, {"behavior": "allow"})
         permission.assert_awaited_once_with(

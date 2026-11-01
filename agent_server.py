@@ -97,6 +97,7 @@ from codex_app_server import (
     CodexAppServerTimeout,
     decline_server_request,
 )
+from claude_chat_routing import print_routing_settings
 from claude_sdk_client import (
     CLAUDE_PROVIDER_MCP_SERVER_NAME,
     CLAUDE_PROVIDER_MCP_TOOL_NAME,
@@ -1824,6 +1825,9 @@ You are operating through AgentsDock, backed by AgentsServer.
 - Link editor-readable files with Markdown paths relative to the chat working directory, optionally with `#L42`; do not use `file://`.
 - Publish user-facing files to this chat with the AgentsDock provider tool described below. Say “attached” only after a successful JSON receipt. Older-server fallback: write `{{"files":["/absolute/path.ext"]}}` to resolved `$AGENTSDOCK_MANIFEST_PATH` and say only “submitted for attachment.” Use absolute paths and playable `.mp4`/`.mov` videos.
 - Use the run-bound AgentsDock provider tool described below for cross-chat messages.
+- An AgentsDock @Chat is not a native Claude session, teammate, or child agent. Never use ListAgents/ListPeers or native SendMessage to resolve or contact it, even when a name or working directory matches. A native success receipt is not AgentsDock delivery; report delivery only from the AgentsDock helper's accepted message/exchange receipt.
+- Discover the selected AgentsDock @Chat with Chats list. For an async_route_v1 route, send or ask with its exact route_id and --route. Do not assume a selected mention is a one-use --target-index handle; use that only when a one-use handle is actually available.
+- Native SendMessage remains available for children created in this Claude session: address the exact agent ID returned by Agent/Task, not a display name; children may reply to main. If an AgentsDock route is unavailable, report that blocker rather than substituting another recipient or transport.
 - `$AGENTSDOCK_TMUX_SESSION` identifies this chat's persistent terminal when available.
 - Check skills and project playbooks before claiming an environment or remote path is unavailable.
 - If optional cleanup makes a compound command fail, immediately retry the still-safe requested operation without it.
@@ -1845,7 +1849,7 @@ Attaching files to this AgentsDock chat from Cursor:
 - On older runtimes without the internal tool, the authorized file-writing fallback needs no shell: write `{{"files":["/absolute/path.ext"]}}` to `{manifest_path}` and say only "submitted for attachment". Do not use this fallback to bypass an explicit denial.
 - For attachments to this chat, including generated images: write the image to a real file first, then list that absolute path in the manifest.
 """
-CLAUDE_SDK_CONFIGURATION_VERSION = 10
+CLAUDE_SDK_CONFIGURATION_VERSION = 11
 CODEX_PROMPT_PRELUDE = """\
 You are operating through AgentsDock, backed by AgentsServer.
 - Keep the final answer concise; the UI renders tool calls, command output, reasoning, and artifacts separately.
@@ -62385,19 +62389,21 @@ def build_claude_cmd(
         cmd.extend(["--model", str(sess["model"])])
     if sess.get("effort"):
         cmd.extend(["--effort", str(sess["effort"])])
+    runtime_settings = print_routing_settings(manifest_path)
     subagent_limit = sess.get("subagent_limit")
     if type(subagent_limit) is int and subagent_limit > 0:
         # Flag settings override inherited user/project env without writing
         # shared Claude settings or changing another chat's process.
-        cmd.extend(["--settings", json.dumps({"env": {
+        runtime_settings["env"] = {
             "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": str(subagent_limit),
-        }}, separators=(",", ":"))])
+        }
     if sess.get("provider_connection") == "custom":
-        _, settings_path = PROVIDER_CONNECTION_STORE.claude_overrides(sess)
-        if "--settings" in cmd:
-            index = cmd.index("--settings")
-            del cmd[index:index + 2]
+        _, settings_path = PROVIDER_CONNECTION_STORE.claude_overrides(
+            sess, runtime_settings=runtime_settings,
+        )
         cmd.extend(["--settings", settings_path])
+    else:
+        cmd.extend(["--settings", json.dumps(runtime_settings, separators=(",", ":"))])
     if no_session_persistence and not provider_id:
         cmd.append("--no-session-persistence")
     if provider_id:
@@ -62606,7 +62612,7 @@ def build_claude_sdk_options(
         },
         permission_mode=effective_claude_permission_mode(sess),
         can_use_tool=can_use_tool,
-        hooks=claude_background_tracking_hooks(),
+        hooks=claude_background_tracking_hooks(manifest_path.with_name("claude-child-routing")),
         # This internal tool performs its own exact live-run authorization.
         # Do not make the desktop ask the user to approve the transport
         # wrapper in normal Claude permission modes.

@@ -15,6 +15,21 @@ current route revision. Delivery turns receive only the exact reverse member
 for the message's immutable sender. They cannot discover or contact the
 recipient's other peers. Forks inherit no pair permission.
 
+## Claude native messaging is a separate namespace
+
+An AgentsDock `@Chat` must use the run-bound Chats helper and its exact issued
+route, not Claude's native session discovery or a display-name match. Native
+SendMessage success is not an AgentsDock delivery/read receipt. If the route
+is unavailable, do not substitute a similarly named native Claude session.
+
+Both SDK and print-mode Claude runtimes enforce this boundary with tool hooks.
+Native ListAgents/ListPeers discovery is denied; native SendMessage remains
+available for exact child IDs observed by SubagentStart in the same provider
+session, and for those children's replies to main. Use the ID returned by
+Agent/Task rather than a child display name. The private child registry survives
+SDK reloads but grants no AgentsDock cross-chat permission. Allowed child calls
+still follow Claude's own permission handling.
+
 ## Negotiation and helper behavior
 
 Health adds `capabilities.cross_chat_handoffs_v1.features.async_route_v1: true`

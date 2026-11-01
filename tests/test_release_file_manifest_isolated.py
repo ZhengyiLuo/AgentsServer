@@ -29,6 +29,7 @@ NEW_MODULES = {
     "server_instances.py",
     "chat_mailbox.py",
     "claude_background_reconciliation.py",
+    "claude_chat_routing.py",
     "claude_model_catalog.py",
     "claude_goals.py",
     "opencode_agent_client.py",

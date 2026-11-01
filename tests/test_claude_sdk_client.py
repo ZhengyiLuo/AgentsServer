@@ -31,6 +31,7 @@ from claude_sdk_client import (
     _query_message_stream,
     _ReceivedMessage,
 )
+from claude_chat_routing import NATIVE_CHAT_TOOL_MATCHER
 
 
 class FakeClaudeClient:
@@ -4688,9 +4689,9 @@ class ClaudeSDKBackgroundTrackingHookTests(unittest.IsolatedAsyncioTestCase):
 
     def test_hooks_keep_receipts_mail_and_exact_provider_authority(self) -> None:
         hooks = claude_background_tracking_hooks()
-        self.assertEqual(set(hooks), {"PreToolUse", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure"})
+        self.assertEqual(set(hooks), {"PreToolUse", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "SubagentStart"})
         matchers = hooks["PreToolUse"]
-        self.assertEqual([matcher.matcher for matcher in matchers], [CLAUDE_PROVIDER_MCP_TOOL_NAME])
+        self.assertEqual([matcher.matcher for matcher in matchers], [CLAUDE_PROVIDER_MCP_TOOL_NAME, NATIVE_CHAT_TOOL_MATCHER])
         self.assertEqual(matchers[0].hooks, [reject_subagent_provider_tool_hook])
 
 

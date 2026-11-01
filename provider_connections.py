@@ -242,7 +242,7 @@ class ConnectionStore:
         except HTTPException:
             return {"configured": False, "available": False, "models": [], "efforts": [], "model": None, "base_url": None}
 
-    def claude_overrides(self, session: dict) -> tuple[dict, str | None]:
+    def claude_overrides(self, session: dict, *, runtime_settings: dict | None = None) -> tuple[dict, str | None]:
         value = self.for_session(session)
         if not value:
             return {}, None
@@ -259,7 +259,7 @@ class ConnectionStore:
             env["CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"] = str(session["subagent_limit"])
         # Flag settings outrank project/user settings. Pass a private file path,
         # never a key-bearing JSON argument visible in process listings.
-        content = json.dumps({"env": env, "apiKeyHelper": ""}, sort_keys=True)
+        content = json.dumps({**(runtime_settings or {}), "env": env, "apiKeyHelper": ""}, sort_keys=True)
         digest = hashlib.sha256(content.encode()).hexdigest()
         path = self.root / f"claude-runtime-{digest}.json"
         with self.lock:

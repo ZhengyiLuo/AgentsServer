@@ -57,6 +57,7 @@ FILES = (
     "provider_usage.py",
     "session_unread.py",
     "claude_sdk_client.py",
+    "claude_chat_routing.py",
     "claude_model_catalog.py",
     "claude_goals.py",
     "claude_background_reconciliation.py",

@@ -560,6 +560,7 @@ class ExecutionGateway:
         pump: asyncio.Task[Any] | None = None
         response_started = False
         expects_trailers = False
+        client_disconnected = False
         try:
             secret = _read_secret(self.secret_path)
             identity = _socket_identity(self.socket_path)
@@ -574,11 +575,14 @@ class ExecutionGateway:
                 raise ExecutionTransportError("Execution handshake failed")
 
             async def forward_requests() -> None:
+                nonlocal client_disconnected
                 try:
                     while True:
                         message = await receive()
                         for chunk in _chunks(message):
                             event = _event(chunk, encode=True, kind=scope["type"], direction="request")
+                            if event["type"].endswith(".disconnect"):
+                                client_disconnected = True
                             await _write_frame(writer, {"kind": "event", "event": event})
                         if message["type"].endswith(".disconnect"):
                             writer.close()
@@ -619,6 +623,12 @@ class ExecutionGateway:
                     return
         except (ExecutionTransportError, asyncio.IncompleteReadError, ConnectionError,
                 OSError, asyncio.TimeoutError):
+            if client_disconnected:
+                # Closing ingress also closes IPC. Its resulting EOF is normal
+                # after an explicit client disconnect; the worker still owns
+                # accepted work. Do not report it as an execution failure or
+                # synthesize a response to a client that has already left.
+                return
             if not response_started:
                 if scope["type"] == "http":
                     await send({"type": "http.response.start", "status": 503,

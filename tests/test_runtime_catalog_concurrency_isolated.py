@@ -244,6 +244,11 @@ class RuntimeCatalogConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         # in that same pool can starve the second scope read/probe. Notify the
         # loop instead, and keep the pool deliberately constrained as a guard.
         loop.set_default_executor(ThreadPoolExecutor(max_workers=2))
+        # This checks ownership/order, not latency. Hosted full-suite runs can
+        # stall the loop for longer than five seconds before a probe starts.
+        # Keep a bounded watchdog without treating that scheduling delay as a
+        # broken concurrency contract.
+        watchdog = 30
         entered = [asyncio.Event(), asyncio.Event()]
         release_new = threading.Event()
         self.addCleanup(release_new.set)
@@ -255,26 +260,32 @@ class RuntimeCatalogConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             calls.append(True)
             diagnostic = dict(self.ns["RUNTIME_DIAGNOSTICS"]["codex"])
             loop.call_soon_threadsafe(entered[index].set)
-            if not (self.release if index == 0 else release_new).wait(5):
+            if not (self.release if index == 0 else release_new).wait(watchdog):
                 raise AssertionError("catalog not released")
             return {"backends": {"codex": {"diagnostic": diagnostic, "available": diagnostic["status"] == "ready"}}}
 
         self.ns["discover_runtime_catalog_within_budget"] = discover
-        old = self.task(self.ns["runtime_catalog"](refresh=True))
-        await asyncio.wait_for(entered[0].wait(), 5)
-        self.ns["store_runtime_diagnostic"](self.diagnostic())
-        new = self.task(self.ns["runtime_catalog"](refresh=True))
-        await asyncio.wait_for(entered[1].wait(), 5)
-        new_owner = self.ns["RUNTIME_CATALOG_TASKS"][True][1]
-        self.release.set()
-        self.assertFalse((await old)["backends"]["codex"]["available"])
-        self.assertIs(self.ns["RUNTIME_CATALOG_TASKS"][True][1], new_owner)
-        joining = self.task(self.ns["runtime_catalog"](refresh=True))
-        await self.catalog_waiters(3)
-        release_new.set()
-        self.assertTrue((await new)["backends"]["codex"]["available"])
-        self.assertEqual((await joining)["backends"]["codex"]["diagnostic"]["status"], "ready")
-        self.assertEqual(len(calls), 2)
+        try:
+            old = self.task(self.ns["runtime_catalog"](refresh=True))
+            await asyncio.wait_for(entered[0].wait(), watchdog)
+            self.ns["store_runtime_diagnostic"](self.diagnostic())
+            new = self.task(self.ns["runtime_catalog"](refresh=True))
+            await asyncio.wait_for(entered[1].wait(), watchdog)
+            new_owner = self.ns["RUNTIME_CATALOG_TASKS"][True][1]
+            self.release.set()
+            self.assertFalse((await old)["backends"]["codex"]["available"])
+            self.assertIs(self.ns["RUNTIME_CATALOG_TASKS"][True][1], new_owner)
+            joining = self.task(self.ns["runtime_catalog"](refresh=True))
+            await self.catalog_waiters(3)
+            release_new.set()
+            self.assertTrue((await new)["backends"]["codex"]["available"])
+            self.assertEqual((await joining)["backends"]["codex"]["diagnostic"]["status"], "ready")
+            self.assertEqual(len(calls), 2)
+        finally:
+            # Release both workers before asyncTearDown awaits pending tasks,
+            # including when an ownership assertion or the watchdog fails.
+            self.release.set()
+            release_new.set()
 
     async def test_preflight_revision_and_probe_publication_keep_existing_catalog_shared(self):
         entered = threading.Event()

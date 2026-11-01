@@ -1226,6 +1226,60 @@ class ClaudeHistoryMessageIdentityTests(unittest.TestCase):
         self.assertEqual(self.event_path.read_bytes(), before)
 
 
+    def wake_sequence(self, **overrides):
+        self.write([
+            {"type": "turn_finished", "run_id": "previous"},
+            {"type": "turn_started", "backend": "claude", "prompt": "",
+             "purpose": "provider_background_wake", "metadata_only": True,
+             "provider_generated": True, "file_ids": [], **overrides},
+            {"type": "provider_session", "backend": "claude", "provider_session_id": self.provider_id},
+            {"type": "assistant_text", "backend": "claude", "text": "Background finished",
+             "provider_message_id": self.message_id},
+            {"type": "turn_finished", "backend": "claude", "result_text": "Background finished"},
+            {"type": "turn_started", "run_id": "next", "backend": "claude", "prompt": "Next request"},
+            {"type": "provider_session", "run_id": "next", "backend": "claude", "provider_session_id": self.provider_id},
+            {"type": "assistant_text", "run_id": "next", "backend": "claude", "text": "Next reply",
+             "provider_message_id": self.later_id},
+            {"type": "turn_finished", "run_id": "next", "backend": "claude", "result_text": "Next reply"},
+        ])
+        return [self.source("Background finished"), user("Next request"), self.source("Next reply", self.later_id)]
+
+    def test_native_background_wake_is_not_an_empty_user_credit(self):
+        items = self.wake_sequence()
+        self.assertEqual(self.cursor(items), ([], len(self.events)))
+        self.assertEqual(self.initial(items), [])
+
+    def test_active_goal_between_owned_messages_is_preserved_once(self):
+        items = self.wake_sequence()
+        goal = user("/goal Finish the current task")
+        self.assertEqual(self.cursor([*items[:2], goal, items[2]]), ([goal], len(self.events)))
+
+    def test_genuine_external_repeat_after_wake_is_not_suppressed(self):
+        items = self.wake_sequence()
+        repeat = user("Next request")
+        self.assertEqual(self.cursor([*items, repeat]), ([repeat], len(self.events)))
+        self.assertEqual(self.initial([*items, repeat]), [repeat])
+
+    def test_partial_cursor_stops_at_owned_reply_then_consumes_next_request(self):
+        items = self.wake_sequence()
+        self.assertEqual(self.cursor(items[:1]), ([], 4))
+        self.assertEqual(self.cursor(items[1:], after=4), ([], len(self.events)))
+
+    def test_wake_label_alone_never_erases_user_credit(self):
+        for overrides in ({"metadata_only": False}, {"provider_generated": False},
+                          {"provider_user_authored": True}, {"imported": True},
+                          {"backend": "codex"}, {"file_ids": ["attachment"]},
+                          {"prompt": "Real user text"}):
+            with self.subTest(overrides=overrides):
+                self.wake_sequence(**overrides)
+                # Imported rows are already excluded from ordinary delta credits.
+                keys, _, _ = agent_server.history_timeline_message_keys(
+                    "test-chat", timeline_after_seq=1, timeline_through_seq=len(self.events),
+                    tail=False, include_imported=True,
+                )
+                self.assertEqual(keys[0][0], 2)
+
+
 class CodexGoalHistoryMatchingTests(unittest.TestCase):
     provider = "11111111-2222-3333-4444-555555555555"
 

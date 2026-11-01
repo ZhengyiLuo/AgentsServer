@@ -50461,6 +50461,18 @@ def history_timeline_message_keys(
                 if len(provider_runs) > maximum:
                     provider_runs.pop(next(iter(provider_runs)))
             before_window = raw_seq <= after_seq
+            if (event_type == "turn_started" and event.get("backend") == BACKEND_CLAUDE
+                    and event.get("purpose") == "provider_background_wake"
+                    and event.get("metadata_only") is True
+                    and event.get("provider_generated") is True
+                    and event.get("imported") is not True and event.get("prompt") in (None, "")
+                    and not event.get("file_ids")
+                    and event.get("provider_user_authored") is not True):
+                # Native task/schedule completion opens a lifecycle-only run.
+                # Claude's notification is intentionally absent from imported
+                # user messages. An empty credit here would block matching its
+                # reply and every subsequent real user/assistant occurrence.
+                continue
             if (event_type == "turn_started" and event.get("backend") == BACKEND_CODEX
                     and event.get("purpose") == "codex_goal_resume"
                     and event.get("imported") is not True and event.get("prompt") in (None, "")

@@ -374,16 +374,13 @@ class LoginHandoffTests(binary.BinaryRefreshTests):
         self.assertEqual(self.ns["CODEX_RETIRED_APP_SERVER_MANAGERS"], [old])
 
     async def test_two_clients_refresh_catalog_without_retiring_opaque_login(self):
-        from fastapi import FastAPI
-        import httpx
         self.login = None
         old = await self.manager("existing")
         thread = self.load("existing", old)
         await self.manager("concurrent")
         self.load("concurrent", old)
         self.ns["BUSY_SESSIONS"].add("concurrent")
-        app = FastAPI()
-        app.get("/api/runtime/catalog")(self.ns["runtime_catalog"])
+        app = self.catalog_app()
         for address in ("127.0.0.1", "100.100.10.20", "127.0.0.1", "100.100.10.20"):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app, client=(address, 12000)), base_url="http://test") as client:
                 response = await client.get("/api/runtime/catalog?refresh=true")

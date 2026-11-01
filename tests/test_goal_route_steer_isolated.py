@@ -83,6 +83,7 @@ class GoalRouteSteerTests(unittest.IsolatedAsyncioTestCase):
             "PROVIDER_CROSS_CHAT_ROUTE_KIND_AMBIENT": "ambient", "PROVIDER_CROSS_CHAT_ROUTE_KIND_REFERENCE": "reference",
             "PROVIDER_CROSS_CHAT_ROUTE_ACTIONS": ("instruction", "request_reply"),
             "PROVIDER_CROSS_CHAT_ROUTE_ID_RE": re.compile(r"route_[0-9a-f]{32}"),
+            "PROVIDER_CROSS_CHAT_ROUTE_PAIR_ID_RE": re.compile(r"^pair_[0-9a-f]{32}$"),
             "provider_cross_chat_routes": lambda session: (session or {}).get("provider_cross_chat_routes", []),
             "normalized_provider_cross_chat_route_snapshot": lambda value: copy.deepcopy(value or []),
             "live_provider_chat_mailbox_route": lambda *_args: None,

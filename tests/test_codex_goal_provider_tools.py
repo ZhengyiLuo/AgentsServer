@@ -117,7 +117,10 @@ class CodexGoalProviderToolsTests(unittest.IsolatedAsyncioTestCase):
     async def test_revoked_capability_and_disconnected_manager_cannot_replay(self):
         self.assertFalse((await self.call()).json()["result"]["isError"])
         self.manager.ready = False
-        self.assertTrue((await self.call()).json()["result"]["isError"])
+        with patch.object(server, "execute_provider_tool_once", AsyncMock()) as execute:
+            rejected = (await self.call()).json()
+        self.assertEqual(rejected["error"], {"code": -32602, "message": "Incomplete turn metadata"})
+        execute.assert_not_awaited()
         self.manager.ready = True
         await server.revoke_cross_chat_capability(self.run)
         self.assertTrue((await self.call()).json()["result"]["isError"])
@@ -137,7 +140,7 @@ class CodexGoalProviderToolsTests(unittest.IsolatedAsyncioTestCase):
         async def start_native_goal(*args, **kwargs):
             self.session["codex_goal"]["status"] = "active"
             run_id = self.active["run_id"]
-            self.assertTrue(run_id.startswith("run_goal_"))
+            self.assertTrue(run_id.startswith("run_codexgoal_"))
             self.assertEqual(server.CURRENT_TURNS[self.sid]["run_id"], run_id)
             self.assertEqual(len(server.CROSS_CHAT_CAPABILITIES), 1)
             observed.append((await self.call()).json())

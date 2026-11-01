@@ -167,6 +167,7 @@ class _AssistantReplays:
         self.source_commands, self.local_command_prompts = {}, {}
         self.goal_history = ClaudeGoalHistoryNormalizer()
         self.goal_input_parents = {}
+        self.goal_input_prompts = {}
 
     def display_key(self, text: str) -> str | None:
         if self.normalize_assistant is None:
@@ -214,6 +215,8 @@ class _AssistantReplays:
         tool_result = isinstance(content, list) and any(isinstance(part, dict) and part.get("type") == "tool_result" for part in content)
         if event.get("type") == "user" and event.get("isMeta") is not True and text.strip() and not tool_result:
             self.source_users.setdefault(identity, []).append((offset, _text_key(text.strip())))
+            if normalized_goal is not event:
+                self.goal_input_prompts[identity] = normalized_goal["message"]["content"]
             if normalized_goal is not event and parent_input is not None:
                 # A native goal command may sit between a submitted question
                 # and its first reply without creating another server run.
@@ -313,8 +316,10 @@ class _AssistantReplays:
                         (CLAUDE_SDK_LITERAL_MESSAGE_PREFIX + matches[0]).strip()))
             # A native local-command result owns its XML input only when the
             # commandRun metadata, source wrapper and original prompt agree.
-            command_match = (identity in self.local_command_prompts
-                             and self.local_command_prompts[identity] == matches[0])
+            command_match = ((identity in self.local_command_prompts
+                              and self.local_command_prompts[identity] == matches[0])
+                             or (source_input in self.goal_input_prompts
+                                 and self.goal_input_prompts[source_input] == matches[0]))
             visited = set()
             while (len(inputs) == 1 and inputs[0][1] not in expected_inputs and not command_match
                    and source_input in self.goal_input_parents and source_input not in visited
@@ -324,6 +329,12 @@ class _AssistantReplays:
                 inputs = self.source_users.get(source_input, ())
             if len(inputs) == 1 and (inputs[0][1] in expected_inputs or command_match):
                 users.add((source_input, inputs[0][1], inputs[0][0]))
+                if command_match:
+                    # Goal history can already contain the canonical slash
+                    # command instead of the source XML. The exact native
+                    # output UUID, input ancestry and commandRun/goal sentinel
+                    # prove this alias; another equal occurrence cannot.
+                    users.add((source_input, _text_key(matches[0]), inputs[0][0]))
         return assistants, users
 
     def prove(self, eligible: dict) -> frozenset:

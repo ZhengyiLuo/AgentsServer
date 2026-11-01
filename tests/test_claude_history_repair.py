@@ -643,6 +643,49 @@ class ClaudeInterruptionRepairTests(unittest.TestCase):
                 self.assertEqual(self.events.read_bytes(), before_events)
                 self.assertEqual(self.source.read_bytes(), before_source)
 
+    def test_normalized_native_goal_clear_repairs_existing_and_first_import(self):
+        wrapped = ("<command-name>/goal</command-name>\n"
+                   "<command-message>goal</command-message>\n<command-args>clear</command-args>")
+        self.owned_followup_fixture(native_prompt="/goal clear", source_prompt=wrapped,
+            native_command={"command": "goal", "args": "clear"})
+        # The history parser has already normalized the native XML command.
+        self.target["prompt"] = "/goal clear"
+        self.events.write_bytes(encode(self.rows))
+        before = self.events.read_bytes(), self.source.read_bytes()
+        self.assertTrue(self.prepare())
+        self.assertTrue(self.cache.is_hidden("chat-1", self.target))
+        window = self.cache.prepare_window("chat-1", self.PROVIDER, self.events, self.root,
+            self.normalize, normalize_full_user=self.normalize, event_window_end=self.events.stat().st_size)
+        self.assertTrue(window.is_hidden(self.target))
+        item = {"kind": "user", "text": "/goal clear", "provider_origin": self.target["provider_origin"]}
+        different_occurrence = {**item, "provider_origin": {**item["provider_origin"], "event_id": self.raw(99)["uuid"]}}
+        items = [item, different_occurrence]
+        filtered = repair.filter_native_claude_mailbox_wake_items(
+            "chat-1", self.PROVIDER, self.events, items, source_path=self.source, root=self.root,
+            sync_checkpoint=self.rows[3]["_history_sync_checkpoint"],
+            normalize_user=self.normalize, normalize_full_user=self.normalize)
+        self.assertTrue(filtered[0].get("metadata_only"))
+        self.assertEqual(filtered[1], different_occurrence)
+        projected = load_server_repair(self.cache)["project_provider_history_event_for_egress"]
+        self.assertEqual(projected(self.rows[0], "chat-1")["prompt"], "/goal clear")
+        self.assertEqual((self.events.read_bytes(), self.source.read_bytes()), before)
+
+    def test_normalized_goal_clear_requires_exact_command_receipt(self):
+        wrapped = ("<command-name>/goal</command-name>\n"
+                   "<command-message>goal</command-message>\n<command-args>clear</command-args>")
+        for changed in ({"linked": False}, {"same_uuid": False}, {"native_command": {}},
+                        {"native_command": {"command": "goal", "args": "other"}},
+                        {"native_command": None}, {"native_prompt": "/goal another"},
+                        {"native_prompt": "Quoted:\n" + wrapped}):
+            with self.subTest(changed=changed):
+                self.cache = repair.ClaudeMetadataRepairCache()
+                self.owned_followup_fixture(**{"native_prompt": "/goal clear", "source_prompt": wrapped,
+                    "native_command": {"command": "goal", "args": "clear"}, **changed})
+                self.target["prompt"] = "/goal clear"
+                self.events.write_bytes(encode(self.rows))
+                self.prepare()
+                self.assertFalse(self.cache.is_hidden("chat-1", self.target))
+
     def test_native_command_wrapper_requires_matching_output_uuid_and_command_metadata(self):
         wrapped = ("<command-name>/context</command-name>\n"
                    "<command-message>context</command-message>\n<command-args></command-args>")

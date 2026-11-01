@@ -226,6 +226,29 @@ class AssistantReplayRepairTests(unittest.TestCase):
                     self.prepare(oversized=oversized)
                     self.assertFalse(self.cache.is_hidden("chat-one", self.rows[5]))
 
+    def test_normalized_goal_start_matches_only_its_exact_native_input(self):
+        for oversized in (False, True):
+            for owned in (True, False):
+                with self.subTest(oversized=oversized, owned=owned):
+                    self.setUp()
+                    self.goal_interleaved_input()
+                    self.rows[0]["prompt"] = "/goal Finish inspection"
+                    command = self.source_rows[2]
+                    self.rows[5].update(prompt="/goal Finish inspection", provider_origin={
+                        "provider": "claude", "event_id": command["uuid"], "session_id": "provider-one",
+                        "timestamp": command["timestamp"]})
+                    if not owned:
+                        self.native["provider_message_id"] = "different-reply"
+                    self.prepare(oversized=oversized)
+                    self.assertEqual(self.cache.is_hidden("chat-one", self.rows[5]), owned)
+                    item = {"kind": "user", "text": "/goal Finish inspection",
+                            "provider_origin": self.rows[5]["provider_origin"]}
+                    filtered = repair.filter_native_claude_mailbox_wake_items(
+                        "chat-one", "provider-one", self.events, [item], sync_checkpoint=self.checkpoint,
+                        source_path=self.source, root=self.root, normalize_user=lambda row: None,
+                        normalize_full_user=lambda row: None)
+                    self.assertEqual(filtered[0].get("metadata_only", False), owned)
+
     def test_small_and_recent_exact_public_source_repairs_only_one_event(self):
         for oversized in (False, True):
             with self.subTest(oversized=oversized):

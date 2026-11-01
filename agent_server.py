@@ -24525,6 +24525,26 @@ def codex_goal_followup_requires_native(
     )
 
 
+def codex_goal_steer_selection_is_plain(selected: dict[str, Any]) -> bool:
+    """Claude's current native lane accepts text/files, not new route or skill grants."""
+    routes = selected.get("provider_cross_chat_route_snapshot")
+    return (
+        str(selected.get("prompt") or "").strip().split(maxsplit=1)[:1] != ["/mail"]
+        and selected.get("skill_selection") is None
+        and not any(
+            isinstance(route, dict)
+            and route.get("route_kind") == PROVIDER_CROSS_CHAT_ROUTE_KIND_REFERENCE
+            for route in (routes if isinstance(routes, list) else [])
+        )
+        and not any(selected.get(field) for field in (
+            "purpose", "chat_references", "team_references",
+            "secure_peer_route_snapshots", "cross_chat_obligation_ids",
+            "cross_chat_exchange_ids", "cross_chat_envelope_id",
+            "cross_chat_exchange_id", "cross_chat_exchange_leg_id",
+        ))
+    )
+
+
 def codex_goal_steer_selection_is_supported(selected: dict[str, Any]) -> bool:
     """User follow-ups keep the current run owner and explicitly selected input."""
     routes = selected.get("provider_cross_chat_route_snapshot")

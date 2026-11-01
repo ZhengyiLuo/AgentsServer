@@ -143,7 +143,7 @@ class GoalRouteSteerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(new["source_user_instruction"], "Ask @Selected to review")
         self.assertEqual(new["source_user_delegation_action"], "route")
         self.ns["CROSS_CHAT"].get.return_value = {
-            **new, "kind": "instruction", "delivery_mode": "mailbox",
+            **new, "id": new["envelope_id"], "kind": "instruction", "delivery_mode": "mailbox",
             "authorization_kind": "configured_route", "authorization_route_id": new["route_id"],
         }
         self.assertTrue(await self.commit(await self.prepare(self.selection("Ask @Selected to retest"))))

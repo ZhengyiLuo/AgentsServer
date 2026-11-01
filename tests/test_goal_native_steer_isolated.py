@@ -420,6 +420,7 @@ class NativeGoalSteerTests(unittest.IsolatedAsyncioTestCase):
             "source_is_user_turn": True,
             "user_delegation_grants": {("recipient", "route")},
             "provider_route_grants": {"route": {"target_session_id": "recipient"}},
+            "provider_route_source_instructions": {"route": "Investigate and deploy the fix."},
             "actions": {"agent_cross_chat_routes", "publish"},
         }
         self.ns["CROSS_CHAT_CAPABILITIES"]["token"] = capability
@@ -440,6 +441,7 @@ class NativeGoalSteerTests(unittest.IsolatedAsyncioTestCase):
             result = await original_rpc(*args, **kwargs)
             self.assertIs(capability["source_is_user_turn"], False)
             self.assertEqual(capability["user_delegation_grants"], set())
+            self.assertNotIn("provider_route_source_instructions", capability)
             return result
 
         self.manager.steer_turn_with_notification_watermark = rpc
@@ -447,6 +449,7 @@ class NativeGoalSteerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(capability["source_user_instruction"], exact_user_text)
         self.assertIs(capability["source_is_user_turn"], True)
         self.assertEqual(capability["user_delegation_grants"], set())
+        self.assertNotIn("provider_route_source_instructions", capability)
         self.assertEqual(reserved_before["source_user_instruction"], "Investigate with the other chat and deploy the fix.")
         self.assertEqual(reserved_before["user_delegation_grants"], {("recipient", "route")})
         self.assertIs(capability["provider_route_grants"], reserved_before["provider_route_grants"])
@@ -494,6 +497,7 @@ class NativeGoalSteerTests(unittest.IsolatedAsyncioTestCase):
                     await self.send(request)
                 self.assertIs(capability["source_is_user_turn"], False)
                 self.assertEqual(capability["user_delegation_grants"], set())
+                self.assertNotIn("provider_route_source_instructions", capability)
                 self.assertEqual(capability["actions"], {"agent_cross_chat_routes", "publish"})
                 self.assertNotIn("_goal_steer_user_delegation_marker", capability)
                 self.assertNotIn("_goal_steer_user_delegation", request)

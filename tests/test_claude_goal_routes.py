@@ -87,14 +87,16 @@ class ClaudeGoalRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call.args[1].skill_selection.revision, "inventory-revision")
         self.assertTrue(call.kwargs["queue_if_busy"])
 
-    async def test_queued_set_preserves_active_run_and_native_pending_state(self):
-        active = {"run_id": "existing-run", "transport": "agent-sdk"}
+    async def test_pending_native_goal_rejects_a_second_set_without_mutating_its_owner(self):
+        active = {"run_id": "existing-run"}  # Admission has not acquired a native SDK owner yet.
         pending = {"run_id": "existing-run", "previous_set_at": "earlier"}
         self.ns["ACTIVE"]["chat"] = active
         self.ns["CLAUDE_GOAL_PENDING"]["chat"] = pending
         self.ns["start_turn"].return_value = {"queued": True, "queued_id": "saved-goal"}
         response = await self.client.put("/api/sessions/chat/claude/goal", json={"condition": "Reply DONE"})
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["detail"], "Claude is already applying a goal")
+        self.ns["start_turn"].assert_not_awaited()
         self.assertIs(self.ns["ACTIVE"]["chat"], active)
         self.assertIs(self.ns["CLAUDE_GOAL_PENDING"]["chat"], pending)
         self.ns["claude_sdk_manager"].assert_not_awaited()

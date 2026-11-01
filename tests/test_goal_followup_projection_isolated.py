@@ -161,6 +161,37 @@ class ClaudeFollowupProjectionTests(GoalFollowupProjectionTests):
                 item.update(native_followup=True, provider_message_id=f"claude-message-{item['seq']}")
         self.write(self.events)
 
+    def test_history_reconcile_credits_prevent_reimporting_the_followup(self):
+        # Claude uses native message receipts, not Codex goal/thread items.
+        # Preserve its original independent projection regression.
+        ns = projection()
+        ns["events_path"] = lambda _: self.path
+        keys, present, truncated = ns["history_timeline_message_keys"](
+            "chat", timeline_after_seq=2, timeline_through_seq=8,
+            tail=False, include_imported=False,
+        )
+        self.assertTrue(present)
+        self.assertFalse(truncated)
+        self.assertEqual([seq for seq, (role, _) in keys if role == "user"], [3, 6])
+        followup_texts = ["Keep working, including the new failure.", "One more clarification"]
+        self.assertEqual([digest for _, (role, digest) in keys if role == "user"], [
+            hashlib.sha256(" ".join(text.split()).encode("utf-8")).hexdigest()
+            for text in followup_texts
+        ])
+        provider_items = [
+            {"kind": "user", "text": followup_texts[0]},
+            {"kind": "assistant", "text": "Continuing after your follow-up"},
+            {"kind": "assistant", "text": "Updated answer"},
+            {"kind": "user", "text": followup_texts[1]},
+            {"kind": "assistant", "text": "Latest answer"},
+            {"kind": "user", "text": followup_texts[0]},
+        ]
+        fresh, consumed_seq = ns["reconcile_cursor_history_items"](
+            "chat", provider_items, timeline_after_seq=2, timeline_through_seq=8,
+        )
+        self.assertEqual(fresh, provider_items[-1:])
+        self.assertEqual(consumed_seq, 8)
+
     def test_unproven_steer_is_not_human_history_or_shareable_input(self):
         for field, value in (
             ("native_followup", False), ("native_steer", False),

@@ -35775,6 +35775,25 @@ def semantic_timeline_event_is_completed_commentary(
     )
 
 
+def semantic_timeline_event_is_claude_output(event: dict[str, Any]) -> bool:
+    """Keep public Claude output ahead of optional compact-history traces."""
+    if event.get("backend") != BACKEND_CLAUDE:
+        return False
+    text = str(event.get("text") or "").strip()
+    if not text:
+        return False
+    if event.get("type") == "assistant_text":
+        return True
+    # Older servers stored native text as commentary. Match the desktop's
+    # existing legacy-report projection without reclassifying genuine thinking
+    # or changing stored events; the client still owns final-answer deduplication.
+    return semantic_timeline_event_is_completed_commentary(event) and (
+        len(text) >= 1200
+        or re.search(r"^#{1,6}\s+\S", text, re.MULTILINE) is not None
+        or re.search(r"\n\s*\|[^|\n]+\|[^|\n]+\|", text) is not None
+    )
+
+
 def semantic_timeline_event_is_trace_anchor(event: dict[str, Any]) -> bool:
     """Keep one lightweight handle so completed trace detail stays discoverable."""
     event_type = str(event.get("type") or "")
@@ -35839,13 +35858,14 @@ def semantic_timeline_ordinary_candidates(
         for event in remaining
         if str(event.get("type") or "") in SEMANTIC_TIMELINE_ESSENTIAL_DETAIL_TYPES
     ]
-    commentary_essential = [
+    output_essential = [
         event
         for event in remaining
-        if preserve_completed_commentary
-        and semantic_timeline_event_is_completed_commentary(event)
+        if semantic_timeline_event_is_claude_output(event)
+        or (preserve_completed_commentary
+            and semantic_timeline_event_is_completed_commentary(event))
     ]
-    essential = [*detail_essential, *commentary_essential]
+    essential = [*detail_essential, *output_essential]
     essential_ids = {
         semantic_timeline_event_identity(event)
         for event in essential

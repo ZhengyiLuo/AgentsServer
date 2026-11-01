@@ -239,7 +239,12 @@ class RuntimeCatalogConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls), 2)
 
     async def test_auth_change_replaces_stale_catalog_without_old_cleanup_removing_new(self):
-        entered = [threading.Event(), threading.Event()]
+        loop = asyncio.get_running_loop()
+        # Exactly two discovery workers must overlap. A blocking entry observer
+        # in that same pool can starve the second scope read/probe. Notify the
+        # loop instead, and keep the pool deliberately constrained as a guard.
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=2))
+        entered = [asyncio.Event(), asyncio.Event()]
         release_new = threading.Event()
         self.addCleanup(release_new.set)
         calls = []
@@ -249,17 +254,17 @@ class RuntimeCatalogConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             index = len(calls)
             calls.append(True)
             diagnostic = dict(self.ns["RUNTIME_DIAGNOSTICS"]["codex"])
-            entered[index].set()
+            loop.call_soon_threadsafe(entered[index].set)
             if not (self.release if index == 0 else release_new).wait(5):
                 raise AssertionError("catalog not released")
             return {"backends": {"codex": {"diagnostic": diagnostic, "available": diagnostic["status"] == "ready"}}}
 
         self.ns["discover_runtime_catalog_within_budget"] = discover
         old = self.task(self.ns["runtime_catalog"](refresh=True))
-        await self.started(entered[0])
+        await asyncio.wait_for(entered[0].wait(), 5)
         self.ns["store_runtime_diagnostic"](self.diagnostic())
         new = self.task(self.ns["runtime_catalog"](refresh=True))
-        await self.started(entered[1])
+        await asyncio.wait_for(entered[1].wait(), 5)
         new_owner = self.ns["RUNTIME_CATALOG_TASKS"][True][1]
         self.release.set()
         self.assertFalse((await old)["backends"]["codex"]["available"])

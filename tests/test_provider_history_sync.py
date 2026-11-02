@@ -632,6 +632,112 @@ class ProviderTranscriptSanitizerTests(unittest.TestCase):
         self.assertEqual(fresh, [])
 
 
+    def native_compact_rows(self):
+        # Transcript shape written by Claude Code 2.1.316 for a manual /compact.
+        provider = "40ac8a6c-7c68-423f-ad52-c8b1e0e1e333"
+        ids = {name: f"6f2edbf4-0cb5-468e-aadd-{index:012d}" for index, name in enumerate(
+            ("boundary", "summary", "caveat", "wrapper", "stdout", "other"))}
+        self.compact_ids = ids
+        def row(uuid, parent, content, **fields):
+            return {"type": "user", "uuid": uuid, "parentUuid": parent, "sessionId": provider,
+                    "promptId": "prompt-compact", "timestamp": "2026-11-02T14:10:37.000Z",
+                    "isSidechain": False, "message": {"role": "user", "content": content}, **fields}
+        return provider, [
+            {"type": "system", "subtype": "compact_boundary", "uuid": ids["boundary"], "parentUuid": None,
+             "sessionId": provider, "content": "Conversation compacted", "isMeta": False},
+            row(ids["summary"], ids["boundary"], "This session is being continued...", isCompactSummary=True),
+            row(ids["caveat"], ids["summary"], "<local-command-caveat>The command below was run directly "
+                "in Claude Code.</local-command-caveat>", isMeta=True),
+            row(ids["wrapper"], ids["caveat"], "<command-name>/compact</command-name>\n            "
+                "<command-message>compact</command-message>\n            <command-args></command-args>"),
+            row(ids["stdout"], ids["wrapper"], "<local-command-stdout>Compacted </local-command-stdout>"),
+        ]
+
+    def test_native_local_command_rows_project_as_command_and_output(self) -> None:
+        provider, rows = self.native_compact_rows()
+        items = agent_server.parse_claude_history_events(rows, None, expected_session_id=SANITIZER_CHAT_ID)
+        self.assertEqual([(item["kind"], item["text"]) for item in items],
+                         [("user", "/compact"), ("assistant", "Compacted")])
+        self.assertEqual(items[1]["provider_origin"]["event_id"], self.compact_ids["stdout"])
+        events = [
+            {"type": "turn_started", "prompt": "/compact"},
+            {"type": "assistant_text", "text": "Compacted", "backend": "claude",
+             "provider_message_id": self.compact_ids["stdout"], "provider_session_id": provider},
+        ]
+        with patch.object(agent_server, "history_timeline_message_keys",
+                          side_effect=fake_history_timeline_scan(events)):
+            fresh = agent_server.unsynced_history_items(SANITIZER_CHAT_ID, items, timeline_through_seq=2)
+        self.assertEqual(fresh, [])
+
+    def compact_transcript(self, rows):
+        path = Path(tempfile.mkdtemp()) / "transcript.jsonl"
+        offsets, data = [], b""
+        for row in rows:
+            data += json.dumps(row).encode() + b"\n"
+            offsets.append(len(data))
+        path.write_bytes(data)
+        return path, offsets
+
+    def parse_delta(self, path, start):
+        stat = os.stat(path)
+        expected = {field: int(getattr(stat, field)) for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns")}
+        items, _offset, _digest, _blocked = agent_server.parse_provider_history_delta(
+            path, agent_server.BACKEND_CLAUDE, start, stat.st_size, limit=None,
+            expected_stat=expected, previous_last_item_digest="",
+            expected_session_id=SANITIZER_CHAT_ID,
+        )
+        return [(item["kind"], item["text"]) for item in items]
+
+    def test_human_quote_after_command_output_stays_user_text(self) -> None:
+        provider, rows = self.native_compact_rows()
+        human = {**rows[4], "uuid": self.compact_ids["other"], "parentUuid": self.compact_ids["stdout"],
+                 "promptId": "prompt-human",
+                 "message": {"role": "user", "content": "<local-command-stdout>literal quote</local-command-stdout>"}}
+        rows.append(human)
+        full = agent_server.parse_claude_history_events(rows, None, expected_session_id=SANITIZER_CHAT_ID)
+        self.assertEqual([(item["kind"], item["text"]) for item in full][-1],
+                         ("user", "<local-command-stdout>literal quote</local-command-stdout>"))
+        path, offsets = self.compact_transcript(rows)
+        self.assertEqual(self.parse_delta(path, offsets[-2]),
+                         [("user", "<local-command-stdout>literal quote</local-command-stdout>")])
+
+    def test_chained_stdout_and_stderr_remain_command_output(self) -> None:
+        _provider, rows = self.native_compact_rows()
+        stderr = {**rows[4], "uuid": self.compact_ids["other"], "parentUuid": self.compact_ids["stdout"],
+                  "message": {"role": "user", "content": "<local-command-stderr>warning</local-command-stderr>"}}
+        repeat = {**stderr, "uuid": "6f2edbf4-0cb5-468e-aadd-000000000099", "parentUuid": self.compact_ids["other"]}
+        rows += [stderr, repeat]
+        items = agent_server.parse_claude_history_events(rows, None, expected_session_id=SANITIZER_CHAT_ID)
+        self.assertEqual([(item["kind"], item["text"]) for item in items],
+                         [("user", "/compact"), ("assistant", "Compacted"), ("assistant", "warning"),
+                          ("user", "<local-command-stderr>warning</local-command-stderr>")])
+
+    def test_incremental_seed_keeps_provenance_of_long_command(self) -> None:
+        _provider, rows = self.native_compact_rows()
+        args = "x" * 70_000
+        rows[3]["message"]["content"] = ("<command-name>/compact</command-name>\n<command-message>compact"
+                                         f"</command-message>\n<command-args>{args}</command-args>")
+        full = agent_server.parse_claude_history_events(rows, None, expected_session_id=SANITIZER_CHAT_ID)
+        self.assertEqual([(item["kind"], item["text"]) for item in full][-1], ("assistant", "Compacted"))
+        path, offsets = self.compact_transcript(rows)
+        # Cursor sits immediately after the >64 KiB wrapper record.
+        self.assertGreater(offsets[3] - offsets[2], 65_536)
+        self.assertEqual(self.parse_delta(path, offsets[3]), [("assistant", "Compacted")])
+        # Full and incremental processing agree for every cursor position.
+        expected = [(item["kind"], item["text"]) for item in full]
+        for index, start in enumerate([0, *offsets[:-1]]):
+            self.assertEqual(self.parse_delta(path, start)[-1], expected[-1], index)
+
+    def test_quoted_local_command_markup_stays_human_text(self) -> None:
+        _provider, rows = self.native_compact_rows()
+        quoted = [rows[3] | {"parentUuid": self.compact_ids["summary"]},
+                  rows[4] | {"parentUuid": self.compact_ids["other"]}]
+        items = agent_server.parse_claude_history_events(quoted, None, expected_session_id=SANITIZER_CHAT_ID)
+        self.assertEqual([item["kind"] for item in items], ["user", "user"])
+        self.assertIn("<command-name>/compact</command-name>", items[0]["text"])
+        self.assertIn("<local-command-stdout>", items[1]["text"])
+
+
 class UnsyncedHistoryItemsTests(unittest.TestCase):
     """Pure selection logic: what does the timeline not have yet?"""
 

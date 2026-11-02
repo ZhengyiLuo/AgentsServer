@@ -9,6 +9,45 @@ recipient message. A fresh, explicit user reference can separately carry bounded
 [user-delegation provenance](CHAT_MAILBOX.md#explicit-user-delegation) through
 the mailbox; permanent pair membership alone cannot.
 
+## Agent-created chats
+
+An agent can create an independent AgentsDock conversation using the run-bound
+Chats helper:
+
+```text
+chats create --title "Research worker" --folder "Research"
+```
+
+Creation also grants the creator and new chat a permanent bidirectional mailbox
+pair. No separate mention or route-approval step is needed. The returned
+`session` identifies the new chat and `route.route_id` can be used immediately
+by the creating run:
+
+```text
+chats send --route <returned-route-id> --message "Investigate the rendering issue."
+```
+
+The new chat discovers its reverse route through `chats list`, and both sides
+use ordinary mailbox send/inbox/read actions. Creating a chat alone does not
+start a provider turn or copy the creator's transcript. The chat appears in the
+normal sidebar under its requested folder and remains independently usable.
+
+Optional `--cwd`, `--backend`, `--model`, `--effort`, and
+`--provider-connection default|custom` select the new chat's settings. Omitted
+settings use the creator's applicable configuration. Native provider thread
+IDs, history, goals, and existing peer routes are not inherited. Folder
+membership does not grant communication with unrelated chats in that folder.
+
+The helper posts to `POST /api/agent/chats` with the live provider capability;
+it does not require the server's administrative token. An explicit idempotency
+key identifies a creation by this creator across reconnects and restarts.
+Retrying the same request returns the same chat. Automatically generated keys
+also include the logical run, so a later turn can create another chat with
+identical settings; use a distinct `--idempotency-key` to intentionally do so
+within the same run.
+
+## Run-bound route access
+
 Credentials remain bound to the server, source chat, and active logical run.
 The send path intersects its issued route snapshot with the live pair and
 current route revision. Delivery turns receive only the exact reverse member
@@ -50,8 +89,9 @@ provider's private runtime advertises support; Chats checks the route listing
 before changing behavior. Only permanent pair routes in a negotiated run have
 `mode: "async_route_v1"` in that listing. A helper request explicitly using
 `--mode async_route_v1` rejects an unsupported route/server before its POST.
-Legacy invocations keep their legacy wire contract and do not perform an
-additional discovery request.
+Exact-route sends check the current route mode even when the shell was
+started before the first route existed. Legacy routes retain their legacy
+wire contract.
 
 Provider discovery is paginated rather than capped: `chats list` returns one
 64-slot issued-route page and `next_cursor`; use `chats list --cursor` with that

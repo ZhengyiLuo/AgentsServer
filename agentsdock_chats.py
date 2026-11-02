@@ -176,7 +176,7 @@ def _authority_path(path: str | None) -> Path:
     return Path(selected).expanduser()
 
 
-def authority(path: str | None) -> str:
+def authority_with_run(path: str | None) -> tuple[str, str]:
     authority_path = _authority_path(path)
     try:
         mode = authority_path.stat().st_mode & 0o777
@@ -194,7 +194,11 @@ def authority(path: str | None) -> str:
         raise ChatsCLIError(
             "AGENTSDOCK_CHAT_ID does not match the authority file"
         )
-    return token
+    return token, str(payload.get("source_run_id") or "").strip()
+
+
+def authority(path: str | None) -> str:
+    return authority_with_run(path)[0]
 
 
 def positive_target_index(value: str) -> int:
@@ -626,6 +630,51 @@ def list_routes(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+def create_chat(args: argparse.Namespace) -> dict[str, Any]:
+    """Create an independent chat and return its connection to the creator."""
+    title = str(args.title or "").strip()
+    if not title:
+        raise ChatsCLIError("--title must not be empty")
+    payload: dict[str, Any] = {"title": title}
+    for name in ("folder", "cwd", "backend", "model", "effort", "provider_connection"):
+        value = getattr(args, name, None)
+        if value is not None:
+            payload[name] = value
+    key = getattr(args, "idempotency_key", None)
+    if key is not None:
+        key = key.strip()
+        if not 8 <= len(key) <= 128:
+            raise ChatsCLIError("--idempotency-key must contain 8 to 128 characters")
+    capability, source_run_id = authority_with_run(args.authority_file)
+    if key is None:
+        if not source_run_id:
+            raise ChatsCLIError("authority file has no source run for the default chat creation key")
+        # Scope automatic keys to the logical run without depending on a
+        # rotating capability. Explicit keys remain reusable across runs.
+        key = "cli_" + hashlib.sha256(
+            (f"create\0{source_run_id}\0" + json.dumps(payload, sort_keys=True, ensure_ascii=False)).encode("utf-8")
+        ).hexdigest()
+    payload["idempotency_key"] = key
+    result = post_json("/api/agent/chats", payload, capability)
+    session = result.get("session")
+    route = result.get("route")
+    if (
+        result.get("ok") is not True
+        or type(result.get("created")) is not bool
+        or type(result.get("duplicate")) is not bool
+        or result["created"] == result["duplicate"]
+        or not isinstance(session, dict)
+        or not isinstance(session.get("id"), str)
+        or not session["id"]
+        or not isinstance(route, dict)
+        or not isinstance(route.get("route_id"), str)
+        or not route["route_id"]
+        or route.get("mode") != "async_route_v1"
+    ):
+        raise ChatsCLIError("AgentsServer returned an invalid chat creation receipt")
+    return result
+
+
 def inbox(args: argparse.Namespace) -> dict[str, Any]:
     """List body-free pending senders; never claim or start their messages."""
     capability = authority(args.authority_file)
@@ -709,10 +758,9 @@ def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
         raise ChatsCLIError("--reply-to requires an exact asynchronous route and message ID from the inbox")
     if requested_mode and not route:
         raise ChatsCLIError("conversation mode requires an exact route")
-    discover_mode = bool(requested_mode or reply_to) or (
-        _bounded_runtime_value("AGENTSDOCK_CROSS_CHAT_MODE") == "async_route_v1"
-    )
-    mode = negotiated_route_mode(capability, route, requested_mode) if route and discover_mode else ""
+    # A create can add the first route after this shell's environment was
+    # captured. Negotiate exact routes from the current server capability.
+    mode = negotiated_route_mode(capability, route, requested_mode) if route else ""
     if reply_to and mode != "async_route_v1":
         raise ChatsCLIError("--reply-to is not supported by legacy exchanges")
     if mode == "async_route_v1":
@@ -1046,7 +1094,7 @@ def add_message_arguments(command: argparse.ArgumentParser) -> None:
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(
-        description="Contact an eligible chat on this AgentsDock server.",
+        description="Create or contact a chat on this AgentsDock server.",
         allow_abbrev=False,
     )
     root.add_argument(
@@ -1057,6 +1105,30 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     commands = root.add_subparsers(dest="command", required=True)
+    create_command = commands.add_parser(
+        "create",
+        help="create an independent AgentsDock chat and automatically connect it to this chat",
+        description=(
+            "Create an independent AgentsDock chat and automatically connect the creator and new chat. "
+            "Omitted settings inherit from the creator. Use send with the returned route to send a message."
+        ),
+        allow_abbrev=False,
+    )
+    create_command.add_argument("--title", required=True)
+    create_command.add_argument("--folder", help="folder for the new chat; inherits when omitted")
+    create_command.add_argument("--cwd", help="working directory on the server; inherits when omitted")
+    create_command.add_argument("--backend", help="agent backend; inherits when omitted")
+    create_command.add_argument("--model", help="model; inherits when omitted")
+    create_command.add_argument("--effort", help="reasoning effort; inherits when omitted")
+    create_command.add_argument("--provider-connection", choices=["default", "custom"])
+    create_command.add_argument(
+        "--idempotency-key",
+        help=(
+            "8 to 128 character retry key; defaults to the same key for identical settings in this run. "
+            "Explicit keys can be reused across runs. Use a different key to intentionally create another chat"
+        ),
+    )
+    create_command.set_defaults(handler=create_chat)
     list_command = commands.add_parser(
         "list",
         help="list one page of eligible same-server chats for this live run",

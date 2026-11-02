@@ -95,7 +95,13 @@ def parse_native_models(info: Any) -> list[dict[str, str]]:
 
 
 
-CACHE_TTL_SECONDS = 300.0
+# Native labels (e.g. "Opus 5.5") are learned only when a real chat connects,
+# and Claude chat processes stay connected for hours. A short lifetime made
+# most periodic catalog reads (desktop: every 15 minutes) fall back to bare
+# aliases. The key already changes with the CLI binary, provider environment,
+# user/managed settings and account identity; every new connection replaces
+# the entry and native authentication failure clears it.
+CACHE_TTL_SECONDS = 24 * 60 * 60.0
 CACHE_LIMIT = 16
 _CACHE_LOCK = threading.Lock()
 _CACHE: OrderedDict[str, tuple[float, list[dict[str, str]]]] = OrderedDict()
@@ -136,8 +142,12 @@ def native_catalog_key(executable: str, env: dict[str, str]) -> str:
     """Fingerprint runtime/config identity without reading native credentials.
 
     Environment credentials are hashed, never retained in plaintext. Native
-    credential rotation alone is not evidence of login or logout; this cache
-    is short lived and is never used as authentication/authorization evidence.
+    credential rotation alone is not evidence of login or logout, so the
+    native credential file contributes only its presence (login/logout), never
+    its revision: OAuth renewal rewrites it for the same account, and the
+    labels are only re-learned when a new chat connects. Account switches are
+    covered by the account identity. This cache is never used as
+    authentication/authorization evidence.
     """
     home = Path(env.get("HOME") or str(Path.home()))
     config = Path(env.get("CLAUDE_CONFIG_DIR") or home / ".claude")
@@ -146,11 +156,11 @@ def native_catalog_key(executable: str, env: dict[str, str]) -> str:
     resolved = shutil.which(executable, path=env.get("PATH")) or executable
     revisions = [_file_revision(Path(resolved)), *(
         _file_revision(path) for path in (
-            config / "settings.json", config / ".credentials.json",
+            config / "settings.json",
             Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
             Path("/etc/claude-code/managed-settings.json"),
         )
-    )]
+    ), ["native-credentials-present", (config / ".credentials.json").exists()]]
     return hashlib.sha256(json.dumps([relevant, revisions, _account_identity(config, home)], sort_keys=True).encode()).hexdigest()
 
 

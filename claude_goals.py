@@ -97,6 +97,126 @@ class ClaudeGoalHistoryNormalizer:
             self._parents.popitem(last=False)
 
 
+CLAUDE_LOCAL_COMMAND_OUTPUT = re.compile(
+    r"\A<local-command-(stdout|stderr)>([\s\S]*)</local-command-\1>\Z"
+)
+CLAUDE_LOCAL_COMMAND_WRAPPER = re.compile(
+    r"\A<command-name>/([A-Za-z0-9_][A-Za-z0-9_.:-]{0,127})</command-name>\s*"
+    r"<command-message>\1</command-message>\s*<command-args>([\s\S]*)</command-args>\Z"
+)
+
+
+def claude_local_command_output(content: Any) -> str | None:
+    """Return the text of a native local-command output record, or None."""
+    if not isinstance(content, str) or len(content) > 1024 * 1024:
+        return None
+    match = CLAUDE_LOCAL_COMMAND_OUTPUT.fullmatch(content)
+    return match[2].strip() if match else None
+
+
+class ClaudeLocalCommandHistoryNormalizer:
+    """Project native local slash commands (e.g. /compact) as Claude shows them.
+
+    Claude records a local command as user-role rows: a metadata caveat, the
+    ``<command-name>`` wrapper, then ``<local-command-stdout>`` output (and
+    optionally stderr), all sharing one ``promptId``. Native Claude Code
+    renders these as the typed command and its output, not as human messages.
+    Only rows proven by that parent chain within the same command occurrence
+    are rewritten. A human quoting the markup starts a new prompt (or lacks the
+    chain) and stays unchanged. ``/goal`` remains owned by
+    ClaudeGoalHistoryNormalizer.
+    """
+
+    # Seeding must recover the complete records preceding an incremental
+    # cursor: a command's arguments can make its wrapper far larger than a
+    # fixed lookback. Bounded by the transcript reader's own record limit.
+    SEED_MAX_RECORDS = 8
+    SEED_MAX_BYTES = 32 * 1024 * 1024 + 64 * 1024
+    SEED_CHUNK_BYTES = 1024 * 1024
+
+    def __init__(self):
+        self._caveats: OrderedDict[str, dict] = OrderedDict()
+        # Wrapper and output rows of one occurrence; the value is shared.
+        self._commands: OrderedDict[str, dict] = OrderedDict()
+
+    def seed(self, path: Path, offset: int) -> None:
+        if offset <= 0:
+            return
+        try:
+            with path.open("rb") as stream:
+                lines = self._records_before(stream, offset)
+        except OSError:
+            return
+        for line in lines:
+            try:
+                self.consume(json.loads(line))
+            except (ValueError, RecursionError):
+                continue
+
+    @classmethod
+    def _records_before(cls, stream, offset: int) -> list[bytes]:
+        """Return up to SEED_MAX_RECORDS complete lines ending at ``offset``."""
+        position, region = offset, b""
+        while position > 0 and region.count(b"\n") <= cls.SEED_MAX_RECORDS:
+            if offset - position >= cls.SEED_MAX_BYTES:
+                break
+            size = min(cls.SEED_CHUNK_BYTES, position, cls.SEED_MAX_BYTES - (offset - position))
+            position -= size
+            stream.seek(position)
+            region = stream.read(size) + region
+        if position > 0:
+            # The first line may be partial; only complete records are trusted.
+            region = region.partition(b"\n")[2]
+        return [line for line in region.splitlines() if line.strip()][-cls.SEED_MAX_RECORDS:]
+
+    def consume(self, event: Any) -> Any:
+        if (not isinstance(event, dict) or event.get("isSidechain") is True
+                or event.get("type") != "user"):
+            return event
+        identity, session = event.get("uuid"), event.get("sessionId")
+        if not isinstance(identity, str) or not isinstance(session, str):
+            return event
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, str) or message.get("role") != "user":
+            return event
+        parent_id, prompt = event.get("parentUuid"), event.get("promptId")
+        if event.get("isMeta") is True:
+            if content.startswith("<local-command-caveat>"):
+                self._remember(self._caveats, identity, {"sessionId": session, "promptId": prompt})
+            return event
+        caveat = self._caveats.get(parent_id)
+        if caveat is not None and caveat["sessionId"] == session and caveat["promptId"] == prompt:
+            match = CLAUDE_LOCAL_COMMAND_WRAPPER.fullmatch(content)
+            if match and match[1] != "goal":
+                self._remember(self._commands, identity,
+                               {"sessionId": session, "promptId": prompt, "outputs": set()})
+                args = match[2].strip()
+                return {**event, "message": {**message, "content": f"/{match[1]}" + (f" {args}" if args else "")}}
+            return event
+        occurrence = self._commands.get(parent_id)
+        output = (CLAUDE_LOCAL_COMMAND_OUTPUT.fullmatch(content)
+                  if occurrence is not None and len(content) <= 1024 * 1024 else None)
+        if (output is None or occurrence["sessionId"] != session or occurrence["promptId"] != prompt
+                or output[1] in occurrence["outputs"]):
+            return event
+        # At most one stdout and one stderr per occurrence, chained in order.
+        occurrence["outputs"].add(output[1])
+        self._remember(self._commands, identity, occurrence)
+        text = output[2].strip()
+        if not text:
+            return {**event, "isMeta": True}
+        return {**event, "type": "assistant",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}}
+
+    @staticmethod
+    def _remember(store: OrderedDict, identity: str, value: dict) -> None:
+        store[identity] = value
+        store.move_to_end(identity)
+        while len(store) > 32:
+            store.popitem(last=False)
+
+
 def _timestamp_ms(value: Any) -> int | None:
     if not isinstance(value, str) or len(value) > 64:
         return None

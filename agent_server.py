@@ -47931,18 +47931,19 @@ def parse_claude_history_events(
     expected_session_id: str | None = None,
     interruption_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    from claude_goals import ClaudeGoalHistoryNormalizer
+    from claude_goals import ClaudeGoalHistoryNormalizer, ClaudeLocalCommandHistoryNormalizer
     items: deque[dict[str, Any]] = deque(
         maxlen=normalized_history_import_limit(limit)
     )
     tracker = ClaudeInterruptionTracker()
     goal_history = ClaudeGoalHistoryNormalizer()
+    local_commands = ClaudeLocalCommandHistoryNormalizer()
     for event in events:
         if not isinstance(event, dict):
             tracker = ClaudeInterruptionTracker()
             continue
         origin = tracker.consume(event)
-        event = goal_history.consume(event)
+        event = local_commands.consume(goal_history.consume(event))
         if origin is not None:
             add_history_item(items, "interruption", message_text(event.get("message")), provider_origin=origin)
         else:
@@ -50072,12 +50073,15 @@ def parse_provider_history_delta(
     last_append_state = None
     blocked_on_unseen_message = False
     tracker = ClaudeInterruptionTracker(interruption_context) if backend == BACKEND_CLAUDE else None
-    from claude_goals import ClaudeGoalHistoryNormalizer
+    from claude_goals import ClaudeGoalHistoryNormalizer, ClaudeLocalCommandHistoryNormalizer
     goal_history = ClaudeGoalHistoryNormalizer() if backend == BACKEND_CLAUDE else None
+    local_commands = ClaudeLocalCommandHistoryNormalizer() if backend == BACKEND_CLAUDE else None
     from codex_history_repair import CodexCompactionSummaryTracker
     compaction = CodexCompactionSummaryTracker() if backend == BACKEND_CODEX else None
     if goal_history is not None:
         goal_history.seed(path, start)
+    if local_commands is not None:
+        local_commands.seed(path, start)
     for event, record_end in bounded_jsonl_records_range(
         path,
         start,
@@ -50105,6 +50109,8 @@ def parse_provider_history_delta(
         origin = tracker.consume(event) if tracker is not None else None
         if goal_history is not None:
             event = goal_history.consume(event)
+        if local_commands is not None:
+            event = local_commands.consume(event)
         if event is not None:
             if backend == BACKEND_CLAUDE:
                 item = normalized_history_item(

@@ -112,7 +112,11 @@ class RuntimeCatalogConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                 "authenticated": status == "ready", "checked_at_epoch": time.time()}
 
     async def test_concurrent_http_reads_share_one_provider_pipeline(self):
-        entered = threading.Event()
+        loop = asyncio.get_running_loop()
+        # The observer must not occupy the worker needed for scope reads and
+        # discovery. Keep the default pool small to catch that fixture deadlock.
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+        entered = asyncio.Event()
         calls = []
         lock = threading.Lock()
 
@@ -120,7 +124,7 @@ class RuntimeCatalogConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             with lock:
                 calls.append((backend, force_runtime_probe))
                 if len(calls) == len(self.ns["VALID_BACKENDS"]):
-                    entered.set()
+                    loop.call_soon_threadsafe(entered.set)
             self.block()
             return {"models": [{"value": backend}], "custom_provider": {"configured": backend == "codex"}}
 
@@ -129,7 +133,7 @@ class RuntimeCatalogConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         app.get("/api/runtime/catalog")(self.ns["runtime_catalog"])
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://fixture") as client:
             requests = [self.task(client.get("/api/runtime/catalog")) for _ in range(24)]
-            await self.started(entered)
+            await asyncio.wait_for(entered.wait(), 5)
             await self.catalog_waiters(24)
             self.assertEqual(sorted(calls), [(backend, False) for backend in sorted(self.ns["VALID_BACKENDS"])])
             self.release.set()

@@ -946,6 +946,49 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             agent_server.CLAUDE_EMPTY_TURN_ERROR,
         )
 
+    async def test_native_compact_local_command_is_success_with_output(self) -> None:
+        # Shape captured from Claude Code 2.1.316 stream-json for /compact.
+        append_event, append_finished, runtime_success, runtime_failure = (
+            await self._run_sdk_terminal_case([
+                {"type": "SystemMessage", "subtype": "compact_boundary",
+                 "data": {"session_id": "provider"}},
+                {"type": "UserMessage", "uuid": "native-summary", "session_id": "provider",
+                 "content": "This session is being continued from a previous conversation."},
+                {"type": "UserMessage", "uuid": "native-stdout", "session_id": "provider",
+                 "content": "<local-command-stdout>Compacted </local-command-stdout>"},
+                {"type": "result", "result": "", "subtype": "success",
+                 "session_id": "provider", "local_command": "compact"},
+            ])
+        )
+
+        terminal = append_finished.await_args.args[1]
+        self.assertEqual(terminal["exit_code"], 0)
+        texts = [call.args[2] for call in append_event.await_args_list
+                 if call.args[1] == "assistant_text"]
+        self.assertEqual([(item["text"], item["provider_message_id"]) for item in texts],
+                         [("Compacted", "native-stdout")])
+        self.assertFalse(any(call.args[1] == "error" for call in append_event.await_args_list))
+        runtime_success.assert_called_once_with(agent_server.BACKEND_CLAUDE)
+        runtime_failure.assert_not_called()
+
+    async def test_quoted_local_command_output_without_native_result_is_not_promoted(self) -> None:
+        append_event, append_finished, _runtime_success, _runtime_failure = (
+            await self._run_sdk_terminal_case([
+                {"type": "UserMessage", "uuid": "human", "session_id": "provider",
+                 "content": "<local-command-stdout>Compacted </local-command-stdout>"},
+                {"type": "result", "result": "", "session_id": "provider",
+                 "terminal_reason": "end_turn"},
+            ])
+        )
+
+        self.assertEqual(append_finished.await_args.args[1]["exit_code"], 1)
+        self.assertFalse(any(call.args[1] == "assistant_text" for call in append_event.await_args_list))
+        self.assertTrue(any(
+            call.args[1] == "error"
+            and call.args[2]["message"] == agent_server.CLAUDE_EMPTY_TURN_ERROR
+            for call in append_event.await_args_list
+        ))
+
     async def test_tool_only_empty_sdk_result_remains_success(self) -> None:
         append_event, append_finished, runtime_success, runtime_failure = (
             await self._run_sdk_terminal_case([
@@ -1092,10 +1135,8 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         runtime_success.assert_not_called()
         runtime_failure.assert_called_once()
 
-    async def test_empty_print_result_without_tools_is_visible_failure(self) -> None:
-        process = FakeClaudePrintProcess([
-            b'{"type":"result","result":"","session_id":"provider"}\n',
-        ])
+    async def _run_print_case(self, lines: list[bytes]):
+        process = FakeClaudePrintProcess(lines)
         append_event = AsyncMock(return_value={})
         append_finished = AsyncMock(return_value={})
         runtime_success = Mock()
@@ -1188,6 +1229,28 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                 dict(self.session),
                 Path(self.cwd) / ".manifest.json",
             )
+        return append_event, append_finished, runtime_success, runtime_failure
+
+    async def test_print_native_compact_local_command_is_success_with_output(self) -> None:
+        append_event, append_finished, runtime_success, runtime_failure = await self._run_print_case([
+            b'{"type":"system","subtype":"compact_boundary","session_id":"provider"}\n',
+            b'{"type":"user","uuid":"native-stdout","session_id":"provider","isReplay":true,'
+            b'"message":{"role":"user","content":"<local-command-stdout>Compacted </local-command-stdout>"}}\n',
+            b'{"type":"result","result":"","subtype":"success","session_id":"provider","local_command":"compact"}\n',
+        ])
+
+        self.assertEqual(append_finished.await_args.args[1]["exit_code"], 0)
+        texts = [call.args[2] for call in append_event.await_args_list if call.args[1] == "assistant_text"]
+        self.assertEqual([(item["text"], item["provider_message_id"]) for item in texts],
+                         [("Compacted", "native-stdout")])
+        self.assertFalse(any(call.args[1] == "error" for call in append_event.await_args_list))
+        runtime_success.assert_called_once_with(agent_server.BACKEND_CLAUDE)
+        runtime_failure.assert_not_called()
+
+    async def test_empty_print_result_without_tools_is_visible_failure(self) -> None:
+        append_event, append_finished, runtime_success, runtime_failure = await self._run_print_case([
+            b'{"type":"result","result":"","session_id":"provider"}\n',
+        ])
 
         terminal = append_finished.await_args.args[1]
         self.assertEqual(terminal["exit_code"], 1)

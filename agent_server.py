@@ -174,7 +174,7 @@ from codex_history_repair import (
     codex_public_item_origin, filter_native_codex_history_items,
 )
 from claude_history_provenance import ClaudeInterruptionTracker, normalize_claude_interruption_context
-from claude_goals import ClaudeGoalProjection
+from claude_goals import ClaudeGoalProjection, claude_local_command_output
 from claude_background_reconciliation import (
     CONSUMED_EVENT as CLAUDE_BACKGROUND_CONSUMED_EVENT,
     RECONCILED_EVENT as CLAUDE_BACKGROUND_RECONCILED_EVENT,
@@ -65374,6 +65374,8 @@ async def run_claude_print(
     stream_error: str | None = None
     result_error: str | None = None
     terminal_result_received = False
+    result_local_command = ""
+    print_local_command_outputs: list[tuple[str, str]] = []
     seen_artifacts: set[str] = set()
     manifest_watch_task = asyncio.create_task(watch_manifest_artifacts(session_id, run_id, manifest_path, seen_artifacts))
 
@@ -65443,7 +65445,17 @@ async def run_claude_print(
                         changed_paths.update(tool_changed_paths(tool))
                         await append_event(session_id, "tool_started", {"run_id": run_id, "tool": tool})
             elif etype == "user":
-                for block in event.get("message", {}).get("content", []):
+                user_content = (event.get("message") or {}).get("content", [])
+                if isinstance(user_content, str):
+                    # Replayed text, e.g. a local command's stdout. Promote it
+                    # only after the result's local_command field proves it.
+                    local_output = claude_local_command_output(user_content)
+                    if local_output:
+                        print_local_command_outputs.append((str(event.get("uuid") or ""), local_output))
+                    continue
+                for block in user_content if isinstance(user_content, list) else []:
+                    if not isinstance(block, dict):
+                        continue
                     if block.get("type") == "tool_result":
                         had_tool_activity = True
                         tid = block.get("tool_use_id")
@@ -65457,6 +65469,11 @@ async def run_claude_print(
                         })
             elif etype == "result":
                 terminal_result_received = True
+                result_local_command = str(event.get("local_command") or "")
+                await project_claude_local_command_outputs(
+                    session_id, run_id, print_local_command_outputs,
+                    local_command=result_local_command,
+                )
                 if run_id in STOPPED_RUNS and is_expected_claude_interruption_result(event):
                     continue
                 result_error = claude_result_error(event)
@@ -65499,6 +65516,7 @@ async def run_claude_print(
             or idle_killed
             or proc.returncode not in (0, None)
         ),
+        local_command=result_local_command,
     )
     if stream_error and not stopped:
         await append_event(session_id, "error", {"run_id": run_id, "message": f"Claude stream failed: {stream_error}", **run_event_metadata(run_id)})
@@ -65760,9 +65778,13 @@ def claude_sdk_result_details(message: Any) -> dict[str, Any]:
         claude_sdk_field(message, "terminal_reason") or ""
     )
     is_error = bool(claude_sdk_field(message, "is_error", False))
+    local_command = claude_sdk_field(message, "local_command")
     return {
         "session_id": str(claude_sdk_field(message, "session_id") or ""),
         "result_text": result,
+        # Native local slash commands (e.g. /compact) finish without a model
+        # response; Claude marks their result with the command name.
+        "local_command": local_command if isinstance(local_command, str) else "",
         "is_error": is_error,
         "error": error_text or (result if is_error else "") or (
             f"Claude SDK ended with {subtype or 'an error'}" if is_error else ""
@@ -65771,6 +65793,39 @@ def claude_sdk_result_details(message: Any) -> dict[str, Any]:
         "terminal_reason": terminal_reason,
         "aborted": terminal_reason in {"aborted_streaming", "aborted_tools"},
     }
+
+
+async def project_claude_local_command_outputs(
+    session_id: str,
+    run_id: str,
+    outputs: list[tuple[str, str]],
+    *,
+    local_command: str,
+) -> list[str]:
+    """Publish replayed local-command output once a result proves its origin.
+
+    ``outputs`` holds (native message UUID, text) pairs buffered from replayed
+    user messages. They become replies only when the terminal result carries
+    Claude's structured ``local_command`` field; otherwise a human message
+    quoting the markup is discarded. The buffer is always cleared.
+    """
+
+    published: list[str] = []
+    if local_command:
+        for message_uuid, output in outputs:
+            text = clean_assistant_text(output)
+            if not text:
+                continue
+            published.append(text)
+            await append_event(session_id, "assistant_text", {
+                "run_id": run_id,
+                "text": text,
+                "backend": BACKEND_CLAUDE,
+                **({"provider_message_id": message_uuid} if message_uuid else {}),
+                **run_event_metadata(run_id),
+            })
+    outputs.clear()
+    return published
 
 
 CLAUDE_EMPTY_TURN_ERROR = (
@@ -65787,11 +65842,13 @@ def claude_empty_turn_failure_message(
     stopped: bool,
     terminal_result_received: bool,
     existing_error: bool,
+    local_command: str = "",
 ) -> str:
     """Return a visible failure for an otherwise silent Claude turn."""
 
     if (
         terminal_result_received
+        and not local_command
         and str(prompt or "").strip()
         and not clean_assistant_text(result_text)
         and not had_tool_activity
@@ -65812,6 +65869,7 @@ async def project_claude_sdk_message(
     changed_paths: set[str],
     tool_activity_run_ids: set[str] | None = None,
     error_run_ids: set[str] | None = None,
+    local_command_outputs: list[tuple[str, str]] | None = None,
 ) -> dict[str, Any] | None:
     """Project one typed SDK message into the existing durable timeline."""
 
@@ -65921,6 +65979,13 @@ async def project_claude_sdk_message(
 
     if message_type == "UserMessage":
         content = claude_sdk_field(message, "content", [])
+        if isinstance(content, str) and local_command_outputs is not None:
+            # A replayed local-command output is held until the terminal
+            # result's structured local_command field proves its origin; a
+            # human message quoting the same markup is never promoted.
+            output = claude_local_command_output(content)
+            if output:
+                local_command_outputs.append((str(claude_sdk_field(message, "uuid") or ""), output))
         for block in content if isinstance(content, list) else []:
             if claude_sdk_type(block) not in {
                 "ToolResultBlock",
@@ -65935,7 +66000,13 @@ async def project_claude_sdk_message(
         return None
 
     if message_type in {"ResultMessage", "result"}:
-        return claude_sdk_result_details(message)
+        details = claude_sdk_result_details(message)
+        if local_command_outputs is not None:
+            text_parts.extend(await project_claude_local_command_outputs(
+                session_id, run_id, local_command_outputs,
+                local_command=details["local_command"],
+            ))
+        return details
     await project_subagent_lifecycle()
     return None
 
@@ -66899,6 +66970,7 @@ async def run_claude_sdk(
     current_diff_baseline = diff_baseline
     current_prompt = prompt
     text_parts: list[str] = []
+    local_command_outputs: list[tuple[str, str]] = []
     current_tools: dict[str, dict[str, Any]] = {}
     tool_activity_run_ids: set[str] = set()
     projection_error_run_ids: set[str] = set()
@@ -67463,6 +67535,7 @@ async def run_claude_sdk(
                     changed_paths=changed_paths,
                     tool_activity_run_ids=tool_activity_run_ids,
                     error_run_ids=projection_error_run_ids,
+                    local_command_outputs=local_command_outputs,
                 )
                 if projected_result is None:
                     continue
@@ -67926,6 +67999,7 @@ async def run_claude_sdk(
             current_diff_baseline = candidate_baseline
             current_prompt = str(steer_state["request_prompt"])
             text_parts = []
+            local_command_outputs = []
             current_tools = {}
             changed_paths = candidate_paths
             seen_artifacts = candidate_artifacts
@@ -68015,6 +68089,7 @@ async def run_claude_sdk(
                         or previous_result_details.get("is_error")
                         or previous_projection_error
                     ),
+                    local_command=str(previous_result_details.get("local_command") or ""),
                 )
                 if previous_empty_error:
                     await append_event(session_id, "error", {
@@ -68334,6 +68409,7 @@ async def run_claude_sdk(
                 or (result_details or {}).get("is_error")
                 or projection_error
             ),
+            local_command=str((result_details or {}).get("local_command") or ""),
         )
         if stream_error and not stopped:
             with suppress(Exception):

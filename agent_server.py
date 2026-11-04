@@ -29321,18 +29321,16 @@ def resize_terminal_pane(session_id: str, columns: int, rows: int) -> dict[str, 
 
 def scroll_terminal_history(session_id: str, delta: int, *, managed: bool = False) -> bool:
     """Scroll the active tmux pane's persistent history without enabling mouse capture."""
-    if session_id not in STORE.sessions:
+    if not delta or session_id not in STORE.sessions:
         return False
     name = terminal_session_name(session_id)
-    if not tmux_session_exists(name):
+    amount = max(1, min(abs(int(delta)), 80))
+    # This query also checks existence; a separate has-session process on every
+    # wheel packet only adds latency ahead of the next queued keystroke.
+    mode = run_tmux(["display-message", "-p", "-t", name, "#{pane_in_mode}"], check=False)
+    if mode.returncode != 0:
         return False
-    amount = max(1, min(abs(int(delta or 0)), 80))
-    if not delta:
-        return False
-    pane_in_mode = run_tmux(
-        ["display-message", "-p", "-t", name, "#{pane_in_mode}"],
-        check=False,
-    ).stdout.strip() == "1"
+    pane_in_mode = mode.stdout.strip() == "1"
     entered_copy_mode = False
     if delta < 0:
         if not pane_in_mode:
@@ -29343,14 +29341,19 @@ def scroll_terminal_history(session_id: str, delta: int, *, managed: bool = Fals
             if entered.returncode != 0:
                 entered = run_tmux(["copy-mode", "-e", "-t", name], check=False)
             entered_copy_mode = entered.returncode == 0
-        run_tmux(["send-keys", "-X", "-N", str(amount), "-t", name, "scroll-up"], check=False)
-    elif pane_in_mode:
-        run_tmux(["send-keys", "-X", "-N", str(amount), "-t", name, "scroll-down"], check=False)
-    still_in_mode = run_tmux(
-        ["display-message", "-p", "-t", name, "#{pane_in_mode}"],
+            if not entered_copy_mode:
+                return False
+    elif not pane_in_mode:
+        return False
+    # tmux executes these commands in order in one client process. Query after
+    # scrolling because -e may leave copy mode at the bottom of the history.
+    scrolled = run_tmux(
+        ["send-keys", "-X", "-N", str(amount), "-t", name,
+         "scroll-up" if delta < 0 else "scroll-down", ";",
+         "display-message", "-p", "-t", name, "#{pane_in_mode}"],
         check=False,
-    ).stdout.strip() == "1"
-    return still_in_mode and (managed or entered_copy_mode)
+    )
+    return scrolled.returncode == 0 and scrolled.stdout.strip() == "1" and (managed or entered_copy_mode)
 
 
 def exit_terminal_auto_scroll(session_id: str) -> None:

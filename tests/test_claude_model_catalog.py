@@ -170,6 +170,20 @@ class PassiveNativeModelCacheTests(unittest.TestCase):
             self.remember()
         self.assertEqual(len(catalog._CACHE), catalog.CACHE_LIMIT)
 
+    def test_labels_outlive_periodic_catalog_refresh_of_long_lived_chat(self):
+        # A chat connects once and stays open; desktop re-reads every 15 min.
+        with patch.object(catalog.time, "monotonic", return_value=1):
+            self.remember()
+        for elapsed in (15 * 60, 60 * 60, 8 * 60 * 60):
+            with patch.object(catalog.time, "monotonic", return_value=1 + elapsed):
+                self.assertEqual(self.read(), [{"value": "opus", "label": "Opus 5"}])
+
+    def test_cli_update_invalidates_cached_labels(self):
+        self.remember()
+        self.assertIsNotNone(self.read())
+        Path(self.executable).write_text("updated fixture binary")
+        self.assertIsNone(self.read())
+
     def test_empty_native_list_is_authoritative(self):
         self.info = {"models": []}
         self.remember()
@@ -187,6 +201,24 @@ class PassiveNativeModelCacheTests(unittest.TestCase):
         self.remember()
         Path(self.executable).write_text("new fixture runtime")
         self.assertIsNone(self.read())
+
+    def test_same_account_credential_rotation_keeps_labels_but_login_change_does_not(self):
+        account = self.root / ".claude.json"
+        account.write_text(json.dumps({"oauthAccount": {"accountUuid": "one", "organizationUuid": "org"}}))
+        credentials = self.root / ".claude/.credentials.json"
+        credentials.parent.mkdir()
+        credentials.write_text('{"claudeAiOauth": {"accessToken": "first"}}')
+        with patch.object(catalog.time, "monotonic", return_value=1):
+            self.remember()
+        # OAuth renewal an hour later rewrites only the token file.
+        credentials.write_text('{"claudeAiOauth": {"accessToken": "renewed-and-longer"}}')
+        with patch.object(catalog.time, "monotonic", return_value=1 + 60 * 60):
+            self.assertEqual(self.read(), [{"value": "opus", "label": "Opus 5"}])
+        credentials.unlink()  # logout
+        self.assertIsNone(self.read())
+        credentials.write_text('{"claudeAiOauth": {"accessToken": "other"}}')
+        account.write_text(json.dumps({"oauthAccount": {"accountUuid": "two", "organizationUuid": "org"}}))
+        self.assertIsNone(self.read())  # login as a different account
 
     def test_late_connect_cannot_publish_under_new_configuration(self):
         old_key = catalog.native_catalog_key(self.executable, self.env)

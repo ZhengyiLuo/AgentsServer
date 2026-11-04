@@ -1,5 +1,11 @@
 # Claude model names in the runtime catalog
 
+> **Status:** catalog reads no longer start a disposable Claude process.
+> Native labels now come passively from real chat connections; see
+> [CLAUDE_PASSIVE_DISCOVERY.md](CLAUDE_PASSIVE_DISCOVERY.md). The display and
+> labelling rules below still apply. The disposable second-initialization
+> expansion, its process limits and the probe verification notes are historical.
+
 Claude discovery now prefers the installed CLI's SDK `initialize` response,
 the source used by TypeScript `supportedModels()` / Python `get_server_info()`.
 It needs no user prompt or model generation. No client API shape changes.

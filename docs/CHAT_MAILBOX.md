@@ -72,6 +72,17 @@ arbitrary work. No tool, filesystem, route, job, deployment, or other
 permissions are added. A body containing lookalike fields or provenance
 wrappers remains untrusted text. Replies do not inherit or forward this proof.
 
+The prepared body identifies the recipient's subtask; the source instruction
+bounds its authorization, rather than asking the recipient to repeat the entire
+sender workflow. For example, when the user asks the sender to create a worker
+and have it calculate a result, the created worker calculates and replies. It
+does not create another worker merely because creation appears in the original
+instruction. Creating another chat is appropriate only when that is the
+recipient's delegated subtask and falls within the user's actual scope.
+When a covered task requests a reply, explicitly send the result using the
+returned reply route and message ID; a local final answer is not forwarded.
+No extra authority is minted or forwarded to make this work.
+
 The instruction and its server-attested delegation marker commit atomically with the
 message and are included in idempotency comparisons. Reads and retries use that
 immutable record, never the sender's latest prompt or current run. Revocation,
@@ -102,6 +113,10 @@ A tool error or an assistant's assertion is not evidence of delivery. A
 rejected body creates no mailbox entry and therefore cannot wake a recipient.
 Retry ambiguous transport outcomes with the same idempotency key; do not
 construct a fresh send merely because confirmation was lost.
+Receipt `state` and `execution_started` describe acceptance, not the recipient's
+later live state. An empty sender inbox says nothing about whether the recipient
+has started or read the task. Without a fresh observation, report acceptance and
+that no reply has been observed; do not infer that execution has not started.
 
 The local regression uses the real helper subprocess and loopback HTTP against
 extracted server handlers and a temporary SQLite mailbox. It covers the

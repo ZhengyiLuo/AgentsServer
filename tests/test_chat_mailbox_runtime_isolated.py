@@ -94,6 +94,17 @@ class DelegationAdmissionTests(unittest.TestCase):
                        "without asking the user to authorize it again", "without a fresh @ mention"):
             self.assertIn(phrase, policy)
 
+    def test_provider_policy_separates_recipient_task_from_sender_orchestration(self):
+        assignment = next(node for node in TREE.body if isinstance(node, ast.Assign)
+                          and any(isinstance(target, ast.Name) and target.id == "PROVIDER_AUTHORITY_USAGE_INSTRUCTIONS" for target in node.targets))
+        policy = eval(compile(ast.Expression(assignment.value), "<actual-provider-policy>", "eval"),
+                      {"CLAUDE_PROVIDER_MCP_TOOL_NAME": "synthetic-provider"})
+        for phrase in ("recipient's subtask", "not a command to repeat the sender's entire workflow",
+                       "you are that worker", "Do not create another worker",
+                       "send the result through Chats", "not live recipient status",
+                       "An empty inbox only means no unread incoming mail"):
+            self.assertIn(phrase, policy)
+
 
 class HTTPException(Exception):
     def __init__(self, status_code, detail):
@@ -152,6 +163,35 @@ def isolated_source():
 
 
 class ChatMailboxRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_worker_task_keeps_original_authorization_separate_from_prepared_subtask(self):
+        original = "Create one worker, ask it to compute 37 times 43, and report its reply. Do not edit files."
+        task = "Compute 37 times 43 and reply to this chat."
+        self.capabilities["sender"].update(source_user_instruction=original, source_is_user_turn=True)
+        req = SimpleNamespace(mode="async_route_v1", action="instruction", artifact_grants=[], body=task,
+                              idempotency_key="worker-task", wait_for_response=False,
+                              response_timeout_seconds=None, reply_to_message_id=None)
+        receipt = await self.ns["submit_provider_route_handoff"](ROUTE, req, SimpleNamespace(owner="sender"))
+        message = (await self.read())["messages"][0]
+        self.assertEqual(message["message_id"], receipt["message_id"])
+        self.assertEqual(message["body"], task)
+        self.assertEqual(message["user_delegation"]["source_user_instruction"], original)
+        self.assertEqual(message["user_delegation"]["target_session_id"], "recipient")
+        # Reading a delegated task does not make this internal wake a user turn
+        # or authorize it to forward the original user's instruction onward.
+        self.assertFalse(self.capabilities["recipient"].get("source_is_user_turn", False))
+        self.assertEqual(self.ns["provider_cross_chat_source_instruction"](
+            "chat_mailbox_wake", self.ns["CHAT_MAILBOX_WAKE_PROMPT"]), "")
+
+    async def test_idle_and_busy_mail_notices_distinguish_recipient_work_from_orchestration(self):
+        self.set_recipient()
+        await self.send()
+        for notice in (self.ns["CHAT_MAILBOX_WAKE_PROMPT"],
+                       self.ns["take_chat_mailbox_hint"]("recipient", "recipient-run")):
+            self.assertIn("recipient's subtask", notice)
+            self.assertIn("not repeat the sender's", notice)
+            self.assertIn("send the result through Chats", notice)
+            self.assertLess(len(notice.encode()), 2048)
+
     def test_source_capture_preserves_user_and_delegated_scope_but_never_generated_prompts(self):
         capture = self.ns["provider_cross_chat_source_instruction"]
         user = "  Render five videos.\nExclude draft clips. 😀\n"

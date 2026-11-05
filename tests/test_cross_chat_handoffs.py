@@ -224,6 +224,32 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             raise AssertionError("expected one exact provider direct grant")
         return handles[0]
 
+    async def test_agent_chat_creation_respects_explicit_action_ceiling(self):
+        for index, actions in enumerate(({"publish", "jobs"}, {"publish"}, set())):
+            with self.subTest(actions=actions):
+                run_id = f"run_restricted_{index}"
+                await agent_server.issue_cross_chat_capability(
+                    "source", run_id, [], actions=actions,
+                )
+                capability = next(value for value in agent_server.CROSS_CHAT_CAPABILITIES.values()
+                                  if value["source_run_id"] == run_id)
+                self.assertEqual(capability["actions"], actions)
+                self.assertNotIn("agent_chats", capability["actions"])
+
+    async def test_agent_chat_creation_requires_authenticated_server(self):
+        for authenticated in (True, False):
+            for explicit in (True, False):
+                with self.subTest(authenticated=authenticated, explicit=explicit):
+                    run_id = f"run_creation_{authenticated}_{explicit}"
+                    with patch.object(agent_server, "AGENT_TOKEN", "test-admin-token" if authenticated else ""):
+                        await agent_server.issue_cross_chat_capability(
+                            "source", run_id, [],
+                            actions={"publish", "agent_chats"} if explicit else None,
+                        )
+                    capability = next(value for value in agent_server.CROSS_CHAT_CAPABILITIES.values()
+                                      if value["source_run_id"] == run_id)
+                    self.assertEqual("agent_chats" in capability["actions"], authenticated)
+
     async def issue_live_waiter_owner(
         self,
         session_id: str,

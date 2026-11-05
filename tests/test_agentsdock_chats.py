@@ -13,6 +13,136 @@ import agentsdock_chats
 
 
 class AgentsDockChatsCLITests(unittest.TestCase):
+    def test_create_omits_inherited_settings_and_reuses_key_after_capability_rotation(self) -> None:
+        args = agentsdock_chats.parser().parse_args(["create", "--title", "  Research  "])
+        receipt = {
+            "ok": True, "created": True, "duplicate": False,
+            "session": {"id": "synthetic-child", "title": "Research"},
+            "route": {"route_id": "route_" + "a" * 32, "mode": "async_route_v1"},
+        }
+        duplicate = {**receipt, "created": False, "duplicate": True}
+        with patch.object(agentsdock_chats, "authority_with_run", side_effect=[
+                ("first-capability", "first-run"), ("rotated-capability", "first-run"),
+                ("later-capability", "later-run"),
+             ]), \
+                patch.object(agentsdock_chats, "post_json", side_effect=[receipt, duplicate, receipt]) as post, \
+                patch.object(agentsdock_chats, "get_json") as get:
+            self.assertEqual(args.handler(args), receipt)
+            self.assertEqual(args.handler(args), duplicate)
+            self.assertEqual(args.handler(args), receipt)
+        first, second, later = post.call_args_list
+        self.assertEqual(first.args[0], "/api/agent/chats")
+        self.assertEqual(first.args[1], second.args[1])
+        self.assertEqual(set(first.args[1]), {"title", "idempotency_key"})
+        self.assertEqual(first.args[1]["title"], "Research")
+        self.assertRegex(first.args[1]["idempotency_key"], r"^cli_[0-9a-f]{64}$")
+        self.assertNotEqual(first.args[1]["idempotency_key"], later.args[1]["idempotency_key"])
+        self.assertEqual([first.args[2], second.args[2]], ["first-capability", "rotated-capability"])
+        get.assert_not_called()
+
+    def test_create_forwards_explicit_settings_and_allows_intentional_repeats(self) -> None:
+        receipt = {
+            "ok": True, "created": True, "duplicate": False,
+            "session": {"id": "synthetic-child"},
+            "route": {"route_id": "route_" + "a" * 32, "mode": "async_route_v1"},
+        }
+        arguments = [
+            "create", "--title", "Research", "--folder", "", "--cwd", "/workspace/project",
+            "--backend", "codex", "--model", "synthetic-model", "--effort", "high",
+            "--provider-connection", "custom",
+        ]
+        with patch.object(agentsdock_chats, "authority_with_run", side_effect=[
+                ("capability", "first-run"), ("capability", "first-run"),
+                ("capability", "first-run"), ("later-capability", "later-run"),
+             ]), \
+                patch.object(agentsdock_chats, "post_json", return_value=receipt) as post:
+            for extra in ([], ["--idempotency-key", "another-chat"], ["--folder", "Research"],
+                          ["--idempotency-key", "another-chat"]):
+                args = agentsdock_chats.parser().parse_args(arguments + extra)
+                self.assertEqual(args.handler(args), receipt)
+        first, explicit, changed, retried = [call.args[1] for call in post.call_args_list]
+        self.assertEqual(explicit, {
+            "title": "Research", "folder": "", "cwd": "/workspace/project", "backend": "codex",
+            "model": "synthetic-model", "effort": "high", "provider_connection": "custom",
+            "idempotency_key": "another-chat",
+        })
+        self.assertNotEqual(first["idempotency_key"], changed["idempotency_key"])
+        self.assertEqual(explicit, retried)
+
+    def test_create_rejects_missing_title_invalid_options_and_incomplete_receipts(self) -> None:
+        from contextlib import redirect_stderr
+        for arguments in (["create"], ["create", "--title", "Research", "--provider-connection", "other"],
+                          ["create", "--title", "Research", "--message", "Start working"]):
+            with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                agentsdock_chats.parser().parse_args(arguments)
+        for arguments in (["create", "--title", "  "],
+                          ["create", "--title", "Research", "--idempotency-key", "short"]):
+            args = agentsdock_chats.parser().parse_args(arguments)
+            with patch.object(agentsdock_chats, "authority_with_run") as auth, \
+                    patch.object(agentsdock_chats, "post_json") as post, \
+                    self.assertRaises(agentsdock_chats.ChatsCLIError):
+                args.handler(args)
+            auth.assert_not_called()
+            post.assert_not_called()
+        args = agentsdock_chats.parser().parse_args(["create", "--title", "Research"])
+        with patch.object(agentsdock_chats, "authority_with_run", return_value=("capability", "first-run")), \
+                patch.object(agentsdock_chats, "post_json", return_value={
+                    "ok": True, "created": True, "duplicate": False, "session": {"id": "synthetic-child"},
+                }), self.assertRaisesRegex(agentsdock_chats.ChatsCLIError, "invalid chat creation receipt"):
+            args.handler(args)
+
+    def test_route_free_shell_can_create_then_send_without_refreshing_its_environment(self) -> None:
+        route_id = "route_" + "a" * 32
+        route = {"route_id": route_id, "available": True, "mode": "async_route_v1"}
+        receipt = {
+            "ok": True, "route_id": route_id, "action": "instruction", "accepted": True,
+            "mode": "async_route_v1", "message_id": "handoff_" + "b" * 32, "duplicate": False,
+            "delivery_mode": "mailbox", "state": "unread", "execution_started": False,
+        }
+        created = False
+
+        def post(path, payload, capability):
+            nonlocal created
+            self.assertEqual(capability, "synthetic-capability")
+            if path == "/api/agent/chats":
+                created = True
+                return {"ok": True, "created": True, "duplicate": False,
+                        "session": {"id": "synthetic-child"}, "route": route}
+            self.assertTrue(created)
+            self.assertEqual(path, f"/api/agent/cross-chat/routes/{route_id}/handoffs")
+            self.assertEqual(payload.get("mode"), "async_route_v1")
+            self.assertNotIn("wait_for_response", payload)
+            return receipt
+
+        def get(path, capability):
+            self.assertEqual(capability, "synthetic-capability")
+            self.assertEqual(path, f"/api/agent/cross-chat/routes?route_id={route_id}" if created
+                             else "/api/agent/cross-chat/routes")
+            return {"routes": [route] if created else []}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            authority_path = Path(temporary) / "authority.json"
+            authority_path.write_text(json.dumps({
+                "provider_capability": "synthetic-capability", "source_session_id": "synthetic-parent",
+                "source_run_id": "synthetic-run",
+            }), encoding="utf-8")
+            authority_path.chmod(0o600)
+            output = io.StringIO()
+            with patch.dict(os.environ, {"AGENTSDOCK_PROVIDER_AUTHORITY_FILE": str(authority_path)}, clear=True), \
+                    patch.object(agentsdock_chats, "post_json", side_effect=post) as posted, \
+                    patch.object(agentsdock_chats, "get_json", side_effect=get) as fetched, \
+                    patch.object(agentsdock_chats.sys, "stdout", output):
+                self.assertEqual(agentsdock_chats.main(["list"]), 0)
+                self.assertEqual(agentsdock_chats.main(["create", "--title", "Research"]), 0)
+                self.assertNotIn("AGENTSDOCK_CROSS_CHAT_MODE", os.environ)
+                self.assertEqual(agentsdock_chats.main(["send", "--route", route_id, "--message", "Investigate"]), 0)
+            results = [json.loads(line) for line in output.getvalue().splitlines()]
+            self.assertEqual(results[0], {"routes": []})
+            self.assertEqual(results[1]["route"], route)
+            self.assertEqual(results[2], receipt)
+            self.assertEqual(posted.call_count, 2)
+            self.assertEqual(fetched.call_count, 2)
+
     def test_inbox_lists_one_page_without_claim_or_send(self) -> None:
         args = agentsdock_chats.parser().parse_args(["inbox", "--cursor", "synthetic-previous-sender"])
         page = {"senders": [{"source_session_id": "synthetic-sender", "pending_count": 2}], "next_cursor": None}
@@ -559,7 +689,6 @@ class AgentsDockChatsCLITests(unittest.TestCase):
         route = "route_" + "a" * 32
         exchange_id = "exchange_" + "4" * 32
         question_leg_id = "leg_" + "5" * 32
-        answer_leg_id = "leg_" + "6" * 32
         receipt = {
             "ok": True,
             "route_id": route,
@@ -570,13 +699,7 @@ class AgentsDockChatsCLITests(unittest.TestCase):
             "live_response_lease_id": "lease_" + "b" * 32,
         }
         post = Mock(return_value=receipt)
-        get = Mock(return_value={
-            "ok": True,
-            "exchange_id": exchange_id,
-            "inbound_leg_id": answer_leg_id,
-            "body": "Route answer",
-            "request_response": False,
-        })
+        get = Mock(return_value={"routes": [{"route_id": route, "available": True}]})
         args = argparse.Namespace(
             authority_file="authority.json",
             route=route,
@@ -599,7 +722,7 @@ class AgentsDockChatsCLITests(unittest.TestCase):
         payload = post.call_args.args[1]
         self.assertTrue(payload["wait_for_response"])
         self.assertEqual(payload["response_timeout_seconds"], 20)
-        get.assert_not_called()
+        get.assert_called_once_with(f"/api/agent/cross-chat/routes?route_id={route}", "capability")
 
     def test_route_ask_accepts_minimal_receipt_only_in_explicit_async_mode(self) -> None:
         args = argparse.Namespace(
@@ -619,6 +742,9 @@ class AgentsDockChatsCLITests(unittest.TestCase):
         }
         with (
             patch.object(agentsdock_chats, "authority", return_value="capability"),
+            patch.object(agentsdock_chats, "get_json", return_value={
+                "routes": [{"route_id": args.route, "available": True}],
+            }),
             patch.object(
                 agentsdock_chats,
                 "post_json",
@@ -825,7 +951,7 @@ class AgentsDockChatsCLITests(unittest.TestCase):
         # Each wait command observes one second and exits normally. Seventy-six
         # pending slices cross the old 75-second semantic cap before the same
         # lease returns its answer, without one shell call becoming long-lived.
-        get = Mock(side_effect=[pending] * 76 + [answer])
+        get = Mock(side_effect=[{"routes": [{"route_id": route, "available": True}]}] + [pending] * 76 + [answer])
         stdout = io.StringIO()
         with (
             patch.object(agentsdock_chats, "authority", return_value="capability"),
@@ -867,16 +993,18 @@ class AgentsDockChatsCLITests(unittest.TestCase):
         self.assertEqual(receipt["body"], answer["body"])
         post.assert_called_once()
         self.assertEqual(post.call_args.args[1]["response_timeout_seconds"], 1)
-        self.assertEqual(get.call_count, 77)
+        get.assert_any_call(f"/api/agent/cross-chat/routes?route_id={route}", "capability")
+        wait_calls = get.call_args_list[1:]
+        self.assertEqual(len(wait_calls), 77)
         self.assertEqual(
-            {call.args[0] for call in get.call_args_list},
-            {get.call_args_list[0].args[0]},
+            {call.args[0] for call in wait_calls},
+            {wait_calls[0].args[0]},
         )
         self.assertTrue(all(
             "timeout_seconds=1" in call.args[0]
             and call.kwargs["timeout"] == 11
             and call.kwargs["live_slice"] is True
-            for call in get.call_args_list
+            for call in wait_calls
         ))
 
     def test_cli_explicit_410_cancel_is_terminal(self) -> None:
@@ -893,9 +1021,10 @@ class AgentsDockChatsCLITests(unittest.TestCase):
             "inbound_leg_id": question_leg_id,
             "live_response_lease_id": lease_id,
         })
-        get = Mock(side_effect=agentsdock_chats.ChatsCLIError(
-            "server rejected request (410): cancelled_by_user"
-        ))
+        get = Mock(side_effect=[
+            {"routes": [{"route_id": route, "available": True}]},
+            agentsdock_chats.ChatsCLIError("server rejected request (410): cancelled_by_user"),
+        ])
         stdout = io.StringIO()
         stderr = io.StringIO()
         with (
@@ -933,7 +1062,8 @@ class AgentsDockChatsCLITests(unittest.TestCase):
 
         self.assertEqual(exit_code, 2)
         self.assertIn("cancelled_by_user", stderr.getvalue())
-        get.assert_called_once()
+        self.assertEqual(get.call_count, 2)
+        self.assertIn("/live-response?", get.call_args.args[0])
 
     def test_live_get_transport_failure_ends_slice_after_one_boundary(self) -> None:
         class FakeOpener:
@@ -1524,6 +1654,9 @@ class AgentsDockChatsCLITests(unittest.TestCase):
 
         with (
             patch.object(agentsdock_chats, "authority", return_value="capability"),
+            patch.object(agentsdock_chats, "get_json", return_value={
+                "routes": [{"route_id": args.route, "available": True}],
+            }),
             patch.object(agentsdock_chats, "post_json", side_effect=post),
         ):
             result = agentsdock_chats.send(args)
@@ -1576,6 +1709,7 @@ class AgentsDockChatsCLITests(unittest.TestCase):
             authority_path.write_text(json.dumps({
                 "provider_capability": "provider-secret",
                 "source_session_id": "sess/source",
+                "source_run_id": "synthetic-run",
             }), encoding="utf-8")
             authority_path.chmod(0o600)
             with patch.dict(os.environ, {
@@ -1585,6 +1719,10 @@ class AgentsDockChatsCLITests(unittest.TestCase):
                 self.assertEqual(
                     agentsdock_chats.authority(None),
                     "provider-secret",
+                )
+                self.assertEqual(
+                    agentsdock_chats.authority_with_run(None),
+                    ("provider-secret", "synthetic-run"),
                 )
 
     def test_authority_rejects_explicit_override_and_ambient_chat_mismatch(self) -> None:

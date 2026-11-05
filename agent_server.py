@@ -1601,7 +1601,9 @@ PROVIDER_TOOL_INPUT_SCHEMA: dict[str, Any] = {
 PROVIDER_TOOL_DESCRIPTION = (
     "Run one capability-scoped AgentsDock helper for the exact live turn. "
     "Choose chats, jobs, publish, emergency, notify, mail, or team; pass ordinary CLI "
-    "arguments without authority/chat identity flags. Discover permitted chats with "
+    "arguments without authority/chat identity flags. Create a new top-level chat with "
+    "chats create --title TITLE [--folder FOLDER]; its returned async route immediately "
+    "connects creator and created chat in both directions. Discover permitted chats with "
     "chats list and contact its exact --route. Legacy one-use handles use "
     "chats send|ask --target-index N. For the current inbound reply use chats "
     "respond-current. Put chats/mail/team message bodies in stdin; Chats also "
@@ -1738,6 +1740,11 @@ PROVIDER_AUTHORITY_USAGE_INSTRUCTIONS = (
     "finish while pending and never loop or background repeated waits.\n"
     "- A `transport_error=true, retryable=true` receipt is a failed observation, not proof the peer is pending. "
     "Retry Chats `wait` with that same receipt; never resend the ask or claim an answer is still pending.\n"
+    "- Create a top-level AgentsDock chat with `chats create --title TITLE [--folder FOLDER] "
+    "[--cwd PATH] [--backend BACKEND] [--model MODEL] [--effort EFFORT] "
+    "[--provider-connection default|custom]`. Omitted settings inherit this chat's configuration. "
+    "Creation returns the new chat and an immediately usable bidirectional async mailbox route; "
+    "it does not start a turn or send a message. Reuse --idempotency-key after an uncertain create.\n"
     "- Discover available messaging routes on demand with `chats list`. Routes advertising "
     "async_route_v1 are permanent pair permissions: `send` and `ask --route` each send one independent message and "
     "return after acceptance. An accepted receipt with message_id confirms durable delivery, not that the peer read "
@@ -6331,6 +6338,29 @@ class CreateSessionRequest(BaseModel):
     gemini_permission_mode: Literal["default", "autoEdit", "yolo", "plan"] | None = None
 
 
+class CreateAgentChatRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    title: str = Field(min_length=1, max_length=MAX_LOCAL_SESSION_LABEL_CHARS)
+    folder: str | None = Field(default=None, max_length=MAX_LOCAL_SESSION_LABEL_CHARS)
+    cwd: str | None = Field(default=None, max_length=MAX_WORKSPACE_PATH_CHARS)
+    backend: str | None = None
+    model: str | None = None
+    effort: str | None = None
+    provider_connection: Literal["default", "custom"] | None = None
+    idempotency_key: str = Field(min_length=8, max_length=128)
+
+    @field_validator("title", "cwd", "backend", "model", "effort")
+    @classmethod
+    def nonempty_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value or "\x00" in value:
+            raise ValueError("chat settings must be nonempty text")
+        return value
+
+
 MAX_BULK_IMPORT_ITEMS = 25
 LOCAL_SESSION_IMPORT_LOCK = asyncio.Lock()
 PROVIDER_SESSION_IDENTIFIER_RE = re.compile(
@@ -7598,7 +7628,7 @@ def normalized_pending_provider_cross_chat_grant(
         parsed_mutation_timestamp = None
     if (
         not PROVIDER_CROSS_CHAT_GRANT_ADMISSION_ID_RE.fullmatch(admission_id)
-        or event_type not in {"turn_started", "turn_queued"}
+        or event_type not in {"turn_started", "turn_queued", "agent_chat_created"}
         or (
             admission_source_session_id is not None
             and (
@@ -10667,12 +10697,19 @@ class SessionStore:
         parent_id: str | None = None,
         initializing_fork: bool = False,
         initializing_import: bool = False,
+        runtime_defaults: dict[str, Any] | None = None,
+        agent_creation: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         backend = (req.backend or DEFAULT_BACKEND).lower()
         if backend not in VALID_BACKENDS:
             raise HTTPException(status_code=400, detail=f"backend must be one of {sorted(VALID_BACKENDS)}")
         validate_session_subagent_limit({"backend": backend}, req.subagent_limit)
         runtime_source = {"backend": backend}
+        if runtime_defaults is not None:
+            runtime_source.update({name: runtime_defaults.get(name) for name in (
+                "codex_provider", "codex_provider_binding", "codex_provider_revision",
+                "provider_connection", "provider_connection_revision",
+            )})
         if initializing_fork and parent_id and req.codex_provider == "custom":
             parent = self.sessions.get(parent_id) or {}
             runtime_source.update({name: parent.get(name) for name in (
@@ -10862,7 +10899,9 @@ class SessionStore:
             "created_at": now,
             "updated_at": now,
         }
-        if not active_provider_id and not parent_id and sess["title"] == "New chat":
+        if agent_creation is not None:
+            sess["_agent_chat_creation"] = dict(agent_creation)
+        if not active_provider_id and not parent_id and agent_creation is None and sess["title"] == "New chat":
             sess["_empty_chat_cleanup"] = {"version": 1, "dismissed_by": {}}
         if req.subagent_limit is not None:
             sess["subagent_limit"] = req.subagent_limit
@@ -20455,14 +20494,18 @@ async def issue_cross_chat_capability(
     jobs_access = effective_provider_jobs_access(
         STORE.sessions.get(source_session_id)
     )
-    effective_actions = set(actions or {
+    # An explicit action set is a ceiling, including for native continuation
+    # and route-only goal authority. Admission opts into chat creation below;
+    # issuance must not silently broaden a restricted caller's permissions.
+    effective_actions = set(actions if actions is not None else {
         "jobs", "publish", "emergency", "notify", "cross_chat_instruction",
-        "cross_chat_request_reply", "agent_cross_chat_routes",
+        "cross_chat_request_reply", "agent_cross_chat_routes", "agent_chats",
         "team_mail",
     })
     if jobs_access == "blocked" or not AGENT_TOKEN:
         effective_actions.discard("jobs")
     if not AGENT_TOKEN:
+        effective_actions.discard("agent_chats")
         effective_actions.discard("cross_chat_instruction")
         effective_actions.discard("cross_chat_request_reply")
         effective_actions.discard("cross_chat_response")
@@ -21203,6 +21246,10 @@ def resolve_provider_tool_arguments(
             raise ProviderToolError("--target-index is available only for Chats")
         return resolved
     command = resolved[0]
+    if command == "create" and "agent_chats" not in set(
+        runtime_env.get("AGENTSDOCK_PROVIDER_AUTHORITY_ACTIONS", "").split(",")
+    ):
+        raise ProviderToolError("chat creation is unavailable for this live run")
     target_index, resolved = provider_tool_argument_value(
         resolved,
         "--target-index",
@@ -21686,7 +21733,7 @@ def native_steer_provider_actions(
     jobs_access = effective_provider_jobs_access(
         STORE.sessions.get(source_session_id)
     )
-    actions = {"publish"}
+    actions = {"publish", "agent_chats"}
     if provider_turn_may_raise_emergency(selected.get("purpose")):
         actions.update({"emergency", "notify"})
     if jobs_access != "blocked" and AGENT_TOKEN:
@@ -30406,7 +30453,7 @@ def is_client_visible_event(event: dict[str, Any]) -> bool:
     reasoning, tools, artifacts, and assistant output remain visible.
     """
 
-    if str(event.get("type") or "") == "_event_sequence_checkpoint":
+    if str(event.get("type") or "") in {"_event_sequence_checkpoint", "agent_chat_created"}:
         return False
     cross_chat_owner = any(
         str(event.get(key) or "").strip()
@@ -39360,6 +39407,7 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
             "chat_mailbox_v1": True,
             "async_queued_message_controls": True,
             "agent_cross_chat_routes": True,
+            "agent_chat_create_v1": True,
             "agent_ambient_local_handoffs": False,
             "configured_route_async_request_reply": True,
             "configured_route_live_request_reply": True,
@@ -44526,6 +44574,7 @@ def expire_provider_route_authority(capability: dict[str, Any]) -> None:
     actions = capability.get("actions")
     if isinstance(actions, set):
         actions.discard("agent_cross_chat_routes")
+        actions.discard("agent_chats")
         actions.discard("team_mail")
         actions.discard("team_send")
         actions.discard("team_skill_publish")
@@ -44613,6 +44662,7 @@ async def authorize_provider_action(
         "emergency",
         "notify",
         "agent_cross_chat_routes",
+        "agent_chats",
         "team_mail",
         "team_read",
         "team_send",
@@ -44637,7 +44687,7 @@ async def authorize_provider_action(
             raise HTTPException(status_code=403, detail="provider capability is bound to another chat")
         run_id = str(capability.get("source_run_id") or "")
         if (
-            action in {"agent_cross_chat_routes", "team_mail", "team_send", "team_skill_publish"}
+            action in {"agent_cross_chat_routes", "agent_chats", "team_mail", "team_send", "team_skill_publish"}
             and float(capability.get("expires_at") or 0) <= time.time()
         ):
             expire_provider_route_authority(capability)
@@ -45115,7 +45165,9 @@ def emergency_alert_response(
     }
 
 
-async def provider_route_capability_source(request: Request) -> str:
+async def provider_route_capability_source(
+    request: Request, *, action: str = "agent_cross_chat_routes",
+) -> str:
     """Resolve a route helper token to its live source without exposing it."""
 
     if not request_client_is_provider_helper_local(request):
@@ -45160,7 +45212,7 @@ async def provider_route_capability_source(request: Request) -> str:
                     "provider capability is no longer attached to a live turn"
                 ),
             )
-        if "agent_cross_chat_routes" not in capability.get("actions", set()):
+        if action not in capability.get("actions", set()):
             raise HTTPException(
                 status_code=403,
                 detail="provider action was not authorized",
@@ -76348,7 +76400,7 @@ async def _start_turn_admission_locked(
             req.purpose,
             req.prompt,
         )
-        provider_actions = {"publish"}
+        provider_actions = {"publish", "agent_chats"}
         if provider_turn_may_raise_emergency(req.purpose):
             provider_actions.update({"emergency", "notify"})
         if req.purpose == "cross_chat_handoff_delivery":
@@ -81431,6 +81483,7 @@ def is_team_hub_server_session_route_allowed(method: str, path: str) -> bool:
     )
 
 AGENT_HELPER_ROUTE_RULES: tuple[tuple[str, re.Pattern[str], int], ...] = (
+    ("POST", re.compile(r"^/api/agent/chats$"), 16 * 1024),
     ("POST", re.compile(r"^/api/agent/cross-chat/handoffs$"), 2 * 1024 * 1024),
     ("GET", re.compile(r"^/api/agent/cross-chat/routes$"), 0),
     ("GET", re.compile(r"^/api/agent/cross-chat/inbox$"), 0),
@@ -95392,6 +95445,139 @@ async def get_chat_mailbox(session_id: str, cursor: str = "", limit: int = 25) -
         "senders": [{**row, "source_title": sanitized_provider_route_label(
             (STORE.sessions.get(str(row["source_session_id"])) or {}).get("title"))} for row in senders["senders"]],
     }
+
+
+def agent_chat_create_settings(
+    req: CreateAgentChatRequest, source: dict[str, Any],
+) -> tuple[CreateSessionRequest, dict[str, Any] | None]:
+    """Inherit configuration only, never native identity, history or grants."""
+    backend = (req.backend or source.get("backend") or DEFAULT_BACKEND).lower()
+    same_backend = backend == source.get("backend")
+    connection_key = "codex_provider" if backend == BACKEND_CODEX else "provider_connection"
+    connection = req.provider_connection or (
+        source.get(connection_key) if same_backend else None
+    ) or "default"
+    inherit_runtime = same_backend and connection == (source.get(connection_key) or "default")
+    settings = {name: source.get(name) for name in (
+        "auto_title_enabled", "system_prompt", "provider_jobs_access",
+    )}
+    if same_backend:
+        settings.update({name: source.get(name) for name in (
+            "subagent_limit", "claude_permission_mode", "cursor_permission_mode",
+            "opencode_permission_mode", "gemini_permission_mode", "codex_approval_policy",
+            "codex_sandbox_mode", "codex_permission_profile", "codex_approvals_reviewer",
+        )})
+    settings.update({
+        "title": req.title, "folder": req.folder if req.folder is not None else source.get("folder"),
+        "cwd": req.cwd or source.get("cwd"), "backend": backend,
+        "model": req.model if req.model is not None else source.get("model") if inherit_runtime else None,
+        "effort": req.effort if req.effort is not None else source.get("effort") if inherit_runtime else None,
+        "codex_provider": connection if backend == BACKEND_CODEX else "default",
+        "provider_connection": connection if backend != BACKEND_CODEX else "default",
+    })
+    return CreateSessionRequest(**settings), source if inherit_runtime else None
+
+
+async def create_provider_chat_locked(
+    req: CreateAgentChatRequest, request: Request, source_session_id: str,
+    capability: dict[str, Any],
+) -> dict[str, Any]:
+    """Finish one idempotent creation while the creator's lifecycle is held."""
+    source = STORE.sessions[source_session_id]
+    run_id = str(capability["source_run_id"])
+    request_hash = hashlib.sha256(json.dumps(
+        req.model_dump(exclude={"idempotency_key"}, exclude_none=True),
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    session = next((session for session in STORE.sessions.values()
+                    if isinstance(session.get("_agent_chat_creation"), dict)
+                    and session["_agent_chat_creation"].get("source_session_id") == source_session_id
+                    and session["_agent_chat_creation"].get("idempotency_key") == req.idempotency_key), None)
+    duplicate = session is not None
+    if session is not None and session["_agent_chat_creation"].get("request_hash") != request_hash:
+        raise HTTPException(409, "idempotency key was already used for different chat settings")
+    if session is None:
+        settings, runtime_defaults = agent_chat_create_settings(req, source)
+        session = await STORE.create(settings, runtime_defaults=runtime_defaults, agent_creation={
+            "source_session_id": source_session_id, "source_run_id": run_id,
+            "idempotency_key": req.idempotency_key, "request_hash": request_hash,
+            "admission_id": "grant_admission_" + uuid.uuid4().hex,
+        })
+    target_session_id = str(session["id"])
+    creation = session["_agent_chat_creation"]
+    admission_id = str(creation["admission_id"])
+    # A crash after the acceptance event but before the final registry save
+    # must not recreate a subsequently revoked pair on retry.
+    accepted = duplicate and (creation.get("accepted") is True or any(
+        event.get("type") == "agent_chat_created"
+        and event.get("provider_cross_chat_grant_admission_id") == admission_id
+        for event in reversed_jsonl_events(events_path(source_session_id))
+    ))
+    mutation = None
+    if not accepted:
+        try:
+            mutation = await persist_provider_cross_chat_pair_grants(
+                source_session_id, [target_session_id], admission_id=admission_id,
+                event_type="agent_chat_created",
+            )
+            await append_durable_event(source_session_id, "agent_chat_created", {
+                "created_session_id": target_session_id,
+                "provider_cross_chat_grant_admission_id": admission_id,
+                "provider_cross_chat_route_snapshot": mutation["routes"],
+            })
+        except BaseException:
+            await rollback_durable_provider_cross_chat_reference_grants(source_session_id, mutation)
+            # Session creation is already visible to the app. Preserve any
+            # work started there; the same request key repairs its pair.
+            raise
+        creation["accepted"] = True
+        await commit_durable_provider_cross_chat_reference_grants(source_session_id, mutation)
+    route = next((live for candidate in provider_cross_chat_routes(source)
+                  if candidate.get("target_session_id") == target_session_id
+                  and (live := live_provider_cross_chat_route(source_session_id, candidate)) is not None), None)
+    if route is None:
+        raise HTTPException(409, "created chat's mailbox route is no longer available")
+    # Extend only the caller's exact active capability. Existing grants and
+    # the server-attested source instruction retain their original provenance.
+    await authorize_provider_action(request, action="agent_chats", session_id=source_session_id)
+    token_hash = hashlib.sha256(provider_capability_header(request).encode("utf-8")).hexdigest()
+    async with CROSS_CHAT_CAPABILITY_LOCK:
+        current = CROSS_CHAT_CAPABILITIES.get(token_hash)
+        if current is None or current.get("source_run_id") != run_id:
+            raise HTTPException(403, "provider capability is no longer attached to a live turn")
+        actions = set(current.get("actions") or set()) | {"agent_cross_chat_routes"}
+        current.setdefault("provider_route_grants", {})[route["route_id"]] = dict(route)
+        current.update({
+            "actions": actions, "async_route_v1": True,
+            "provider_runtime_env": validate_provider_runtime_env({
+                **(current.get("provider_runtime_env") or {}),
+                "AGENTSDOCK_PROVIDER_AUTHORITY_ACTIONS": ",".join(sorted(actions)),
+                "AGENTSDOCK_CROSS_CHAT_MODE": "async_route_v1",
+            }),
+        })
+    return {
+        "ok": True, "created": not duplicate, "duplicate": duplicate,
+        "session": {key: session.get(key) for key in (
+            "id", "title", "folder", "cwd", "backend", "model", "effort", "codex_provider", "provider_connection",
+        )},
+        "route": {**provider_cross_chat_route_projection(source_session_id, route), "mode": "async_route_v1"},
+    }
+
+
+@app.post("/api/agent/chats")
+async def create_provider_chat(req: CreateAgentChatRequest, request: Request) -> dict[str, Any]:
+    source_session_id = await provider_route_capability_source(request, action="agent_chats")
+    async with session_lifecycle_lock(source_session_id):
+        capability = await authorize_provider_action(request, action="agent_chats", session_id=source_session_id)
+        reject_unavailable_route_target(source_session_id, source_session_id)
+        task = asyncio.create_task(create_provider_chat_locked(req, request, source_session_id, capability))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # A disconnected helper may retry. Finish persistence before
+            # releasing the lifecycle lock, so that retry returns one chat.
+            await join_task_despite_caller_cancellation(task)
+            raise
 
 
 @app.get("/api/agent/cross-chat/inbox")

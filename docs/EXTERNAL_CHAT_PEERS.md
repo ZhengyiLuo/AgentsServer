@@ -98,6 +98,23 @@ Incoming mail uses ordinary coalesced idle mailbox admission. Busy work is not
 interrupted, Stop fences remain effective, and paused goals are not resumed.
 Replies remain in the external mailbox and never start an external agent.
 
+## Scheduled delivery
+
+A native chat with Jobs access can select its issued external-peer route with
+`jobs create --chat-route ROUTE_ID=instruction`. The prompt must contain the
+exact visible single-`@` peer name. Creating the job does not send a message.
+
+The saved reference binds the owning chat, peer, policy revision, both route
+IDs, pair ID and instruction-only action. These bindings are revalidated on
+creation, update, dispatch and provider admission. A scheduled turn receives
+only its explicitly saved routes; it does not inherit unrelated ambient pairs.
+Revocation or replacement requires explicit job repair and cannot silently
+retarget a report. Ordinary user-turn references cannot manufacture these
+scheduled grants. Secure-peer scheduled references remain unsupported.
+
+Scheduled native delivery only writes the external mailbox. The external
+assistant must still retrieve replies; this does not push or wake Duet.
+
 ## Verification
 
 Run `PYTHONPATH=server:server/tests python3 -m unittest

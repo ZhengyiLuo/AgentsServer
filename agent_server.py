@@ -6617,7 +6617,7 @@ class ChatReference(BaseModel):
     # may be read or run from an already accepted queue snapshot, but can never
     # silently become durable policy.
     grant_intent: Literal[True] | None = None
-    target_kind: Literal["secure_peer"] | None = None
+    target_kind: Literal["secure_peer", "external_peer"] | None = None
     target_server_identity: str | None = Field(default=None, min_length=8, max_length=240)
     target_connection_id: str | None = None
     target_route_id: str | None = None
@@ -6625,6 +6625,10 @@ class ChatReference(BaseModel):
         default=None,
         pattern=r"^rev_[0-9a-f]{32}$",
     )
+    # External scheduled grants pin the complete owner-provisioned pair. They
+    # are never ordinary user-turn route hints or a way to provision a peer.
+    target_pair_id: str | None = Field(default=None, pattern=r"^pair_[0-9a-f]{32}$")
+    target_paired_route_id: str | None = Field(default=None, pattern=r"^route_[0-9a-f]{32}$")
 
     @field_validator("display_title_snapshot")
     @classmethod
@@ -6635,6 +6639,24 @@ class ChatReference(BaseModel):
 
     @model_validator(mode="after")
     def validate_target_discriminator(self) -> "ChatReference":
+        external_fields = (self.target_pair_id, self.target_paired_route_id)
+        if self.target_kind == "external_peer":
+            if (
+                self.action != "route"
+                or self.route_action != "instruction"
+                or self.grant_intent is not None
+                or self.target_server_identity is not None
+                or self.target_connection_id is not None
+                or self.target_route_revision is None
+                or any(value is None for value in external_fields)
+                or re.fullmatch(r"extpeer_[0-9a-f]{32}", self.session_id) is None
+                or re.fullmatch(r"route_[0-9a-f]{32}", self.target_route_id or "") is None
+                or self.target_route_id == self.target_paired_route_id
+            ):
+                raise ValueError("external peer references require an exact instruction-only scheduled pair")
+            return self
+        if any(value is not None for value in external_fields):
+            raise ValueError("external pair fields require target_kind=external_peer")
         secure_fields = (
             self.target_server_identity,
             self.target_connection_id,
@@ -19006,6 +19028,8 @@ def validate_chat_references(
     prompt: str,
     references: list[ChatReference],
     client_capabilities: list[str] | tuple[str, ...] | None = None,
+    *,
+    allow_scheduled_external_peers: bool = False,
 ) -> list[ChatReference]:
     if not references:
         return []
@@ -19103,6 +19127,21 @@ def validate_chat_references(
                 status_code=400,
                 detail="chat reference marker is not delimited from surrounding text",
             )
+        if reference.target_kind == "external_peer":
+            if not allow_scheduled_external_peers:
+                raise HTTPException(
+                    status_code=400,
+                    detail="external peer references are restricted to scheduled jobs",
+                )
+            if live_scheduled_external_peer_route(source_session_id, reference) is None:
+                raise HTTPException(status_code=409, detail="saved external peer route is unavailable")
+            key = ("external_peer", reference.session_id, str(reference.route_action))
+            if key in seen:
+                raise HTTPException(status_code=400, detail="duplicate external peer job reference")
+            seen.add(key)
+            ranges.append((reference.source_text_start, reference.source_text_end))
+            normalized_references.append(reference)
+            continue
         if reference.target_kind == "secure_peer":
             if not SECURE_PEER_AGENT_RELAY_ENABLED:
                 raise HTTPException(
@@ -19336,12 +19375,14 @@ def validate_scheduled_job_chat_references(
     *,
     redact_target_detail: bool = False,
 ) -> list[ChatReference]:
-    """Normalize one job's durable, same-server cross-chat grants.
+    """Normalize one job's durable local and exact external mailbox grants.
 
     Jobs persist the structured mention spans rather than a provider route
     snapshot.  Reusing the ordinary reference validator both at mutation time
     and immediately before every run keeps the grant bound to the exact prompt,
-    source chat, target chat, and action.  Secure-peer snapshots are deliberately
+    source chat, target chat, and action. External mailbox grants additionally
+    pin their owner-provisioned policy revision and complete pair identity.
+    Secure-peer snapshots are deliberately
     excluded: their revisions are short-lived routing state and must never turn
     into unattended durable authority.
     """
@@ -19366,10 +19407,10 @@ def validate_scheduled_job_chat_references(
             status_code=400,
             detail="scheduled job chat reference is invalid",
         ) from exc
-    if any(reference.target_kind is not None for reference in normalized):
+    if any(reference.target_kind == "secure_peer" for reference in normalized):
         raise ScheduledJobChatReferenceRepairRequired(
             status_code=400,
-            detail="scheduled jobs support same-server chat references only",
+            detail="scheduled jobs do not support secure peer chat references",
         )
     if source_session_id not in STORE.sessions:
         raise ScheduledJobChatReferenceRepairRequired(
@@ -19382,6 +19423,7 @@ def validate_scheduled_job_chat_references(
             prompt,
             normalized,
             [CROSS_CHAT_HANDOFFS_V2_CLIENT_CAPABILITY],
+            allow_scheduled_external_peers=True,
         )
     except HTTPException as exc:
         # Authentication/service availability can recover without changing
@@ -19476,7 +19518,23 @@ def provider_job_chat_references(
                 detail="scheduled job chat action was not granted to this live turn",
             )
         target_session_id = str(live.get("target_session_id") or "")
-        target = STORE.sessions.get(target_session_id)
+        external_binding: dict[str, Any] = {}
+        if live.get("target_kind") == "external_peer":
+            peer = external_chat_peers.principal(EXTERNAL_CHAT_PEERS_CONFIG, target_session_id)
+            target = (
+                {"title": peer["display_name"]}
+                if peer and peer["target_session_id"] == source_session_id
+                else None
+            )
+            external_binding = {
+                "target_kind": "external_peer",
+                "target_route_id": live["route_id"],
+                "target_route_revision": live["revision"],
+                "target_pair_id": live["pair_id"],
+                "target_paired_route_id": live["paired_route_id"],
+            }
+        else:
+            target = STORE.sessions.get(target_session_id)
         if not target:
             raise HTTPException(
                 status_code=409,
@@ -19525,6 +19583,7 @@ def provider_job_chat_references(
             source_text_end=selected_range[1],
             action="route",
             route_action=selection.action,
+            **external_binding,
         ))
     return validate_scheduled_job_chat_references(
         source_session_id,
@@ -19797,6 +19856,33 @@ def live_provider_cross_chat_route(
     if not allowed_actions:
         return None
     return {**current, "actions": allowed_actions}
+
+
+def live_scheduled_external_peer_route(
+    source_session_id: str,
+    reference: ChatReference,
+) -> dict[str, Any] | None:
+    """Resolve a saved job's exact external pair without widening or regranting."""
+
+    if (reference.target_kind != "external_peer"
+            or reference.action != "route"
+            or reference.route_action != "instruction"
+            or reference.grant_intent is not None):
+        return None
+    peer = external_chat_peers.principal(EXTERNAL_CHAT_PEERS_CONFIG, reference.session_id)
+    if peer is None or peer["target_session_id"] != source_session_id:
+        return None
+    current = external_chat_peers.route(peer)
+    if any(current[key] != expected for key, expected in (
+        ("route_id", reference.target_route_id),
+        ("revision", reference.target_route_revision),
+        ("pair_id", reference.target_pair_id),
+        ("paired_route_id", reference.target_paired_route_id),
+    )):
+        return None
+    # Re-read at the ordinary live resolver: source archive/deletion, exact
+    # route revocation, and any concurrent registry replacement still deny it.
+    return live_provider_cross_chat_route(source_session_id, current)
 
 
 def live_provider_chat_mailbox_route(
@@ -20095,6 +20181,15 @@ def provider_cross_chat_route_snapshot_for_authority(
                         for reference in references if reference.session_id in paired_routes)
     route_index = 0
     for reference in references:
+        if reference.target_kind == "external_peer":
+            external_route = live_scheduled_external_peer_route(source_session_id, reference)
+            if external_route is not None:
+                routes.append(external_route)
+                used_route_ids.add(str(external_route["route_id"]))
+                used_revisions.add(str(external_route["revision"]))
+                used_aliases.add(str(external_route["alias"]))
+            # No fallback to a new prompt-reference route if this pair changed.
+            continue
         if (
             reference.target_kind is not None
             or reference.action not in {"direct_message", "route"}

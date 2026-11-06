@@ -6,14 +6,17 @@ launches are deliberately off; provider ownership is a synthetic live run and
 its credential is issued by the real native capability issuer. No live helper
 authority, installed config, personal chat or provider credential is used.
 
-The scheduled-job check also uses the real SDK MCP server over MCP's in-memory
-protocol transport, then the real helper subprocess and loopback Jobs HTTP API.
-Only turn admission/model execution and SDK process ownership are synthetic;
+The scheduled checks also use the real SDK MCP server over MCP's in-memory
+protocol transport, its helper subprocess, and the loopback Jobs HTTP API.
+The external route check separately exercises actual locked admission and
+capability issuance, including revocation between dispatch and admission.
+Native runtime probes, model execution, and SDK process ownership are fixtures;
 this does not claim a live Claude model or host scheduler-lifespan acceptance.
 """
 from __future__ import annotations
 
 import asyncio
+from contextlib import ExitStack
 import hashlib
 import json
 import os
@@ -24,7 +27,7 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 
 class ExternalChatHTTPIntegrationTests(unittest.TestCase):
@@ -49,6 +52,325 @@ class ExternalChatHTTPIntegrationTests(unittest.TestCase):
             self.assertEqual(receipt["provider"], "native-issuer-with-synthetic-live-run")
             self.assertEqual(receipt["checks"], 21)
             self.assertEqual(receipt["scheduled_mcp"], "real-sdk-mcp-helper-http")
+            self.assertEqual(receipt["scheduled_external"], "provider-http-create-update-dispatch-mailbox")
+
+
+async def _scheduled_external_admission_check(s, root, peer, save_policy, job_id):
+    """Keep actual locked admission/issuance; stub only native runtime work."""
+    import external_chat_peers as peers
+
+    target = peer["target_session_id"]
+    entered, release = asyncio.Event(), asyncio.Event()
+    tasks, capabilities = {}, {}
+    race_policy_change = False
+
+    async def block_model(*args, **kwargs):
+        entered.set()
+        await release.wait()
+
+    async def admit(chat, req, **kwargs):
+        assert req.purpose == "scheduled_job"
+        assert kwargs["scheduled_job_chat_references"] is True
+        assert s.initial_provider_cross_chat_route_snapshot(chat, req, "chat") == []
+        if race_policy_change:
+            # JobStore has already accepted the old binding for dispatch.
+            # Locked admission must independently reject this changed policy.
+            peer["enabled"] = False
+            save_policy()
+        # Older saved jobs may lack the desktop mailbox capability flag;
+        # scheduled admission must still issue async_route_v1 authority.
+        req.client_capabilities = [flag for flag in req.client_capabilities
+                                   if flag != s.ASYNC_ROUTE_V1_CLIENT_CAPABILITY]
+        return await s._start_turn_locked(chat, req, **kwargs)
+
+    model = AsyncMock(side_effect=block_model)
+    runtime_patches = (
+        patch.object(s, "ACTIVE", {}),
+        patch.object(s, "BUSY_SESSIONS", set()),
+        patch.object(s, "CURRENT_TURNS", {}),
+        patch.object(s, "QUEUED_TURNS", {}),
+        patch.object(s, "SERVER_MAINTENANCE_SESSIONS", set()),
+        patch.object(s, "SESSION_TURN_TASKS", tasks),
+        patch.object(s, "RUN_METADATA", {}),
+        patch.object(s, "CROSS_CHAT_CAPABILITIES", capabilities),
+        patch.object(s, "AGENT_AMBIENT_LOCAL_HANDOFFS_ENABLED", True),
+        patch.object(s, "managed_server_update_admission_blocker", return_value=None),
+        patch.object(s, "managed_server_update_scheduled_job_blocker", return_value=None),
+        patch.object(s, "turn_start_blocker", AsyncMock(return_value=None)),
+        patch.object(s, "ensure_runtime_available", AsyncMock(return_value={})),
+        patch.object(s, "resolve_provider_command_selection", AsyncMock(return_value=None)),
+        patch.object(s, "build_turn_provider_prompt", return_value="Synthetic scheduled provider prompt"),
+        patch.object(s, "codex_manifest_path", return_value=root / "scheduled-admission-manifest.json"),
+        patch.object(s, "scrub_tmux_global_secret_environment", return_value=None),
+        patch.object(s, "reconcile_provider_task_exit", AsyncMock()),
+        patch.object(s, "run_claude", model),
+        patch.object(s, "start_turn", side_effect=admit),
+    )
+    with ExitStack() as stack:
+        for runtime_patch in runtime_patches:
+            stack.enter_context(runtime_patch)
+        result = await s.JOBS.run_job(job_id)
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        try:
+            assert result["queued"] is False
+            assert len(capabilities) == 1
+            capability = next(iter(capabilities.values()))
+            assert capability["source_run_id"] == result["run_id"]
+            assert capability["provider_route_grants"] == {peer["route_id"]: peers.route(peer)}
+            assert capability["async_route_v1"] is True
+            assert capability["reciprocal_mint_allowed"] is False
+            assert capability["provider_direct_grants"] == {} and capability["grants"] == set()
+            assert "agent_cross_chat_routes" in capability["actions"]
+            assert model.await_args.kwargs["interactive_agent_sdk"] is True
+            assert result["event"]["chat_references"][0]["target_pair_id"] == peer["pair_id"]
+            assert result["event"]["provider_cross_chat_route_snapshot"] == []
+        finally:
+            release.set()
+            await asyncio.gather(*list(tasks.get(target, set())))
+            await s.revoke_cross_chat_capability(result["run_id"])
+            s.BUSY_SESSIONS.discard(target)
+            s.CURRENT_TURNS.pop(target, None)
+
+        race_policy_change = True
+        try:
+            try:
+                await s.JOBS.run_job(job_id)
+            except s.ScheduledJobChatReferenceRepairRequired:
+                pass
+            else:
+                raise AssertionError("policy change between dispatch and admission launched provider")
+            assert model.await_count == 1 and capabilities == {}
+            assert not tasks.get(target)
+            assert (await s.JOBS.snapshot(job_id))["enabled"] is False
+        finally:
+            peer["enabled"] = True
+            save_policy()
+
+
+async def _scheduled_external_route_check(s, root, http):
+    """Exercise durable external job bindings without a live model or scheduler."""
+    import external_chat_peers as peers
+
+    target, other = "sess_external_job_synthetic", "sess_external_job_other"
+    secret = "synthetic-scheduled-secret-" + "c" * 40
+    peer = {
+        "peer_id": "extpeer_" + "6" * 32, "display_name": "Scheduled Duet",
+        "target_session_id": target, "credential_sha256": hashlib.sha256(secret.encode()).hexdigest(),
+        "revision": "rev_" + "7" * 32, "pair_id": "pair_" + "8" * 32,
+        "route_id": "route_" + "9" * 32, "inbound_route_id": "route_" + "a" * 32,
+        "enabled": True,
+        "policy": {"approval_id": "synthetic-scheduled-owner-approval", "approved_at": "2026-11-06T00:00:00Z",
+                   "delegated_by": "Synthetic owner", "source_user_instruction":
+                   "Synthetic fixture only: send scheduled synthetic updates to the paired external mailbox."},
+    }
+    unselected_peer = {
+        **peer, "peer_id": "extpeer_" + "f" * 32, "display_name": "Unselected external peer",
+        "credential_sha256": hashlib.sha256(b"synthetic-unselected-credential").hexdigest(),
+        "revision": "rev_" + "0" * 32, "pair_id": "pair_" + "1" * 32,
+        "route_id": "route_" + "2" * 32, "inbound_route_id": "route_" + "3" * 32,
+    }
+    config = root / "external-chat-peers.json"
+
+    def save_policy():
+        config.write_text(json.dumps({"version": 1, "peers": [peer, unselected_peer]}))
+        config.chmod(0o600)
+
+    save_policy()
+    for chat in (target, other):
+        s.ensure_dirs(chat)
+        s.STORE.sessions[chat] = {
+            "id": chat, "title": "Synthetic external scheduled owner", "backend": "claude",
+            "cwd": str(root), "created_at": s.now_iso(), "provider_jobs_access": "full",
+        }
+    await s.STORE.save()
+    active_runs = []
+
+    async def activate(chat, run, routes, *, ordinary=True):
+        previous = s.CURRENT_TURNS.get(chat, {}).get("run_id")
+        if previous:
+            await s.revoke_cross_chat_capability(previous)
+        s.CURRENT_TURNS[chat] = {"run_id": run}
+        s.ACTIVE[chat] = {"run_id": run, "backend": "claude", "stop_requested": False}
+        s.BUSY_SESSIONS.add(chat)
+        authority = await s.issue_cross_chat_capability(
+            chat, run, [], actions={"jobs", "agent_cross_chat_routes"},
+            provider_route_snapshot=routes, async_route_v1=True,
+            reciprocal_mint_allowed=ordinary,
+        )
+        active_runs.append(run)
+        return {"x-agentsdock-provider-capability": json.loads(authority.read_text())["provider_capability"]}
+
+    async def request(method, path, status, **kwargs):
+        response = await http.request(method, path, **kwargs)
+        assert response.status_code == status, (method, path, response.status_code, response.text[:500])
+        return response.json()
+
+    def assert_saved_binding(job):
+        refs = job["chat_references"]
+        assert len(refs) == 1
+        reference = refs[0]
+        for key, expected in {
+            "session_id": peer["peer_id"], "target_kind": "external_peer",
+            "action": "route", "route_action": "instruction",
+            "target_route_id": peer["route_id"], "target_route_revision": peer["revision"],
+            "target_pair_id": peer["pair_id"], "target_paired_route_id": peer["inbound_route_id"],
+        }.items():
+            assert reference[key] == expected, (key, reference.get(key))
+        assert reference.get("target_server_identity") is None
+        assert reference.get("target_connection_id") is None
+        start, end = reference["source_text_start"], reference["source_text_end"]
+        assert job["prompt"][start:end] == "@Scheduled Duet"
+        return refs
+
+    def assert_no_saved_route(chat, prompt, refs):
+        try:
+            s.validate_scheduled_job_chat_references(chat, prompt, refs)
+        except s.ScheduledJobChatReferenceRepairRequired:
+            pass
+        else:
+            raise AssertionError("stale or other-source external scheduled binding was accepted")
+        parsed = [s.ChatReference.model_validate(ref) for ref in refs]
+        assert s.provider_cross_chat_route_snapshot_for_authority(
+            [], parsed, source_session_id=chat, per_job_reference_routes=True,
+        ) == []
+
+    try:
+        headers = await activate(target, "run_external_job_create", [peers.route(peer)])
+        path = f"/api/agent/sessions/{target}/jobs"
+        fields = {
+            "title": "Synthetic external schedule", "prompt": "Send a synthetic update to @Scheduled Duet today.",
+            "schedule_kind": "interval", "interval_seconds": 3600, "loop": True,
+            "chat_routes": [{"route_id": peer["route_id"], "action": "instruction"}],
+        }
+        await request("POST", path, 403, headers=headers,
+                      json={**fields, "chat_routes": [{"route_id": peer["route_id"], "action": "request_reply"}]})
+        await request("POST", path, 409, headers=headers,
+                      json={**fields, "chat_routes": [{"route_id": unselected_peer["route_id"], "action": "instruction"}]})
+        # A missing exact mention must not consume the one-conversion grant.
+        await request("POST", path, 400, headers=headers, json={**fields, "prompt": "Missing mention"})
+        public = (await request("POST", path, 200, headers=headers, json=fields))["job"]
+        job_id = public["id"]
+        assert public["chat_target_count"] == 1 and public["chat_targets"][0]["display_title_snapshot"] == "Scheduled Duet"
+        rendered = json.dumps(public)
+        assert all(private not in rendered for private in (peer["peer_id"], peer["pair_id"], peer["revision"], peer["inbound_route_id"]))
+        assert "chat_references" not in public
+        refs = assert_saved_binding(await s.JOBS.snapshot(job_id))
+        # Saving the schedule never contacts the external peer.
+        mailbox = await request("GET", "/api/external-chat/replies", 200, headers={"Authorization": "Bearer " + secret})
+        assert mailbox["messages"] == []
+        # Provider-written internal reference fields cannot replace route selection.
+        await request("POST", path, 403, headers=headers,
+                      json={**fields, "chat_references": refs})
+        await request("POST", path, 403, headers=headers, json=fields)
+
+        headers = await activate(target, "run_external_job_update", [peers.route(peer)])
+        updated_prompt = "Send a revised synthetic update to @Scheduled Duet today."
+        await request("PATCH", f"{path}/{job_id}", 200, headers=headers,
+                      json={"prompt": updated_prompt, "chat_routes": fields["chat_routes"]})
+        job = await s.JOBS.snapshot(job_id)
+        refs = assert_saved_binding(job)
+        assert job["prompt"] == updated_prompt
+        parsed = [s.ChatReference.model_validate(ref) for ref in refs]
+        try:
+            s.validate_chat_references(target, updated_prompt, parsed, [s.CROSS_CHAT_HANDOFFS_V2_CLIENT_CAPABILITY])
+        except s.HTTPException:
+            pass
+        else:
+            raise AssertionError("ordinary turn admitted server-only external scheduled reference")
+        for secure_field in ("target_server_identity", "target_connection_id"):
+            try:
+                s.ChatReference.model_validate({**refs[0], secure_field: "forged-secure-field"})
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("external reference accepted secure-peer field")
+        for binding_field, prefix in (("target_pair_id", "pair_"), ("target_paired_route_id", "route_")):
+            assert_no_saved_route(target, updated_prompt, [{**refs[0], binding_field: prefix + "f" * 32}])
+
+        observed = []
+
+        async def admit(chat, req, **kwargs):
+            assert chat == target and req.purpose == "scheduled_job"
+            assert kwargs["scheduled_job_chat_references"] is True
+            assert kwargs["provider_context_mode"] == "chat"
+            assert s.initial_provider_cross_chat_route_snapshot(chat, req, "chat") == []
+            snapshot = s.provider_cross_chat_route_snapshot_for_authority(
+                [], req.chat_references, source_session_id=chat, per_job_reference_routes=True,
+            )
+            assert snapshot == [peers.route(peer)], snapshot
+            run_id = "run_external_job_dispatch_" + str(len(observed))
+            scheduled_headers = await activate(chat, run_id, snapshot, ordinary=False)
+            routes = await request("GET", "/api/agent/cross-chat/routes", 200, headers=scheduled_headers)
+            assert [route["route_id"] for route in routes["routes"]] == [peer["route_id"]]
+            handoff = await request(
+                "POST", f'/api/agent/cross-chat/routes/{peer["route_id"]}/handoffs', 200,
+                headers=scheduled_headers,
+                json={"mode": "async_route_v1", "action": "instruction", "body": "Synthetic scheduled update",
+                      "idempotency_key": "scheduled-native-update-" + str(len(observed))},
+            )
+            record = await s.CROSS_CHAT.get(handoff["message_id"])
+            assert record["source_session_id"] == target and record["target_session_id"] == peer["peer_id"]
+            # The scheduled grant can deliver, but cannot spawn another durable schedule.
+            await request("POST", path, 403, headers=scheduled_headers,
+                          json={**fields, "chat_routes": [{"route_id": peer["route_id"], "action": "instruction"}]})
+            observed.append(handoff["message_id"])
+            return {"run_id": run_id}
+
+        with patch.object(s, "start_turn", side_effect=admit):
+            await s.JOBS.run_job(job_id)
+        mailbox = await request("GET", "/api/external-chat/replies", 200, headers={"Authorization": "Bearer " + secret})
+        assert [message["message_id"] for message in mailbox["messages"]] == observed
+        assert mailbox["messages"][0]["text"] == "Synthetic scheduled update"
+
+        await _scheduled_external_admission_check(s, root, peer, save_policy, job_id)
+
+        # Exact peer identity alone is insufficient: another source owns no route.
+        assert_no_saved_route(other, updated_prompt, refs)
+        other_headers = await activate(other, "run_external_job_other", [peers.route(peer)])
+        await request("POST", f"/api/agent/sessions/{other}/jobs", 409, headers=other_headers, json=fields)
+
+        peer["enabled"] = False
+        save_policy()
+        assert_no_saved_route(target, updated_prompt, refs)
+        with patch.object(s, "start_turn", side_effect=AssertionError("revoked schedule admitted a turn")):
+            try:
+                await s.JOBS.run_job(job_id)
+            except s.ScheduledJobChatReferenceRepairRequired:
+                pass
+            else:
+                raise AssertionError("revoked schedule dispatched")
+        assert (await s.JOBS.snapshot(job_id))["enabled"] is False
+
+        # A regrant must not silently refresh an old job's binding.
+        peer.update({"enabled": True, "revision": "rev_" + "b" * 32,
+                     "pair_id": "pair_" + "c" * 32, "route_id": "route_" + "d" * 32,
+                     "inbound_route_id": "route_" + "e" * 32})
+        save_policy()
+        assert_no_saved_route(target, updated_prompt, refs)
+        with patch.object(s, "start_turn", side_effect=AssertionError("regrant silently refreshed old job")):
+            try:
+                await s.JOBS.run_job(job_id)
+            except s.ScheduledJobChatReferenceRepairRequired:
+                pass
+            else:
+                raise AssertionError("regranted old schedule dispatched")
+        headers = await activate(target, "run_external_job_repair", [peers.route(peer)])
+        await request("PATCH", f"{path}/{job_id}", 200, headers=headers,
+                      json={"enabled": True, "chat_routes": [{"route_id": peer["route_id"], "action": "instruction"}]})
+        assert_saved_binding(await s.JOBS.snapshot(job_id))
+        with patch.object(s, "start_turn", side_effect=admit):
+            await s.JOBS.run_job(job_id)
+        assert len(observed) == 2
+        mailbox = await request("GET", "/api/external-chat/replies", 200, headers={"Authorization": "Bearer " + secret})
+        assert [message["message_id"] for message in mailbox["messages"]] == [observed[-1]]
+        return "provider-http-create-update-dispatch-mailbox"
+    finally:
+        for run in active_runs:
+            await s.revoke_cross_chat_capability(run)
+        for chat in (target, other):
+            s.ACTIVE.pop(chat, None)
+            s.CURRENT_TURNS.pop(chat, None)
+            s.BUSY_SESSIONS.discard(chat)
 
 
 async def _scheduled_mcp_check(s, root):
@@ -277,7 +599,10 @@ async def _isolated_http_check():
             await request("POST", "/api/external-chat/messages", 401, headers=external_headers,
                           json={**payload, "idempotency_key": "revoked-message"})
         scheduled = await _scheduled_mcp_check(s, root)
+        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", trust_env=False, timeout=10) as http:
+            scheduled_external = await _scheduled_external_route_check(s, root, http)
         print(json.dumps({"http": "real-loopback-tcp", "checks": checks, "scheduled_mcp": scheduled,
+                          "scheduled_external": scheduled_external,
                           "provider": "native-issuer-with-synthetic-live-run", "state": "disposable"}))
     finally:
         server.should_exit = True

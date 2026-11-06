@@ -30392,6 +30392,24 @@ def client_safe_event(event: dict[str, Any]) -> dict[str, Any]:
             event,
             projection_session_id,
         )
+    if (str(event.get("type") or "").startswith("chat_conversation_message_")
+            and event.get("conversation_mode") == "async_route_v1"
+            and event.get("delivery_mode") == "mailbox"):
+        # Older external-mail events persisted the local-chat fallback title.
+        # Repair presentation at egress, without rewriting history or deriving
+        # sender identity from the message. A replacement pair cannot relabel
+        # mail belonging to a previous pairing or a different native chat.
+        for side, counterpart in (("source", "target"), ("target", "source")):
+            peer_id = str(event.get(side + "_session_id") or "")
+            if not peer_id.startswith("extpeer_"):
+                continue
+            peer = external_chat_peers.principal(EXTERNAL_CHAT_PEERS_CONFIG, peer_id)
+            if (peer and peer["target_session_id"] == projection_session_id
+                    and peer["target_session_id"] == event.get(counterpart + "_session_id")
+                    and peer["pair_id"] == event.get("conversation_id")):
+                title = sanitized_provider_route_label(peer["display_name"])
+                if event.get(side + "_title") != title:
+                    event = {**event, side + "_title": title}
     safe = event
     if (
         "provider_cross_chat_route_snapshot" in event
@@ -39698,10 +39716,12 @@ def async_route_conversation_fields(record: dict[str, Any]) -> dict[str, Any]:
         "source_session_id": source_id,
         "target_session_id": target_id,
         "source_title": sanitized_provider_route_label(
-            (STORE.sessions.get(source_id) or {}).get("title")
+            (external_chat_peers.principal(EXTERNAL_CHAT_PEERS_CONFIG, source_id) or {}).get("display_name")
+            if source_id.startswith("extpeer_") else (STORE.sessions.get(source_id) or {}).get("title")
         ),
         "target_title": sanitized_provider_route_label(
-            (STORE.sessions.get(target_id) or {}).get("title")
+            (external_chat_peers.principal(EXTERNAL_CHAT_PEERS_CONFIG, target_id) or {}).get("display_name")
+            if target_id.startswith("extpeer_") else (STORE.sessions.get(target_id) or {}).get("title")
         ),
         **({
             "delivery_mode": "mailbox",

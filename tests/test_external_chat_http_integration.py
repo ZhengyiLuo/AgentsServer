@@ -50,7 +50,7 @@ class ExternalChatHTTPIntegrationTests(unittest.TestCase):
             receipt = json.loads(completed.stdout.strip().splitlines()[-1])
             self.assertEqual(receipt["http"], "real-loopback-tcp")
             self.assertEqual(receipt["provider"], "native-issuer-with-synthetic-live-run")
-            self.assertEqual(receipt["checks"], 21)
+            self.assertEqual(receipt["checks"], 22)
             self.assertEqual(receipt["scheduled_mcp"], "real-sdk-mcp-helper-http")
             self.assertEqual(receipt["scheduled_external"], "provider-http-create-update-dispatch-mailbox")
 
@@ -558,6 +558,10 @@ async def _isolated_http_check():
             record = await s.CROSS_CHAT.get(first["message_id"])
             assert record["source_run_id"] == "" and record["source_session_id"] == peer["peer_id"]
             assert peer["peer_id"] not in s.STORE.sessions
+            received = next(event for event in s.read_events(target)
+                            if event.get("message_id") == first["message_id"])
+            assert received["source_title"] == "Synthetic Duet"
+            assert received["target_title"] == "Synthetic Zenith"
             read = (await request("POST", "/api/agent/cross-chat/inbox/read", 200, headers=native_headers,
                                   json={"source_session_id": peer["peer_id"], "request_id": "http-test-read-one"})).json()
             delegation = read["messages"][0]["user_delegation"]
@@ -570,6 +574,28 @@ async def _isolated_http_check():
             reply_one = (await request("POST", route_path, 200, headers=native_headers, json=reply)).json()
             await request("POST", route_path, 200, headers=native_headers,
                           json={**reply, "body": "Synthetic reply two", "idempotency_key": "http-reply-two"})
+            sent = next(event for event in s.read_events(target)
+                        if event.get("message_id") == reply_one["message_id"])
+            assert sent["source_title"] == "Synthetic Zenith" and sent["target_title"] == "Synthetic Duet"
+            # Represent a historical event written before external labels were
+            # supported, then read it through the desktop's real HTTP endpoint.
+            legacy = await s.append_durable_event(target, "chat_conversation_message_received", {
+                **s.cross_chat_lifecycle_fields(record, "stored"), "source_title": "Untitled chat",
+            })
+            peer["display_name"] = "Claude Duet"
+            save_policy()
+            persisted = s.events_path(target).read_bytes()
+            with patch.object(s, "schedule_provider_history_sync", return_value=None):
+                history = (await request("GET", f"/api/sessions/{target}", 200,
+                                         headers={"x-agentsdock-token": s.AGENT_TOKEN})).json()
+            projected = next(event for event in history["events"] if event["id"] == legacy["id"])
+            assert projected["source_title"] == "Claude Duet"
+            assert projected["source_session_id"] == peer["peer_id"]
+            assert projected["conversation_id"] == peer["pair_id"]
+            assert legacy["source_title"] == "Untitled chat"
+            assert s.events_path(target).read_bytes() == persisted
+            assert all(event["target_title"] == "Claude Duet" for event in history["events"]
+                       if event.get("target_session_id") == peer["peer_id"])
             page = (await request("GET", "/api/external-chat/replies?limit=1", 200, headers=external_headers)).json()
             assert page["has_more"] is True
             assert page["messages"][0]["message_id"] == reply_one["message_id"]

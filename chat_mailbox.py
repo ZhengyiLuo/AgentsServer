@@ -57,6 +57,9 @@ def _pairs(values: Iterable[str]) -> str:
 def initialize(connection: sqlite3.Connection) -> None:
     """Add mailbox tables without altering existing envelopes or their bodies."""
     statements = (
+        """CREATE TABLE IF NOT EXISTS external_chat_admissions (
+            message_id TEXT PRIMARY KEY REFERENCES cross_chat_envelopes(id) ON DELETE CASCADE,
+            admission_id TEXT NOT NULL UNIQUE, provenance_json TEXT NOT NULL)""",
         """CREATE TABLE IF NOT EXISTS chat_mailbox_reads (
             id TEXT PRIMARY KEY, target_session_id TEXT NOT NULL,
             source_session_id TEXT NOT NULL, reader_run_id TEXT NOT NULL,
@@ -103,7 +106,8 @@ _VALID = """m.excluded_at IS NULL AND e.status='stored' AND e.delivery_mode='mai
     AND e.source_session_id=m.source_session_id AND e.target_session_id=m.target_session_id
     AND e.authorization_pair_id=m.pair_id"""
 _COLUMNS = """m.*, e.body AS original_body, e.target_body, e.message_revision, e.created_at,
-    e.source_run_id, e.source_user_instruction, e.source_user_delegation_action"""
+    e.source_run_id, e.source_user_instruction, e.source_user_delegation_action,
+    (SELECT provenance_json FROM external_chat_admissions a WHERE a.message_id=e.id) AS external_provenance"""
 
 
 def _message(row: sqlite3.Row) -> dict:
@@ -133,6 +137,11 @@ def _message(row: sqlite3.Row) -> dict:
             "reference_action": row["source_user_delegation_action"],
             "source_user_instruction": row["source_user_instruction"],
         }
+    if ("external_provenance" in row.keys() and row["external_provenance"]
+            and row["message_revision"] == 0 and not row["source_run_id"]):
+        # Only external admission writes this separate immutable ledger record.
+        # The body, local-user markers and caller request fields cannot mint it.
+        message["user_delegation"] = json.loads(row["external_provenance"])
     return message
 
 

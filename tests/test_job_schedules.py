@@ -1031,6 +1031,63 @@ class JobStoreTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(current["run_count"], 0)
                     save.assert_not_awaited()
 
+    async def test_claude_chat_jobs_select_sdk_without_changing_standalone_or_routes(self) -> None:
+        for context_mode in ("chat", "standalone"):
+            for explicit_backend in (None, agent_server.BACKEND_CLAUDE):
+                with self.subTest(context_mode=context_mode, backend=explicit_backend):
+                    store = agent_server.JobStore()
+                    store.jobs["job_claude"] = {
+                        "id": "job_claude", "session_id": "source",
+                        "title": "Check in", "prompt": "Check in",
+                        "backend": explicit_backend, "context_mode": context_mode,
+                        "schedule_kind": "interval", "enabled": True, "run_count": 0,
+                    }
+                    session = {"id": "source", "backend": agent_server.BACKEND_CLAUDE}
+                    sdk, print_runner = AsyncMock(), AsyncMock()
+                    admitted = []
+
+                    async def launch(session_id, req, **kwargs):
+                        admitted.append((req, kwargs))
+                        # Exercise the scheduler request through the actual
+                        # transport selector, without a live model or schedule.
+                        await agent_server.run_claude(
+                            session_id, "run_job", req.prompt, session,
+                            Path("unused-manifest.json"),
+                            interactive_agent_sdk=(
+                                agent_server.CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY
+                                in req.client_capabilities
+                            ),
+                            standalone_provider_context=kwargs["provider_context_mode"] == "standalone",
+                        )
+                        return {"run_id": "run_job"}
+
+                    with (
+                        patch.object(agent_server.STORE, "sessions", {"source": session}),
+                        patch.object(agent_server, "CLAUDE_TRANSPORT", agent_server.CLAUDE_TRANSPORT_AGENT_SDK),
+                        patch.object(agent_server, "start_turn", side_effect=launch),
+                        patch.object(agent_server, "run_claude_sdk", sdk),
+                        patch.object(agent_server, "run_claude_print", print_runner),
+                        patch.object(agent_server, "evict_claude_sdk_chat", AsyncMock(return_value=True)),
+                        patch.object(store, "mark_ran", AsyncMock()),
+                        patch.object(store, "save", AsyncMock()),
+                        patch.object(agent_server, "append_event", AsyncMock()),
+                    ):
+                        await store.run_job("job_claude")
+                        req, kwargs = admitted[0]
+                        self.assertEqual(req.purpose, "scheduled_job")
+                        self.assertFalse(kwargs["queue_if_busy"])
+                        self.assertEqual(req.chat_references, [])
+                        self.assertEqual(
+                            agent_server.initial_provider_cross_chat_route_snapshot("source", req, context_mode), [],
+                        )
+                    if context_mode == "chat":
+                        sdk.assert_awaited_once()
+                        print_runner.assert_not_awaited()
+                    else:
+                        sdk.assert_not_awaited()
+                        print_runner.assert_awaited_once()
+                        self.assertNotIn(agent_server.CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY, req.client_capabilities)
+
     async def test_run_job_revalidates_and_forwards_exact_chat_references(
         self,
     ) -> None:

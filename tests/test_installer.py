@@ -1447,7 +1447,7 @@ exit 0
         self.assertIsNotNone(release_files_match)
         release_files = release_files_match.group(1).split()
         for filename in (
-            "activation_transaction.py agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py chat_mailbox.py agentsdock_emergency.py agentsdock_notify.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py provider_commands.py claude_sdk_client.py claude_background_reconciliation.py codex_app_server.py cursor_agent_client.py cursor_provider_mcp.py opencode_agent_client.py cursor_process_guard.py"
+            "activation_transaction.py agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py chat_mailbox.py external_chat_peers.py agentsdock_emergency.py agentsdock_notify.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py provider_commands.py claude_sdk_client.py claude_background_reconciliation.py codex_app_server.py cursor_agent_client.py cursor_provider_mcp.py opencode_agent_client.py cursor_process_guard.py"
         ).split():
             self.assertIn(filename, release_files)
         self.assertIn('"$STAGE_DIR/activation_transaction.py"', installer_source)

@@ -51,6 +51,7 @@ FILES = (
     "agentsdock_jobs.py",
     "agentsdock_chats.py",
     "chat_mailbox.py",
+    "external_chat_peers.py",
     "agentsdock_emergency.py",
     "agentsdock_notify.py",
     "agentsdock_publish.py",

@@ -29,6 +29,7 @@ NEW_MODULES = {
     "title_generation.py",
     "server_instances.py",
     "chat_mailbox.py",
+    "external_chat_peers.py",
     "claude_background_reconciliation.py",
     "claude_chat_routing.py",
     "claude_model_catalog.py",

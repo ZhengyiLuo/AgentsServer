@@ -27056,6 +27056,11 @@ def unsupported_coordinated_update_turns() -> list[str]:
         or session_id in STOP_REQUESTS or (ACTIVE.get(session_id) or {}).get("stop_requested")
         or (owner.get("purpose") is not None and not coordinated_update_goal(session_id))
         or owner.get("provider_context_mode", "chat") != "chat"
+        # Cursor only commits its native session after a successful terminal.
+        # Interrupting the first turn would otherwise resume in a new thread
+        # with only our generic continuation, losing the user's actual task.
+        or (owner.get("backend") == BACKEND_CURSOR
+            and not (STORE.sessions.get(session_id) or {}).get("cursor_session_id"))
         or owner.get("backend") not in {BACKEND_CODEX, BACKEND_CLAUDE, BACKEND_CURSOR}]
 
 

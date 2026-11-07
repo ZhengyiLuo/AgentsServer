@@ -42,6 +42,22 @@ class AbandonedTurnDetectionTests(unittest.TestCase):
         ):
             self.assertEqual(set(agent_server.unsupported_coordinated_update_turns()), {"chat-b", "chat-c"})
 
+    def test_first_cursor_turn_waits_until_native_session_is_durable(self) -> None:
+        owner = {"run_id": "run-cursor", "backend": "cursor", "purpose": None,
+                 "provider_context_mode": "chat"}
+        session = {"backend": "cursor", "cursor_session_id": None}
+        with patch.object(agent_server, "BUSY_SESSIONS", {"chat-cursor"}), patch.object(
+            agent_server, "CURRENT_TURNS", {"chat-cursor": owner},
+        ), patch.object(agent_server.STORE, "sessions", {"chat-cursor": session}), patch.object(
+            agent_server, "STOP_REQUESTS", set(),
+        ), patch.object(agent_server, "ACTIVE", {
+            "chat-cursor": {"run_id": "run-cursor", "provider_session_id": "native-cursor"},
+        }):
+            # A live init event alone is not a committed resumable thread.
+            self.assertEqual(agent_server.unsupported_coordinated_update_turns(), ["chat-cursor"])
+            session["cursor_session_id"] = "native-cursor"
+            self.assertEqual(agent_server.unsupported_coordinated_update_turns(), [])
+
     def test_detects_latest_unfinished_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "events.jsonl"

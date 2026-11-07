@@ -28895,6 +28895,32 @@ async def write_terminal_input(fd: int, data: bytes) -> None:
         view = view[written:]
 
 
+class TerminalOutputCredit:
+    """Opt-in output window, ACKed only after the terminal parses PTY bytes."""
+
+    def __init__(self, enabled: bool, window: int = 64 * 1024) -> None:
+        self.enabled = enabled
+        self.window = window
+        self.sent = 0
+        self.consumed = 0
+        self.ready = asyncio.Event()
+        self.ready.set()
+
+    async def wait(self) -> None:
+        while self.enabled and self.sent - self.consumed >= self.window:
+            self.ready.clear()
+            await self.ready.wait()
+
+    def record(self, size: int) -> None:
+        self.sent += size
+
+    def acknowledge(self, offset: object) -> None:
+        # Absolute byte offsets reject duplicate, stale and invented credit.
+        if self.enabled and type(offset) is int and self.consumed < offset <= self.sent:
+            self.consumed = offset
+            self.ready.set()
+
+
 async def read_terminal_output(fd: int) -> bytes:
     loop = asyncio.get_running_loop()
     ready: asyncio.Future[bytes] = loop.create_future()
@@ -29416,8 +29442,9 @@ def exit_terminal_auto_scroll(session_id: str) -> None:
     if shutil.which("tmux") is None:
         return
     name = terminal_session_name(session_id)
-    if tmux_session_exists(name):
-        run_tmux(["send-keys", "-X", "-t", name, "cancel"], check=False)
+    # send-keys already fails safely if the target has gone away. Avoid a
+    # separate has-session process in front of the first post-scroll keystroke.
+    run_tmux(["send-keys", "-X", "-t", name, "cancel"], check=False)
 
 
 def _kill_terminal_session_locked(session_id: str) -> dict[str, Any]:
@@ -100076,6 +100103,7 @@ async def session_terminal(
     columns: int = 120,
     rows: int = 36,
     cwd: str | None = None,
+    flow_control: str | None = None,
 ) -> None:
     selected_subprotocol = websocket_endpoint_subprotocol(
         ws,
@@ -100111,17 +100139,20 @@ async def session_terminal(
             cols,
             lines,
         )
+        credit = TerminalOutputCredit(flow_control == "ack-v1")
         await ws.send_json({
             "type": "ready",
             "session_id": session_id,
             "name": name,
             "columns": cols,
             "rows": lines,
+            **({"flow_control": "ack-v1"} if credit.enabled else {}),
         })
 
         async def pump_output() -> None:
             assert master_fd is not None
             while True:
+                await credit.wait()
                 try:
                     data = await read_terminal_output(master_fd)
                 except OSError as exc:
@@ -100130,6 +100161,7 @@ async def session_terminal(
                     raise
                 if not data:
                     return
+                credit.record(len(data))
                 await ws.send_bytes(data)
 
         async def receive_input() -> None:
@@ -100156,7 +100188,9 @@ async def session_terminal(
                         continue
                     if not isinstance(control, dict):
                         continue
-                    if control.get("type") == "resize":
+                    if control.get("type") == "output_ack":
+                        credit.acknowledge(control.get("offset"))
+                    elif control.get("type") == "resize":
                         # Control frames are untrusted and may come from a
                         # mixed-version or partially restored renderer. Match
                         # scroll handling: discard malformed geometry without

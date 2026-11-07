@@ -144,7 +144,7 @@ class InteractiveChatGlueTests(unittest.IsolatedAsyncioTestCase):
 
     def test_guest_metadata_survives_durable_queue_and_owner_admission(self):
         source = SOURCE.read_text()
-        for name in ("enqueue_turn", "_start_next_queued_turn_locked", "queued_turn_from_event", "_start_turn_locked"):
+        for name in ("enqueue_turn", "_start_next_queued_turn_locked", "queued_turn_from_event", "_start_turn_admission_locked"):
             fn = next(node for node in self.tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name)
             segment = ast.get_source_segment(source, fn)
             self.assertTrue("shared_chat_metadata" in segment or "shared_chat_request_id" in segment, name)

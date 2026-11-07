@@ -4,13 +4,17 @@ Side chat uses the provider's conversation context, not a projection of the
 desktop timeline. No main turn, queue item, goal mutation, or provider-history
 import is created by a side question.
 
-- Codex: `thread/fork` with `ephemeral: true`, reusing that fork for follow-ups.
+- Codex: `thread/fork`, reusing that fork for follow-ups. Synced Side chat saves
+  its native fork for resumption; the legacy request-scoped API uses an
+  ephemeral fork. Native full-history subagent forks require a saved rollout
+  and therefore work in synced Side chat, not the legacy ephemeral fork.
   Its dedicated app-server process uses the parent's workspace and selected
   permissions. Like native Codex Side chat, it can read/search files, run
   non-mutating checks and use configured tools. Inherited tasks and approvals
   are reference context; mutations require a new explicit request in Side chat.
-  Subagents remain unavailable. Native approval requests use the existing
-  approval UI and belong only to the ephemeral child. The main run's internal
+  Native subagents remain available. Approval requests use the existing UI
+  only for the side fork and descendants whose native lineage reaches it;
+  inherited parent agents remain outside that ownership. The main run's internal
   AgentsDock helper transport and credentials are not inherited. The source
   thread is never resumed, interrupted or modified.
 - Claude: native `side_question` control (the `/btw` operation) on the exact
@@ -35,8 +39,8 @@ even when the inherited conversation predates those files.
 `DELETE /api/sessions/{session}/side-chats/{side_chat}` closes the side chat.
 Both are native-operator-only and scoped to the authenticated owner and parent.
 Clear, profile shutdown and server shutdown release owned resources. Idle side
-contexts expire after thirty minutes without polling; stale follow-ups receive
-410 rather than silently starting with different context. Cancellation/error
+contexts remain available until explicitly closed or their owning runtime shuts
+down; elapsed idle time does not discard native context. Cancellation/error
 also closes the side conversation; the user can Clear to start again.
 
 Tests must cover real tool-result context, successive questions, cancellation

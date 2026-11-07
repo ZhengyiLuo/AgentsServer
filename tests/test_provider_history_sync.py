@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import agent_server
+from codex_history_repair import filter_native_codex_history_items
 
 
 def user(text: str) -> dict[str, str]:
@@ -631,6 +632,112 @@ class ProviderTranscriptSanitizerTests(unittest.TestCase):
         self.assertEqual(fresh, [])
 
 
+    def native_compact_rows(self):
+        # Transcript shape written by Claude Code 2.1.316 for a manual /compact.
+        provider = "40ac8a6c-7c68-423f-ad52-c8b1e0e1e333"
+        ids = {name: f"6f2edbf4-0cb5-468e-aadd-{index:012d}" for index, name in enumerate(
+            ("boundary", "summary", "caveat", "wrapper", "stdout", "other"))}
+        self.compact_ids = ids
+        def row(uuid, parent, content, **fields):
+            return {"type": "user", "uuid": uuid, "parentUuid": parent, "sessionId": provider,
+                    "promptId": "prompt-compact", "timestamp": "2026-11-02T14:10:37.000Z",
+                    "isSidechain": False, "message": {"role": "user", "content": content}, **fields}
+        return provider, [
+            {"type": "system", "subtype": "compact_boundary", "uuid": ids["boundary"], "parentUuid": None,
+             "sessionId": provider, "content": "Conversation compacted", "isMeta": False},
+            row(ids["summary"], ids["boundary"], "This session is being continued...", isCompactSummary=True),
+            row(ids["caveat"], ids["summary"], "<local-command-caveat>The command below was run directly "
+                "in Claude Code.</local-command-caveat>", isMeta=True),
+            row(ids["wrapper"], ids["caveat"], "<command-name>/compact</command-name>\n            "
+                "<command-message>compact</command-message>\n            <command-args></command-args>"),
+            row(ids["stdout"], ids["wrapper"], "<local-command-stdout>Compacted </local-command-stdout>"),
+        ]
+
+    def test_native_local_command_rows_project_as_command_and_output(self) -> None:
+        provider, rows = self.native_compact_rows()
+        items = agent_server.parse_claude_history_events(rows, None, expected_session_id=SANITIZER_CHAT_ID)
+        self.assertEqual([(item["kind"], item["text"]) for item in items],
+                         [("user", "/compact"), ("assistant", "Compacted")])
+        self.assertEqual(items[1]["provider_origin"]["event_id"], self.compact_ids["stdout"])
+        events = [
+            {"type": "turn_started", "prompt": "/compact"},
+            {"type": "assistant_text", "text": "Compacted", "backend": "claude",
+             "provider_message_id": self.compact_ids["stdout"], "provider_session_id": provider},
+        ]
+        with patch.object(agent_server, "history_timeline_message_keys",
+                          side_effect=fake_history_timeline_scan(events)):
+            fresh = agent_server.unsynced_history_items(SANITIZER_CHAT_ID, items, timeline_through_seq=2)
+        self.assertEqual(fresh, [])
+
+    def compact_transcript(self, rows):
+        path = Path(tempfile.mkdtemp()) / "transcript.jsonl"
+        offsets, data = [], b""
+        for row in rows:
+            data += json.dumps(row).encode() + b"\n"
+            offsets.append(len(data))
+        path.write_bytes(data)
+        return path, offsets
+
+    def parse_delta(self, path, start):
+        stat = os.stat(path)
+        expected = {field: int(getattr(stat, field)) for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns")}
+        items, _offset, _digest, _blocked = agent_server.parse_provider_history_delta(
+            path, agent_server.BACKEND_CLAUDE, start, stat.st_size, limit=None,
+            expected_stat=expected, previous_last_item_digest="",
+            expected_session_id=SANITIZER_CHAT_ID,
+        )
+        return [(item["kind"], item["text"]) for item in items]
+
+    def test_human_quote_after_command_output_stays_user_text(self) -> None:
+        provider, rows = self.native_compact_rows()
+        human = {**rows[4], "uuid": self.compact_ids["other"], "parentUuid": self.compact_ids["stdout"],
+                 "promptId": "prompt-human",
+                 "message": {"role": "user", "content": "<local-command-stdout>literal quote</local-command-stdout>"}}
+        rows.append(human)
+        full = agent_server.parse_claude_history_events(rows, None, expected_session_id=SANITIZER_CHAT_ID)
+        self.assertEqual([(item["kind"], item["text"]) for item in full][-1],
+                         ("user", "<local-command-stdout>literal quote</local-command-stdout>"))
+        path, offsets = self.compact_transcript(rows)
+        self.assertEqual(self.parse_delta(path, offsets[-2]),
+                         [("user", "<local-command-stdout>literal quote</local-command-stdout>")])
+
+    def test_chained_stdout_and_stderr_remain_command_output(self) -> None:
+        _provider, rows = self.native_compact_rows()
+        stderr = {**rows[4], "uuid": self.compact_ids["other"], "parentUuid": self.compact_ids["stdout"],
+                  "message": {"role": "user", "content": "<local-command-stderr>warning</local-command-stderr>"}}
+        repeat = {**stderr, "uuid": "6f2edbf4-0cb5-468e-aadd-000000000099", "parentUuid": self.compact_ids["other"]}
+        rows += [stderr, repeat]
+        items = agent_server.parse_claude_history_events(rows, None, expected_session_id=SANITIZER_CHAT_ID)
+        self.assertEqual([(item["kind"], item["text"]) for item in items],
+                         [("user", "/compact"), ("assistant", "Compacted"), ("assistant", "warning"),
+                          ("user", "<local-command-stderr>warning</local-command-stderr>")])
+
+    def test_incremental_seed_keeps_provenance_of_long_command(self) -> None:
+        _provider, rows = self.native_compact_rows()
+        args = "x" * 70_000
+        rows[3]["message"]["content"] = ("<command-name>/compact</command-name>\n<command-message>compact"
+                                         f"</command-message>\n<command-args>{args}</command-args>")
+        full = agent_server.parse_claude_history_events(rows, None, expected_session_id=SANITIZER_CHAT_ID)
+        self.assertEqual([(item["kind"], item["text"]) for item in full][-1], ("assistant", "Compacted"))
+        path, offsets = self.compact_transcript(rows)
+        # Cursor sits immediately after the >64 KiB wrapper record.
+        self.assertGreater(offsets[3] - offsets[2], 65_536)
+        self.assertEqual(self.parse_delta(path, offsets[3]), [("assistant", "Compacted")])
+        # Full and incremental processing agree for every cursor position.
+        expected = [(item["kind"], item["text"]) for item in full]
+        for index, start in enumerate([0, *offsets[:-1]]):
+            self.assertEqual(self.parse_delta(path, start)[-1], expected[-1], index)
+
+    def test_quoted_local_command_markup_stays_human_text(self) -> None:
+        _provider, rows = self.native_compact_rows()
+        quoted = [rows[3] | {"parentUuid": self.compact_ids["summary"]},
+                  rows[4] | {"parentUuid": self.compact_ids["other"]}]
+        items = agent_server.parse_claude_history_events(quoted, None, expected_session_id=SANITIZER_CHAT_ID)
+        self.assertEqual([item["kind"] for item in items], ["user", "user"])
+        self.assertIn("<command-name>/compact</command-name>", items[0]["text"])
+        self.assertIn("<local-command-stdout>", items[1]["text"])
+
+
 class UnsyncedHistoryItemsTests(unittest.TestCase):
     """Pure selection logic: what does the timeline not have yet?"""
 
@@ -929,6 +1036,55 @@ class UnsyncedHistoryItemsTests(unittest.TestCase):
         self.assertEqual(fresh, [user("external message")])
         self.assertEqual(consumed_seq, 7)
 
+    def test_goal_resume_control_boundary_does_not_duplicate_steered_history(self) -> None:
+        prompt = "@Target Keep the original work running"
+        events = [
+            {"seq": 1, "type": "turn_finished", "run_id": "run_previous"},
+            {"seq": 2, "type": "turn_started", "backend": "codex", "purpose": "codex_goal_resume",
+             "run_id": "run_goal", "message": "Resuming the persistent Codex goal."},
+            {"seq": 3, "type": "reasoning_summary", "phase": "commentary", "backend": "codex",
+             "run_id": "run_goal", "item_id": "msg_progress", "text": "Starting the work"},
+            {"seq": 4, "type": "turn_steered", "backend": "codex", "purpose": "codex_goal_resume",
+             "run_id": "run_goal", "provider_turn_id": "turn_goal", "queued_id": "queued_user",
+             "native_steer": True, "native_goal_steer": True, "provider_user_authored": True, "prompt": prompt},
+            {"seq": 5, "type": "assistant_text", "phase": "final_answer", "backend": "codex",
+             "run_id": "run_goal", "item_id": "msg_final", "provider_turn_id": "turn_goal", "text": "Done"},
+            {"seq": 6, "type": "turn_finished", "run_id": "run_goal"},
+        ]
+        native = [
+            {**assistant("Starting the work"), "provider_origin": {"provider": "codex", "kind": "assistant", "event_id": "msg_progress"}},
+            {**user(prompt), "provider_user_authored": True,
+             "provider_origin": {"provider": "codex", "kind": "user", "turn_id": "turn_goal"}},
+            {**assistant("Done"), "provider_origin": {"provider": "codex", "kind": "assistant", "event_id": "msg_final"}},
+        ]
+        # An equal-text later exchange is a distinct occurrence, not another
+        # copy to delete merely because it matches an earlier goal message.
+        external = [user(prompt), assistant("Done")]
+        with tempfile.TemporaryDirectory() as tempdir:
+            event_path = Path(tempdir) / "events.jsonl"
+            event_path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            with patch.object(agent_server, "events_path", return_value=event_path):
+                fresh, consumed = agent_server.reconcile_cursor_history_items(
+                    "chat-x", native + external, timeline_after_seq=1, timeline_through_seq=6)
+        self.assertEqual(fresh, external)
+        self.assertEqual(consumed, 6)
+
+    def test_goal_history_scanner_keeps_real_user_input_and_attachment_credits(self) -> None:
+        events = [
+            {"seq": 1, "type": "turn_started", "backend": "codex", "purpose": "codex_goal_resume",
+             "prompt": "A real request"},
+            {"seq": 2, "type": "turn_started", "backend": "codex", "purpose": "codex_goal_resume",
+             "prompt": "", "file_ids": ["image"]},
+            {"seq": 3, "type": "turn_started", "backend": "codex", "prompt": ""},
+        ]
+        with tempfile.TemporaryDirectory() as tempdir:
+            event_path = Path(tempdir) / "events.jsonl"
+            event_path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            with patch.object(agent_server, "events_path", return_value=event_path):
+                keys, _has_messages, _truncated = agent_server.history_timeline_message_keys(
+                    "chat-x", timeline_after_seq=0, timeline_through_seq=3, tail=False, include_imported=False)
+        self.assertEqual([seq for seq, _key in keys], [1, 2, 3])
+
     def test_cursor_ownership_credit_overflow_advances_across_front_windows(
         self,
     ) -> None:
@@ -1174,6 +1330,120 @@ class ClaudeHistoryMessageIdentityTests(unittest.TestCase):
         summary = agent_server.prune_duplicate_imported_history_sync("test-chat", dry_run=True)
         self.assertEqual(summary["removed_events"], 0)
         self.assertEqual(self.event_path.read_bytes(), before)
+
+
+    def wake_sequence(self, **overrides):
+        self.write([
+            {"type": "turn_finished", "run_id": "previous"},
+            {"type": "turn_started", "backend": "claude", "prompt": "",
+             "purpose": "provider_background_wake", "metadata_only": True,
+             "provider_generated": True, "file_ids": [], **overrides},
+            {"type": "provider_session", "backend": "claude", "provider_session_id": self.provider_id},
+            {"type": "assistant_text", "backend": "claude", "text": "Background finished",
+             "provider_message_id": self.message_id},
+            {"type": "turn_finished", "backend": "claude", "result_text": "Background finished"},
+            {"type": "turn_started", "run_id": "next", "backend": "claude", "prompt": "Next request"},
+            {"type": "provider_session", "run_id": "next", "backend": "claude", "provider_session_id": self.provider_id},
+            {"type": "assistant_text", "run_id": "next", "backend": "claude", "text": "Next reply",
+             "provider_message_id": self.later_id},
+            {"type": "turn_finished", "run_id": "next", "backend": "claude", "result_text": "Next reply"},
+        ])
+        return [self.source("Background finished"), user("Next request"), self.source("Next reply", self.later_id)]
+
+    def test_native_background_wake_is_not_an_empty_user_credit(self):
+        items = self.wake_sequence()
+        self.assertEqual(self.cursor(items), ([], len(self.events)))
+        self.assertEqual(self.initial(items), [])
+
+    def test_active_goal_between_owned_messages_is_preserved_once(self):
+        items = self.wake_sequence()
+        goal = user("/goal Finish the current task")
+        self.assertEqual(self.cursor([*items[:2], goal, items[2]]), ([goal], len(self.events)))
+
+    def test_genuine_external_repeat_after_wake_is_not_suppressed(self):
+        items = self.wake_sequence()
+        repeat = user("Next request")
+        self.assertEqual(self.cursor([*items, repeat]), ([repeat], len(self.events)))
+        self.assertEqual(self.initial([*items, repeat]), [repeat])
+
+    def test_partial_cursor_stops_at_owned_reply_then_consumes_next_request(self):
+        items = self.wake_sequence()
+        self.assertEqual(self.cursor(items[:1]), ([], 4))
+        self.assertEqual(self.cursor(items[1:], after=4), ([], len(self.events)))
+
+    def test_wake_label_alone_never_erases_user_credit(self):
+        for overrides in ({"metadata_only": False}, {"provider_generated": False},
+                          {"provider_user_authored": True}, {"imported": True},
+                          {"backend": "codex"}, {"file_ids": ["attachment"]},
+                          {"prompt": "Real user text"}):
+            with self.subTest(overrides=overrides):
+                self.wake_sequence(**overrides)
+                # Imported rows are already excluded from ordinary delta credits.
+                keys, _, _ = agent_server.history_timeline_message_keys(
+                    "test-chat", timeline_after_seq=1, timeline_through_seq=len(self.events),
+                    tail=False, include_imported=True,
+                )
+                self.assertEqual(keys[0][0], 2)
+
+
+class CodexGoalHistoryMatchingTests(unittest.TestCase):
+    provider = "11111111-2222-3333-4444-555555555555"
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory(prefix="codex-goal-history-")
+        self.addCleanup(folder.cleanup)
+        self.path = Path(folder.name) / "events.jsonl"
+        patcher = patch.object(agent_server, "events_path", return_value=self.path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        owner = {"run_id": "goal-run", "purpose": "codex_goal_resume"}
+        self.events = [
+            {"type": "turn_started", "backend": "codex", "thread_id": self.provider, **owner},
+            {"type": "assistant_text", "item_id": "item-1", "provider_turn_id": "turn-1", "text": "First answer.", **owner},
+            {"type": "reasoning_summary", "phase": "commentary", "item_id": "item-2",
+             "provider_turn_id": "turn-2", "text": "Second answer.", **owner},
+            {"type": "turn_finished", "backend": "codex", "status": "interrupted",
+             "result_text": "Second answer.", **owner},
+        ]
+        self.write()
+
+    def write(self):
+        self.path.write_text("".join(json.dumps({"seq": index, "id": f"native-{index}", **event}) + "\n"
+                                     for index, event in enumerate(self.events, 1)))
+
+    def source(self, number, *, distinct=False):
+        return {"kind": "assistant", "text": "First answer." if number == 1 else "Second answer.",
+                "provider_origin": {"provider": "codex", "kind": "assistant", "session_id": self.provider,
+                    "turn_id": f"turn-{number}", "event_id": f"{'external' if distinct else 'item'}-{number}",
+                    "timestamp": f"2026-10-01T10:0{number}:00Z"}}
+
+    def test_promptless_goal_and_public_output_use_exact_filter_in_all_sync_modes(self):
+        source = [self.source(1, distinct=True), self.source(1), self.source(2, distinct=True), self.source(2)]
+        expected = [source[0], source[2]]
+        for tail in (False, True):
+            keys, _has_messages, _truncated = agent_server.history_timeline_message_keys(
+                "chat", timeline_after_seq=0, timeline_through_seq=4, tail=tail, include_imported=True,
+            )
+            self.assertEqual(keys, [])
+        first_sync = agent_server.unsynced_history_items("chat", source, timeline_through_seq=4)
+        for bootstrap in (False, True):
+            fresh, consumed = agent_server.reconcile_cursor_history_items(
+                "chat", source, timeline_after_seq=0, timeline_through_seq=4, bootstrap=bootstrap,
+            )
+            self.assertEqual(consumed, 4)
+            self.assertEqual(fresh, source)
+            self.assertEqual(filter_native_codex_history_items("chat", self.provider, self.path, fresh), expected)
+        self.assertEqual(filter_native_codex_history_items("chat", self.provider, self.path, first_sync), expected)
+
+    def test_real_prompt_and_imported_goal_lookalike_keep_existing_credits(self):
+        self.events[0]["prompt"] = "A real human message"
+        self.events[1]["imported"] = True
+        self.write()
+        keys, _has_messages, _truncated = agent_server.history_timeline_message_keys(
+            "chat", timeline_after_seq=0, timeline_through_seq=4, tail=True, include_imported=True,
+        )
+        self.assertEqual(keys, [(1, agent_server.history_dedup_key("user", "A real human message")),
+                               (2, agent_server.history_dedup_key("assistant", "First answer."))])
 
 
 class SyncProviderHistoryTests(unittest.IsolatedAsyncioTestCase):

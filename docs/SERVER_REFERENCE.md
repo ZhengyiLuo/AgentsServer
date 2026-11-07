@@ -791,23 +791,45 @@ without losing chat state:
 | `AGENTSDOCK_BACKEND` | Default backend, `claude` or `codex` | `claude` |
 | `CLAUDE_BIN` | Claude Code executable name/path | `claude` |
 | `AGENTSDOCK_CLAUDE_TRANSPORT` | Interactive Claude transport: `auto`, `agent-sdk`, or `print` | `auto` |
-| `AGENTSDOCK_CLAUDE_SDK_IDLE_TTL_SECONDS` | Idle per-chat SDK client retention | `300` |
-| `AGENTSDOCK_CLAUDE_SDK_MAX_LOADED_CHATS` | Maximum retained per-chat SDK clients | `4` |
+| `AGENTSDOCK_CLAUDE_SDK_IDLE_TTL_SECONDS` | Optional idle SDK connection eviction; `0` retains until explicit cleanup | `0` |
+| `AGENTSDOCK_CLAUDE_SDK_MAX_LOADED_CHATS` | Optional retained SDK connection cap; `0` disables count eviction | `0` |
 | `CODEX_BIN` | Codex executable name/path | `codex` |
+| `AGENTSDOCK_CODEX_APP_SERVER_MAX_LOADED_THREADS` | Optional retained native thread cap; `0` disables count eviction | `0` |
 | `AGENTSDOCK_RUNTIME_CATALOG_TIMEOUT_SECONDS` | Per-command CLI version/help/model probe timeout | `6` |
 | `AGENTSDOCK_RUNTIME_DIAGNOSTIC_TTL_SECONDS` | Cache lifetime for safe CLI version/auth probes | `60` |
 | `CLAUDE_PROJECTS_ROOT` | Claude history search root | `~/.claude/projects` |
 | `CODEX_SESSIONS_ROOT` | Codex history search root | `~/.codex/sessions` |
 | `AGENTSDOCK_JOB_MAX_ACTIVE_RUNS` | Scheduled-job concurrency cap (`0` disables this dedicated cap) | `0` |
 | `AGENTSDOCK_MAX_ACTIVE_AGENT_RUNS` | Optional server-wide concurrency cap for chat, cron and goal runs (`0` means no count limit) | `0` |
-| `AGENTSDOCK_JOB_MIN_AVAILABLE_MEM_MB` | Job launch memory guardrail | `4096` |
-| `AGENTSDOCK_MIN_START_AVAILABLE_MEM_MB` | Interactive launch memory guardrail | `2048` |
+| `AGENTSDOCK_JOB_MIN_AVAILABLE_MEM_MB` | Optional job launch memory floor; `0` disables | `0` |
+| `AGENTSDOCK_MIN_START_AVAILABLE_MEM_MB` | Optional interactive launch memory floor; `0` disables | `0` |
 | `AGENTSDOCK_HANDOFF_DIGEST_BACKEND` | LLM backend for context digests, `claude` or `codex` | `claude` |
 | `AGENTSDOCK_HANDOFF_DIGEST_MODEL` | LLM model for context digests | `sonnet` |
 | `AGENTSDOCK_HANDOFF_DIGEST_EFFORT` | Optional digest reasoning/effort setting | unset |
 | `AGENTSDOCK_HANDOFF_DIGEST_TIMEOUT_SECONDS` | Digest summarizer timeout | `180` |
 | `AGENTSDOCK_HANDOFF_DIGEST_CHARS` | Final digest character cap | `56000` |
 | `AGENTSDOCK_CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS` | Maximum time for each isolated Git worktree snapshot | `120` |
+
+Provider execution deadlines are opt-in. Zero disables the execution deadline
+for `AGENTSDOCK_IDLE_KILL_SECONDS`,
+`AGENTSDOCK_CODEX_APP_SERVER_FIRST_ACTIVITY_TIMEOUT_SECONDS`,
+`AGENTSDOCK_CODEX_RESUME_ACTIVITY_TIMEOUT_SECONDS`,
+`AGENTSDOCK_CLAUDE_SDK_PRE_ACK_TIMEOUT_SECONDS`,
+`AGENTSDOCK_CLAUDE_SDK_POST_ACK_FIRST_ACTIVITY_TIMEOUT_SECONDS`,
+`AGENTSDOCK_CLAUDE_SDK_IDLE_TIMEOUT_SECONDS`, and
+`AGENTSDOCK_CLAUDE_SDK_TURN_TIMEOUT_SECONDS`. Cursor and OpenCode likewise accept
+zero for their `STARTUP_TIMEOUT_SECONDS`, `TURN_TIMEOUT_SECONDS` and
+`IDLE_TIMEOUT_SECONDS` settings. These default to zero; positive operator
+settings remain enforced. Informational idle warnings, explicit Stop, transport
+errors, connection establishment and control-request deadlines remain active.
+
+Claude connections and loaded Codex threads are retained by default so native
+background work and provider schedules are not ended by automatic eviction.
+This retains more processes and memory. Operators can opt into a positive
+retained-client/thread cap or Claude idle TTL; explicit closure and server
+shutdown still release owned connections. Native
+background work and timers follow the provider lifecycle; AgentsDock Jobs are
+available for schedules that must outlive a provider connection.
 
 Runtime catalog refreshes share a 25-second CLI/network-probe budget so they
 can finish before the desktop and mobile clients' 30-second request timeout.
@@ -1065,6 +1087,14 @@ bidirectional permission. Each later run receives fresh, live-run-bound
 credentials and discovers its permitted routes with `chats list` when needed.
 The permission persists without another mention; it does not extend to other
 chats, forks, or a recipient's other routes.
+
+Agents can also use `chats create --title "Worker" --folder "Research"` to
+create a normal independent chat and automatically establish the same
+bidirectional mailbox pair with its creator. The returned route is immediately
+usable by the current run; creation alone does not start a provider turn.
+This uses `POST /api/agent/chats` with a run-bound provider capability and a
+retry-safe idempotency key. See [agent-created chats](ASYNC_CHAT_ROUTES.md#agent-created-chats)
+for settings inheritance and helper usage.
 
 Clients negotiate `chat_conversation_async_route_v1` using the additive health
 capability. For paired routes advertising `mode: async_route_v1`, `send` and
@@ -1374,6 +1404,57 @@ Workspace-files capability v4 adds no-overwrite creation. Post
 `{path, kind: "directory"}` to create one directory. Creation is
 descriptor-relative, rejects symlinked parents and existing destinations, and
 is unavailable for archived chats.
+
+## Workspace intelligence
+
+The optional `workspace_intelligence` v1 capability provides project-aware
+completion, hover information, definitions, and diagnostics for Python and
+TypeScript/JavaScript in the desktop editor. Language servers run on the
+connected server machine, rooted in the chat's exact working directory.
+
+Install the language server on that machine before enabling intelligence:
+
+- Python uses `pyright-langserver --stdio`. Discovery prefers
+  `.venv/bin/pyright-langserver`, then `node_modules/.bin/pyright-langserver`,
+  then the server's executable search path. A project-local npm installation
+  can be prepared with `npm install --save-dev pyright`.
+- TypeScript/JavaScript uses `typescript-language-server --stdio`. Discovery
+  prefers `node_modules/.bin/typescript-language-server`, then the server's
+  executable search path. For a compatible project-local installation, use
+  `npm install --save-dev typescript-language-server typescript@6`.
+  The language server requires a TypeScript installation containing
+  `lib/tsserver.js`; TypeScript 7 alone does not provide it. Validation used
+  Pyright 1.1.414, typescript-language-server 6.0.2, and TypeScript 6.0.3.
+
+Installation is a separate user action. AgentsServer discovers existing
+executables and returns setup guidance when missing; it never installs these
+packages automatically. Checking availability does not start a process.
+
+```text
+GET /api/sessions/{session_id}/workspace/intelligence
+WS  /api/sessions/{session_id}/workspace/intelligence/{language}
+```
+
+The status result contains `root`, its server-generated `root_uri`, and a
+`languages` array with `id` (`python` or `typescript`), `available`, and optional
+`message`/`install_hint`. Availability indicates executable discovery; language
+server initialization can still report a missing or incompatible project
+dependency. HTTP requires exactly one native token header. WebSockets require
+`agentsdock-intelligence-v1` plus the existing canonical
+`agentsdock-token.<base64url>` subprotocol; browser-origin requests, cookies,
+alternate credentials, and query parameters are rejected.
+
+Each WebSocket exchanges individual JSON-RPC 2.0 objects and owns a separate
+stdio language-server process, so unsaved buffers from two editors cannot
+overwrite each other. The bridge forwards requests, responses, notifications,
+and cancellation messages in both directions. Initialization uses the actual
+chat workspace and no client-supplied executable or process identity. The only
+accepted initialization option is TypeScript's `tsserver.useSyntaxServer: "never"`,
+used by symbol search to wait for the semantic project instead of a partial
+syntax index. A changed workspace closes the old connection; closing the editor or shutting down the
+server reaps only its owned language-server process group. No agent turn or
+terminal process is started or stopped. Bridge failures can send
+`{type: "intelligence_error", message}` before closing the connection.
 
 ## Workspace Git
 

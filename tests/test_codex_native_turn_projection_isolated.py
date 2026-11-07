@@ -18,6 +18,9 @@ from unittest.mock import AsyncMock, Mock
 _SOURCE = (Path(__file__).resolve().parents[1] / "agent_server.py")
 _FUNCTIONS = {
     "consume_codex_native_turn",
+    "codex_shell_intents_pending",
+    "observe_codex_shell_notification",
+    "publish_codex_shell_completions",
     "concise_error_message",
     "is_codex_reconnect_notice",
     "is_codex_app_server_retry_notice",
@@ -121,6 +124,7 @@ class NativeTurnProjectionTests(unittest.IsolatedAsyncioTestCase):
             "finish_reasoning_summary_stream": AsyncMock(),
             "claim_codex_control_terminal_publication": AsyncMock(return_value=claimed),
             "stop_codex_goal_resume": AsyncMock(),
+            "revoke_cross_chat_capability": AsyncMock(),
             "finish_codex_control_terminal_publication": AsyncMock(),
             "release_codex_control_thread": AsyncMock(),
             "release_codex_interactive_control_lease": Mock(),
@@ -138,6 +142,7 @@ class NativeTurnProjectionTests(unittest.IsolatedAsyncioTestCase):
         self.namespace = namespace
         self.manager = manager
         self.subscription = subscription
+        self.goal = goal
         await namespace["consume_codex_native_turn"](
             "chat", "operation", "goal_resume" if goal else "review",
             manager, "thread", "reservation", subscription,
@@ -152,6 +157,10 @@ class NativeTurnProjectionTests(unittest.IsolatedAsyncioTestCase):
 
     def assert_clean_release(self, *, schedule_queue=True):
         self.assertEqual(self.subscription.closed, 1)
+        if self.goal:
+            self.namespace["revoke_cross_chat_capability"].assert_awaited_once_with("operation")
+        else:
+            self.namespace["revoke_cross_chat_capability"].assert_not_awaited()
         self.namespace["claim_codex_control_terminal_publication"].assert_awaited_once_with(
             "chat", "operation", "thread", "reservation",
         )
@@ -205,6 +214,7 @@ class NativeTurnProjectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("codex_internal_context", json.dumps(events))
         self.assertEqual(self.events("turn_started"), [])
         self.assertEqual([event["text"] for event in self.events("assistant_text")], ["Actual answer."])
+        self.assert_clean_release()
 
     async def test_reasoning_channels_are_distinct_and_encrypted_content_is_not_read(self):
         class ExposedReasoning(dict):
@@ -317,12 +327,29 @@ class NativeTurnProjectionTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertTrue(all(data["run_id"] == "operation" and
                             data["purpose"] == "codex_goal_resume" for data in rows))
+        self.assertTrue(all(data["backend"] == "codex" and data["provider_thread_id"] == "thread"
+                            for data in rows))
         self.assertEqual(self.events("assistant_text"), [])
         self.assertEqual(self.events("error"), [])
         self.assertEqual(self.events("turn_finished")[0]["status"], "completed")
         self.assertTrue(self.namespace["ACTIVE"]["chat"]["codex_goal_handoff_closed"])
         self.namespace["stop_codex_goal_resume"].assert_not_awaited()
         self.assert_clean_release()
+
+    async def test_goal_final_answers_keep_thread_and_item_provenance_after_interruption(self):
+        await self.run_projection([
+            started(), item("answer-1", "agentMessage", text="First final.", phase="final_answer"),
+            completed(), started("turn-2"),
+            item("answer-2", "agentMessage", turn="turn-2", text="Second final.", phase="final_answer"),
+            completed("turn-2", status="interrupted"),
+        ], goal=True)
+        rows = self.events("assistant_text")
+        self.assertEqual([(row["provider_turn_id"], row["item_id"], row["text"]) for row in rows], [
+            ("turn-1", "answer-1", "First final."), ("turn-2", "answer-2", "Second final."),
+        ])
+        self.assertTrue(all(row["backend"] == "codex" and row["provider_thread_id"] == "thread"
+                            for row in rows))
+        self.assertEqual(self.events("turn_finished")[0]["status"], "interrupted")
 
     async def test_new_goal_turn_resets_error_before_a_real_failed_terminal(self):
         await self.run_projection([

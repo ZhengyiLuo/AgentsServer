@@ -112,7 +112,11 @@ class GoalFollowupLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.manager.start_turn = AsyncMock(return_value=self.turn)
         self.manager.client = SimpleNamespace(unmatched_notifications=[])
         self.manager.retire_generation = AsyncMock()
-        self.authority = object()
+        self.authority = {
+            "source_session_id": "chat", "source_run_id": "operation",
+            "source_user_instruction": "Original goal request", "source_is_user_turn": True,
+            "user_delegation_grants": set(), "actions": {"publish", "agent_cross_chat_routes"},
+        }
         self.tasks = []
         self.requests = []
         self.before_wait = None
@@ -165,7 +169,7 @@ class GoalFollowupLifecycleTests(unittest.IsolatedAsyncioTestCase):
             "acquire_codex_run_thread": AsyncMock(return_value="thread"),
             "persist_run_provider_session": AsyncMock(return_value=True),
             "codex_provider_mcp_run_proof": Mock(return_value="synthetic-original-proof"),
-            "codex_provider_command_turn_input": lambda prompt, command: [{"type": "text", "text": prompt}],
+            "codex_provider_command_turn_input": lambda prompt, command: [{"type": "text", "text": prompt, "text_elements": []}],
             "watch_manifest_artifacts": watch, "append_event": append_event,
             "append_durable_event": append_event, "append_durable_event_batch": append_batch,
             "await_native_steer_result": observe_wait,

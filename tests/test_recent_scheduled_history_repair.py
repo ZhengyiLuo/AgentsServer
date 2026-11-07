@@ -27,8 +27,9 @@ class RecentScheduledRepairTests(unittest.TestCase):
         self.addCleanup(patch.stopall)
         patch.object(repair, "MAX_EVENTS_BYTES", 8192).start()
 
-    def fixture(self, *, human=False, extra_row=False, source_prefix=True):
+    def fixture(self, *, human=False, extra_row=False, source_prefix=True, padding=b""):
         prefix = encode([{"type": "progress", "data": "x" * 1000}] * 24) if source_prefix else b""
+        prefix += padding
         source_rows = [{
             "type": "user", "uuid": "scheduled-source", "sessionId": "provider-one",
             "timestamp": "2026-09-10T12:00:02Z", "text": self.full_text,
@@ -84,6 +85,104 @@ class RecentScheduledRepairTests(unittest.TestCase):
         return self.cache.prepare("chat-one", "provider-one", self.events, self.root,
                                   lambda row: row.get("text", "")[:48],
                                   normalize_full_user=full or (lambda row: row.get("text")))
+
+    def first_import(self, source_rows, checkpoint, *, candidate_fields=None):
+        raw = self.source.read_bytes()[:checkpoint["previous_source_offset"]] + encode(source_rows)
+        self.source.write_bytes(raw)
+        checkpoint["cursor"].update(source_offset=len(raw), source_digest=hashlib.sha256(raw).hexdigest())
+        native = [{"provider_session_id": "provider-one", **row} for row in self.rows
+                  if not str(row.get("run_id", "")).startswith("import_")]
+        self.events.write_bytes(encode(native))
+        items = [{"kind": "user", "text": row["prompt"], "provider_origin": row["provider_origin"],
+                  "source_text_sha256": hashlib.sha256(" ".join(source["text"].split()).encode()).hexdigest()}
+                 for row, source in zip(self.imported, source_rows)]
+        if candidate_fields:
+            items[0].update(candidate_fields)
+        before_events, before_source = self.events.read_bytes(), self.source.read_bytes()
+        filtered = repair.filter_native_claude_mailbox_wake_items(
+            "chat-one", "provider-one", self.events, items, source_path=self.source, root=self.root,
+            sync_checkpoint=checkpoint, normalize_user=lambda row: row.get("text", "")[:48],
+            normalize_full_user=lambda row: row.get("text"))
+        self.assertEqual(self.events.read_bytes(), before_events)
+        self.assertEqual(self.source.read_bytes(), before_source)
+        return items, filtered
+
+    def test_first_import_hides_exact_scheduled_input_and_keeps_same_prefix_human(self):
+        source_rows, checkpoint = self.fixture(human=True)
+        items, filtered = self.first_import(source_rows, checkpoint)
+        self.assertTrue(filtered[0].get("metadata_only"))
+        self.assertEqual(filtered[0]["text"], "")
+        self.assertEqual(filtered[0]["provider_history_repair"], "source_proven_import")
+        self.assertEqual(filtered[1], items[1])
+        self.assertTrue(all("metadata_only" not in item for item in items))
+
+    def test_first_import_keeps_unproven_or_explicitly_authored_scheduled_text(self):
+        for change in ("different_text", "human", "duplicate", "incomplete", "wrong_provider", "mixed_owner", "wrong_origin", "candidate_human"):
+            with self.subTest(change=change):
+                source_rows, checkpoint = self.fixture()
+                if change == "different_text":
+                    source_rows[0]["text"] = self.full_text[:-len("scheduled ending")] + "different ending"
+                elif change == "human":
+                    source_rows[0]["clientUserMessageId"] = "human-message"
+                elif change == "duplicate":
+                    source_rows.append(dict(source_rows[0], uuid="another-source"))
+                elif change == "incomplete":
+                    self.rows[25]["type"] = "raw_event"
+                elif change == "wrong_provider":
+                    source_rows[0]["sessionId"] = "provider-other"
+                elif change == "mixed_owner":
+                    self.rows[25]["provider_session_id"] = "provider-other"
+                elif change == "wrong_origin":
+                    self.imported[0]["provider_origin"]["event_id"] = "different-source"
+                items, filtered = self.first_import(source_rows, checkpoint,
+                    candidate_fields={"client_user_message_id": "human-message"} if change == "candidate_human" else None)
+                self.assertEqual(filtered, items)
+
+    def test_repeated_schedule_input_is_owned_per_occurrence(self):
+        source_rows, checkpoint = self.fixture(human=True)
+        source_rows[1].update(text=self.full_text, timestamp="2026-09-10T12:05:02Z")
+        self.imported[1]["provider_origin"]["timestamp"] = source_rows[1]["timestamp"]
+        self.rows[26:26] = [
+            {**self.rows[24], "seq": 27, "run_id": "scheduled-next", "ts": "2026-09-10T12:05:01Z"},
+            {**self.rows[25], "seq": 28, "run_id": "scheduled-next", "ts": "2026-09-10T12:05:03Z"},
+        ]
+        _items, filtered = self.first_import(source_rows, checkpoint)
+        self.assertTrue(all(item.get("metadata_only") for item in filtered))
+
+    def test_identical_human_input_after_scheduled_occurrence_stays_visible(self):
+        source_rows, checkpoint = self.fixture(human=True)
+        source_rows[1].update(text=self.full_text, timestamp="2026-09-10T12:05:02Z")
+        self.imported[1]["provider_origin"]["timestamp"] = source_rows[1]["timestamp"]
+        items, filtered = self.first_import(source_rows, checkpoint)
+        self.assertTrue(filtered[0].get("metadata_only"))
+        self.assertEqual(filtered[1], items[1])
+
+    def test_nul_padding_before_checkpoint_preserves_first_import_and_historical_proof(self):
+        source_rows, checkpoint = self.fixture(human=True, padding=b"\0" * 3377 + b"\n")
+        self.assertTrue(self.prepare())
+        self.assertTrue(self.cache.is_hidden("chat-one", self.imported[0]))
+        self.assertFalse(self.cache.is_hidden("chat-one", self.imported[1]))
+        window = self.prepare_window(self.events.stat().st_size)
+        self.assertTrue(window.is_hidden(self.imported[0]))
+        self.assertFalse(window.is_hidden(self.imported[1]))
+        # Exercise the full proof as well as the bounded historical window.
+        self.cache = repair.ClaudeMetadataRepairCache()
+        with patch.object(repair, "MAX_EVENTS_BYTES", 1024 * 1024):
+            self.assertTrue(self.prepare())
+            self.assertTrue(self.cache.is_hidden("chat-one", self.imported[0]))
+        items, filtered = self.first_import(source_rows, checkpoint)
+        self.assertTrue(filtered[0].get("metadata_only"))
+        self.assertEqual(filtered[1], items[1])
+
+    def test_mixed_nul_or_malformed_record_does_not_establish_proof(self):
+        for padding in (b"\0" * 3377 + b"{}\n", b"{broken}\n"):
+            with self.subTest(padding_size=len(padding)):
+                self.cache = repair.ClaudeMetadataRepairCache()
+                source_rows, checkpoint = self.fixture(padding=padding)
+                self.assertFalse(self.prepare())
+                self.assertFalse(self.cache.is_hidden("chat-one", self.imported[0]))
+                items, filtered = self.first_import(source_rows, checkpoint)
+                self.assertEqual(filtered, items)
 
     def test_recent_exact_occurrence_hides_duplicate_and_only_complete_batch_companions(self):
         self.fixture()
@@ -214,9 +313,9 @@ class RecentScheduledRepairTests(unittest.TestCase):
         signature = self.cache.signature("chat-one")
         reads = []
         original = repair._bounded_records
-        def records(path, stamp, start, stop):
+        def records(path, stamp, start, stop, **kwargs):
             reads.append((path, start, stop))
-            yield from original(path, stamp, start, stop)
+            yield from original(path, stamp, start, stop, **kwargs)
         with patch.object(repair, "_bounded_records", side_effect=records):
             window = self.prepare_window(end)
         self.assertEqual(len(reads), 2)

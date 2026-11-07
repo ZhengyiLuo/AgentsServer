@@ -45,7 +45,7 @@ def install_actual_route_guards(namespace):
         ):
             nodes.append(deepcopy(node))
     start = next(node for node in runtime.TREE.body if isinstance(node, ast.AsyncFunctionDef)
-                 and node.name == "_start_turn_locked")
+                 and node.name == "_start_turn_admission_locked")
     snapshot_blocks = [node for node in ast.walk(start) if isinstance(node, ast.If)
         and ast.unparse(node.test) == "mailbox_wake_claim is not None"
         and any(isinstance(child, ast.Assign) and any(isinstance(target, ast.Name)

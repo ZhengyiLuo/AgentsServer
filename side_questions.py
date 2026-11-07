@@ -27,10 +27,11 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 
-MAX_QUESTION_CHARS = 8000
 MAX_HISTORY_ITEMS = 32
 MAX_HISTORY_CHARS = 60000
 MAX_REQUEST_BYTES = 512 * 1024
+# The streamed body limit bounds input; avoid a second, smaller model-text cap.
+MAX_QUESTION_CHARS = MAX_REQUEST_BYTES
 MAX_CONTEXT_CHARS = 60000
 MAX_LOG_BYTES = 4 * 1024 * 1024
 MAX_OUTPUT_BYTES = 1024 * 1024
@@ -339,11 +340,6 @@ class _NativeConversation:
     closed: bool = False
     timer: object = None
     close_task: asyncio.Task | None = None
-
-
-NATIVE_IDLE_SECONDS = 30 * 60
-
-
 class SideQuestions:
     def __init__(self, answer=None, *, native_factory=None, storage_path=None, notify=None, admission_check=None):
         self.answer = answer
@@ -365,6 +361,43 @@ class SideQuestions:
     def active_work_labels(self):
         return [f"Side chat in {session_id}" for session_id in sorted(self.active_session_ids())]
 
+    def background_work_scopes(self):
+        handles = [(key[1], conversation.handle) for key, conversation in self.conversations.items()
+                   if not conversation.closed and conversation.handle is not None]
+        if self.synced is not None:
+            handles.extend((key[1], handle) for key, handle in self.synced.handles.items())
+        scopes = []
+        for session_id, handle in handles:
+            inspect = getattr(handle, "background_work_scope", None)
+            scope = inspect() if callable(inspect) else None
+            if scope is not None:
+                scopes.append((session_id, handle, scope))
+        return tuple(scopes)
+
+    async def prepare_background_work_snapshot(self, *, timeout_seconds=5.0):
+        scopes = self.background_work_scopes()
+
+        async def inspect(session_id, handle, _scope):
+            try:
+                active = await handle.has_background_work()
+            except Exception:
+                return f"Side chat provider state unknown in {session_id}"
+            return f"Side chat background work in {session_id}" if active else None
+
+        try:
+            values = await asyncio.wait_for(asyncio.gather(*(inspect(*scope) for scope in scopes)),
+                                            timeout=timeout_seconds)
+            labels = tuple(sorted(set(value for value in values if value)))
+        except asyncio.TimeoutError:
+            labels = tuple(f"Side chat provider state unknown in {session_id}" for session_id, _, _ in scopes)
+        return {"scopes": scopes, "labels": labels}
+
+    def background_work_labels_from_snapshot(self, snapshot):
+        scopes = self.background_work_scopes()
+        if snapshot.get("scopes", ()) != scopes:
+            return ["Side chat provider state changed during inspection"]
+        return list(snapshot.get("labels", ()))
+
     async def _close_conversation(self, conversation):
         conversation.closed = True
         if conversation.timer is not None:
@@ -384,7 +417,7 @@ class SideQuestions:
             await asyncio.shield(conversation.close_task)
 
     def _expire_conversation(self, key, conversation):
-        if self.conversations.get(key) is not conversation or conversation.busy:
+        if self.conversations.get(key) is not conversation or conversation.busy or not conversation.closed:
             return
         self.conversations.pop(key, None)
         task = asyncio.create_task(self._close_conversation(conversation), name="side-chat-expiry")
@@ -429,8 +462,9 @@ class SideQuestions:
             raise
         finally:
             conversation.busy = False
-            conversation.timer = asyncio.get_running_loop().call_later(
-                NATIVE_IDLE_SECONDS, self._expire_conversation, key, conversation)
+            if conversation.closed:
+                conversation.timer = asyncio.get_running_loop().call_later(
+                    RECEIPT_TTL_SECONDS, self._expire_conversation, key, conversation)
 
     async def close_conversation(self, owner, session_id, side_chat_id):
         key = (owner, session_id, side_chat_id)
@@ -441,7 +475,7 @@ class SideQuestions:
                 await self.cancel(*receipt_key)
         await self._close_conversation(conversation)
         conversation.timer = asyncio.get_running_loop().call_later(
-            NATIVE_IDLE_SECONDS, self._expire_conversation, key, conversation)
+            RECEIPT_TTL_SECONDS, self._expire_conversation, key, conversation)
 
     def _prune(self):
         now = time.monotonic()
@@ -797,8 +831,6 @@ class SyncedSideChats:
                     self.cleanup_tasks.discard(cleanup)
             if self.tasks.get(key) is asyncio.current_task():
                 self.tasks.pop(key, None)
-                if not self.stopping:
-                    self.timers[key] = asyncio.get_running_loop().call_later(NATIVE_IDLE_SECONDS, self._expire, key)
 
     async def _finish(self, key, side_chat_id, request_id, status, **result):
         async with self._lock(key):
@@ -958,7 +990,7 @@ def create_side_question_router(*, authorize, session_exists, runtime: SideQuest
         if not isinstance(request_id, str) or not IDENTIFIER.fullmatch(request_id):
             raise HTTPException(400, "Invalid side question request ID")
         if not isinstance(question, str) or not question.strip() or len(question) > MAX_QUESTION_CHARS:
-            raise HTTPException(400, "Question must contain 1 to 8000 characters")
+            raise HTTPException(400, f"Question must contain 1 to {MAX_QUESTION_CHARS} characters")
         try:
             question.encode("utf-8")
         except UnicodeEncodeError:
@@ -1056,7 +1088,7 @@ def create_side_question_router(*, authorize, session_exists, runtime: SideQuest
                 raise HTTPException(400, "Invalid side conversation ID")
         question = value["question"]
         if not isinstance(question, str) or not question.strip() or len(question) > MAX_QUESTION_CHARS:
-            raise HTTPException(400, "Question must contain 1 to 8000 characters")
+            raise HTTPException(400, f"Question must contain 1 to {MAX_QUESTION_CHARS} characters")
         try:
             question.encode("utf-8")
         except UnicodeEncodeError:

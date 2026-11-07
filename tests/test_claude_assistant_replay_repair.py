@@ -48,8 +48,9 @@ class AssistantReplayRepairTests(unittest.TestCase):
             {**common, "seq": 110, "run_id": "import_shared", "type": "turn_finished", "imported": True},
         ]
 
-    def prepare(self, *, oversized=False, normalize_assistant=None):
+    def prepare(self, *, oversized=False, normalize_assistant=None, padding=b""):
         prefix = encode([{"type": "progress", "data": "x" * 1000}] * 20) if oversized else b""
+        prefix += padding
         raw = prefix + encode(self.source_rows)
         self.source.write_bytes(raw)
         stamp = self.source.stat()
@@ -119,6 +120,41 @@ class AssistantReplayRepairTests(unittest.TestCase):
         self.assertIsNotNone(self.cache.project_event("chat-one", self.imported))
         self.assertIsNone(self.cache.project_event("chat-one", other_import))
 
+    def test_ordinary_sdk_final_after_nul_padding_repairs_and_prevents_only_exact_uuid_replay(self):
+        for oversized in (False, True):
+            with self.subTest(oversized=oversized):
+                self.setUp()
+                for row in self.rows[:4]:
+                    row.pop("purpose", None)
+                    row.pop("job_id", None)
+                self.native.update(type="assistant_text", provider_message_id="source-one")
+                self.native.pop("phase")
+                self.rows[3]["result_text"] = self.native["text"]
+                other = {**self.imported, "seq": 109,
+                         "provider_origin": {**self.imported["provider_origin"], "event_id": "source-two"}}
+                self.source_rows.append({**self.source_rows[0], "uuid": "source-two"})
+                self.rows[-2] = other
+                self.assertTrue(self.prepare(oversized=oversized, padding=b"\0" * 3377 + b"\n"))
+                before = (self.events.read_bytes(), self.source.read_bytes())
+                self.assertTrue(self.cache.project_event("chat-one", self.imported)["metadata_only"])
+                self.assertIsNone(self.cache.project_event("chat-one", other))
+                self.assertIsNone(self.cache.project_event("chat-one", self.native))
+                window = self.cache.prepare_window(
+                    "chat-one", "provider-one", self.events, self.root, lambda row: None,
+                    event_window_end=self.events.stat().st_size, normalize_full_user=lambda row: None)
+                self.assertTrue(window.project_event(self.imported)["metadata_only"])
+                self.assertIsNone(window.project_event(other))
+                items = [{"kind": "assistant", "text": row["text"], "provider_origin": row["provider_origin"]}
+                         for row in (self.imported, other)]
+                filtered = repair.filter_native_claude_mailbox_wake_items(
+                    "chat-one", "provider-one", self.events, items, sync_checkpoint=self.checkpoint,
+                    source_path=self.source, root=self.root, normalize_user=lambda row: None,
+                    normalize_full_user=lambda row: None)
+                self.assertTrue(filtered[0]["metadata_only"])
+                self.assertEqual(filtered[0]["provider_history_repair"], "source_proven_assistant_replay")
+                self.assertEqual(filtered[1], items[1])
+                self.assertEqual((self.events.read_bytes(), self.source.read_bytes()), before)
+
     def test_normalization_is_opt_in_nonempty_and_cannot_repair_modified_target(self):
         self.decorate()
         self.prepare()
@@ -130,6 +166,88 @@ class AssistantReplayRepairTests(unittest.TestCase):
         self.prepare(normalize_assistant=CLEAN_ASSISTANT_TEXT)
         self.assertIsNotNone(self.cache.project_event("chat-one", self.imported))
         self.assertIsNone(self.cache.project_event("chat-one", {**self.imported, "text": "🎉 Full public report ending."}))
+
+    def goal_interleaved_input(self):
+        for row in self.rows[:4]:
+            row.pop("purpose", None)
+            row.pop("job_id", None)
+        self.rows[0]["prompt"] = "Inspect the files"
+        self.native.update(type="assistant_text", provider_message_id="source-one")
+        self.native.pop("phase")
+        self.rows[3]["result_text"] = self.native["text"]
+        origin = {"provider": "claude", "event_id": "user-one", "session_id": "provider-one",
+                  "timestamp": "2026-09-10T12:00:01.100Z"}
+        self.rows[5].update(prompt="Inspect the files", provider_origin=origin)
+        source_user = {"type": "user", "uuid": "user-one", "sessionId": "provider-one",
+                       "timestamp": origin["timestamp"], "message": {"role": "user", "content": "Inspect the files"}}
+        sentinel = {"type": "attachment", "uuid": "goal-sentinel", "parentUuid": "user-one",
+                    "sessionId": "provider-one", "timestamp": "2026-09-10T12:00:01.200Z",
+                    "attachment": {"type": "goal_status", "sentinel": True, "met": False, "condition": "Finish inspection"}}
+        command = {"type": "user", "uuid": "goal-command", "parentUuid": "goal-sentinel",
+                   "sessionId": "provider-one", "timestamp": "2026-09-10T12:00:01.300Z",
+                   "message": {"role": "user", "content": "<command-name>/goal</command-name><command-message>goal</command-message><command-args>Finish inspection</command-args>"}}
+        self.source_rows[0]["parentUuid"] = "goal-command"
+        self.source_rows = [source_user, sentinel, command, *self.source_rows]
+
+    def test_goal_interleaving_repairs_only_exact_ancestral_user_copy(self):
+        for oversized in (False, True):
+            with self.subTest(oversized=oversized):
+                self.setUp()
+                self.goal_interleaved_input()
+                # Equal text from a different native user occurrence is genuine.
+                repeated = {**self.source_rows[0], "uuid": "user-two", "timestamp": "2026-09-10T12:00:04Z"}
+                self.source_rows.append(repeated)
+                self.rows[7].update(prompt="Inspect the files", provider_origin={
+                    **self.rows[5]["provider_origin"], "event_id": "user-two", "timestamp": repeated["timestamp"]})
+                self.prepare(oversized=oversized)
+                before = (self.events.read_bytes(), self.source.read_bytes())
+                self.assertTrue(self.cache.is_hidden("chat-one", self.rows[5]))
+                self.assertFalse(self.cache.is_hidden("chat-one", self.rows[7]))
+                self.assertFalse(self.cache.is_hidden("chat-one", self.rows[0]))
+                window = self.cache.prepare_window("chat-one", "provider-one", self.events, self.root,
+                    lambda row: None, event_window_end=self.events.stat().st_size, normalize_full_user=lambda row: None)
+                self.assertTrue(window.is_hidden(self.rows[5]))
+                self.assertEqual((self.events.read_bytes(), self.source.read_bytes()), before)
+
+    def test_unproven_goal_or_input_ancestry_is_not_repaired(self):
+        mutations = [lambda: self.source_rows[1]["attachment"].update(sentinel=False),
+                     lambda: self.source_rows[1]["attachment"].update(condition="Different goal"),
+                     lambda: self.source_rows[2].update(parentUuid="unknown"),
+                     lambda: self.source_rows[2].update(sessionId="other-provider"),
+                     lambda: self.native.update(provider_message_id="other-reply"),
+                     lambda: self.rows[0].update(prompt="Different user message"),
+                     lambda: self.source_rows.insert(3, dict(self.source_rows[2]))]
+        for oversized in (False, True):
+            for mutate in mutations:
+                with self.subTest(oversized=oversized, mutation=mutate):
+                    self.setUp()
+                    self.goal_interleaved_input()
+                    mutate()
+                    self.prepare(oversized=oversized)
+                    self.assertFalse(self.cache.is_hidden("chat-one", self.rows[5]))
+
+    def test_normalized_goal_start_matches_only_its_exact_native_input(self):
+        for oversized in (False, True):
+            for owned in (True, False):
+                with self.subTest(oversized=oversized, owned=owned):
+                    self.setUp()
+                    self.goal_interleaved_input()
+                    self.rows[0]["prompt"] = "/goal Finish inspection"
+                    command = self.source_rows[2]
+                    self.rows[5].update(prompt="/goal Finish inspection", provider_origin={
+                        "provider": "claude", "event_id": command["uuid"], "session_id": "provider-one",
+                        "timestamp": command["timestamp"]})
+                    if not owned:
+                        self.native["provider_message_id"] = "different-reply"
+                    self.prepare(oversized=oversized)
+                    self.assertEqual(self.cache.is_hidden("chat-one", self.rows[5]), owned)
+                    item = {"kind": "user", "text": "/goal Finish inspection",
+                            "provider_origin": self.rows[5]["provider_origin"]}
+                    filtered = repair.filter_native_claude_mailbox_wake_items(
+                        "chat-one", "provider-one", self.events, [item], sync_checkpoint=self.checkpoint,
+                        source_path=self.source, root=self.root, normalize_user=lambda row: None,
+                        normalize_full_user=lambda row: None)
+                    self.assertEqual(filtered[0].get("metadata_only", False), owned)
 
     def test_small_and_recent_exact_public_source_repairs_only_one_event(self):
         for oversized in (False, True):

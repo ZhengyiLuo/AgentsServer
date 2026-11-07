@@ -3,13 +3,88 @@
 import asyncio
 import json
 from pathlib import Path
+import resource
 import socket
+import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+import execution_service
 from execution_service import ComponentHealth, ProcessLease, WorkerLifespan, remove_stale_worker_socket, serve_worker
+
+
+class FileDescriptorLimitTests(unittest.TestCase):
+    def test_service_entrypoints_have_headroom_with_old_low_limit_configuration(self):
+        # Exercise real kernel limits only inside owned child processes. The
+        # existing service definitions need not be rewritten to gain headroom.
+        script = '''
+import asyncio, json, os, resource, sys, tempfile
+from pathlib import Path
+from unittest.mock import patch
+import execution_service
+role = sys.argv[1]
+soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+if hard != resource.RLIM_INFINITY and hard < 512:
+    sys.exit(77)
+resource.setrlimit(resource.RLIMIT_NOFILE, (256, hard))
+async def serve(args, lease):
+    descriptors = []
+    try:
+        for _ in range(300):
+            descriptors.append(os.open(os.devnull, os.O_RDONLY))
+        current_soft, current_hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        print(json.dumps({"role": args.role, "opened": len(descriptors),
+                          "soft": current_soft, "hard_preserved": current_hard == hard}))
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
+with tempfile.TemporaryDirectory() as temporary:
+    sys.argv = ["execution_service", role, "--runtime-dir", str(Path(temporary).resolve() / "runtime")]
+    with patch.object(execution_service, "serve_worker", serve), patch.object(execution_service, "serve_gateway", serve):
+        sys.exit(execution_service.main())
+'''
+        for role in ("worker", "gateway"):
+            with self.subTest(role=role):
+                result = subprocess.run(
+                    [sys.executable, "-B", "-c", script, role],
+                    cwd=Path(execution_service.__file__).parent,
+                    capture_output=True, text=True, timeout=10,
+                )
+                if result.returncode == 77:
+                    self.skipTest("OS hard file-descriptor limit is below the probe's requirement")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                observed = json.loads(result.stdout)
+                self.assertEqual(observed["role"], role)
+                self.assertEqual(observed["opened"], 300)
+                self.assertTrue(observed["hard_preserved"])
+                self.assertGreaterEqual(observed["soft"], 512)
+
+    def test_low_soft_limit_is_raised_without_changing_hard_limit(self):
+        for hard, expected in ((resource.RLIM_INFINITY, 8192), (1024, 1024)):
+            with self.subTest(hard=hard), \
+                    patch("execution_service.resource.getrlimit", return_value=(256, hard)), \
+                    patch("execution_service.resource.setrlimit") as set_limit:
+                execution_service.ensure_file_descriptor_headroom()
+                set_limit.assert_called_once_with(resource.RLIMIT_NOFILE, (expected, hard))
+
+    def test_existing_higher_or_infinite_limits_are_never_lowered(self):
+        for limits in ((16384, 32768), (resource.RLIM_INFINITY, resource.RLIM_INFINITY), (256, 256)):
+            with self.subTest(limits=limits), \
+                    patch("execution_service.resource.getrlimit", return_value=limits), \
+                    patch("execution_service.resource.setrlimit") as set_limit:
+                execution_service.ensure_file_descriptor_headroom()
+                set_limit.assert_not_called()
+
+    def test_os_refusal_does_not_prevent_service_startup(self):
+        for error in (OSError("not permitted"), ValueError("exceeds system maximum")):
+            with self.subTest(error=type(error).__name__), \
+                    patch("execution_service.resource.getrlimit", return_value=(256, resource.RLIM_INFINITY)), \
+                    patch("execution_service.resource.setrlimit", side_effect=error), \
+                    self.assertLogs(level="WARNING"):
+                execution_service.ensure_file_descriptor_headroom()
 
 
 class LeaseTests(unittest.TestCase):

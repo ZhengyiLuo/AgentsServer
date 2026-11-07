@@ -71,13 +71,32 @@ def _digest(path: Path) -> str:
 
 def _interpreter_digest(path: Path) -> str:
     if not path.is_absolute() or path.resolve(strict=True) != path:
-        raise ValueError("recovery interpreter must be a resolved executable")
+        raise ValueError(f"recovery interpreter must be a resolved executable: {path}")
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     try:
         info = os.fstat(descriptor)
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid not in {0, os.getuid()}
-                or info.st_mode & 0o022 or not info.st_mode & 0o111):
-            raise PermissionError("recovery interpreter is not a trusted executable")
+        # The acceptance predicate below is unchanged; each rejection now
+        # names the failed requirement plus the observed path, owner and mode
+        # so an operator can act on it without guessing.
+        if not stat.S_ISREG(info.st_mode):
+            raise PermissionError(
+                f"recovery interpreter is not a trusted executable: {path} is not a regular file"
+            )
+        if info.st_uid not in {0, os.getuid()}:
+            raise PermissionError(
+                f"recovery interpreter is not a trusted executable: {path} is owned by uid "
+                f"{info.st_uid}, expected root or the current uid {os.getuid()}"
+            )
+        if info.st_mode & 0o022:
+            raise PermissionError(
+                f"recovery interpreter is not a trusted executable: {path} is group- or "
+                f"world-writable (mode {info.st_mode & 0o7777:04o})"
+            )
+        if not info.st_mode & 0o111:
+            raise PermissionError(
+                f"recovery interpreter is not a trusted executable: {path} has no execute "
+                f"bits (mode {info.st_mode & 0o7777:04o})"
+            )
         digest = hashlib.sha256()
         while block := os.read(descriptor, 1024 * 1024):
             digest.update(block)

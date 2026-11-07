@@ -85,6 +85,26 @@ class LargeTranscriptImportTests(unittest.TestCase):
                 self.assertEqual(final["source_offset"], self.path.stat().st_size)
                 self.assertEqual(final["source_digest"], hashlib.sha256(self.path.read_bytes()).hexdigest())
 
+    def test_claude_nul_padding_preserves_messages_and_serialized_cursor(self):
+        sess = {"id": "test-claude", "backend": "claude", "claude_session_id": PROVIDER}
+        self.path.write_bytes(encoded(message("claude", "Before")))
+        with patch.object(server, "provider_history_path", return_value=self.path):
+            _, first, cursor, _ = server.load_provider_history_with_cursor(sess, None, None)
+            with self.path.open("ab") as stream:
+                stream.write(b"\0" * 3377 + b"\n")
+                stream.write(encoded(message("claude", "After")))
+            raw = self.path.read_bytes()
+            self.assertEqual([item["text"] for item in server.parse_claude_history(self.path, None)], ["Before", "After"])
+            _, delta, current, continued = server.load_provider_history_with_cursor(sess, None, json.loads(json.dumps(cursor)))
+            _, repeated, final, _ = server.load_provider_history_with_cursor(sess, None, json.loads(json.dumps(current)))
+        self.assertEqual([item["text"] for item in first], ["Before"])
+        self.assertEqual([item["text"] for item in delta], ["After"])
+        self.assertTrue(continued)
+        self.assertEqual(repeated, [])
+        self.assertEqual(final["source_offset"], len(raw))
+        self.assertEqual(final["source_digest"], hashlib.sha256(raw).hexdigest())
+        self.assertEqual(self.path.read_bytes(), raw)
+
     def test_partial_large_record_is_consumed_only_when_completed(self):
         raw = encoded(large_record("codex"))
         self.path.write_bytes(raw[:-1])

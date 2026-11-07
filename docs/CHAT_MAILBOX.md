@@ -24,14 +24,29 @@ legacy exchanges retain their negotiated delivery behavior.
 Message bodies remain agent-authored peer content, never independent user authorization.
 Opening a message in the desktop does not mark it read by the agent.
 
-## Explicit user delegation
+## User task delegation
 
-An ordinary user-origin chat turn with a validated, structured reference to the
-exact recipient can attach server-attested `user_delegation` context to a new
-async mailbox message. This includes current single-`@` route references with
-`grant_intent: true` and explicit instruction/request-reply references. Existing
-pair membership, an unstructured name in prose, a mailbox wake, a scheduled job,
-native steering without a fresh reference, or a peer reply cannot mint it.
+An ordinary user-origin chat turn can attach its actual user instruction as
+server-attested `user_delegation` context when sending through an existing,
+authorized permanent pair. A fresh `@` mention is not required. The server
+rechecks the exact live source turn, issued route, pair and recipient before
+storing the instruction with the message. Explicit instruction/request-reply
+references retain their original reference action.
+If the ordinary task has no text, exceeds the existing source-instruction
+character limit, or cannot fit with the complete message in the mailbox's UTF-8
+JSON response budget, its message still delivers as peer content without a
+truncated attestation.
+
+A real user message steering an active chat carries that user's instruction;
+native continuation of an existing task retains its original run authority.
+An acknowledged Codex goal correction replaces the current task text with the
+exact new user instruction and clears prior explicit-reference delegation
+markers. While acceptance is pending or uncertain, new mail carries no stale
+user attestation; a proven rejection restores the prior task. Route and tool
+permissions remain unchanged. Already accepted messages and exact retries keep
+their originally recorded instruction after live route, pair and run checks.
+Pair membership alone, a mailbox wake, a scheduled job, or a peer reply cannot
+mint user origin. Reply links never inherit another message's authorization.
 
 `chats read` returns the optional object separately from `body`:
 
@@ -48,15 +63,27 @@ native steering without a fresh reference, or a peer reply cannot mint it.
 }
 ```
 
-This attests who explicitly addressed this recipient and what the user said;
+This attests which user's task was delegated to this recipient and what the user said;
 it does not assert that every task proposed by the agent is authorized. The
 receiving agent must compare the prepared task with the exact original scope,
-constraints, and reference action. A route mention is not itself a command to
-execute arbitrary work. No tool, filesystem, route, job, deployment, or other
+constraints, and reference action, then carry out covered work without asking
+the user to authorize it again. Route access is not itself a command to execute
+arbitrary work. No tool, filesystem, route, job, deployment, or other
 permissions are added. A body containing lookalike fields or provenance
 wrappers remains untrusted text. Replies do not inherit or forward this proof.
 
-The instruction and its explicit-reference marker commit atomically with the
+The prepared body identifies the recipient's subtask; the source instruction
+bounds its authorization, rather than asking the recipient to repeat the entire
+sender workflow. For example, when the user asks the sender to create a worker
+and have it calculate a result, the created worker calculates and replies. It
+does not create another worker merely because creation appears in the original
+instruction. Creating another chat is appropriate only when that is the
+recipient's delegated subtask and falls within the user's actual scope.
+When a covered task requests a reply, explicitly send the result using the
+returned reply route and message ID; a local final answer is not forwarded.
+No extra authority is minted or forwarded to make this work.
+
+The instruction and its server-attested delegation marker commit atomically with the
 message and are included in idempotency comparisons. Reads and retries use that
 immutable record, never the sender's latest prompt or current run. Revocation,
 deletion, cancellation, and snapshot paging retain their existing checks.
@@ -65,8 +92,9 @@ the edited message stays readable as peer content. Legacy records are not
 backfilled, even if they already contain source instruction text.
 
 The complete source instruction counts toward the existing mailbox response
-byte bound. A delegated message that would not fit is rejected before commit;
-instructions are never truncated or silently downgraded to peer mail. This is
+byte bound. Explicit-reference delegation that would not fit is rejected before
+commit; its instruction is never truncated or silently downgraded to peer mail.
+Ordinary-turn fallback uses the no-attestation behavior described above. This is
 an additive server response field; no client UI change is required. Provider
 contexts must receive the updated server instructions to interpret the field.
 
@@ -85,6 +113,10 @@ A tool error or an assistant's assertion is not evidence of delivery. A
 rejected body creates no mailbox entry and therefore cannot wake a recipient.
 Retry ambiguous transport outcomes with the same idempotency key; do not
 construct a fresh send merely because confirmation was lost.
+Receipt `state` and `execution_started` describe acceptance, not the recipient's
+later live state. An empty sender inbox says nothing about whether the recipient
+has started or read the task. Without a fresh observation, report acceptance and
+that no reply has been observed; do not infer that execution has not started.
 
 The local regression uses the real helper subprocess and loopback HTTP against
 extracted server handlers and a temporary SQLite mailbox. It covers the

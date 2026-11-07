@@ -14,6 +14,7 @@ from cursor_agent_client import (
     CURSOR_PERMISSION_MODES,
     CursorEventParseError,
     build_cursor_cmd,
+    canonical_cursor_call_id,
     cursor_account_is_free_tier,
     cursor_permission_flags,
     normalize_cursor_stream_event,
@@ -500,6 +501,38 @@ class NormalizeCursorStreamEventTests(unittest.TestCase):
                 CursorEventParseError
             ):
                 normalize_cursor_stream_event(json.dumps(payload))
+
+    def test_current_composite_tool_id_keeps_start_and_result_correlated(self) -> None:
+        # Captured with Cursor 2026.10.22-27dcf5f on a real read-tool request.
+        # The same two-part ID is emitted on started/completed, separated by LF.
+        raw_id = ("call-00000000-0000-4000-8000-000000000001-0\n"
+                  "fc_00000000-0000-4000-8000-000000000002_0")
+        normalized = []
+        for subtype in ("started", "completed"):
+            body = {"args": {"path": "hello.txt"}}
+            if subtype == "completed":
+                body["result"] = {"success": {"content": "fixture"}}
+            normalized.append(normalize_cursor_stream_event(json.dumps({
+                "type": "tool_call", "subtype": subtype, "call_id": raw_id,
+                "session_id": SESSION_ID,
+                "tool_call": {"readToolCall": body, "toolCallId": raw_id,
+                              "hookAdditionalContexts": []},
+            })))
+        identifier = normalized[0]["call_id"]
+        self.assertEqual(identifier, normalized[1]["call_id"])
+        self.assertLessEqual(len(identifier), 240)
+        self.assertTrue(all(32 <= ord(c) != 127 for c in identifier))
+        self.assertNotIn(raw_id, json.dumps(normalized))
+        self.assertNotEqual(identifier, canonical_cursor_call_id(raw_id.replace("_0", "_1")))
+        self.assertNotEqual(identifier, canonical_cursor_call_id(raw_id.replace("\n", "")))
+        # A literal provider ID in the encoded namespace must not collide.
+        self.assertNotEqual(identifier, canonical_cursor_call_id(identifier))
+
+    def test_composite_compatibility_does_not_accept_arbitrary_controls(self) -> None:
+        for value in ("a\nb", "\nleading", "trailing\n", "a\rb", "a\tb",
+                      "a\x00b", "a\x1bb", "a\x7fb", "x" * 241):
+            with self.subTest(value=value), self.assertRaises(CursorEventParseError):
+                canonical_cursor_call_id(value)
 
     def test_tool_events_recover_valid_nested_id_when_top_level_is_invalid(
         self,

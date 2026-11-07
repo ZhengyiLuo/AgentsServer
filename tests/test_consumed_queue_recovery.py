@@ -161,5 +161,83 @@ class ConsumedGoalQueueRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.launch.await_args.kwargs["queued_id"], self.queued_id)
 
 
+class ConsumedClaudeQueueRecoveryTests(ConsumedGoalQueueRecoveryTests):
+    def setUp(self) -> None:
+        super().setUp()
+        agent_server.STORE.sessions[self.session_id]["backend"] = "claude"
+
+    def incident_events(self) -> list[dict]:
+        events = super().incident_events()
+        for event in events:
+            if "backend" in event:
+                event["backend"] = "claude"
+            if event.pop("native_goal_steer", False):
+                event["native_followup"] = True
+            event.pop("purpose", None)
+        events[-1]["provider_message_id"] = "accepted-claude-user-message"
+        return events
+
+    async def test_missing_or_non_authoritative_acknowledgement_keeps_delivery_paused(self) -> None:
+        cases = [self.incident_events()[:3], self.incident_events()[:4]]
+        for field, value in (
+            ("native_steer", False), ("native_followup", False),
+            ("provider_user_authored", False), ("provider_generated", True),
+            ("backend", "codex"), ("purpose", "scheduled_job"),
+            ("run_id", ""), ("queued_id", "different-row"),
+            ("provider_message_id", None), ("provider_message_id", " "),
+        ):
+            events = self.incident_events()
+            events[-1] = {**events[-1], field: value}
+            cases.append(events)
+        for index, events in enumerate(cases):
+            with self.subTest(case=index):
+                agent_server.QUEUED_TURNS.clear()
+                self.launch.reset_mock()
+                self.write_events(events)
+                recovery = await agent_server.recover_queued_turns_after_start()
+                await self.settle()
+                await agent_server.start_next_queued_turn(self.session_id)
+                self.launch.assert_not_awaited()
+                self.assertEqual(recovery, (1, 0))
+                queued = await agent_server.queued_turns_snapshot(self.session_id)
+                self.assertEqual(len(queued), 1)
+                self.assertEqual(queued[0]["queued_id"], self.queued_id)
+                self.assertTrue(queued[0]["paused"])
+                self.assertEqual(queued[0]["pause_reason"], "delivery_uncertain")
+
+    async def test_truncated_acceptance_record_remains_paused_until_durable(self) -> None:
+        events = self.incident_events()
+        self.write_events(events[:-1])
+        accepted = json.dumps({
+            "id": "accepted", "seq": 5, "session_id": self.session_id,
+            "ts": "2026-09-21T23:57:15Z", **events[-1],
+        })
+        split = len(accepted) // 2
+        with self.path.open("a") as stream:
+            stream.write(accepted[:split])
+        self.assertEqual(await agent_server.recover_queued_turns_after_start(), (1, 0))
+        await self.settle()
+        await agent_server.start_next_queued_turn(self.session_id)
+        self.launch.assert_not_awaited()
+        self.assertEqual((await agent_server.queued_turns_snapshot(self.session_id))[0]["pause_reason"],
+                         "delivery_uncertain")
+        with self.path.open("a") as stream:
+            stream.write(accepted[split:] + "\n")
+        agent_server.QUEUED_TURNS.clear()
+        self.assertEqual(await agent_server.recover_queued_turns_after_start(), (0, 0))
+        await self.settle()
+        self.launch.assert_not_awaited()
+        self.assertEqual(await agent_server.queued_turns_snapshot(self.session_id), [])
+
+    async def test_ordinary_steer_event_does_not_consume_a_waiting_queue_row(self) -> None:
+        events = self.incident_events()
+        ordinary_steer = {**events[-1], "native_followup": False}
+        self.write_events([events[0], ordinary_steer])
+        self.assertEqual(await agent_server.recover_queued_turns_after_start(), (1, 1))
+        await self.settle()
+        self.launch.assert_awaited_once()
+        self.assertEqual(self.launch.await_args.kwargs["queued_id"], self.queued_id)
+
+
 if __name__ == "__main__":
     unittest.main()

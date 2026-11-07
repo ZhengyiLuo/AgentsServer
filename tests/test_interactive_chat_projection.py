@@ -70,6 +70,23 @@ class InteractiveChatProjectionTests(unittest.TestCase):
         with patch.object(projection.json, "loads", side_effect=AssertionError("unchanged source must not be parsed")):
             self.assertEqual(reader.load(), second)
 
+    def test_native_background_wake_has_no_empty_user_message_in_public_or_shared_text(self):
+        self.append({"type": "turn_started", "prompt": "Finish my background task"},
+                    {"type": "assistant_text", "text": "Started"},
+                    {"type": "turn_finished", "result_text": "Started"},
+                    {"type": "turn_started", "run_id": "wake", "backend": "claude",
+                     "purpose": "provider_background_wake", "provider_generated": True,
+                     "metadata_only": True, "prompt": "", "file_ids": [],
+                     "parent_run_id": "run", "provider_task_id": "task"},
+                    {"type": "assistant_text", "run_id": "wake", "text": "Background result"},
+                    {"type": "turn_finished", "run_id": "wake", "result_text": "Background result"})
+        reader = projection.IncrementalChatTranscript(self.path, projector())
+        result = reader.load()
+        self.assertEqual(result["messages"], read_public_transcript(self.path, projector())["messages"])
+        self.assertEqual([(row["role"], row["text"]) for row in result["messages"]],
+                         [("user", "Finish my background task"), ("assistant", "Started"),
+                          ("assistant", "Background result")])
+
     def test_partial_tail_waits_for_newline_and_only_reads_from_committed_offset(self):
         self.append({"type": "turn_started", "prompt": "Question"})
         reader = projection.IncrementalChatTranscript(self.path, projector())

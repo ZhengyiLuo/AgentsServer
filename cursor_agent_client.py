@@ -18,6 +18,7 @@ draining; this module deliberately contains no process lifecycle state.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from typing import Any, Iterator
@@ -31,6 +32,13 @@ CURSOR_SESSION_IDENTIFIER_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
 )
 CURSOR_CALL_ID_MAX_CHARS = 240
+# Cursor 2026.10.22 emits this compound correlation key even for a normal
+# file-read tool. LF is part of the opaque ID, not a second stream event.
+_CURSOR_UUID_PATTERN = r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
+_CURSOR_COMPOSITE_CALL_ID_RE = re.compile(
+    rf"call-{_CURSOR_UUID_PATTERN}-[0-9]+\nfc_{_CURSOR_UUID_PATTERN}_[0-9]+"
+)
+_CURSOR_ENCODED_CALL_ID_PREFIX = "cursor-call-sha256:"
 CURSOR_LIFECYCLE_VALUE_MAX = 2_147_483_647
 CURSOR_ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 CURSOR_TOOL_SUCCESS_OUTCOMES = (
@@ -90,7 +98,13 @@ def canonical_cursor_session_id(value: Any) -> str | None:
 
 
 def canonical_cursor_call_id(value: Any) -> str:
-    """Validate the opaque correlation key used by Cursor tool events."""
+    """Bound an opaque tool key and encode the observed compound CLI format.
+
+    Keep the complete key in the digest: stripping LF, keeping only one half,
+    or assigning a fresh ID per event could merge distinct tools or orphan a
+    completion. The encoded namespace is reserved so literal provider IDs
+    cannot collide with it. Arbitrary control characters remain invalid.
+    """
 
     if not isinstance(value, str):
         raise CursorEventParseError("tool_call call_id must be a string")
@@ -98,11 +112,17 @@ def canonical_cursor_call_id(value: Any) -> str:
         not value
         or value != value.strip()
         or len(value) > CURSOR_CALL_ID_MAX_CHARS
-        or any(ord(character) < 32 or ord(character) == 127 for character in value)
     ):
         raise CursorEventParseError(
             "tool_call call_id must be a bounded nonempty identifier"
         )
+    composite = _CURSOR_COMPOSITE_CALL_ID_RE.fullmatch(value) is not None
+    if not composite and any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise CursorEventParseError(
+            "tool_call call_id must be a bounded nonempty identifier"
+        )
+    if composite or value.startswith(_CURSOR_ENCODED_CALL_ID_PREFIX):
+        return _CURSOR_ENCODED_CALL_ID_PREFIX + hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()
     return value
 
 

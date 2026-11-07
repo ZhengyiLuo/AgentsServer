@@ -422,19 +422,18 @@ class NativeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         release.set()
         self.assertEqual((await active.task)["answer"], "Finished")
 
-    async def test_native_idle_expiry_closes_handle_and_followup_cannot_create_new_context(self):
+    async def test_native_idle_context_remains_until_explicit_close(self):
         await self.submit().task
         key = ("owner", "chat", "panel")
         conversation = self.runtime.conversations[key]
+        self.assertIsNone(conversation.timer)
         self.runtime._expire_conversation(key, conversation)
         await asyncio.gather(*tuple(self.runtime.cleanup_tasks))
-        self.handles[0].close.assert_awaited_once()
-        self.assertNotIn(key, self.runtime.conversations)
-        stale = self.submit("followup", after_request_id="first")
-        with self.assertRaises(side.SideQuestionError) as caught:
-            await stale.task
-        self.assertEqual(caught.exception.status_code, 410)
+        self.handles[0].close.assert_not_awaited()
+        await self.submit("followup", after_request_id="first").task
         self.factory.assert_awaited_once()
+        await self.runtime.close_conversation(*key)
+        self.handles[0].close.assert_awaited_once()
 
     async def test_native_concurrent_clear_joins_cleanup_even_after_first_waiter_disconnects(self):
         await self.submit().task
@@ -477,6 +476,34 @@ class NativeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(receipt.task.done())
         handle.ask.assert_not_awaited()
         handle.close.assert_awaited_once()
+
+
+class BackgroundWorkSnapshotTests(unittest.IsolatedAsyncioTestCase):
+    async def test_idle_side_handle_blocks_only_for_native_active_descendants(self):
+        runtime = side.SideQuestions()
+        identity = object()
+        handle = SimpleNamespace(background_work_scope=lambda: identity,
+                                 has_background_work=AsyncMock(return_value=True), close=AsyncMock())
+        runtime.conversations[("owner", "chat", "side")] = side._NativeConversation(handle=handle)
+        self.assertEqual(runtime.active_session_ids(), set())
+        snapshot = await runtime.prepare_background_work_snapshot()
+        self.assertEqual(runtime.background_work_labels_from_snapshot(snapshot), ["Side chat background work in chat"])
+        handle.has_background_work.return_value = False
+        snapshot = await runtime.prepare_background_work_snapshot()
+        self.assertEqual(runtime.background_work_labels_from_snapshot(snapshot), [])
+        identity = object()
+        self.assertEqual(runtime.background_work_labels_from_snapshot(snapshot), ["Side chat provider state changed during inspection"])
+        await runtime.close()
+
+    async def test_background_probe_failure_and_clear_cannot_prove_idle(self):
+        runtime = side.SideQuestions()
+        handle = SimpleNamespace(background_work_scope=lambda: "owner",
+                                 has_background_work=AsyncMock(side_effect=RuntimeError("disconnected")), close=AsyncMock())
+        runtime.conversations[("owner", "chat", "side")] = side._NativeConversation(handle=handle)
+        snapshot = await runtime.prepare_background_work_snapshot()
+        self.assertEqual(runtime.background_work_labels_from_snapshot(snapshot), ["Side chat provider state unknown in chat"])
+        await runtime.close()
+        self.assertEqual(runtime.background_work_labels_from_snapshot(snapshot), ["Side chat provider state changed during inspection"])
 
 
 class RouteTests(unittest.IsolatedAsyncioTestCase):
@@ -603,7 +630,6 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_auth_and_shape_fail_before_provider_start(self):
         for payload in ({"request_id": "x", "question": ""},
-                        {"request_id": "x", "question": "a" * 8001},
                         {"request_id": "x", "question": "\ud800"},
                         {"request_id": "../parent", "question": "q"},
                         {"request_id": "x", "question": "q", "tools": ["Bash"]}):
@@ -617,6 +643,17 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
             await self.post("chat", request)
         self.assertEqual(caught.exception.status_code, 401)
         self.assertEqual(self.calls, 0)
+
+    async def test_large_question_uses_request_body_bound(self):
+        request, _ = self.request({"request_id": "large", "question": "a" * 8001})
+        task = asyncio.create_task(self.post("chat", request))
+        await self.started.wait()
+        self.finish.set()
+        self.assertEqual(json.loads((await task).body)["answer"], "Contextual answer")
+        request, _ = self.request({"request_id": "too-large", "question": "a" * side.MAX_REQUEST_BYTES})
+        with self.assertRaises(HTTPException) as caught:
+            await self.post("chat", request)
+        self.assertEqual(caught.exception.status_code, 413)
 
 
 class ProviderTests(unittest.IsolatedAsyncioTestCase):
@@ -844,7 +881,8 @@ class ServerCallbackTests(unittest.IsolatedAsyncioTestCase):
         self.manager = SimpleNamespace(ask_side_question=AsyncMock(return_value={
             "answer": "Native Claude answer", "context_note": "Native context"}))
         self.codex = SimpleNamespace(ask=AsyncMock(return_value="Native Codex answer"), close=AsyncMock(),
-                                     closed=False, thread_id="side-fork")
+                                     closed=False, thread_id="side-fork",
+                                     owns_thread=lambda thread: thread in {"side-fork", "side-descendant"})
         self.codex_factory = Mock(return_value=self.codex)
         self.options = SimpleNamespace(resume="claude-parent")
         self.namespace = dict(asyncio=asyncio, side_questions=side, STATE_DIR=root,
@@ -900,6 +938,7 @@ class ServerCallbackTests(unittest.IsolatedAsyncioTestCase):
         bridge.side_effect = owns
         callback = options["server_request_handler"]
         self.assertTrue(await callback(1, "item/commandExecution/requestApproval", {"threadId": "side-fork"}))
+        self.assertTrue(await callback(4, "item/commandExecution/requestApproval", {"threadId": "side-descendant"}))
         self.assertFalse(await callback(2, "item/commandExecution/requestApproval", {"threadId": "codex-parent"}))
         self.session["codex_thread_id"] = "replacement"
         self.assertFalse(await callback(3, "item/commandExecution/requestApproval", {"threadId": "side-fork"}))

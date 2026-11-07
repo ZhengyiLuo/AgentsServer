@@ -7,7 +7,7 @@ import sys
 import threading
 import unittest
 from concurrent.futures import Future
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import agent_server
 
@@ -351,7 +351,9 @@ class RuntimeProbeTimeoutTests(unittest.TestCase):
             seen.append((kwargs, agent_server.RUNTIME_CATALOG_DEADLINE.get()))
             return {"backends": {}, "generated_at": "test"}
 
-        with patch.object(agent_server, "discover_runtime_catalog_within_budget", side_effect=discover):
+        with patch.object(agent_server, "discover_runtime_catalog_within_budget", side_effect=discover), patch.object(
+            agent_server, "refresh_codex_app_server_binary", new_callable=AsyncMock,
+        ), patch.object(agent_server, "refresh_codex_app_server_login", new_callable=AsyncMock):
             result = asyncio.run(agent_server.runtime_catalog(refresh=True))
         self.assertEqual(json.loads(json.dumps(result))["backends"], {})
         self.assertEqual(seen[0][0], {"force_runtime_probe": True})

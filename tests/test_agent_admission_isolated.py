@@ -59,11 +59,19 @@ class AgentAdmissionTests(unittest.IsolatedAsyncioTestCase):
         ns = load_admission()
         self.assertEqual(ns["MAX_ACTIVE_AGENT_RUNS"], 0)
         self.assertEqual(ns["JOB_MAX_ACTIVE_RUNS"], 0)
-        self.assertEqual(ns["MIN_START_AVAILABLE_MEM_MB"], 2048)
-        self.assertEqual(ns["JOB_MIN_AVAILABLE_MEM_MB"], 4096)
+        self.assertEqual(ns["MIN_START_AVAILABLE_MEM_MB"], 0)
+        self.assertEqual(ns["JOB_MIN_AVAILABLE_MEM_MB"], 0)
         self.assertIsNone(await ns["turn_start_blocker"]())
         self.assertIsNone(await ns["turn_start_blocker"](ignore_session_id="busy-0"))
         self.assertIsNone(await ns["scheduled_job_blocker"]("new-cron"))
+
+    async def test_default_does_not_impose_available_memory_floor(self):
+        ns = load_admission()
+        for available in (0, 567, 2047, 4095):
+            with self.subTest(available=available):
+                ns["host_pressure_snapshot"] = lambda: {"available_mem_mb": available}
+                self.assertIsNone(await ns["turn_start_blocker"]())
+                self.assertIsNone(await ns["scheduled_job_blocker"]("new-cron"))
 
     async def test_explicit_operator_cap_is_respected_including_legacy_config(self):
         for prefix in ("AGENTSDOCK", "ZENITHBOT"):
@@ -78,7 +86,7 @@ class AgentAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await ns["turn_start_blocker"]())
 
     async def test_interactive_memory_boundaries_and_reported_567_mib(self):
-        ns = load_admission()
+        ns = load_admission({"AGENTSDOCK_MIN_START_AVAILABLE_MEM_MB": "2048"})
         for available in (0, 480, 511, 512, 513, 567, 1024, 2047, 2048, 2049):
             with self.subTest(available=available):
                 ns["host_pressure_snapshot"] = lambda: {"available_mem_mb": available}
@@ -92,7 +100,8 @@ class AgentAdmissionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIsNone(blocker)
 
     async def test_scheduled_memory_floor_and_action_are_independent(self):
-        ns = load_admission()
+        ns = load_admission({"AGENTSDOCK_MIN_START_AVAILABLE_MEM_MB": "2048",
+                             "AGENTSDOCK_JOB_MIN_AVAILABLE_MEM_MB": "4096"})
         for available in (2048, 2049, 3072, 4095, 4096, 4097):
             with self.subTest(available=available):
                 ns["host_pressure_snapshot"] = lambda: {"available_mem_mb": available}
@@ -148,7 +157,8 @@ class AgentAdmissionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("at least 1 GiB (1024 MiB) required to start a scheduled job", blocker)
                 else:
                     self.assertIsNone(blocker)
-        ns = load_admission({"AGENTSDOCK_JOB_MIN_AVAILABLE_MEM_MB": "0"})
+        ns = load_admission({"AGENTSDOCK_JOB_MIN_AVAILABLE_MEM_MB": "0",
+                             "AGENTSDOCK_MIN_START_AVAILABLE_MEM_MB": "2048"})
         for available in (511, 567, 2047):
             ns["host_pressure_snapshot"] = lambda: {"available_mem_mb": available}
             self.assertIn("at least 2 GiB (2048 MiB) required", await ns["scheduled_job_blocker"]("new-cron"))

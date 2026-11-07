@@ -125,11 +125,9 @@ In that checkout, `./install.sh --show-token` reads an existing default token.
 
 ### Memory at launch
 
-New agent turns require **2 GiB (2048 MiB) of available server RAM** by default;
-scheduled jobs require **4 GiB (4096 MiB)**. This is a launch check, not total RAM or a
-guarantee that every workload will fit. Low-memory errors show the available
-amount, required minimum, and recovery advice. See [memory settings](docs/MEMORY_ADMISSION.md)
-for operator overrides.
+Available-memory admission floors are disabled by default. Operators can choose
+a positive floor for new turns or scheduled jobs; existing explicit settings
+remain effective. See [memory settings](docs/MEMORY_ADMISSION.md).
 
 ## Multiple servers on one machine
 

@@ -39,8 +39,35 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
                               if row["source_run_id"] == run_id)
                 self.assertEqual(record["user_delegation_grants"], expected)
                 self.assertEqual(record["source_user_instruction"], prompt)
+                self.assertIs(record["source_is_user_turn"], user_turn)
                 self.assertNotIn(prompt, serialized)
                 self.assertNotIn("user_delegation_grants", serialized)
+                self.assertNotIn("source_is_user_turn", serialized)
+
+    async def test_existing_pair_preserves_user_task_through_real_capability_authorization(self) -> None:
+        with self.native_transports(), patch.object(agent_server.STORE, "save", AsyncMock()):
+            mutation = await agent_server.persist_durable_provider_cross_chat_reference_grants(
+                "source", [self.grant_reference()],
+                admission_id="grant_admission_" + "3" * 32, event_type="turn_started",
+            )
+            await agent_server.commit_durable_provider_cross_chat_reference_grants("source", mutation)
+            routes = agent_server.provider_cross_chat_routes(agent_server.STORE.sessions["source"])
+            prompt = "Coordinate the investigation with the other chat. Do not deploy."
+            agent_server.CURRENT_TURNS["source"] = {"run_id": "run_followup_without_mention"}
+            authority = await agent_server.issue_cross_chat_capability(
+                "source", "run_followup_without_mention", [],
+                source_user_instruction=prompt, source_is_user_turn=True,
+                actions={"agent_cross_chat_routes"}, provider_route_snapshot=routes, async_route_v1=True,
+            )
+            token = json.loads(authority.read_text())["provider_capability"]
+            reservation = await agent_server.reserve_async_provider_route_message(
+                self.provider_request(token), source_session_id="source", route_id=routes[0]["route_id"],
+                body="Investigate the configuration mismatch.", idempotency_key="followup-without-mention",
+            )
+        self.assertEqual(reservation["source_user_instruction"], prompt)
+        self.assertEqual(reservation["source_user_delegation_action"], "route")
+        self.assertEqual(reservation["target_session_id"], "target")
+        self.assertEqual(reservation["authorization_pair_id"], routes[0]["pair_id"])
 
     def test_route_request_cannot_supply_delegation_provenance(self) -> None:
         request = agent_server.AgentRouteHandoffRequest.model_validate({

@@ -88,6 +88,30 @@ class StreamingTranscriptTests(unittest.TestCase):
         with patch.object(reader,'CHUNK_BYTES',128), self.assertRaises(reader.TranscriptBudgetExceeded):
             self.parse(raw,cancelled=cancelled)
 
+    def test_native_nul_padding_requires_opt_in_and_preserves_exact_receipt(self):
+        for size in (3377, reader.CHUNK_BYTES + 7):
+            raw = b'{"text":"before"}\n' + b'\0' * size + b'\n{"text":"after"}\n'
+            with self.subTest(size=size):
+                with self.assertRaises(ValueError):
+                    self.parse(raw, strict=True)
+                records = self.parse(raw, strict=True, allow_nul_padding=True)
+                self.assertEqual([row[0] for row in records], [{"text": "before"}, None, {"text": "after"}])
+                self.assertTrue(records[1][2].malformed)
+                self.assertFalse(records[1][2].blank)
+                digest = hashlib.sha256()
+                for _, _, receipt in records:
+                    receipt.update_hash(digest)
+                self.assertEqual(digest.hexdigest(), hashlib.sha256(raw).hexdigest())
+
+    def test_native_nul_padding_does_not_relax_malformed_or_resource_checks(self):
+        for raw in (b'\0' * 3377, b'\0{}\n', b'\0garbage\n', b'\0 \n', b' \0\n', b'\0\r\n', b'{broken}\n'):
+            with self.subTest(raw_size=len(raw)), self.assertRaises(ValueError):
+                self.parse(raw, strict=True, allow_nul_padding=True)
+        with self.assertRaises(reader.TranscriptBudgetExceeded):
+            self.parse(b'1' * 2048 + b'\n', strict=True, allow_nul_padding=True)
+        with self.assertRaises(reader.TranscriptBudgetExceeded):
+            self.parse(b'\0' * 3377 + b'\n', strict=True, allow_nul_padding=True, deadline=time.monotonic() - 1)
+
     def test_partial_end_and_raw_offsets(self):
         raw=b'{"a":1}\n{broken}\n{"b":2}'
         with self.assertRaisesRegex(ValueError,'complete line'): self.parse(raw)

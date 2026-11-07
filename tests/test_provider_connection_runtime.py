@@ -154,6 +154,19 @@ class RuntimeBindingTests(unittest.TestCase):
         self.assertEqual(config["model"], "agentsdock_custom/vendor/model")
         self.assertEqual(env["AGENTSDOCK_CUSTOM_API_KEY"], "synthetic-first-key")
 
+    def test_claude_print_routing_hooks_preserve_private_endpoint_settings(self):
+        from claude_chat_routing import print_routing_settings
+        chat = {**self.chat(), "subagent_limit": 3}
+        routing = print_routing_settings(Path(self.store.root) / "manifest.json")
+        env, path = self.store.claude_overrides(chat, runtime_settings=routing)
+        settings = json.loads(Path(path).read_text())
+        self.assertEqual(settings["hooks"], routing["hooks"])
+        self.assertEqual(settings["env"], env)
+        self.assertEqual(env["CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"], "3")
+        self.assertEqual(settings["apiKeyHelper"], "")
+        self.assertNotIn("synthetic-first-key", path)
+        self.assertEqual(Path(path).stat().st_mode & 0o777, 0o600)
+
     def test_custom_without_model_cannot_borrow_native_default(self):
         self.input["model"] = None
         chat = self.chat()

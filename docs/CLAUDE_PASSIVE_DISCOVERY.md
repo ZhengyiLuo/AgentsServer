@@ -10,14 +10,21 @@ Claude readiness remains passive: installation/version is inspected, while a
 real Claude request establishes authentication success or failure. Unknown
 authentication is not a signed-out result.
 
-Model discovery uses a bounded, five-minute, in-memory cache populated from
-the initialization metadata of an existing real SDK connection. The pinned
+Model discovery uses a bounded, 24-hour, in-memory cache populated from
+the initialization metadata of an existing real SDK connection. Claude chat
+processes stay connected for hours and clients re-read the catalog
+periodically (desktop: every 15 minutes), so a short lifetime made most reads
+fall back to bare aliases such as `Opus` while an `Opus 5.5` chat was open. The pinned
 SDK's `get_server_info()` returns metadata already obtained during `connect()`;
 it sends no extra request. Only sanitized model values/labels survive the
 projection. Catalog reads never create a client or extend a client's lifetime.
 
 The cache is partitioned by executable, relevant provider environment and
-native configuration revision. Workspace-specific settings are not promoted
+native configuration revision, so a CLI update, settings change or account
+switch starts a new entry. Each new connection replaces its entry. The native
+credential file contributes only its presence (login/logout), not its
+revision: same-account OAuth renewal rewrites it without changing what the
+account can select, and must not discard labels learned from a connection. Workspace-specific settings are not promoted
 into the global model picker. Native authentication failure clears the cache.
 Cached metadata is not authentication evidence or permission to execute a model.
 

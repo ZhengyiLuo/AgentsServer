@@ -2369,17 +2369,20 @@ class CodexAppServerClient:
         validated["turn"] = _protocol_turn(method, result.get("turn"))
         return validated
 
-    async def run_thread_shell_command(self, thread_id: str, command: str) -> None:
+    async def run_thread_shell_command(
+        self, thread_id: str, command: str, *,
+        before_send: Callable[[], bool] | None = None,
+    ) -> None:
         thread_id = _require_nonempty_string(thread_id, "thread_id")
         command = _require_nonempty_string(command, "command")
         method = "thread/shellCommand"
-        _protocol_empty_object(
-            method,
-            await self.request(
-                method,
-                {"threadId": thread_id, "command": command},
-            ),
-        )
+        params = {"threadId": thread_id, "command": command}
+        if before_send is None:
+            result = await self.request(method, params)
+        else:
+            await self.start()
+            result = await self._request_connected(method, params, before_send=before_send)
+        _protocol_empty_object(method, result)
 
     async def list_background_terminals(
         self,
@@ -3011,8 +3014,14 @@ class CodexAppServerManager:
             delivery=delivery,
         )
 
-    async def run_thread_shell_command(self, thread_id: str, command: str) -> None:
-        await self.client.run_thread_shell_command(thread_id, command)
+    async def run_thread_shell_command(
+        self, thread_id: str, command: str, *,
+        before_send: Callable[[], bool] | None = None,
+    ) -> None:
+        if before_send is None:
+            await self.client.run_thread_shell_command(thread_id, command)
+        else:
+            await self.client.run_thread_shell_command(thread_id, command, before_send=before_send)
 
     async def list_background_terminals(
         self,

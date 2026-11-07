@@ -190,6 +190,33 @@ class AbandonedTurnDetectionTests(unittest.TestCase):
 
 
 class AbandonedTurnRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_update_recovery_preserves_exact_interactive_transport(self) -> None:
+        for backend, transport, capabilities in (
+            ("claude", agent_server.CLAUDE_TRANSPORT_AGENT_SDK, [agent_server.CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY]),
+            ("codex", agent_server.CODEX_TRANSPORT_APP_SERVER, [agent_server.CODEX_INTERACTIVE_CLIENT_CAPABILITY]),
+            ("claude", agent_server.CLAUDE_TRANSPORT_PRINT, []),
+        ):
+            with self.subTest(backend=backend, transport=transport):
+                saved = {"session_id": "chat", "run_id": "old-run", "backend": backend, "transport": transport, "stop_confirmed": True}
+                receipt = {"request_id": "restart", "_resume_interrupted_turns": True, "_continuation_runs": [saved]}
+                with patch.object(agent_server.STORE, "sessions", {"chat": {"backend": backend}}), patch.object(
+                    agent_server, "read_server_restart_status", return_value=receipt,
+                ), patch.object(agent_server, "has_server_update_continuation", return_value=False), patch.object(
+                    agent_server, "append_durable_event", AsyncMock(),
+                ) as append:
+                    await agent_server.queue_interrupted_server_update_turn(
+                        "chat", {"run_id": "old-run", "backend": backend}, "restart",
+                    )
+                    queued = append.await_args_list[0].args[2]
+                    self.assertEqual(queued["client_capabilities"], capabilities)
+                    restored = agent_server.queued_turn_from_event({"type": "turn_queued", **queued}, {"backend": backend}, 1)
+                    self.assertEqual(restored["client_capabilities"], capabilities)
+                    append.reset_mock()
+                    await agent_server.queue_interrupted_server_update_turn(
+                        "chat", {"run_id": "different-run", "backend": backend}, "restart",
+                    )
+                    self.assertEqual(append.await_args_list[0].args[2]["client_capabilities"], [])
+
     async def test_gracefully_stopped_force_update_turn_is_saved_and_recovered(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

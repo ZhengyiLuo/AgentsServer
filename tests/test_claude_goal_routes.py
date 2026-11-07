@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from typing import Any
 import unittest
 import uuid
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 from fastapi import FastAPI, HTTPException
 import httpx
@@ -53,6 +53,7 @@ def load_routes():
         "provider_command_prompt_matches": lambda prompt, invocation: prompt == invocation or (
             prompt.startswith(invocation) and prompt[len(invocation):len(invocation) + 1] in " \t\r\n"),
         "ensure_session_not_deleting": lambda session_id: None,
+        "cancel_server_update_goal_continuation": Mock(),
         "start_turn": AsyncMock(return_value={"run_id": "new-run"}),
         "stop_turn": AsyncMock(return_value={"stopped": True, "pending": False}),
     }
@@ -86,6 +87,7 @@ class ClaudeGoalRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call.args[1].skill_selection.id, "opaque-native-goal")
         self.assertEqual(call.args[1].skill_selection.revision, "inventory-revision")
         self.assertTrue(call.kwargs["queue_if_busy"])
+        self.ns["cancel_server_update_goal_continuation"].assert_called_once_with("chat")
 
     async def test_pending_native_goal_rejects_a_second_set_without_mutating_its_owner(self):
         active = {"run_id": "existing-run"}  # Admission has not acquired a native SDK owner yet.
@@ -322,6 +324,7 @@ class ClaudeGoalRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200, response.text)
         manager = self.ns["claude_sdk_manager"].return_value
         manager.clear_goal.assert_awaited_once_with("chat", run_id="exact-active-run")
+        self.ns["cancel_server_update_goal_continuation"].assert_called_once_with("chat")
         self.ns["start_turn"].assert_not_awaited()
 
     async def test_idle_clear_uses_native_command_and_invalid_sessions_never_send(self):

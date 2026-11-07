@@ -1558,6 +1558,7 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
             schedule_id = "d" * 32
             goal = {"status": "active", "objective": "Finish original work", "createdAt": 1,
                     "tokenBudget": 9000, "tokensUsed": 100, "timeUsedSeconds": 30}
+            consumer = asyncio.Future()
             with restart_environment(root) as forced_signal, patch.object(
                 agent_server, "SERVER_VERSION", "1.0.0",
             ), patch.object(agent_server, "BUSY_SESSIONS", {"chat-1"}), patch.object(
@@ -1567,7 +1568,19 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
             ), patch.object(agent_server.STORE, "sessions", {"chat-1": {
                 "backend": "codex", "session_id": "native-thread", "codex_goal": goal,
                 "codex_goal_time_budget_seconds": 300,
-            }}):
+            }}), patch.object(agent_server, "ACTIVE", {"chat-1": {
+                "run_id": "run-goal", "owner_task": consumer,
+            }}), patch.object(agent_server, "CODEX_NATIVE_ACTION_TASKS", {
+                ("chat-1", "run-goal"): consumer,
+            }), patch.object(
+                agent_server, "provider_background_work_labels_from_snapshot",
+                side_effect=lambda _snapshot: agent_server.active_codex_work_labels(),
+            ):
+                snapshot = agent_server.server_restart_blocker_snapshot_locked(
+                    provider_background_work_labels=agent_server.active_codex_work_labels(),
+                )
+                self.assertEqual(snapshot["active_count"], 1)
+                self.assertEqual(snapshot["provider_background_count"], 0)
                 agent_server.write_fresh_server_update_status(
                     phase="pending", schedule_id=schedule_id,
                     target_version="1.1.0", latest_version="1.1.0", track="stable",
@@ -1586,6 +1599,45 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(row["server_update_goal"]["time_budget_seconds"], 300)
                 self.assertEqual(goal["tokensUsed"], 100)
                 forced_signal.assert_called_once_with(accepted["request_id"])
+
+    async def test_native_goal_deduplication_keeps_other_or_stale_consumers_blocking(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task, other = asyncio.Future(), asyncio.Future()
+            session = {"backend": "codex", "session_id": "native-thread",
+                       "codex_goal": {"status": "active", "objective": "Work", "createdAt": 1}}
+            active = {"run_id": "goal-run", "owner_task": task}
+            with restart_environment(root), patch.object(agent_server, "BUSY_SESSIONS", {"chat"}), patch.object(
+                agent_server, "CURRENT_TURNS", {"chat": {
+                    "backend": "codex", "run_id": "goal-run", "purpose": "codex_goal_resume",
+                }},
+            ), patch.object(agent_server, "ACTIVE", {"chat": active}), patch.object(
+                agent_server.STORE, "sessions", {"chat": session},
+            ), patch.object(agent_server, "CODEX_NATIVE_ACTION_TASKS", {
+                ("chat", "goal-run"): task, ("chat", "other-run"): other,
+            }), patch.object(agent_server, "CODEX_PENDING_INTERACTIONS", {}), patch.object(
+                agent_server, "CODEX_SUBAGENT_STATE", {},
+            ):
+                def count():
+                    return agent_server.server_restart_blocker_snapshot_locked(
+                        provider_background_work_labels=agent_server.active_codex_work_labels(),
+                    )["provider_background_count"]
+
+                self.assertEqual(count(), 1)  # Only the same goal consumer is deduplicated.
+                active["owner_task"] = other
+                self.assertEqual(count(), 2)  # Changed consumer ownership is not safe.
+                active["owner_task"] = task
+                active["run_id"] = "replacement"
+                self.assertEqual(count(), 2)
+                active["run_id"] = "goal-run"
+                active["stop_requested"] = True
+                self.assertEqual(count(), 2)
+                active.pop("stop_requested")
+                session["codex_goal"]["status"] = "complete"
+                self.assertEqual(count(), 2)
+                session["codex_goal"]["status"] = "active"
+                task.set_result(None)
+                self.assertEqual(count(), 1)  # Unrelated operation still blocks.
 
     async def test_force_update_replay_is_idempotent_and_schedule_is_fingerprinted(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -78512,6 +78512,23 @@ def server_restart_blocker_snapshot_locked(
             for session_id in maintenance_session_ids
         ),
     }
+    # A resumed native goal is both an active chat and a registered native
+    # operation. Count its exact live consumer once; otherwise coordinated
+    # updates wait for the goal to finish instead of checkpointing it. Other
+    # operations, prompts and child agents remain independent blockers.
+    for session_id in active_session_ids:
+        owner = CURRENT_TURNS.get(session_id) or {}
+        active = ACTIVE.get(session_id) or {}
+        operation_id = str(owner.get("run_id") or "")
+        task = CODEX_NATIVE_ACTION_TASKS.get((session_id, operation_id))
+        if (owner.get("purpose") == "codex_goal_resume"
+                and operation_id and active.get("run_id") == operation_id
+                and task is not None and not task.done()
+                and active.get("owner_task") is task
+                and coordinated_update_goal(session_id)):
+            duplicate_provider_labels.add(
+                f"Codex operation {operation_id} in {session_id}"
+            )
     provider_work_labels = [
         str(label)[:200]
         for label in (

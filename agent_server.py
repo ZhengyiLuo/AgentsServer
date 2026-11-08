@@ -101319,6 +101319,11 @@ def configure_server_logging(
 
 def main() -> int:
     global SERVER_BIND_ADDRESS, SERVER_PORT
+    # Legacy managed services still start here after an update, not through
+    # execution_service.main(). Give their provider children the same safe
+    # descriptor headroom as the split worker/gateway entrypoints.
+    from execution_service import ensure_file_descriptor_headroom
+    ensure_file_descriptor_headroom()
     configure_server_logging(STATE_DIR)
     parser = argparse.ArgumentParser(description="AgentsServer")
     parser.add_argument("cmd", nargs="?", default="serve", choices=["serve"])

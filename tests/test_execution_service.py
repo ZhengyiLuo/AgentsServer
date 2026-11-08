@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 from pathlib import Path
 import resource
 import socket
@@ -17,6 +18,51 @@ from execution_service import ComponentHealth, ProcessLease, WorkerLifespan, rem
 
 
 class FileDescriptorLimitTests(unittest.TestCase):
+    def test_legacy_server_entrypoint_and_provider_children_have_headroom(self):
+        # Managed updates retain the legacy `agent_server.py serve` entrypoint.
+        # Exercise its real process limit and child inheritance, without opening
+        # a listener or importing the user's state/configuration.
+        script = '''
+import json, os, resource, subprocess, sys
+from pathlib import Path
+from unittest.mock import patch
+root = Path(sys.argv[1])
+soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+if hard != resource.RLIM_INFINITY and hard < 512:
+    sys.exit(77)
+resource.setrlimit(resource.RLIMIT_NOFILE, (256, hard))
+with patch("pathlib.Path.home", return_value=root):
+    import agent_server
+def run(*args, **kwargs):
+    child = subprocess.run([sys.executable, "-c", "import json,os,resource; f=[os.open(os.devnull,os.O_RDONLY) for _ in range(300)]; print(json.dumps(dict(opened=len(f),soft=resource.getrlimit(resource.RLIMIT_NOFILE)[0])))"], capture_output=True, text=True, check=True)
+    print(child.stdout.strip())
+sys.argv = ["agent_server", "serve", "--bind", "127.0.0.1", "--port", "7851"]
+with patch.object(agent_server.uvicorn, "run", side_effect=run):
+    assert agent_server.main() == 0
+assert resource.getrlimit(resource.RLIMIT_NOFILE)[1] == hard
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            environment = {key: value for key, value in os.environ.items() if not key.startswith(
+                ("AGENTSDOCK_", "AGENTS_SERVER_", "ZENITHBOT_", "ZENITHDOCK_", "CLAUDE_", "CODEX_", "AGENT_"))}
+            environment.update({
+                "HOME": str(root),
+                "AGENTSDOCK_STATE_DIR": str(root / "state"),
+                "AGENTS_SERVER_CONFIG_DIR": str(root / "config"),
+                "CLAUDE_PROJECTS_ROOT": str(root / "claude"),
+                "CODEX_SESSIONS_ROOT": str(root / "codex"),
+                "AGENT_TOKEN": "isolated-limit-test",
+            })
+            result = subprocess.run([sys.executable, "-B", "-c", script, str(root)],
+                                    cwd=Path(execution_service.__file__).parent,
+                                    env=environment, capture_output=True, text=True, timeout=30)
+            if result.returncode == 77:
+                self.skipTest("OS hard file-descriptor limit is below the probe's requirement")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            observed = json.loads(result.stdout)
+            self.assertEqual(observed["opened"], 300)
+            self.assertGreaterEqual(observed["soft"], 512)
+
     def test_service_entrypoints_have_headroom_with_old_low_limit_configuration(self):
         # Exercise real kernel limits only inside owned child processes. The
         # existing service definitions need not be rewritten to gain headroom.

@@ -354,6 +354,7 @@ class AsyncRouteAcceptanceTests(unittest.IsolatedAsyncioTestCase):
             # Bind the extracted production functions to the same SQLite test namespace.
             function = actual[name]
             self.ns[name] = type(function)(function.__code__, self.ns, name, function.__defaults__, function.__closure__)
+            self.ns[name].__kwdefaults__ = deepcopy(function.__kwdefaults__)
         token = "isolated-provider-token"
         token_hash = hashlib.sha256(token.encode()).hexdigest()
         self.capability.update(server_identity="isolated-server", expires_at=time.time() + 3600,

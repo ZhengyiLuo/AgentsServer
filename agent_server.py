@@ -79000,17 +79000,20 @@ def _reconcile_server_update_team_hub_fence(status: dict[str, Any]) -> None:
 def finalize_abandoned_server_update(status: dict[str, Any]) -> dict[str, Any]:
     """Release a stale update drain after its detached runner disappeared."""
 
-    if status.get("_activation_recovery"):
-        from update_recovery import journal_present
-        if journal_present(Path(os.environ["AGENTS_SERVER_INSTALL_DIR"]).expanduser().resolve()):
-            raise RuntimeError("interrupted activation requires its retained installer recovery")
-    expected_update_id = str(status.get("update_id") or "")
     with server_update_status_lock(SERVER_UPDATE_STATUS_FILE):
         current = read_server_update_status()
-        if str(current.get("update_id") or "") != expected_update_id:
+        # The detached runner does not hold the HTTP operation lock. A failed
+        # liveness probe may already be obsolete when this file lock is acquired.
+        # Preserve any progress or ownership change, even within the same update,
+        # before inspecting recovery or clearing its exact maintenance fence.
+        if current != status:
             return current
         if str(current.get("phase") or "") not in SERVER_UPDATE_ACTIVE_PHASES:
             return current
+        if current.get("_activation_recovery"):
+            from update_recovery import journal_present
+            if journal_present(Path(os.environ["AGENTS_SERVER_INSTALL_DIR"]).expanduser().resolve()):
+                raise RuntimeError("interrupted activation requires its retained installer recovery")
         # The status-file CAS lock and the caller's operation lock prevent an
         # old updater or a new /start from replacing ownership. Clear this
         # exact fence while the active phase still blocks HTTP mutations; only
@@ -87822,6 +87825,10 @@ async def check_server_update(
                     status_code=503,
                     detail="the previous server update could not be safely finalized",
                 ) from exc
+            if str(status.get("phase") or "") in SERVER_UPDATE_ACTIVE_PHASES:
+                raise HTTPException(status_code=409, detail="a server update is already running")
+            if managed_server_update_is_pending(status):
+                return public_server_update_status(status)
         track: Literal["stable", "beta"] = (
             body.track
             if body is not None and body.track is not None
@@ -88178,6 +88185,8 @@ async def _start_server_update(
                     status_code=503,
                     detail="the previous server update could not be safely finalized",
                 ) from exc
+            if str(status.get("phase") or "") in SERVER_UPDATE_ACTIVE_PHASES:
+                raise HTTPException(status_code=409, detail="a server update is already running")
         pending_schedule_id = (
             str(status.get("schedule_id") or "").strip()
             if managed_server_update_is_pending(status)

@@ -112,6 +112,10 @@ class GoalFollowupAdmissionTests(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
         self.ns = dict(self.source_namespace)
+        # Stop now also invalidates an update receipt; these AST-isolated tests
+        # have no persisted update state. Real receipt behavior is covered by
+        # the restart/recovery suites.
+        self.ns["cancel_server_update_goal_continuation"] = Mock()
         # Extracted functions retain their defining globals. Re-execution into
         # this test's namespace keeps concurrent/previous cases fully isolated.
         for name in FUNCTIONS:

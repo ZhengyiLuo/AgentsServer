@@ -169,6 +169,19 @@ class MailboxWakeRepairTests(unittest.TestCase):
                     self.assertTrue(self.cache.is_hidden("chat-one", self.input))
                     self.assertFalse(self.cache.prepare("chat-one", "provider-one", self.events, self.root, lambda row: None))
 
+    def test_update_continuation_input_is_hidden_only_with_internal_claim(self):
+        self.rows[0].update(purpose="server_update_continuation",
+                            queued_id="queued_" + "a" * 16)
+        self.rows[0].pop("mailbox_wake_id")
+        self.rows[0].pop("mailbox_wake_through_seq")
+        self.cache = repair.ClaudeMetadataRepairCache()
+        self.assertTrue(self.prepare())
+        self.assertTrue(self.cache.is_hidden("chat-one", self.input))
+        self.rows[0].pop("queued_id")
+        self.cache = repair.ClaudeMetadataRepairCache()
+        self.assertTrue(self.prepare())
+        self.assertFalse(self.cache.is_hidden("chat-one", self.input))
+
     def test_reported_decorated_mailbox_reply_has_one_visible_assistant(self):
         # Same shape as native seq 2137 / imported seq 2145: public commentary,
         # exact provider UUID, second-resolution native vs precise source time.

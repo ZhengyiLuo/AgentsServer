@@ -17,6 +17,12 @@ from fastapi.testclient import TestClient
 
 
 class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # Endpoint admission fixtures do not own the developer's managed install.
+        # Managed package preparation has separate isolated coverage and any
+        # fixture that needs it must explicitly supply its own installation root.
+        self.enterContext(patch.dict(os.environ, {"AGENTS_SERVER_INSTALL_DIR": ""}))
+
     async def test_update_endpoint_direct_invocation_repeats_native_auth(self):
         request = Request({
             "type": "http",
@@ -1664,7 +1670,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response["managed_updates"])
         self.assertEqual(
             response["capabilities"]["server_updates"]["version"],
-            11,
+            12,
         )
         self.assertEqual(response["update_service_cgroup"], {
             "safe": True,
@@ -3928,6 +3934,12 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
             message_task: asyncio.Task | None = None
             try:
                 with ExitStack() as stack:
+                    # Exercise admission against the in-flight message mutation;
+                    # package preparation is covered separately and depends on
+                    # whether the test host has a managed install configured.
+                    stack.enter_context(
+                        patch.dict(os.environ, {"AGENTS_SERVER_INSTALL_DIR": ""})
+                    )
                     stack.enter_context(
                         patch.object(agent_server, "TEAM_HUB_RUNTIME", runtime)
                     )
@@ -4114,11 +4126,22 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                                 },
                             )
                         )
-                        entered = await asyncio.wait_for(
-                            asyncio.to_thread(message_outbox_entered.wait, 2),
-                            timeout=3,
-                        )
-                        self.assertTrue(entered)
+                        # A loaded CI runner can delay the real TestClient
+                        # request. Poll the event without occupying another
+                        # worker, and report an early HTTP response instead of
+                        # masking it as an event timeout.
+                        for _ in range(300):
+                            if message_outbox_entered.is_set():
+                                break
+                            if message_task.done():
+                                response = await message_task
+                                self.fail(
+                                    "message returned before reaching the outbox: "
+                                    f"{response.status_code} {response.text[:300]}"
+                                )
+                            await asyncio.sleep(0.05)
+                        else:
+                            self.fail("message did not reach the outbox within 15 seconds")
                         self.assertEqual(
                             agent_server.unsafe_http_mutation_count_locked(),
                             1,

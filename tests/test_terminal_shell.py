@@ -351,6 +351,7 @@ class TerminalHistoryScrollingTests(unittest.TestCase):
         managed: bool = False,
     ) -> tuple[bool, list[list[str]]]:
         calls: list[list[str]] = []
+        self.invocations: list[list[str]] = []
         in_mode = initially_in_mode
 
         def fake_tmux(
@@ -361,7 +362,18 @@ class TerminalHistoryScrollingTests(unittest.TestCase):
         ) -> subprocess.CompletedProcess[str]:
             nonlocal in_mode
             del check, timeout
-            calls.append(args)
+            self.invocations.append(args)
+            commands: list[list[str]] = [[]]
+            for arg in args:
+                if arg == ";":
+                    commands.append([])
+                else:
+                    commands[-1].append(arg)
+            calls.extend(commands)
+            if len(commands) > 1:
+                self.assertEqual(commands[0][0], "send-keys")
+                self.assertEqual(commands[1][0], "display-message")
+                return subprocess.CompletedProcess(args, 0, stdout=f"{int(in_mode)}\n", stderr="")
             if args[0] == "display-message":
                 return subprocess.CompletedProcess(args, 0, stdout=f"{int(in_mode)}\n", stderr="")
             if args[:2] == ["copy-mode", "-eH"]:
@@ -427,6 +439,47 @@ class TerminalHistoryScrollingTests(unittest.TestCase):
         self.assertTrue(result)
         self.assertFalse(any(args[0] == "copy-mode" for args in calls))
         self.assertTrue(any(args[-1] == "scroll-up" for args in calls))
+
+    def test_repeated_scroll_needs_only_two_tmux_processes(self) -> None:
+        result, _ = self.run_scroll(-5, initially_in_mode=True, managed=True)
+        self.assertTrue(result)
+        self.assertEqual(len(self.invocations), 2)
+
+    def test_zero_delta_does_not_probe_tmux(self) -> None:
+        result, calls = self.run_scroll(0, initially_in_mode=False)
+        self.assertFalse(result)
+        self.assertEqual(calls, [])
+
+    def test_missing_terminal_returns_without_copy_mode_or_scroll(self) -> None:
+        failed = subprocess.CompletedProcess([], 1, stdout="", stderr="no server running")
+        with patch.dict(agent_server.STORE.sessions, {self.session_id: {"id": self.session_id}}), patch.object(
+            agent_server, "run_tmux", return_value=failed,
+        ) as run_tmux:
+            self.assertFalse(agent_server.scroll_terminal_history(self.session_id, -5))
+        self.assertEqual(run_tmux.call_count, 1)
+
+    def test_failed_copy_mode_entry_does_not_send_scroll_commands(self) -> None:
+        responses = [subprocess.CompletedProcess([], code, stdout=text, stderr="") for code, text in [(0, "0"), (1, ""), (1, "")]]
+        with patch.dict(agent_server.STORE.sessions, {self.session_id: {"id": self.session_id}}), patch.object(
+            agent_server, "run_tmux", side_effect=responses,
+        ) as run_tmux:
+            self.assertFalse(agent_server.scroll_terminal_history(self.session_id, -5))
+        self.assertEqual([call.args[0][0] for call in run_tmux.call_args_list], ["display-message", "copy-mode", "copy-mode"])
+
+    def test_scroll_to_bottom_releases_owned_copy_mode_and_keeps_packet_bound(self) -> None:
+        responses = [subprocess.CompletedProcess([], 0, stdout=text, stderr="") for text in ("1", "0")]
+        with patch.dict(agent_server.STORE.sessions, {self.session_id: {"id": self.session_id}}), patch.object(
+            agent_server, "run_tmux", side_effect=responses,
+        ) as run_tmux:
+            self.assertFalse(agent_server.scroll_terminal_history(self.session_id, 200, managed=True))
+        command = run_tmux.call_args_list[-1].args[0]
+        self.assertEqual(command[:4], ["send-keys", "-X", "-N", "80"])
+        self.assertIn(";", command)
+
+    def test_unknown_chat_never_probes_tmux(self) -> None:
+        with patch.object(agent_server.STORE, "sessions", {}), patch.object(agent_server, "run_tmux") as run_tmux:
+            self.assertFalse(agent_server.scroll_terminal_history("unknown-chat", -5))
+        run_tmux.assert_not_called()
 
     def test_downward_scroll_only_moves_when_copy_mode_is_active(self) -> None:
         active_result, active_calls = self.run_scroll(

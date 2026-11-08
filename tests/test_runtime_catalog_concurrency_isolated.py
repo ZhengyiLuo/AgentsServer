@@ -95,10 +95,10 @@ class RuntimeCatalogConcurrencyTests(unittest.IsolatedAsyncioTestCase):
     async def started(self, event):
         self.assertTrue(await asyncio.wait_for(asyncio.to_thread(event.wait, 5), 6))
 
-    async def catalog_waiters(self, count):
+    async def catalog_waiters(self, count, *, timeout=5):
         # Scope reads run off-thread. Keep the synthetic probe blocked until
         # every intended overlapping request has actually reached the join.
-        async with asyncio.timeout(5):
+        async with asyncio.timeout(timeout):
             while self.catalog_requests_ready < count:
                 await asyncio.sleep(0)
 
@@ -112,7 +112,15 @@ class RuntimeCatalogConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                 "authenticated": status == "ready", "checked_at_epoch": time.time()}
 
     async def test_concurrent_http_reads_share_one_provider_pipeline(self):
-        entered = threading.Event()
+        loop = asyncio.get_running_loop()
+        # The observer must not occupy the worker needed for scope reads and
+        # discovery. Keep the default pool small to catch that fixture deadlock.
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+        # This is an ownership/overlap contract, not a latency benchmark. Full
+        # CI has stalled the first HTTP task for over six seconds. Use the same
+        # bounded watchdog as the overlapping-generation test below.
+        watchdog = 30
+        entered = asyncio.Event()
         calls = []
         lock = threading.Lock()
 
@@ -120,8 +128,9 @@ class RuntimeCatalogConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             with lock:
                 calls.append((backend, force_runtime_probe))
                 if len(calls) == len(self.ns["VALID_BACKENDS"]):
-                    entered.set()
-            self.block()
+                    loop.call_soon_threadsafe(entered.set)
+            if not self.release.wait(watchdog):
+                raise AssertionError("test did not release synthetic probe")
             return {"models": [{"value": backend}], "custom_provider": {"configured": backend == "codex"}}
 
         self.ns["discover_runtime_backend_catalog"] = pipeline
@@ -129,8 +138,8 @@ class RuntimeCatalogConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         app.get("/api/runtime/catalog")(self.ns["runtime_catalog"])
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://fixture") as client:
             requests = [self.task(client.get("/api/runtime/catalog")) for _ in range(24)]
-            await self.started(entered)
-            await self.catalog_waiters(24)
+            await asyncio.wait_for(entered.wait(), watchdog)
+            await self.catalog_waiters(24, timeout=watchdog)
             self.assertEqual(sorted(calls), [(backend, False) for backend in sorted(self.ns["VALID_BACKENDS"])])
             self.release.set()
             responses = await asyncio.gather(*requests)

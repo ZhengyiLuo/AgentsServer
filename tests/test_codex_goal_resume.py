@@ -248,6 +248,295 @@ class CodexGoalResumeTests(unittest.IsolatedAsyncioTestCase):
             "chat", agent_server.CodexGoalRequest(status="active", **values)
         )
 
+    def update_continuation(self) -> dict:
+        saved = {
+            "thread_id": "thread-goal",
+            "identity": agent_server.coordinated_update_goal_identity(self.session["codex_goal"]),
+            "time_budget_seconds": None,
+        }
+        receipt = {
+            "request_id": "update-request", "_resume_interrupted_turns": True,
+            "_continuation_runs": [{"session_id": "chat", "run_id": "old-run", "server_update_goal": saved}],
+        }
+        self.stack.enter_context(patch.object(agent_server, "read_server_restart_status", return_value=receipt))
+        self.stack.enter_context(patch.object(agent_server, "write_server_restart_status", side_effect=lambda **changes: receipt.update(changes)))
+        self.stack.enter_context(patch.object(agent_server, "append_durable_event", agent_server.append_event))
+        return {
+            "queued_id": agent_server.server_update_continuation_id("update-request", "chat", "old-run"),
+            "purpose": agent_server.SERVER_UPDATE_CONTINUATION_PURPOSE,
+            "server_update_goal": saved, "server_update_restart_request_id": "update-request",
+            "backend": "codex", "prompt": agent_server.SERVER_UPDATE_CONTINUATION_PROMPT,
+            "display_prompt": "", "_durable": True,
+        }
+
+    async def test_update_resume_uses_native_goal_before_waiting_user_messages(self) -> None:
+        item = self.update_continuation()
+        agent_server.QUEUED_TURNS["chat"] = deque([item, {"queued_id": "user-next", "prompt": "next"}])
+        with patch.object(agent_server, "_start_turn_locked", AsyncMock()) as ordinary:
+            await agent_server._start_next_queued_turn_locked("chat", admission_backend="codex")
+        ordinary.assert_not_awaited()
+        self.manager.set_thread_goal.assert_awaited_once_with("thread-goal", status="active")
+        self.assertEqual(self.session["codex_goal"]["tokensUsed"], 10)
+        self.assertEqual(self.session["codex_goal"]["timeUsedSeconds"], 4)
+        self.assertEqual(agent_server.QUEUED_TURNS["chat"][0]["queued_id"], "user-next")
+        started = [data for kind, data in self.events if kind == "turn_started"]
+        self.assertEqual(len(started), 1)
+        self.assertEqual(started[0]["queued_id"], item["queued_id"])
+        self.assertEqual(started[0]["purpose"], "codex_goal_resume")
+        self.assertNotIn("prompt", started[0])
+        await self.complete_goal()
+
+    async def test_update_resume_preserves_identity_but_accepts_new_progress(self) -> None:
+        item = self.update_continuation()
+        self.session["codex_goal"].update(tokensUsed=42, timeUsedSeconds=9, updatedAt=99)
+        agent_server.validate_server_update_goal_continuation("chat", item)
+
+    async def test_update_resume_rejects_completed_replaced_cancelled_and_exhausted_goals(self) -> None:
+        for change in (
+            {"status": "complete"}, {"status": "blocked"}, {"status": "budget_limit"},
+            {"objective": "another task"}, {"createdAt": 999}, {"tokenBudget": 500},
+        ):
+            with self.subTest(change=change):
+                original = dict(self.session["codex_goal"])
+                item = self.update_continuation()
+                self.session["codex_goal"].update(change)
+                with self.assertRaises(HTTPException) as error:
+                    agent_server.validate_server_update_goal_continuation("chat", item)
+                self.assertEqual(error.exception.status_code, 410)
+                self.session["codex_goal"] = original
+        item = self.update_continuation()
+        agent_server.cancel_server_update_goal_continuation("chat")
+        with self.assertRaises(HTTPException):
+            agent_server.validate_server_update_goal_continuation("chat", item)
+        self.manager.set_thread_goal.assert_not_awaited()
+
+    async def test_manual_goal_pause_revokes_update_resume_even_when_already_paused(self) -> None:
+        item = self.update_continuation()
+        await agent_server.put_codex_goal("chat", agent_server.CodexGoalRequest(status="paused"))
+        with self.assertRaises(HTTPException):
+            agent_server.validate_server_update_goal_continuation("chat", item)
+
+    async def test_update_resume_rejects_actual_budget_exhaustion_and_thread_change(self) -> None:
+        self.session["codex_goal"]["tokenBudget"] = 100
+        self.session["codex_goal_time_budget_seconds"] = 60
+        item = self.update_continuation()
+        item["server_update_goal"]["time_budget_seconds"] = 60
+        for goal_change, session_change in (
+            ({"tokensUsed": 100}, {}),
+            ({"timeUsedSeconds": 60}, {}),
+            ({}, {"codex_goal_time_budget_exhausted": True}),
+            ({}, {"codex_thread_id": "different-thread", "session_id": "different-thread"}),
+            ({}, {"codex_goal_time_budget_seconds": 120}),
+        ):
+            with self.subTest(goal=goal_change, session=session_change):
+                with patch.dict(self.session["codex_goal"], goal_change), patch.dict(self.session, session_change):
+                    with self.assertRaises(HTTPException) as error:
+                        agent_server.validate_server_update_goal_continuation("chat", item)
+                    self.assertEqual(error.exception.status_code, 410)
+        self.manager.set_thread_goal.assert_not_awaited()
+
+    async def test_shutdown_pauses_only_the_receipts_exact_run_and_boot(self) -> None:
+        self.update_continuation()
+        receipt = agent_server.read_server_restart_status()
+        receipt["_source_instance_id"] = agent_server.SERVER_INSTANCE_ID
+        agent_server.ACTIVE["chat"] = {"run_id": "new-run"}
+        with patch.object(agent_server, "pause_active_codex_goal_for_stop", AsyncMock(return_value=(True, True, None))) as pause:
+            await agent_server.pause_coordinated_update_goals()
+            pause.assert_not_awaited()
+            agent_server.ACTIVE["chat"]["run_id"] = "old-run"
+            await agent_server.pause_coordinated_update_goals()
+            pause.assert_awaited_once_with("chat", {"run_id": "old-run"})
+            receipt["_source_instance_id"] = "older-boot"
+            await agent_server.pause_coordinated_update_goals()
+            self.assertEqual(pause.await_count, 1)
+
+    async def test_orphan_recovery_preserves_saved_native_goal_and_manual_cancellation(self) -> None:
+        item = self.update_continuation()
+        receipt = agent_server.read_server_restart_status()
+        receipt["_continuation_runs"][0].update(backend="codex", purpose="codex_goal_resume")
+        with patch.object(agent_server, "has_server_update_continuation", return_value=False):
+            await agent_server.queue_interrupted_server_update_turn(
+                "chat", {"run_id": "old-run", "backend": "codex"}, "update-request",
+            )
+            queued = [data for kind, data in self.events if kind == "turn_queued"]
+            self.assertEqual(queued[0]["server_update_goal"], item["server_update_goal"])
+            self.events.clear()
+            agent_server.cancel_server_update_goal_continuation("chat")
+            self.assertIsNone(await agent_server.queue_interrupted_server_update_turn(
+                "chat", {"run_id": "old-run", "backend": "codex"}, "update-request",
+            ))
+            self.assertEqual(self.events, [])
+
+    async def test_update_shutdown_requires_native_claude_stop_confirmation(self) -> None:
+        self.update_continuation()
+        receipt = agent_server.read_server_restart_status()
+        receipt["_source_instance_id"] = agent_server.SERVER_INSTANCE_ID
+        row = {"session_id": "chat", "run_id": "old-run", "backend": "claude", "transport": "agent-sdk"}
+        receipt["_continuation_runs"] = [row]
+        handle = SimpleNamespace(wait_result=AsyncMock(side_effect=RuntimeError("not confirmed")))
+        agent_server.ACTIVE["chat"] = {"run_id": "old-run", "backend": "claude", "transport": "agent-sdk", "claude_sdk_run": handle}
+        with patch.object(agent_server, "interrupt_claude_sdk_run_bounded", AsyncMock(return_value=True)) as interrupt:
+            await agent_server.pause_coordinated_update_goals()
+            self.assertIsNot(row.get("stop_confirmed"), True)
+            handle.wait_result.side_effect = None
+            await agent_server.pause_coordinated_update_goals()
+            self.assertTrue(row["stop_confirmed"])
+            self.assertEqual(interrupt.await_args.args, (handle,))
+            self.assertTrue(agent_server.ACTIVE["chat"]["stop_requested"])
+            self.assertFalse(agent_server.ACTIVE["chat"]["claude_permissions_open"])
+
+    async def test_unconfirmed_claude_stop_warns_once_instead_of_starting_second_owner(self) -> None:
+        self.update_continuation()
+        receipt = agent_server.read_server_restart_status()
+        row = {"session_id": "chat", "run_id": "old-run", "backend": "claude", "transport": "agent-sdk"}
+        receipt["_continuation_runs"] = [row]
+        for _ in range(2):
+            self.assertIsNone(await agent_server.queue_interrupted_server_update_turn("chat", row, "update-request"))
+        self.assertEqual([kind for kind, _ in self.events], ["error"])
+        self.assertEqual(self.events[0][1]["error_code"], "server_update_resume_requires_review")
+        self.assertEqual(receipt["_continuation_cancelled_sessions"], ["chat"])
+
+    async def test_slow_native_stop_does_not_prevent_other_chats_from_pausing(self) -> None:
+        self.update_continuation()
+        receipt = agent_server.read_server_restart_status()
+        receipt["_source_instance_id"] = agent_server.SERVER_INSTANCE_ID
+        receipt["_continuation_runs"] = [
+            {"session_id": sid, "run_id": sid + "-run", "backend": "claude", "transport": "agent-sdk"}
+            for sid in ("slow", "fast")
+        ]
+        slow_gate, fast_done = asyncio.Event(), asyncio.Event()
+
+        async def fast_result():
+            fast_done.set()
+
+        agent_server.ACTIVE.update({
+            "slow": {"run_id": "slow-run", "claude_sdk_run": SimpleNamespace(wait_result=slow_gate.wait)},
+            "fast": {"run_id": "fast-run", "claude_sdk_run": SimpleNamespace(wait_result=fast_result)},
+        })
+        with patch.object(agent_server, "interrupt_claude_sdk_run_bounded", AsyncMock(return_value=True)):
+            task = asyncio.create_task(agent_server.pause_coordinated_update_goals())
+            try:
+                await asyncio.wait_for(fast_done.wait(), 1)
+                self.assertFalse(task.done())
+            finally:
+                slow_gate.set()
+                await asyncio.wait_for(task, 1)
+        self.assertTrue(all(row.get("stop_confirmed") for row in receipt["_continuation_runs"]))
+
+    def claude_update_receipt(self):
+        self.update_continuation()
+        self.session.update(backend="claude", claude_session_id="native-claude")
+        goal = {"condition": "Finish only the current file", "set_at": 123, "status": "active"}
+        row = {
+            "session_id": "chat", "run_id": "old-run", "backend": "claude", "transport": "agent-sdk",
+            "stop_confirmed": True, "claude_goal_checked": True,
+            "claude_provider_session_id": "native-claude",
+            "server_update_claude_goal": {key: goal[key] for key in ("condition", "set_at")},
+        }
+        agent_server.read_server_restart_status()["_continuation_runs"] = [row]
+        self.stack.enter_context(patch.object(agent_server, "refresh_claude_goal", AsyncMock(return_value=goal)))
+        self.stack.enter_context(patch.object(agent_server, "CLAUDE_GOAL_PROJECTIONS", {"chat": SimpleNamespace(caught_up=True)}))
+        queued_id = agent_server.server_update_continuation_id("update-request", "chat", "old-run")
+        return goal, row, queued_id
+
+    async def test_claude_recovery_is_bound_to_current_native_goal_not_old_conversation_tasks(self) -> None:
+        goal, row, queued_id = self.claude_update_receipt()
+        prompt = await agent_server.validate_claude_update_continuation("chat", queued_id)
+        self.assertIn(goal["condition"], prompt)
+        self.assertIn("Do not resume earlier, replaced, cleared, or unrelated goals", prompt)
+        self.assertIn("Do not set a new goal or reset the existing goal", prompt)
+        with patch.object(agent_server, "has_server_update_continuation", return_value=False):
+            await agent_server.queue_interrupted_server_update_turn("chat", {"run_id": "old-run", "backend": "claude"}, "update-request")
+        event = next(data for kind, data in self.events if kind == "turn_queued")
+        restored = agent_server.queued_turn_from_event({**event, "type": "turn_queued"}, self.session, 1)
+        self.assertEqual(restored["prompt"], prompt)
+        self.assertIn(agent_server.CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY, restored["client_capabilities"])
+        self.assertFalse(event["provider_user_authored"])
+
+    async def test_claude_recovery_rejects_replaced_completed_cleared_and_unconfirmed_goals(self) -> None:
+        goal, row, queued_id = self.claude_update_receipt()
+        for change in ({"condition": "new goal"}, {"set_at": 124}, {"status": "achieved"}, {"status": "cleared"}, {"status": "failed"}):
+            with self.subTest(change=change), patch.dict(goal, change):
+                with self.assertRaises(HTTPException) as error:
+                    await agent_server.validate_claude_update_continuation("chat", queued_id)
+                self.assertEqual(error.exception.status_code, 410)
+        for change in ({"stop_confirmed": False}, {"claude_goal_checked": False}, {"claude_provider_session_id": "other"}):
+            with self.subTest(change=change), patch.dict(row, change):
+                with self.assertRaises(HTTPException):
+                    await agent_server.validate_claude_update_continuation("chat", queued_id)
+        agent_server.cancel_server_update_goal_continuation("chat")
+        with self.assertRaises(HTTPException):
+            await agent_server.validate_claude_update_continuation("chat", queued_id)
+
+    async def test_claude_no_goal_recovery_cannot_take_over_a_new_native_goal(self) -> None:
+        goal, row, queued_id = self.claude_update_receipt()
+        row["server_update_claude_goal"] = None
+        with self.assertRaises(HTTPException):
+            await agent_server.validate_claude_update_continuation("chat", queued_id)
+        agent_server.refresh_claude_goal.return_value = None
+        self.assertEqual(await agent_server.validate_claude_update_continuation("chat", queued_id), agent_server.SERVER_UPDATE_CONTINUATION_PROMPT)
+        agent_server.CLAUDE_GOAL_PROJECTIONS["chat"].caught_up = False
+        with self.assertRaises(HTTPException) as error:
+            await agent_server.validate_claude_update_continuation("chat", queued_id)
+        self.assertEqual(error.exception.status_code, 503)
+
+    async def test_claude_recovery_revalidates_native_goal_at_actual_turn_admission(self) -> None:
+        goal, row, queued_id = self.claude_update_receipt()
+        req = agent_server.TurnRequest(
+            prompt=agent_server.server_update_continuation_prompt(row), display_prompt="",
+            purpose=agent_server.SERVER_UPDATE_CONTINUATION_PURPOSE,
+            client_capabilities=[agent_server.CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY],
+        )
+        goal["status"] = "cleared"
+        with self.assertRaises(HTTPException) as error:
+            await agent_server._start_turn_locked("chat", req, queued_id=queued_id)
+        self.assertEqual(error.exception.status_code, 410)
+        goal["status"] = "active"
+        req.prompt = agent_server.SERVER_UPDATE_CONTINUATION_PROMPT
+        with self.assertRaises(HTTPException) as error:
+            await agent_server._start_turn_locked("chat", req, queued_id=queued_id)
+        self.assertEqual(error.exception.status_code, 400)
+        self.assertEqual(self.events, [])
+        self.assertEqual(agent_server.ACTIVE, {})
+
+    async def test_claude_shutdown_saves_exact_native_goal_and_confirmed_stop_together(self) -> None:
+        goal, row, _queued_id = self.claude_update_receipt()
+        agent_server.read_server_restart_status()["_source_instance_id"] = agent_server.SERVER_INSTANCE_ID
+        row.pop("stop_confirmed")
+        row.pop("server_update_claude_goal")
+        handle = SimpleNamespace(wait_result=AsyncMock())
+        agent_server.ACTIVE["chat"] = {"run_id": "old-run", "claude_sdk_run": handle}
+        with patch.object(agent_server, "interrupt_claude_sdk_run_bounded", AsyncMock()):
+            await agent_server.pause_coordinated_update_goals()
+        self.assertTrue(row["stop_confirmed"])
+        self.assertEqual(row["server_update_claude_goal"], {"condition": goal["condition"], "set_at": 123})
+        self.assertTrue(row["claude_goal_checked"])
+
+    async def test_update_receipt_captures_only_active_goal_and_exact_native_identity(self) -> None:
+        agent_server.BUSY_SESSIONS.add("chat")
+        agent_server.CURRENT_TURNS["chat"] = {"run_id": "old-run", "backend": "codex", "purpose": "codex_goal_resume"}
+        self.session["codex_goal"]["status"] = "active"
+        self.assertEqual(agent_server.unsupported_coordinated_update_turns(), [])
+        row = agent_server.active_coordinated_update_turns()[0]
+        self.assertEqual(row["server_update_goal"]["thread_id"], "thread-goal")
+        self.session["codex_goal"]["status"] = "paused"
+        self.assertEqual(agent_server.unsupported_coordinated_update_turns(), ["chat"])
+
+    async def test_update_goal_queue_roundtrip_retains_native_resume_not_generic_prompt(self) -> None:
+        item = self.update_continuation()
+        restored = agent_server.queued_turn_from_event({**item, "type": "turn_queued"}, self.session, 1)
+        self.assertEqual(restored["server_update_goal"], item["server_update_goal"])
+        agent_server.validate_server_update_goal_continuation("chat", restored)
+
+    async def test_update_cannot_capture_a_user_stop_still_draining(self) -> None:
+        agent_server.BUSY_SESSIONS.add("chat")
+        agent_server.CURRENT_TURNS["chat"] = {"run_id": "old-run", "backend": "codex", "purpose": None}
+        agent_server.STOP_REQUESTS.add("chat")
+        self.assertEqual(agent_server.unsupported_coordinated_update_turns(), ["chat"])
+        agent_server.STOP_REQUESTS.clear()
+        agent_server.ACTIVE["chat"] = {"run_id": "old-run", "stop_requested": True}
+        self.assertEqual(agent_server.unsupported_coordinated_update_turns(), ["chat"])
+
     async def wait_for_subscription_reads(self, minimum: int) -> None:
         async def wait() -> None:
             while self.manager.subscriptions[0].read_calls < minimum:

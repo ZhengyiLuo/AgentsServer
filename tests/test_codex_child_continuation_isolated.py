@@ -668,6 +668,7 @@ class CodexChildContinuationTests(unittest.IsolatedAsyncioTestCase):
         exec(PROJECTION_CODE, namespace)
         namespace.update({
             "SESSION_TURN_TASKS": {}, "CODEX_NATIVE_ACTION_TASKS": {},
+            "cancel_server_update_goal_continuation": Mock(),
             "empty_subagent_stop_result": Mock(side_effect=AdmissionChecked),
         })
         with self.assertRaises(AdmissionChecked):
@@ -697,6 +698,7 @@ class CodexChildContinuationTests(unittest.IsolatedAsyncioTestCase):
         exec(PROJECTION_CODE, namespace)
         namespace.update({
             "SESSION_TURN_TASKS": {}, "CODEX_NATIVE_ACTION_TASKS": {},
+            "cancel_server_update_goal_continuation": Mock(),
             "empty_subagent_stop_result": Mock(side_effect=AdmissionChecked),
         })
         for label, native_turn, should_interrupt in (

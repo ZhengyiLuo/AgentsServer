@@ -1088,6 +1088,14 @@ credentials and discovers its permitted routes with `chats list` when needed.
 The permission persists without another mention; it does not extend to other
 chats, forks, or a recipient's other routes.
 
+Agents can also use `chats create --title "Worker" --folder "Research"` to
+create a normal independent chat and automatically establish the same
+bidirectional mailbox pair with its creator. The returned route is immediately
+usable by the current run; creation alone does not start a provider turn.
+This uses `POST /api/agent/chats` with a run-bound provider capability and a
+retry-safe idempotency key. See [agent-created chats](ASYNC_CHAT_ROUTES.md#agent-created-chats)
+for settings inheritance and helper usage.
+
 Clients negotiate `chat_conversation_async_route_v1` using the additive health
 capability. For paired routes advertising `mode: async_route_v1`, `send` and
 `ask` each send one independent message and return after acceptance. An idle

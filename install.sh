@@ -89,16 +89,16 @@ INSTANCE_EXPLICIT="false"
 LABEL="com.agentsdock.server"
 INSTANCE_LOG_DIR="$HOME/Library/Logs/AgentsServer"
 LEGACY_SERVICE_NAME="zenithbot-agent"
-# AgentsServer's cooperative shutdown has 18 independently bounded cleanup
+# AgentsServer's cooperative shutdown has 19 independently bounded cleanup
 # phases in addition to uvicorn's graceful window.  Five seconds was shorter
 # than even an ordinary slow shutdown: launchctl had already accepted bootout,
 # then the installer abandoned activation/rollback and could leave the service
 # unloaded.  Keep this wait bounded, but long enough for the server's complete
 # worst-case graceful budget before declaring the exact launchd job wedged.
-# AgentsServer caps the configurable uvicorn window at 60 seconds; 185 seconds
-# covers that window, all 18 five-second teardown phases, the watchdog margin,
+# AgentsServer caps the configurable uvicorn window at 60 seconds; 190 seconds
+# covers that window, all 19 five-second teardown phases, the watchdog margin,
 # and another 30 seconds for launchd to reap the terminated process.
-LAUNCHCTL_STOP_ATTEMPTS=1850
+LAUNCHCTL_STOP_ATTEMPTS=1900
 LAUNCHCTL_STOP_DELAY=0.1
 LAUNCHCTL_BOOTSTRAP_ATTEMPTS=3
 NON_INTERACTIVE="false"

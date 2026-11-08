@@ -508,6 +508,35 @@ class ServerRestartStateTests(unittest.TestCase):
         thread.assert_not_called()
         kill.assert_not_called()
 
+    def test_update_activation_gives_native_pause_full_shutdown_budget(self):
+        for worker in (agent_server.signal_forced_server_restart, agent_server.signal_managed_server_restart):
+            with self.subTest(worker=worker.__name__), tempfile.TemporaryDirectory() as temporary:
+                request_id = str(uuid.uuid4())
+                with restart_environment(Path(temporary)), \
+                     patch.object(agent_server.time, "sleep"), \
+                     patch.object(agent_server.os, "getpid", return_value=321), \
+                     patch.object(agent_server.os, "kill") as kill, \
+                     patch.object(agent_server.threading, "Thread") as thread:
+                    agent_server.write_server_restart_status(
+                        phase="accepted", request_id=request_id,
+                        _source_instance_id=SERVER_INSTANCE_ID, _forced=True,
+                        _resume_interrupted_turns=True, _update_schedule_id="a" * 32,
+                    )
+                    worker(request_id)
+                    self.assertEqual(thread.call_args.kwargs["args"], (
+                        request_id, 321, agent_server.SERVER_RESTART_GRACEFUL_KILL_DELAY_SECONDS,
+                    ))
+                    kill.assert_called_once_with(321, signal.SIGTERM)
+
+    def test_stale_or_unbound_update_receipt_keeps_emergency_restart_deadline(self):
+        receipt = {"request_id": "req", "_source_instance_id": agent_server.SERVER_INSTANCE_ID,
+                   "_resume_interrupted_turns": True, "_update_schedule_id": "a" * 32}
+        self.assertTrue(agent_server.is_coordinated_update_restart(receipt, "req"))
+        for change in ({"request_id": "other"}, {"_source_instance_id": "old-boot"},
+                       {"_resume_interrupted_turns": False}, {"_update_schedule_id": ""}):
+            with self.subTest(change=change):
+                self.assertFalse(agent_server.is_coordinated_update_restart({**receipt, **change}, "req"))
+
     def test_duplicate_signal_workers_claim_only_one_restart(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1464,6 +1493,152 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("_force_restart_requested_at", public_pending)
         forced_signal.assert_called_once_with(str(request_id))
 
+    async def test_coordinated_force_refuses_turns_without_a_continuation_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            schedule_id = "a" * 32
+            with restart_environment(root) as forced_signal, patch.object(
+                agent_server, "SERVER_VERSION", "1.0.0",
+            ), patch.object(agent_server, "BUSY_SESSIONS", {"chat-1"}), patch.object(
+                agent_server, "CURRENT_TURNS", {"chat-1": {
+                    "run_id": "run-1", "backend": "opencode", "purpose": None,
+                    "provider_context_mode": "chat",
+                }},
+            ):
+                agent_server.write_fresh_server_update_status(
+                    phase="pending", schedule_id=schedule_id,
+                    target_version="1.1.0", latest_version="1.1.0",
+                    track="stable", update_available=True,
+                    when_idle=True, cancelable=True,
+                )
+                body = restart_body(force=True, update_schedule_id=schedule_id).model_copy(
+                    update={"resume_interrupted_turns": True},
+                )
+                with self.assertRaises(HTTPException) as rejected:
+                    await agent_server.restart_server_endpoint(
+                        body, http_request(method="POST"), BackgroundTasks(),
+                    )
+                pending = agent_server.read_server_update_status()
+        self.assertEqual(rejected.exception.detail["code"], "server_update_continuation_unsupported")
+        self.assertTrue(pending["cancelable"])
+        forced_signal.assert_not_called()
+
+    async def test_coordinated_force_preserves_untracked_background_work(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            schedule_id = "c" * 32
+            snapshot = {"revision": "0" * 64, "snapshot_degraded": False,
+                        "has_safety_blockers": False, "provider_background_count": 1,
+                        "tmux_server_in_service_cgroup": False, "tmux_server_cgroup_unknown": False}
+            with restart_environment(root) as forced_signal, patch.object(
+                agent_server, "SERVER_VERSION", "1.0.0",
+            ), patch.object(agent_server, "current_server_restart_blocker_snapshot",
+                            AsyncMock(return_value=snapshot)):
+                agent_server.write_fresh_server_update_status(
+                    phase="pending", schedule_id=schedule_id,
+                    target_version="1.1.0", latest_version="1.1.0",
+                    track="stable", update_available=True,
+                    when_idle=True, cancelable=True,
+                )
+                body = restart_body(force=True, update_schedule_id=schedule_id).model_copy(
+                    update={"resume_interrupted_turns": True},
+                )
+                with self.assertRaises(HTTPException) as rejected:
+                    await agent_server.restart_server_endpoint(
+                        body, http_request(method="POST"), BackgroundTasks(),
+                    )
+                pending = agent_server.read_server_update_status()
+        self.assertEqual(rejected.exception.detail["code"], "server_update_continuation_unsafe")
+        self.assertTrue(pending["cancelable"])
+        forced_signal.assert_not_called()
+
+    async def test_coordinated_force_checkpoints_native_goal_without_changing_its_budget(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            schedule_id = "d" * 32
+            goal = {"status": "active", "objective": "Finish original work", "createdAt": 1,
+                    "tokenBudget": 9000, "tokensUsed": 100, "timeUsedSeconds": 30}
+            consumer = asyncio.Future()
+            with restart_environment(root) as forced_signal, patch.object(
+                agent_server, "SERVER_VERSION", "1.0.0",
+            ), patch.object(agent_server, "BUSY_SESSIONS", {"chat-1"}), patch.object(
+                agent_server, "CURRENT_TURNS", {"chat-1": {
+                    "run_id": "run-goal", "backend": "codex", "purpose": "codex_goal_resume",
+                }},
+            ), patch.object(agent_server.STORE, "sessions", {"chat-1": {
+                "backend": "codex", "session_id": "native-thread", "codex_goal": goal,
+                "codex_goal_time_budget_seconds": 300,
+            }}), patch.object(agent_server, "ACTIVE", {"chat-1": {
+                "run_id": "run-goal", "owner_task": consumer,
+            }}), patch.object(agent_server, "CODEX_NATIVE_ACTION_TASKS", {
+                ("chat-1", "run-goal"): consumer,
+            }), patch.object(
+                agent_server, "provider_background_work_labels_from_snapshot",
+                side_effect=lambda _snapshot: agent_server.active_codex_work_labels(),
+            ):
+                snapshot = agent_server.server_restart_blocker_snapshot_locked(
+                    provider_background_work_labels=agent_server.active_codex_work_labels(),
+                )
+                self.assertEqual(snapshot["active_count"], 1)
+                self.assertEqual(snapshot["provider_background_count"], 0)
+                agent_server.write_fresh_server_update_status(
+                    phase="pending", schedule_id=schedule_id,
+                    target_version="1.1.0", latest_version="1.1.0", track="stable",
+                    update_available=True, when_idle=True, cancelable=True,
+                )
+                body = restart_body(force=True, update_schedule_id=schedule_id).model_copy(
+                    update={"resume_interrupted_turns": True},
+                )
+                accepted = await agent_server.restart_server_endpoint(body, http_request(method="POST"), BackgroundTasks())
+                receipt = agent_server.read_server_restart_status()
+                self.assertEqual(accepted["phase"], "accepted")
+                row = receipt["_continuation_runs"][0]
+                self.assertEqual(row["purpose"], "codex_goal_resume")
+                self.assertEqual(row["server_update_goal"]["identity"]["tokenBudget"], 9000)
+                self.assertEqual(row["server_update_goal"]["thread_id"], "native-thread")
+                self.assertEqual(row["server_update_goal"]["time_budget_seconds"], 300)
+                self.assertEqual(goal["tokensUsed"], 100)
+                forced_signal.assert_called_once_with(accepted["request_id"])
+
+    async def test_native_goal_deduplication_keeps_other_or_stale_consumers_blocking(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task, other = asyncio.Future(), asyncio.Future()
+            session = {"backend": "codex", "session_id": "native-thread",
+                       "codex_goal": {"status": "active", "objective": "Work", "createdAt": 1}}
+            active = {"run_id": "goal-run", "owner_task": task}
+            with restart_environment(root), patch.object(agent_server, "BUSY_SESSIONS", {"chat"}), patch.object(
+                agent_server, "CURRENT_TURNS", {"chat": {
+                    "backend": "codex", "run_id": "goal-run", "purpose": "codex_goal_resume",
+                }},
+            ), patch.object(agent_server, "ACTIVE", {"chat": active}), patch.object(
+                agent_server.STORE, "sessions", {"chat": session},
+            ), patch.object(agent_server, "CODEX_NATIVE_ACTION_TASKS", {
+                ("chat", "goal-run"): task, ("chat", "other-run"): other,
+            }), patch.object(agent_server, "CODEX_PENDING_INTERACTIONS", {}), patch.object(
+                agent_server, "CODEX_SUBAGENT_STATE", {},
+            ):
+                def count():
+                    return agent_server.server_restart_blocker_snapshot_locked(
+                        provider_background_work_labels=agent_server.active_codex_work_labels(),
+                    )["provider_background_count"]
+
+                self.assertEqual(count(), 1)  # Only the same goal consumer is deduplicated.
+                active["owner_task"] = other
+                self.assertEqual(count(), 2)  # Changed consumer ownership is not safe.
+                active["owner_task"] = task
+                active["run_id"] = "replacement"
+                self.assertEqual(count(), 2)
+                active["run_id"] = "goal-run"
+                active["stop_requested"] = True
+                self.assertEqual(count(), 2)
+                active.pop("stop_requested")
+                session["codex_goal"]["status"] = "complete"
+                self.assertEqual(count(), 2)
+                session["codex_goal"]["status"] = "active"
+                task.set_result(None)
+                self.assertEqual(count(), 1)  # Unrelated operation still blocks.
+
     async def test_force_update_replay_is_idempotent_and_schedule_is_fingerprinted(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2171,6 +2346,33 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(status["phase"], "accepted")
         self.assertTrue(status["forced"])
+
+    async def test_coordinated_force_keeps_chats_running_if_restart_receipt_cannot_be_saved(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            schedule_id = "b" * 32
+            with restart_environment(root) as forced_signal, patch.object(
+                agent_server, "SERVER_VERSION", "1.0.0",
+            ):
+                agent_server.write_fresh_server_update_status(
+                    phase="pending", schedule_id=schedule_id,
+                    target_version="1.1.0", latest_version="1.1.0",
+                    track="stable", update_available=True,
+                    when_idle=True, cancelable=True,
+                )
+                body = restart_body(force=True, update_schedule_id=schedule_id).model_copy(
+                    update={"resume_interrupted_turns": True},
+                )
+                with patch.object(agent_server, "write_server_restart_status", side_effect=OSError("disk full")):
+                    with self.assertRaises(HTTPException) as rejected:
+                        await agent_server.restart_server_endpoint(
+                            body, http_request(method="POST"), BackgroundTasks(),
+                        )
+                pending = agent_server.read_server_update_status()
+        self.assertEqual(rejected.exception.detail["code"], "server_update_continuation_receipt_failed")
+        self.assertTrue(pending["cancelable"])
+        self.assertIsNone(pending.get("_force_restart_request_id"))
+        forced_signal.assert_not_called()
 
     async def test_force_restart_proceeds_when_team_hub_snapshot_fails(self):
         with tempfile.TemporaryDirectory() as temporary:

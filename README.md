@@ -158,9 +158,12 @@ named instances to avoid taking over the default gateway.
 
 Use the app's managed update controls for an installed server. Updating the npm
 CLI alone leaves its running server unchanged. Signed updates preserve the
-server's token and chat history. A paired desktop release updates the app first,
-then reconciles its saved servers. Busy servers wait for idle; offline servers
-resume after reconnecting. Check each server's result: a failed update needs
+server's token and chat history. With recoverable coordinated updates, each saved
+server independently prepares its signed update, saves supported active work,
+restarts and resumes that work. Unsupported work waits for a safe boundary.
+The app installs only after all saved servers are ready; offline servers must
+reconnect first. Older app versions reconcile servers after the app update.
+Check each server's result: a failed update needs
 Retry, and an older unsupported installation may need a guided upgrade.
 See the [release notes](https://github.com/ZhengyiLuo/AgentsDock/releases/latest)
 for the current release's validation limits.

@@ -1629,6 +1629,62 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
         await second_client.emit({"type": "result", "result": "done"})
         await asyncio.wait_for(collect(second), 1)
 
+    async def test_lookup_during_connect_preserves_connected_provider_tool_owner(self) -> None:
+        factory = HostileConnectFactory()
+        manager = ClaudeSDKSupervisorManager(client_factory=factory)
+
+        def options():
+            owner = {"token": "", "run_id": ""}
+
+            def bind(token, run_id):
+                owner.update(token=token, run_id=run_id)
+
+            return {
+                "_agentsdock_bind_provider_tool_owner": bind,
+                "mcp_servers": {"agentsdock": {"inbox": lambda: (owner["token"], owner["run_id"])}},
+            }
+
+        original, replacement = options(), options()
+        start = asyncio.create_task(manager.start_run(
+            "chat", "Read my inbox", run_id="run-inbox", options=original, configuration_key="same",
+        ))
+        try:
+            async def connecting_client():
+                while not factory.clients:
+                    await asyncio.sleep(0)
+                await factory.clients[0].connect_started.wait()
+                return factory.clients[0]
+
+            client = await asyncio.wait_for(connecting_client(), 1)
+            supervisor = await manager.get("chat", options=replacement, configuration_key="same")
+            client.release_connect.set()
+            handle = await asyncio.wait_for(start, 1)
+            await asyncio.wait_for(handle.wait_acknowledged(), 1)
+            # Invoke the callback captured by the connected client, not the
+            # newer options returned by concurrent discovery.
+            bound_owner = client.options["mcp_servers"]["agentsdock"]["inbox"]()
+            self.assertEqual(bound_owner, (supervisor.ownership_token, "run-inbox"))
+            self.assertTrue(manager.owns_active_run("chat", *bound_owner))
+            await client.emit({"type": "result", "result": "Inbox read"})
+            await asyncio.wait_for(collect(handle), 1)
+        finally:
+            for client in factory.clients:
+                client.release_connect.set()
+            await asyncio.gather(start, return_exceptions=True)
+            await manager.close_all()
+
+    async def test_disconnected_side_question_uses_latest_resume_binding(self) -> None:
+        supervisor = await self.manager.get(
+            "child-chat", options={"resume": "parent-native"}, configuration_key="same",
+        )
+        await self.manager.get(
+            "child-chat", options={"resume": "child-native"}, configuration_key="same",
+        )
+        lease = await supervisor.get_side_question_client(expected_provider_id="child-native")
+        self.assertIs(lease.client, self.factory.clients[0])
+        self.assertEqual(lease.client.options["resume"], "child-native")
+        self.assertEqual(lease.client.query_envelopes, [])
+
     async def test_fork_reconnect_uses_latest_child_binding_without_replacing_live_owner(self) -> None:
         options = {
             "cwd": "/shared-project", "resume": "parent-native", "fork_session": True,

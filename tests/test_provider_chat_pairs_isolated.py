@@ -125,6 +125,7 @@ class ChatPairTests(unittest.IsolatedAsyncioTestCase):
             "append_agent_handoff_route_audit": AsyncMock(),
             "retire_revoked_provider_route_deliveries": self.retired,
             "LOCAL_CROSS_CHAT_DELIVERY_PURPOSE": "cross_chat_handoff_delivery",
+            "SERVER_UPDATE_CONTINUATION_PURPOSE": "server_update_continuation",
             "SECURE_PEER_DELIVERY_PURPOSE": "secure_peer_handoff_delivery",
             "CROSS_CHAT_DELIVERY_PURPOSES": {"cross_chat_handoff_delivery", "secure_peer_handoff_delivery"},
             "ASYNC_ROUTE_V1_CLIENT_CAPABILITY": "chat_conversation_async_route_v1",

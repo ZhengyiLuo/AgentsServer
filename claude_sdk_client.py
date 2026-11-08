@@ -2739,8 +2739,8 @@ class ClaudeSDKSupervisor:
             return
         try:
             if not self.connected and command.expected_provider_id is not None:
-                resume = (self.options.get("resume") if isinstance(self.options, dict)
-                          else getattr(self.options, "resume", None))
+                resume = (self._reconnect_options.get("resume") if isinstance(self._reconnect_options, dict)
+                          else getattr(self._reconnect_options, "resume", None))
                 if not resume or resume != command.expected_provider_id:
                     raise ClaudeSDKUnavailable(
                         "The native Claude conversation is not available to resume"
@@ -3825,16 +3825,9 @@ class ClaudeSDKSupervisorManager:
             # newer persisted resume/fork binding merely because this client
             # is connected. Its actor may need to reconnect after this lookup.
             supervisor._reconnect_options = options
-            # A disconnected actor has no live provider state. Refresh its
-            # lazy reconnect options so a newly persisted resume/fork binding
-            # is honored after a stream failure without changing the stable
-            # process-configuration key used by healthy persistent clients.
-            if not supervisor.connected and not supervisor.is_active:
-                supervisor.options = options
-                bind_permission_owner(
-                    supervisor.options,
-                    supervisor.ownership_token,
-                )
+            # _new_client selects the options for each connection. While
+            # connect() is awaiting, its MCP callbacks already captured them;
+            # replacing them here would bind the owner into another closure.
             self._supervisors.move_to_end(chat_id)
         return supervisor, old_to_close
 

@@ -317,6 +317,58 @@ class ExecutionTransportTests(unittest.IsolatedAsyncioTestCase):
             await writer.wait_closed()
         await asyncio.wait_for(committed.wait(), 1)
 
+    async def assert_gateway_client_disconnect_preserves_worker(self, websocket):
+        finish = asyncio.Event()
+        disconnected = asyncio.Event()
+        committed = asyncio.Event()
+        incoming = asyncio.Queue()
+        responses = []
+        cancellations = []
+        scope = http_scope()
+        if websocket:
+            scope.update(type="websocket", scheme="wss")
+            scope.pop("method")
+        initial = {"type": "websocket.connect"} if websocket else {"type": "http.request", "body": b""}
+        disconnect = ({"type": "websocket.disconnect", "code": 1000, "reason": "Client leaving"}
+                      if websocket else {"type": "http.disconnect"})
+        incoming.put_nowait(initial)
+
+        async def app(scope, receive, send):
+            await receive()
+            await send({"type": "websocket.accept"} if websocket else
+                       {"type": "http.response.start", "status": 200})
+            self.assertEqual(await receive(), disconnect)
+            disconnected.set()
+            try:
+                await finish.wait()
+                committed.set()
+            except asyncio.CancelledError:
+                cancellations.append(True)
+                raise
+
+        server, gateway = await self.start(app)
+
+        async def send(message):
+            responses.append(message)
+            incoming.put_nowait(disconnect)
+
+        try:
+            await asyncio.wait_for(gateway(scope, incoming.get, send), 2)
+            await asyncio.wait_for(disconnected.wait(), 2)
+            self.assertEqual(len(responses), 1)
+            self.assertEqual(server.active_connections, 1)
+            self.assertFalse(committed.is_set())
+            self.assertFalse(cancellations)
+        finally:
+            finish.set()
+        await asyncio.wait_for(committed.wait(), 2)
+
+    async def test_gateway_client_websocket_close_is_not_a_worker_failure(self):
+        await self.assert_gateway_client_disconnect_preserves_worker(websocket=True)
+
+    async def test_gateway_client_http_disconnect_is_not_a_worker_failure(self):
+        await self.assert_gateway_client_disconnect_preserves_worker(websocket=False)
+
     async def test_declared_trailers_are_forwarded_before_response_completes(self):
         body_sent = asyncio.Event()
         release_trailers = asyncio.Event()

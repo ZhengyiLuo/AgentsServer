@@ -32,6 +32,7 @@ ENV_KEY = "AGENTSDOCK_CODEX_PROVIDER_API_KEY"
 MAX_BODY_BYTES = 16 * 1024
 MAX_SUMMARY_CAPABILITIES_BYTES = 192 * 1024
 MAX_MODEL_CATALOG_BYTES = 384 * 1024
+MODEL_CATALOG_TTL_SECONDS = 300
 TEST_TIMEOUT_SECONDS = 45
 TEST_TOOL = "agentsdock_compatibility_ping"
 TEST_INSTRUCTIONS = (
@@ -434,7 +435,9 @@ class ProviderStore:
                 capabilities[model] = model_capability({**capabilities.get(model, {}), "reasoning_summary_supported": supported})
             if selected and selected.get("model"):
                 capabilities.setdefault(selected["model"], model_capability())
+            age = time.time() - cached.get("fetched_at", 0)
             return {"models": cached.get("models", []), "efforts": [],
+                "discovery_status": cached.get("discovery_status", "unavailable") if 0 <= age < MODEL_CATALOG_TTL_SECONDS else "unavailable",
                 "model_efforts": {model: [option for option in EFFORT_OPTIONS if option["value"] in capability["reasoning_efforts"]]
                     for model, capability in capabilities.items()},
                 "model_capabilities": capabilities,
@@ -445,8 +448,13 @@ class ProviderStore:
         with self.lock:
             previous = self._saved_model_catalog(selected)
             legacy_default = previous.get("legacy_default_model") or (previous.get("default_model") if not selected.get("model") else None)
+            status = catalog.get("discovery_status", "ready")
+            if status not in {"ready", "empty", "partial"}:
+                # Retain only this credential's previous inventory on failure.
+                catalog = {**previous, "discovery_status": status}
             models = catalog.get("models", [])
             self._catalogs[catalog_key(selected)] = {"models": models,
+                "fetched_at": time.time(), "discovery_status": status,
                 "model_capabilities": {model["value"]: model_capability(catalog.get("model_capabilities", {}).get(model["value"])) for model in models},
                 "default_model": catalog.get("default_model", ""), "legacy_default_model": legacy_default}
             self._save_model_catalog(selected, self._catalogs[catalog_key(selected)])
@@ -456,6 +464,20 @@ class ProviderStore:
                 if catalog.get("model_capabilities", {}).get(model["value"], {}).get("reasoning_summary_supported") is False}
             if denials:
                 self._cache_summary_capabilities(selected, denials)
+
+    def refresh_catalog(self, *, force: bool = False) -> None:
+        selected = self.registration(include_key=True)
+        if not selected:
+            return
+        with self.lock:
+            cached = self._catalogs.get(catalog_key(selected)) or self._saved_model_catalog(selected)
+            age = time.time() - cached.get("fetched_at", 0)
+            if not force and 0 <= age < MODEL_CATALOG_TTL_SECONDS:
+                return
+        result = endpoint_model_catalog(selected)
+        current = self.registration(include_key=True)
+        if current and current.get("credential_id") == selected.get("credential_id"):
+            self.cache_catalog(selected, result)
 
     def _save_model_catalog(self, selected: dict, catalog: dict) -> None:
         identifier = selected.get("credential_id")
@@ -515,6 +537,8 @@ class ProviderStore:
                 default_model = validate_model(default_model)
             legacy = catalog.get("legacy_default_model")
             result = {"models": models, "model_capabilities": capabilities, "default_model": default_model,
+                      "fetched_at": catalog.get("fetched_at", 0) if isinstance(catalog.get("fetched_at", 0), (int, float)) else 0,
+                      "discovery_status": catalog.get("discovery_status", "unavailable"),
                       "legacy_default_model": validate_model(legacy) if legacy else None}
             self._saved_catalogs[identifier] = result
             return result

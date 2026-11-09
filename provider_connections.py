@@ -29,7 +29,7 @@ MAX_BODY_BYTES = 16 * 1024
 # Keep this explicit probe bounded and single-shot, including for such models.
 MODEL_CHECK_MAX_OUTPUT_TOKENS = 256
 PROTOCOLS = {"claude": {"anthropic"}, "opencode": {"anthropic", "chat_completions", "responses"}, "cursor": {"cursor"}, "gemini": {"gemini"}}
-RESULTS = {"verified", "authentication_failed", "rate_limited", "unsupported", "connection_failed", "invalid_response", "model_required", "cli_update_required"}
+RESULTS = {"verified", "authentication_failed", "rate_limited", "unsupported", "model_unavailable", "connection_failed", "invalid_response", "model_required", "cli_update_required"}
 
 
 def backend_name(value: str) -> str:
@@ -75,6 +75,35 @@ class ConnectionStore:
         self.root = root
         self.lock = threading.RLock()
         self.catalog_cache = {}
+        self.catalog_status = {}
+        self.model_checks = {}
+
+    def remember_catalog(self, backend: str, value: dict, result: dict) -> list[dict]:
+        key = (backend, value["revision"])
+        with self.lock:
+            old = self.catalog_cache.get(key)
+            status = result.get("discovery_status", "unavailable")
+            # A transient failure is not an authoritative empty inventory.
+            models = result["models"] if status in {"ready", "empty", "partial"} else (old[1] if old else result["models"])
+            self.catalog_cache[key] = (time.monotonic(), models)
+            self.catalog_status[key] = status
+            while len(self.catalog_cache) > 32:
+                oldest = next(iter(self.catalog_cache))
+                self.catalog_cache.pop(oldest, None)
+                self.catalog_status.pop(oldest, None)
+            return self.checked_models(backend, value, models)
+
+    def checked_models(self, backend: str, value: dict, models: list[dict]) -> list[dict]:
+        result = []
+        for model in models:
+            evidence = self.model_checks.get((backend, value["revision"], model["value"]))
+            row = dict(model)
+            if evidence and time.monotonic() - evidence[0] < 300:
+                row["check_status"] = evidence[1]
+                if evidence[1] in {"unsupported", "model_unavailable"}:
+                    row.update(locked=True, locked_reason="This model rejected a request for this API connection. Check again or choose another model.")
+            result.append(row)
+        return result
 
     def _directory(self, create=False):
         if self.root.is_symlink() or self.root.parent.is_symlink():
@@ -219,24 +248,29 @@ class ConnectionStore:
                 return {"configured": configured, "available": configured and installed,
                         "model": model, "base_url": value.get("base_url")}
             models = []
+            status = "unavailable"
             if configured:
                 cache_key = (backend, value["revision"])
                 cached = self.catalog_cache.get(cache_key)
                 if cached and time.monotonic() - cached[0] < 300:
                     models = cached[1]
+                    status = self.catalog_status.get(cache_key, "ready")
                 elif session is None and backend != "cursor":  # Cursor discovery uses an async CLI probe.
-                    models = discover_models(value)
-                    self.catalog_cache[cache_key] = (time.monotonic(), models)
-                    if len(self.catalog_cache) > 32:
-                        self.catalog_cache.pop(next(iter(self.catalog_cache)))
+                    result = discover_catalog(value)
+                    models = self.remember_catalog(backend, value, result)
+                    status = result.get("discovery_status", "unavailable")
+                elif cached:
+                    models = cached[1]  # stale, not revalidated for this binding
                 if backend == "cursor" and not models:
                     models = [{"value": "auto", "label": "Auto"}]
                 if backend == "gemini":
                     from gemini_api import model_options
                     models = model_options(value, models)
-                if model and not any(item["value"] == model for item in models):
-                    models = [{"value": model, "label": model}, *models]
+                models = self.checked_models(backend, value, models)
+                if session is None and self.read(backend)["revision"] != value["revision"]:
+                    raise HTTPException(409, "Endpoint settings changed while reading models.")
             return {"configured": configured, "available": configured and installed,
+                    "discovery_status": status,
                     "models": models, "efforts": [], "default_model": model,
                     "model": model, "default_effort": None, "base_url": value.get("base_url")}
         except HTTPException:
@@ -325,10 +359,14 @@ def require_model(value: dict) -> str:
 
 
 def discover_models(value: dict) -> list[dict]:
+    return discover_catalog(value)["models"]
+
+
+def discover_catalog(value: dict) -> dict:
     if value["protocol"] == "gemini":
         from gemini_api import catalog
-        return catalog(value)["models"]
-    return endpoint_model_catalog(value, protocol=value["protocol"])["models"]
+        return catalog(value)
+    return endpoint_model_catalog(value, protocol=value["protocol"])
 
 
 def native_credentials_present(backend: str, diagnostic: dict) -> bool:
@@ -441,6 +479,8 @@ async def probe(selected: dict) -> str:
                     return "authentication_failed"
                 if response.status_code == 429:
                     return "rate_limited"
+                if response.status_code == 404:
+                    return "model_unavailable"
                 if response.status_code != 200:
                     return "unsupported" if response.status_code < 500 else "connection_failed"
                 raw = bytearray()
@@ -599,15 +639,47 @@ def create_router(*, authorize, store: ConnectionStore, check=probe, account=nat
         if backend == "codex":
             codex_store.cache_catalog(selected, result)
         else:
-            with store.lock:
-                store.catalog_cache[(backend, selected["revision"])] = (time.monotonic(), result["models"])
-                if len(store.catalog_cache) > 32: store.catalog_cache.pop(next(iter(store.catalog_cache)))
+            result["models"] = store.remember_catalog(backend, selected, result)
         model = selected.get("model")
         if backend == "gemini":
-            from gemini_api import default_model
+            from gemini_api import default_model, model_options
             model = default_model(selected)
+            result["models"] = model_options(selected, result["models"])
         return reply({"backend": backend, "revision": selected.get("credential_id") if backend == "codex" else selected["revision"],
+                      "check_available": backend in {"claude", "opencode", "gemini"},
                       "models": result["models"], "default_model": model, "discovery_status": result["discovery_status"]})
+
+    @router.post("/api/admin/provider-models/{backend}/check")
+    async def check_model(backend: str, request: Request):
+        authorize(request)
+        if backend not in {"claude", "opencode", "gemini"}:
+            raise HTTPException(400, "Use this provider's native model check.")
+        payload = await body(request)
+        if set(payload) != {"model", "expected_revision"}:
+            raise HTTPException(400, "Provide model and saved revision only.")
+        model = validate_model(payload["model"])
+        if not model or model == "auto":
+            raise HTTPException(400, "Choose an explicit model for this check.")
+        selected = await model_selection(backend)
+        if selected["revision"] != revision(payload["expected_revision"]):
+            raise HTTPException(409, "Endpoint settings changed. Refresh and try again.")
+        if locks[backend].locked():
+            raise HTTPException(409, "An endpoint operation is already in progress.")
+        async with locks[backend]:
+            if (await model_selection(backend))["revision"] != selected["revision"]:
+                raise HTTPException(409, "Endpoint settings changed. Refresh and try again.")
+            # Explicit, single-shot text request. Never changes saved model,
+            # login readiness, credentials or a chat; no project/tool access.
+            result = await check({**selected, "model": model})
+            current = await model_selection(backend)
+            if current["revision"] != selected["revision"]:
+                raise HTTPException(409, "Endpoint settings changed. Refresh and try again.")
+            with store.lock:
+                store.model_checks[(backend, selected["revision"], model)] = (time.monotonic(), result)
+                while len(store.model_checks) > 512:
+                    store.model_checks.pop(next(iter(store.model_checks)))
+        return reply({"backend": backend, "revision": selected["revision"], "model": model,
+                      "status": result, "scope": "text_request"})
 
     @router.put("/api/admin/provider-models/{backend}")
     async def default_model(backend: str, request: Request):
@@ -635,7 +707,16 @@ def create_router(*, authorize, store: ConnectionStore, check=probe, account=nat
                     value = {key: current[key] for key in ("base_url", "api_key", "protocol", "auth_header")}
                     saved = store.write(backend, current["revision"], {**value, "model": model, "expected_revision": current["revision"]}, current["last_result"], checked_at=current["checked_at"])
                     cached = store.catalog_cache.get((backend, current["revision"]))
-                    if cached: store.catalog_cache[(backend, saved["revision"])] = cached
+                    if cached:
+                        store.remember_catalog(backend, saved, {"models": cached[1],
+                            "discovery_status": store.catalog_status.get((backend, current["revision"]), "unavailable")})
+                    # This operation changes only the default, not credentials,
+                    # endpoint or protocol. Preserve still-fresh observations.
+                    for (source_backend, source_revision, source_model), evidence in list(store.model_checks.items()):
+                        if source_backend == backend and source_revision == current["revision"]:
+                            store.model_checks[(backend, saved["revision"], source_model)] = evidence
+                    while len(store.model_checks) > 512:
+                        store.model_checks.pop(next(iter(store.model_checks)))
                     effective_model = saved["model"]
                     if backend == "gemini":
                         from gemini_api import default_model as gemini_default_model

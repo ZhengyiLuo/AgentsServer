@@ -24,6 +24,15 @@ Describe differences and extra provider usage for server-provided equivalents.
   settings. Unknown model capabilities stay unverified, not guessed from names.
 - [ ] Keep custom endpoints, credentials, chats and server instances isolated.
   Do not rewrite shared native login/configuration. Bound probes and redact secrets.
+- [ ] Read current-account/current-endpoint model inventory, not a static version
+  whitelist. Test account changes, reconnect, explicit refresh, pagination and
+  large catalogs. Saved chat/default IDs are not evidence of current availability.
+  Empty inventory, stale cache, failed discovery and confirmed rejection must stay
+  distinct. Never trigger credential renewal merely to populate Claude's picker.
+- [ ] Distinguish listed models from real-request evidence. Use explicit bounded
+  checks with disclosed provider usage; keep text success separate from tool,
+  streaming and reasoning compatibility. Quota, auth and network errors do not
+  prove retirement. Fence late results to the exact account/connection revision.
 
 ## 2. Conversation lifecycle
 

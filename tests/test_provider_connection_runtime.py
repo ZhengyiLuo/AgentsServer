@@ -195,7 +195,9 @@ class RuntimeBindingTests(unittest.TestCase):
 
     def test_public_catalog_has_no_keys_and_session_projection_never_networks(self):
         chat = self.chat()
-        with patch.object(connections, "discover_models", return_value=[{"value": "catalog/model", "label": "catalog/model"}]) as discover:
+        with patch.object(connections, "discover_catalog", return_value={
+            "models": [{"value": "catalog/model", "label": "catalog/model"}], "discovery_status": "ready",
+        }) as discover:
             self.assertTrue(self.store.catalog("claude")["available"])
             self.assertEqual(discover.call_count, 1)
             self.store.catalog("claude")

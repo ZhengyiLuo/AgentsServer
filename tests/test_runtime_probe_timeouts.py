@@ -54,7 +54,9 @@ class RuntimeProbeTimeoutTests(unittest.TestCase):
             result = agent_server.parse_claude_help_catalog()
         popen.assert_not_called()
         self.assertTrue(result["models"])
-        self.assertIn("fallback", result["model_source"])
+        self.assertIn("native aliases; availability unverified", result["model_source"])
+        self.assertEqual(result["discovery_status"], "unavailable")
+        self.assertFalse(any(row["value"].startswith("claude-") for row in result["models"]))
 
     def test_authentication_failure_invalidates_model_cache(self):
         with patch("claude_model_catalog.clear_native_models") as clear:

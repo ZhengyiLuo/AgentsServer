@@ -52,6 +52,13 @@ def parse_models(value):
         model = str(item.get("name") or "").removeprefix("models/")
         if not MODEL.fullmatch(model) or "generateContent" not in item.get("supportedGenerationMethods", []):
             continue
+        # generateContent also lists audio-only products. These cannot satisfy
+        # the text/tool contract of Gemini CLI. Unknown chat families stay in
+        # the inventory; do not use a version/deprecation blacklist.
+        modalities = item.get("outputModalities")
+        if (isinstance(modalities, list) and modalities and "TEXT" not in modalities
+                or re.search(r"(?:^|-)tts(?:-|$)", model) or model.startswith("lyria-")):
+            continue
         label = item.get("displayName") or model
         if not isinstance(label, str) or not label or len(label) > 256 or any(ord(c) < 32 or ord(c) == 127 for c in label):
             label = model
@@ -107,6 +114,7 @@ async def probe(selected):
             async with client.stream(method, target, headers=headers, **kwargs) as response:
                 if response.status_code in {400, 401, 403}: return "authentication_failed" if not model or response.status_code != 400 else "unsupported"
                 if response.status_code == 429: return "rate_limited"
+                if response.status_code == 404 and model: return "model_unavailable"
                 if response.status_code != 200: return "connection_failed"
                 raw = bytearray()
                 async for chunk in response.aiter_bytes():

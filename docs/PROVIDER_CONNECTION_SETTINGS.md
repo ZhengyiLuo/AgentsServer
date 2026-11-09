@@ -134,6 +134,39 @@ the chat selector still allow an exact ID. Friendly names are
 shown alongside exact IDs; confirmed non-chat/non-tool models are filtered out.
 Inventory presence is not proof of permission, billing or agent-tool compatibility.
 
+### Account-scoped freshness and optional model checks
+
+Catalog refresh reads the current native account or saved endpoint, with no
+static version whitelist. Claude uses metadata from actual SDK chats (or the
+Models API for API credentials); on a cache miss it exposes native family
+aliases without claiming account verification. It never opens a disposable
+OAuth process for discovery. OpenCode explicit refresh also refreshes its CLI
+registry. Cursor API inventories support up to 512 rows rather than 256.
+
+Reconnecting desktop reconciles its disk cache passively. Custom API inventory
+is credential-scoped and refreshable; failed discovery can retain that same
+connection's previous rows with an unconfirmed warning. A successful empty
+inventory replaces old rows. A saved model absent from the current list is
+shown separately as not listed, not silently added as an available model.
+An exact manual ID remains possible; actual sends decide availability.
+
+Claude, OpenCode and Gemini Custom API cards offer **Test this model** for an
+explicit selected model. It sends one bounded text request, may incur a charge,
+and does not change the saved default, credentials, connection readiness or
+any chat. Success only verifies this text request, not every agent feature.
+Rejections are marked for this connection for five minutes; quota/auth/network
+failures remain inconclusive about model availability. Changing only a default
+preserves observations; replacing credentials does not carry them forward.
+Known audio-only Gemini products are excluded from the text-agent inventory;
+other inventory rows still require the provider to accept the actual request.
+
+The native-only POST `/api/admin/provider-models/{claude|opencode|gemini}/check`
+accepts exactly `model` and `expected_revision` and returns `status` with
+`scope: "text_request"`. Model-list GET advertises `check_available`; older
+servers do not show the new action. Codex retains its native compatibility
+check, and Cursor uses its own account-scoped CLI inventory. No bulk automatic
+inference or additional login process is introduced.
+
 Gemini's integration is an exception to the empty-default rule:
 the official Google Developer API uses the native CLI **Auto** selector when
 no model is chosen. Explicit models still take precedence. Compatible third-party

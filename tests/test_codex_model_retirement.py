@@ -100,14 +100,17 @@ class CodexModelRetirementTests(unittest.IsolatedAsyncioTestCase):
 
     def test_api_catalog_preserves_explicit_gpt55(self):
         self.write_auth({'OPENAI_API_KEY': 'fixture-only'})
-        with patch.object(agent_server, 'run_catalog_command', return_value='{"models": []}'), patch.object(
-            agent_server, 'codex_user_config_defaults', return_value=('gpt-5.5', 'xhigh', ''),
-        ):
-            catalog = agent_server.discover_codex_catalog()
-            self.assertEqual(catalog['default_model'], 'gpt-5.5')
-            self.assertIn('gpt-5.5', {item['value'] for item in catalog['models']})
-            self.assertEqual(catalog['model_replacements'], {})
-            self.assertEqual(agent_server.codex_runtime_settings({})[0], 'gpt-5.5')
+        for native_models in ([], [{'slug': 'gpt-5.5', 'visibility': 'list', 'supported_in_api': True}]):
+            with self.subTest(native_models=native_models), patch.object(
+                agent_server, 'run_catalog_command', return_value=json.dumps({'models': native_models}),
+            ), patch.object(agent_server, 'codex_user_config_defaults', return_value=('gpt-5.5', 'xhigh', '')):
+                catalog = agent_server.discover_codex_catalog()
+                self.assertEqual(catalog['default_model'], 'gpt-5.5')
+                # Preserve explicit API selection without inventing account
+                # inventory when the native catalog authoritatively omits it.
+                self.assertEqual('gpt-5.5' in {item['value'] for item in catalog['models']}, bool(native_models))
+                self.assertEqual(catalog['model_replacements'], {})
+                self.assertEqual(agent_server.codex_runtime_settings({})[0], 'gpt-5.5')
 
     def test_preview_keeps_native_ids_and_never_changes_original_history(self):
         original = {'id': 'fixture-chat', 'backend': 'codex', 'model': 'gpt-5.5', 'effort': 'high',

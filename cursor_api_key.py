@@ -57,7 +57,9 @@ async def catalog(selected: dict, *, executable: str | None, env: dict) -> dict:
                   and selected["api_key"] not in item["id"] + item["label"]]
         if not models:
             return {"models": [], "discovery_status": "unavailable"}
-        return {"models": models[:256], "discovery_status": "ready"}
+        # Match the shared catalog boundary. A truncated list is not complete
+        # evidence that a saved model disappeared from this account.
+        return {"models": models[:512], "discovery_status": "partial" if len(models) > 512 else "ready"}
     except SideQuestionError:
         # Offline and invalid keys can look identical in CLI output. Do not
         # misclassify an outage as a logout or return key-bearing stderr.

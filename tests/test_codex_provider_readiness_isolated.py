@@ -31,6 +31,7 @@ class CodexProviderReadinessTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.selected = {"base_url": "https://gateway.example/v1", "model": "openai/openai/gpt-6-astra"}
         self.store = SimpleNamespace(selection=Mock(side_effect=RuntimeError("must not read custom key for normal auth")),
+            refresh_catalog=Mock(),
             for_session=Mock(return_value=self.selected), catalog=Mock(return_value={
                 **self.selected, "configured": True, "available": True}))
         self.command = Mock(return_value=subprocess.CompletedProcess([], 0, "Codex 0.153.3", ""))
@@ -121,6 +122,7 @@ class CodexProviderReadinessTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["custom_provider"]["available"])
         self.assertEqual(result["custom_provider"]["model"], self.selected["model"])
         self.store.catalog.assert_called_once_with(available=True)
+        self.store.refresh_catalog.assert_called_once_with(force=False)
 
     def test_claude_does_not_read_or_use_codex_provider_settings(self):
         self.command.side_effect = [subprocess.CompletedProcess([], 0, "Claude 1.0", "")]

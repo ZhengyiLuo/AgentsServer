@@ -10,6 +10,34 @@ import agent_server
 
 
 class OpenCodeRuntimeResolutionTests(unittest.TestCase):
+    def test_refresh_timeout_uses_native_registry_but_does_not_claim_freshness(self):
+        with patch.object(agent_server, "runtime_catalog_budget_expired", return_value=False), patch.object(
+            agent_server, "run_catalog_command", side_effect=[
+                subprocess.TimeoutExpired("opencode models --refresh", 6),
+                "opencode/new-free\n",
+            ],
+        ) as command:
+            result = agent_server.discover_opencode_catalog(executable="/test/opencode", refresh=True)
+        self.assertEqual([row["value"] for row in result["models"]], ["", "opencode/new-free"])
+        self.assertEqual(result["discovery_status"], "unavailable")
+        self.assertIn("cached registry", result["model_source"])
+        self.assertEqual([call.args[0] for call in command.call_args_list], [
+            ["/test/opencode", "models", "--refresh"], ["/test/opencode", "models"],
+        ])
+
+    def test_empty_inventory_is_authoritative_and_expired_budget_does_not_retry(self):
+        with patch.object(agent_server, "run_catalog_command", return_value="") as command:
+            result = agent_server.discover_opencode_catalog(executable="/test/opencode", refresh=True)
+        self.assertEqual(result["models"], [])
+        self.assertEqual(result["discovery_status"], "empty")
+        command.assert_called_once()
+        with patch.object(agent_server, "runtime_catalog_budget_expired", return_value=True), patch.object(
+            agent_server, "run_catalog_command", side_effect=agent_server.RuntimeCatalogBudgetExpired(),
+        ) as command:
+            result = agent_server.discover_opencode_catalog(executable="/test/opencode", refresh=True)
+        command.assert_called_once()
+        self.assertEqual(result["discovery_status"], "unavailable")
+
     def test_compatibility_probe_requires_native_file_support(self):
         help_text = (
             "opencode run [message..]\n"

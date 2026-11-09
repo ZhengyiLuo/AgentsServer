@@ -771,6 +771,23 @@ class RuntimeDiagnosticTests(unittest.TestCase):
         self.assertEqual(result["model_source"], "Cached Claude SDK initialize")
         api.assert_called_once_with(timeout_seconds=2.0)
 
+    def test_claude_default_follows_native_account_unless_explicitly_configured(self):
+        self.native_models.return_value = ([
+            {"value": "default", "label": "Default — Opus 5.5"},
+            {"value": "sonnet", "label": "Sonnet 5.5"},
+        ], "success")
+        for configured, expected, label in [("", "default", "Default — Opus 5.5"), ("sonnet", "sonnet", "Sonnet 5.5")]:
+            with self.subTest(configured=configured), patch.dict(agent_server.os.environ, {
+                "CLAUDE_MODEL": configured, "ANTHROPIC_MODEL": "",
+            }), patch.object(agent_server, "agentsdock_setting", return_value=""), patch.object(
+                agent_server, "run_catalog_command", return_value="",
+            ), patch.object(agent_server, "claude_supports_effort", return_value=False), patch.object(
+                agent_server, "discover_claude_provider_models", return_value=([], "unavailable"),
+            ):
+                result = agent_server.parse_claude_help_catalog()
+            self.assertEqual(result["default_model"], expected)
+            self.assertEqual(result["models"][0], {"value": "", "label": label})
+
     def test_claude_api_models_do_not_expand_cached_native_permissions(self) -> None:
         self.native_models.return_value = ([
             {"value": "opus", "label": "Opus 5.5"},
@@ -849,7 +866,7 @@ class RuntimeDiagnosticTests(unittest.TestCase):
             ["fable", "opus", "sonnet", "claude-fable-5-1"],
         )
 
-    def test_claude_catalog_fallback_includes_current_official_models(self) -> None:
+    def test_claude_catalog_cache_miss_never_invents_account_access_from_version_pins(self) -> None:
         help_text = """\
   --model <model>                       Provide an alias for the latest model
                                         (e.g. 'fable', 'opus', or 'sonnet')
@@ -867,11 +884,9 @@ class RuntimeDiagnosticTests(unittest.TestCase):
         self.assertIn("fable", by_value)
         self.assertIn("opus", by_value)
         self.assertIn("sonnet", by_value)
-        self.assertEqual(by_value["claude-fable-5-1"]["label"], "Fable 5.1")
-        self.assertEqual(by_value["claude-mythos-5-1"]["availability"], "limited")
-        self.assertIn("claude-opus-5", by_value)
-        self.assertIn("claude-sonnet-5", by_value)
-        self.assertIn("current fallback", catalog["model_source"])
+        self.assertFalse(any(value.startswith("claude-") for value in by_value))
+        self.assertEqual(catalog["discovery_status"], "unavailable")
+        self.assertIn("availability unverified", catalog["model_source"])
 
     def test_claude_catalog_uses_account_scoped_models_without_extra_pins(self) -> None:
         provider_options = [

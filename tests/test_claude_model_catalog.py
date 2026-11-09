@@ -160,6 +160,12 @@ class PassiveNativeModelCacheTests(unittest.TestCase):
             popen.assert_not_called()
         self.assertNotIn("private", repr(catalog._CACHE))
 
+    def test_real_chat_scheduler_limit_does_not_hide_native_models_from_catalog(self):
+        chat_env = {**self.env, "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "4"}
+        self.remember(env=chat_env)
+        self.assertEqual(self.read(), [{"value": "opus", "label": "Opus 5"}])
+        self.assertIsNone(self.read({**chat_env, "ANTHROPIC_API_KEY": "other-account"}))
+
     def test_cache_expires_and_is_bounded(self):
         with patch.object(catalog.time, "monotonic", return_value=1):
             self.remember()

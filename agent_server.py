@@ -929,29 +929,14 @@ RUNTIME_CATALOG_DEADLINE: ContextVar[float | None] = ContextVar(
 )
 RUNTIME_DIAGNOSTIC_TTL_SECONDS = float(agentsdock_setting("RUNTIME_DIAGNOSTIC_TTL_SECONDS", "60"))
 # Claude Code only promises the family aliases in ``--help``; account-scoped
-# pinned models come from Anthropic's Models API when an API key is available.
-# These entries are therefore a last-resort catalog when native SDK metadata
-# and the API are unavailable, not the primary source of truth. Keep aliases
-# so new models remain selectable even before this fallback is updated.
+# pinned models come from native session metadata or Anthropic's Models API.
+# Aliases are a usable fallback, not evidence of account-specific availability.
 CLAUDE_CLI_MODEL_ALIASES = (
     ("fable", "Fable"),
     ("opus", "Opus"),
     ("sonnet", "Sonnet"),
     ("haiku", "Haiku"),
     ("opus[1m]", "Opus 1M"),
-)
-CLAUDE_CURRENT_MODEL_FALLBACKS = (
-    ("claude-fable-5-1", "Fable 5.1", False),
-    ("claude-mythos-5-1", "Mythos 5.1 (limited access)", True),
-    ("claude-opus-5", "Opus 5", False),
-    ("claude-sonnet-5", "Sonnet 5", False),
-    ("claude-haiku-4-5-20251001", "Haiku 4.5", False),
-)
-CLAUDE_LEGACY_MODEL_FALLBACKS = (
-    ("claude-fable-5", "Fable 5", False),
-    ("claude-mythos-5", "Mythos 5 (limited access)", True),
-    ("claude-opus-4-8", "Opus 4.8", False),
-    ("claude-opus-4-8[1m]", "Opus 4.8 1M", False),
 )
 CLAUDE_MODEL_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\-\[\]]{0,255}$")
 CLAUDE_MODELS_API_MAX_BYTES = 2 * 1024 * 1024
@@ -60407,21 +60392,11 @@ def discover_codex_catalog() -> dict[str, Any]:
         service_tier = str(model.get("default_service_tier") or "").strip()
         model_options.append(runtime_option(slug, label, efforts=model_efforts.get(slug, []), service_tier=service_tier or None))
 
-    if not model_options:
-        for slug, label in CODEX_FALLBACK_MODELS:
-            if slug in replacements:
-                continue
-            fallback_efforts = [
-                runtime_option(effort, title_effort_label(effort))
-                for effort in CODEX_FALLBACK_MODEL_EFFORTS.get(slug, CODEX_FALLBACK_EFFORTS)
-            ]
-            model_efforts[slug] = fallback_efforts
-            service_tier = codex_default_service_tier(slug)
-            model_options.append(runtime_option(slug, label, efforts=fallback_efforts, service_tier=service_tier or None))
+    # A failed/empty account inventory is not permission to advertise our old
+    # pinned versions. Keep the configured default for existing turn settings,
+    # but do not manufacture selectable model rows from it.
     if not effort_options:
         effort_options.extend(runtime_option(effort, title_effort_label(effort)) for effort in CODEX_FALLBACK_EFFORTS)
-    if configured_model and configured_model not in replacements and not any(option.get("value") == configured_model for option in model_options):
-        model_options.insert(0, runtime_option(configured_model, title_model_label(configured_model)))
     if configured_effort and not any(option.get("value") == configured_effort for option in effort_options):
         effort_options.append(runtime_option(configured_effort, title_effort_label(configured_effort)))
     if default_model not in model_efforts:
@@ -60439,6 +60414,7 @@ def discover_codex_catalog() -> dict[str, Any]:
         "efforts": unique_runtime_options(effort_options, f"Server default ({default_effort_label})" if default_effort_label else None),
         "model_efforts": model_efforts,
         "model_source": model_source,
+        "discovery_status": "unavailable" if model_source.endswith("failed") else "ready" if model_options else "empty",
         "effort_source": effort_source,
         "default_model": default_model or None,
         "default_effort": default_effort or None,
@@ -60647,20 +60623,6 @@ def discover_claude_provider_models(
         return [], "failed"
 
 
-def claude_fallback_model_options() -> list[dict[str, Any]]:
-    return [
-        runtime_option(
-            value,
-            label,
-            **({"availability": "limited"} if limited else {}),
-        )
-        for value, label, limited in (
-            *CLAUDE_CURRENT_MODEL_FALLBACKS,
-            *CLAUDE_LEGACY_MODEL_FALLBACKS,
-        )
-    ]
-
-
 def discover_claude_native_models() -> tuple[list[dict[str, Any]], str]:
     from claude_model_catalog import cached_native_models
 
@@ -60677,12 +60639,12 @@ def discover_claude_native_models() -> tuple[list[dict[str, Any]], str]:
 def parse_claude_help_catalog() -> dict[str, Any]:
     model_options: list[dict[str, Any]] = []
     effort_options: list[dict[str, Any]] = []
-    default_model = (
+    configured_default_model = (
         os.environ.get("CLAUDE_MODEL")
         or os.environ.get("ANTHROPIC_MODEL")
         or agentsdock_setting("CLAUDE_MODEL", "")
-        or "sonnet"
     )
+    default_model = configured_default_model or "sonnet"
     default_effort = os.environ.get("CLAUDE_EFFORT") or agentsdock_setting("CLAUDE_EFFORT", "")
     supports_ultracode = claude_supports_effort("ultracode")
     # Optional candidate discovery must leave time for the native picker,
@@ -60709,20 +60671,20 @@ def parse_claude_help_catalog() -> dict[str, Any]:
         # after the native picker applies account/organization restrictions.
         # Never append unfiltered static pins to a successful native result.
         model_options.extend(native_options)
+        if not configured_default_model and any(option["value"] == "default" for option in native_options):
+            # The account's native default can change independently of the
+            # Sonnet alias. Preserve the native selector instead of labeling
+            # or pinning the server default to our historical assumption.
+            default_model = "default"
     else:
         model_options.extend(discovered_help_aliases)
         model_options.extend(runtime_option(value, label) for value, label in CLAUDE_CLI_MODEL_ALIASES)
         if provider_status == "success":
             # The API is account-scoped; don't add static pins absent from it.
             model_options.extend(provider_options)
-        else:
-            model_options.extend(claude_fallback_model_options())
-            model_options.extend(discovered_help_full_names)
-    if native_status != "success" and provider_status != "success" and default_model and not any(
-        str(option.get("value") or "") == default_model
-        for option in model_options
-    ):
-        model_options.insert(0, runtime_option(default_model, title_model_label(default_model)))
+        # Help examples and our historical version pins are not evidence of
+        # account access. Retain native aliases on a cache miss, not guessed
+        # versions. Real SDK connections populate the passive native catalog.
 
     effort_match = re.search(r"--effort\s+<level>.*?\(([^)]+)\)", help_text, re.IGNORECASE | re.DOTALL)
     if effort_match:
@@ -60748,7 +60710,7 @@ def parse_claude_help_catalog() -> dict[str, Any]:
     if native_status != "success" and provider_status != "success":
         if provider_status == "failed":
             model_sources.append("Anthropic Models API failed")
-        model_sources.append("current fallback")
+        model_sources.append("native aliases; availability unverified")
     effort_source = "claude --help" if help_available else "claude --help failed"
     default_model_label = next(
         (option["label"] for option in model_options if option["value"] == default_model),
@@ -60758,30 +60720,41 @@ def parse_claude_help_catalog() -> dict[str, Any]:
         "models": unique_runtime_options(model_options, default_model_label),
         "efforts": unique_runtime_options(effort_options, title_effort_label(default_effort) if default_effort else ""),
         "model_source": " + ".join(model_sources),
+        "discovery_status": "ready" if native_status == "success" or provider_status == "success" else "unavailable",
         "effort_source": effort_source,
         "default_model": default_model,
         "default_effort": default_effort or None,
     }
 
 
-def discover_opencode_catalog(*, executable: str | None = None) -> dict[str, Any]:
+def discover_opencode_catalog(*, executable: str | None = None, refresh: bool = False) -> dict[str, Any]:
     """Discover models from the OpenCode CLI.
 
-    `opencode models` prints one `provider/model` id per line and returns in
-    well under a second. The list is account-shaped: with no credentials only
-    the `opencode/*` models (mostly free ones) appear, and configuring a
-    provider adds its models. Nothing is marked locked, because unlike Cursor
-    the listed models were the runnable ones in every capture.
+    `opencode models` prints connected providers' inventory as `provider/model`
+    IDs. Explicit refresh also refreshes the CLI registry. Listing is not proof
+    of inference entitlement: the provider may still reject a particular model.
     """
     from opencode_agent_client import parse_opencode_models_list
 
     model_source = "opencode models"
+    discovery_status = "ready"
     try:
         executable = executable or resolve_opencode_executable()
         if executable is None:
             raise RuntimeError("no compatible OpenCode executable is available")
         model_source = f"{Path(executable).name} models"
-        output = run_catalog_command([executable, "models"])
+        try:
+            output = run_catalog_command([executable, "models", *(["--refresh"] if refresh else [])])
+        except Exception:
+            if not refresh or runtime_catalog_budget_expired():
+                raise
+            # Registry refresh can need the network. Ask the same native CLI
+            # for its current inventory within the remaining shared budget;
+            # do not resurrect another account's server/client cached rows or
+            # claim that this fallback confirms a successful online refresh.
+            output = run_catalog_command([executable, "models"])
+            discovery_status = "unavailable"
+            model_source += " (registry refresh unavailable; native cached registry)"
         parsed = parse_opencode_models_list(output)
     except Exception as exc:
         logger.warning(
@@ -60789,6 +60762,7 @@ def discover_opencode_catalog(*, executable: str | None = None) -> dict[str, Any
             type(exc).__name__,
         )
         parsed = []
+        discovery_status = "unavailable"
         model_source = f"{model_source} failed"
 
     if not parsed:
@@ -60806,6 +60780,7 @@ def discover_opencode_catalog(*, executable: str | None = None) -> dict[str, Any
             "effort_source": "none",
             "default_model": "",
             "default_effort": None,
+            "discovery_status": "empty" if discovery_status == "ready" else discovery_status,
         }
     default_entry = next(
         (model for model in parsed if model.get("is_free")), parsed[0]
@@ -60820,6 +60795,7 @@ def discover_opencode_catalog(*, executable: str | None = None) -> dict[str, Any
         "effort_source": "none",
         "default_model": str(default_entry.get("id") or ""),
         "default_effort": None,
+        "discovery_status": discovery_status,
     }
 
 
@@ -60950,6 +60926,11 @@ def discover_runtime_backend_catalog(backend: str, *, force_runtime_probe: bool 
         catalog = parse_claude_help_catalog()
     elif backend == BACKEND_CODEX:
         catalog = discover_codex_catalog()
+        if not runtime_catalog_budget_expired():
+            try:
+                CODEX_PROVIDER_STORE.refresh_catalog(force=force_runtime_probe)
+            except (HTTPException, OSError):
+                logger.debug("Custom Codex model refresh unavailable")
         catalog["custom_provider"] = CODEX_PROVIDER_STORE.catalog(
             available=CODEX_TRANSPORT != CODEX_TRANSPORT_EXEC
             and diagnostic.get("installed") is True,
@@ -60968,7 +60949,7 @@ def discover_runtime_backend_catalog(backend: str, *, force_runtime_probe: bool 
             "default_permission_mode": CURSOR_DEFAULT_PERMISSION_MODE,
         })
     else:
-        catalog = discover_opencode_catalog(executable=executable) if ready and not runtime_catalog_budget_expired() else {
+        catalog = discover_opencode_catalog(executable=executable, refresh=force_runtime_probe) if ready and not runtime_catalog_budget_expired() else {
             "models": [],
             "efforts": [],
             "model_source": "Runtime refresh deadline" if ready else "OpenCode runtime unavailable",

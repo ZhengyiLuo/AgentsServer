@@ -151,8 +151,11 @@ def native_catalog_key(executable: str, env: dict[str, str]) -> str:
     """
     home = Path(env.get("HOME") or str(Path.home()))
     config = Path(env.get("CLAUDE_CONFIG_DIR") or home / ".claude")
+    # The runner adds this scheduling limit to real chat processes. It does
+    # not change account/model policy and is absent from catalog reads.
     relevant = {key: value for key, value in env.items()
-                if key.startswith(("ANTHROPIC_", "CLAUDE_")) or key == "HOME"}
+                if (key.startswith(("ANTHROPIC_", "CLAUDE_")) or key == "HOME")
+                and key != "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"}
     resolved = shutil.which(executable, path=env.get("PATH")) or executable
     revisions = [_file_revision(Path(resolved)), *(
         _file_revision(path) for path in (

@@ -15,6 +15,7 @@ import sqlite3
 import tempfile
 import time
 from types import SimpleNamespace
+import unicodedata
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -25,6 +26,7 @@ import chat_mailbox
 TREE = ast.parse((Path(__file__).resolve().parents[1] / "agent_server.py").read_text())
 FUNCTIONS = {
     "is_async_route_message", "async_route_conversation_fields",
+    "sanitized_provider_route_label", "client_safe_event",
     "cross_chat_message_event_type", "cross_chat_lifecycle_fields",
     "async_message_target_fields",
     "public_cross_chat_envelope", "reserve_async_provider_route_message",
@@ -57,12 +59,15 @@ def server_namespace():
             copied.decorator_list = []
             nodes.append(copied)
     namespace = {
-        "asyncio": asyncio, "hashlib": hashlib, "suppress": suppress,
+        "asyncio": asyncio, "hashlib": hashlib, "suppress": suppress, "unicodedata": unicodedata,
         "HTTPException": HTTPException,
         "PROVIDER_CROSS_CHAT_ROUTE_ID_RE": re.compile(r"route_[0-9a-f]{32}"),
         "PROVIDER_CROSS_CHAT_ROUTE_PAIR_ID_RE": re.compile(r"pair_[0-9a-f]{32}"),
         "STORE": SimpleNamespace(sessions={"a": {"title": "Alice"}, "b": {"title": "Bob"}}),
-        "sanitized_provider_route_label": lambda value: str(value or "Untitled chat"),
+        "EXTERNAL_CHAT_PEERS_CONFIG": None,
+        "external_chat_peers": SimpleNamespace(principal=lambda *_: None),
+        "project_provider_history_event_for_egress": lambda event, *_: event,
+        "CODEX_APP_SERVER_TOOL_OUTPUT_MAX_CHARS": 100_000,
         "CROSS_CHAT_SOURCE_USER_INSTRUCTION_MAX_CHARS": 100000,
     }
     exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])),
@@ -108,6 +113,47 @@ class AsyncRouteProjectionTests(unittest.TestCase):
         self.assertEqual(full["body"], record["body"])
         self.assertEqual(full["body_sha256"], fields["handoff_body_sha256"])
         self.assertNotIn("body", self.ns["public_cross_chat_envelope"](record))
+
+    def test_external_names_survive_lifecycle_and_full_envelope_projection(self):
+        peer_id = "extpeer_" + "d" * 32
+        self.ns["external_chat_peers"] = SimpleNamespace(principal=lambda _, identity:
+            {"display_name": "Claude\u202e Duet\n"} if identity == peer_id else None)
+        for source, target, titles in ((peer_id, "b", ("Claude Duet", "Bob")),
+                                       ("a", peer_id, ("Alice", "Claude Duet"))):
+            record = envelope(source_session_id=source, target_session_id=target, delivery_mode="mailbox")
+            for phase in ("registered", "received", "read", "cancelled", "deleted"):
+                fields = self.ns["cross_chat_lifecycle_fields"](record, phase)
+                self.assertEqual((fields["source_title"], fields["target_title"]), titles)
+            full = self.ns["public_cross_chat_envelope"](record, include_body=True)
+            self.assertEqual((full["source_title"], full["target_title"]), titles)
+
+    def test_historical_external_titles_are_corrected_only_for_the_exact_pair(self):
+        peer_id = "extpeer_" + "d" * 32
+        peer = {"peer_id": peer_id, "target_session_id": "b", "pair_id": PAIR,
+                "display_name": "Claude Duet"}
+        self.ns["external_chat_peers"] = SimpleNamespace(principal=lambda _, identity:
+            peer if identity == peer_id else None)
+        project = self.ns["client_safe_event"]
+        for source, target, title_field in ((peer_id, "b", "source_title"),
+                                             ("b", peer_id, "target_title")):
+            event = {"id": "old-event", "seq": 7, "session_id": "b",
+                     "type": "chat_conversation_message_received", "conversation_mode": "async_route_v1",
+                     "delivery_mode": "mailbox", "conversation_id": PAIR,
+                     "source_session_id": source, "target_session_id": target,
+                     title_field: "Untitled chat", "handoff_preview": "From a forged display name"}
+            original = deepcopy(event)
+            safe = project(event)
+            self.assertEqual(safe, {**original, title_field: "Claude Duet"})
+            self.assertEqual(event, original)
+            self.assertIs(project(safe), safe)
+            for mismatch in ({"conversation_id": "pair_" + "e" * 32}, {"session_id": "unrelated"},
+                             {"target_session_id" if source == peer_id else "source_session_id": "unrelated"},
+                             {"delivery_mode": "legacy"}, {"conversation_mode": "legacy"},
+                             {"type": "assistant_text"}):
+                wrong = {**event, **mismatch}
+                self.assertIs(project(wrong), wrong)
+        self.ns["external_chat_peers"] = SimpleNamespace(principal=lambda *_: None)
+        self.assertIs(project(event), event)
 
     def test_native_goal_control_reservation_has_no_delivery_local_dependency(self):
         function = next(node for node in TREE.body if isinstance(node, ast.AsyncFunctionDef)

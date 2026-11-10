@@ -704,6 +704,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         messages: list[object] | None = None,
         *,
         handle: FakeClaudeRun | None = None,
+        options_mock: Mock | None = None,
     ) -> tuple[AsyncMock, AsyncMock, Mock, Mock]:
         manager = FakeClaudeManager(handle or FakeClaudeRun(messages))
         append_event = AsyncMock(return_value={})
@@ -721,7 +722,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         ), patch.object(
             agent_server,
             "build_claude_sdk_options",
-            return_value=(object(), "config", "/usr/bin/claude"),
+            options_mock or Mock(return_value=(object(), "config", "/usr/bin/claude")),
         ), patch.object(
             agent_server,
             "claude_sdk_manager",
@@ -791,6 +792,13 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                 Path(self.cwd) / ".manifest.json",
             )
         return append_event, append_finished, runtime_success, runtime_failure
+
+    async def test_scheduled_sdk_run_uses_unattended_process_options(self) -> None:
+        agent_server.RUN_METADATA["run-claude"] = {"purpose": "scheduled_job", "job_id": "job-test"}
+        options = Mock(return_value=(object(), "config", "/usr/bin/claude"))
+        terminal = {"type": "result", "result": "Scheduled result", "session_id": "provider"}
+        await self._run_sdk_terminal_case([terminal], options_mock=options)
+        self.assertTrue(options.call_args.kwargs["unattended"])
 
     async def test_goal_receipt_settles_exact_operation_without_becoming_provider_output(self) -> None:
         receipt = ClaudeSDKGoalReceipt("queued-goal", "Hooks are restricted")
@@ -2197,6 +2205,28 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                 "system-prompt-snapshot": "off",
             },
         )
+
+    async def test_unattended_options_keep_provider_tool_and_isolate_interactive_tool_policy(self) -> None:
+        session = {**self.session, "claude_permission_mode": "default"}
+        with (
+            patch.object(agent_server, "claude_sdk_cli_path", return_value="/usr/bin/claude"),
+            patch.object(agent_server, "resolve_claude_resume_provider", return_value=("same-provider", None)),
+            patch.object(agent_server, "create_claude_agent_options", side_effect=lambda **kwargs: kwargs),
+        ):
+            interactive, normal_key, _ = agent_server.build_claude_sdk_options(
+                "chat-claude", session, self.cwd, Path(self.cwd) / "manifest.json",
+            )
+            scheduled, scheduled_key, _ = agent_server.build_claude_sdk_options(
+                "chat-claude", session, self.cwd, Path(self.cwd) / "manifest.json", unattended=True,
+            )
+        self.assertNotEqual(normal_key, scheduled_key)
+        self.assertNotIn("disallowed_tools", interactive)
+        self.assertEqual(scheduled["disallowed_tools"], ["AskUserQuestion", "EnterPlanMode", "ExitPlanMode"])
+        self.assertEqual(scheduled["permission_mode"], "default")
+        self.assertEqual(scheduled["resume"], "same-provider")
+        self.assertIn(agent_server.CLAUDE_PROVIDER_MCP_SERVER_NAME, scheduled["mcp_servers"])
+        self.assertIn(agent_server.CLAUDE_PROVIDER_MCP_TOOL_NAME, scheduled["allowed_tools"])
+        self.assertEqual(session["claude_permission_mode"], "default")
 
     async def test_sdk_options_explicitly_shadow_server_secrets(self) -> None:
         captured_options: dict[str, object] = {}
@@ -7042,6 +7072,42 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(result, FakePermissionResultDeny)
         self.assertTrue(getattr(result, "interrupt", False))
         self.assertFalse(agent_server.CLAUDE_PENDING_INTERACTIONS)
+
+    async def test_scheduled_permissions_never_wait_or_expand_captured_permission_mode(self) -> None:
+        manager = FakeClaudeManager()
+        manager.active_run_id = "run-claude"
+        agent_server.CLAUDE_SDK_MANAGER = manager
+        agent_server.RUN_METADATA["run-claude"] = {"purpose": "scheduled_job"}
+        self.session["claude_permission_mode"] = "bypassPermissions"
+        for mode in ("default", "acceptEdits", "dontAsk", "bypassPermissions"):
+            for tool in ("AskUserQuestion", "EnterPlanMode", "ExitPlanMode", "Write"):
+                with self.subTest(mode=mode, tool=tool):
+                    agent_server.ACTIVE = {"chat-claude": {
+                        "run_id": "run-claude", "backend": agent_server.BACKEND_CLAUDE,
+                        "transport": agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+                        "interactive_agent_sdk": True,
+                        "claude_sdk_owner_token": manager.owner_token,
+                        "claude_permission_run_id": "run-claude",
+                        "claude_permissions_open": True, "claude_permission_mode": mode,
+                    }}
+                    events, metadata = AsyncMock(), AsyncMock()
+                    with (
+                        patch.dict(sys.modules, fake_claude_sdk_modules()),
+                        patch.object(agent_server, "append_event", events),
+                        patch.object(agent_server, "update_claude_pending_session_metadata", metadata),
+                    ):
+                        result = await asyncio.wait_for(agent_server.handle_claude_tool_permission(
+                            "chat-claude", tool, {}, {"tool_use_id": "scheduled-tool"},
+                            owner_token=manager.owner_token,
+                        ), 0.2)
+                    if mode == "bypassPermissions" and tool == "Write":
+                        self.assertIsInstance(result, FakePermissionResultAllow)
+                    else:
+                        self.assertIsInstance(result, FakePermissionResultDeny)
+                        self.assertFalse(result.interrupt)
+                    self.assertFalse(agent_server.CLAUDE_PENDING_INTERACTIONS)
+                    events.assert_not_awaited()
+                    metadata.assert_not_awaited()
 
     async def test_no_prompt_modes_skip_questions_without_pending_interaction(self) -> None:
         manager = FakeClaudeManager()

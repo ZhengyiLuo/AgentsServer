@@ -232,7 +232,7 @@ class TerminalShellInitializationTests(unittest.TestCase):
         new_session = next(args for args in commands if args[0] == "new-session")
         self.assertEqual(
             new_session[-1],
-            "SHELL=/bin/bash PATH=/home/user/.local/bin:/usr/bin:/bin "
+            "cd -- /workspace && SHELL=/bin/bash PATH=/home/user/.local/bin:/usr/bin:/bin "
             "exec /bin/bash -l",
         )
         self.assertIn(["set-environment", "-t", session_name, "SHELL", "/bin/bash"], commands)

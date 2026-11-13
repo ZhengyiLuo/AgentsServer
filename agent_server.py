@@ -28433,6 +28433,10 @@ def run_tmux(args: list[str], *, check: bool = True, timeout: float = TMUX_COMMA
             capture_output=True,
             timeout=timeout,
             check=False,
+            # A long-lived tmux daemon must not inherit a removable checkout
+            # as its cwd. Affected tmux versions ignore even absolute -c paths
+            # after that directory disappears (tmux/tmux#5473).
+            cwd="/",
             # Any tmux command can be the one that implicitly starts the
             # shared daemon. Never let that first command seed server secrets
             # into tmux's long-lived global environment.
@@ -28806,6 +28810,7 @@ def bootstrap_isolated_tmux_server() -> bool:
             check=False,
             timeout=10,
             env=environment,
+            cwd="/",
         )
     except (OSError, subprocess.SubprocessError) as exc:
         run_tmux(["kill-session", "-t", sentinel], check=False)
@@ -28985,14 +28990,17 @@ def terminal_session_path() -> str:
     return os.pathsep.join(entries)
 
 
-def terminal_login_command(shell: str, path: str | None = None) -> str:
+def terminal_login_command(shell: str, path: str | None = None, *, cwd: str | None = None) -> str:
     """Return a tmux shell-command that starts a login shell with known env."""
-    if path is None:
-        return f"exec {shlex.quote(shell)} -l"
-    return (
-        f"SHELL={shlex.quote(shell)} PATH={shlex.quote(path)} "
-        f"exec {shlex.quote(shell)} -l"
-    )
+    command = f"exec {shlex.quote(shell)} -l"
+    if path is not None:
+        command = f"SHELL={shlex.quote(shell)} PATH={shlex.quote(path)} {command}"
+    # Also recover new panes on an already-running affected daemon. Do this
+    # before login startup files (brew/pip/etc. may call getcwd). Never send cd
+    # into an existing pane: it may be running a user's foreground command.
+    if cwd is not None:
+        command = f"cd -- {shlex.quote(cwd)} && {command}"
+    return command
 
 
 def configure_terminal_session_shell(name: str, shell: str, path: str) -> None:
@@ -29046,7 +29054,7 @@ def _ensure_terminal_session_locked(
         # first tmux use on a Linux systemd-user installation.
         bootstrap_isolated_tmux_server()
         scrub_tmux_global_secret_environment()
-        workdir = existing_cwd(cwd or sess.get("cwd") or DEFAULT_CWD)
+        workdir = str(Path(existing_cwd(cwd or sess.get("cwd") or DEFAULT_CWD)).absolute())
         cols, lines = terminal_dimensions(columns, rows)
         try:
             run_tmux([
@@ -29060,7 +29068,7 @@ def _ensure_terminal_session_locked(
                 str(lines),
                 "-c",
                 workdir,
-                terminal_login_command(shell, path),
+                terminal_login_command(shell, path, cwd=workdir),
             ])
             created = True
         except HTTPException:
@@ -29810,13 +29818,16 @@ def _terminal_action_locked(session_id: str, action: str, target: str | None = N
         ["display-message", "-p", "-t", name, "#{pane_current_path}"],
         check=False,
     ).stdout.strip()
-    workdir = existing_cwd(active_cwd or STORE.sessions[session_id].get("cwd") or DEFAULT_CWD)
+    workdir = str(Path(existing_cwd(active_cwd or STORE.sessions[session_id].get("cwd") or DEFAULT_CWD)).absolute())
     if clean_action == "new-window":
-        run_tmux(["new-window", "-t", name, "-c", workdir])
+        run_tmux(["new-window", "-t", name, "-c", workdir,
+                  terminal_login_command(resolve_terminal_login_shell(), terminal_session_path(), cwd=workdir)])
     elif clean_action == "split-right":
-        run_tmux(["split-window", "-h", "-t", name, "-c", workdir])
+        run_tmux(["split-window", "-h", "-t", name, "-c", workdir,
+                  terminal_login_command(resolve_terminal_login_shell(), terminal_session_path(), cwd=workdir)])
     elif clean_action == "split-down":
-        run_tmux(["split-window", "-v", "-t", name, "-c", workdir])
+        run_tmux(["split-window", "-v", "-t", name, "-c", workdir,
+                  terminal_login_command(resolve_terminal_login_shell(), terminal_session_path(), cwd=workdir)])
     elif clean_action == "next-window":
         run_tmux(["next-window", "-t", name])
     elif clean_action == "previous-window":

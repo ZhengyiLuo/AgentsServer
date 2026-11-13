@@ -1148,6 +1148,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("--collect", command)
         self.assertIn("/usr/bin/tmux", command)
         self.assertIn("env", run.call_args.kwargs)
+        self.assertEqual(run.call_args.kwargs["cwd"], "/")
         self.assertEqual(
             run.call_args.kwargs["env"]["XDG_RUNTIME_DIR"],
             "/run/user/1000",

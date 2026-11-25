@@ -253,7 +253,7 @@ class SyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item["request_id"] for item in (await self.snapshot())["exchanges"]], ["request1", "request2"])
         self.assertTrue(self.notices)
         for session, notice in self.notices:
-            self.assertEqual(set(notice), {"type", "session_id", "revision"})
+            self.assertEqual(set(notice), {"type", "session_id", "side_chat_id", "conversation_id", "revision"})
             self.assertEqual(notice["type"], "side_chat_updated")
 
     async def test_duplicate_send_is_idempotent_busy_and_stale_submissions_preserve_existing(self):

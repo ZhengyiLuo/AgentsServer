@@ -36,6 +36,32 @@ Codex captures the main context on its first question; Clear starts a new fork
 with the latest main context. Its workspace tools can inspect current files
 even when the inherited conversation predates those files.
 
+Servers advertising `side_questions.multiple` support independent synchronized
+side chats under one parent conversation. Each Codex side chat owns its native
+fork and saved provider reference. Each Claude side chat sends only its own
+server-owned exchange history to the native `/btw` control. Provider work,
+progress, model selection, Stop and Clear remain scoped to the selected side
+chat; opening another chat does not copy a timeline or alter the parent.
+
+- `GET /api/sessions/{session}/side-chats` returns `{session_id, side_chats}`,
+  with full snapshots and the original default conversation first.
+- `POST /api/sessions/{session}/side-chats` accepts `{}` or a client-generated
+  `side_chat_id` and returns a new snapshot. Repeating the same creation ID is
+  idempotent while that generation exists; creation does not start a provider.
+- `GET /api/sessions/{session}/side-chats/{side_chat_id}` reads one chat.
+- Existing singular submission and Clear routes accept any selected
+  `side_chat_id`. The singular GET continues returning the original default.
+  Stop accepts optional `?side_chat_id=...`, including when it overtakes POST;
+  otherwise its persisted request receipt identifies the target conversation.
+
+Snapshots and `side_chat_updated` invalidations include an opaque
+`conversation_id` that stays stable across Clear. `side_chat_id` changes on
+Clear and remains the request-generation fence. Revisions are per conversation.
+Old singleton history and provider references stay in place; additional chats
+use separate rows. A restart marks unfinished exchanges interrupted without
+resending them. Receipt and generation aliases keep delayed requests or stale
+devices from affecting a replacement conversation or another side chat.
+
 Servers advertising `side_questions.runtime_settings` accept optional Codex
 `model` and `effort` on both submission routes. Selection changes apply to the
 next turn in the existing child; they do not clear history or change the main
@@ -45,7 +71,8 @@ alongside the native thread reference, and expose it in snapshots; legacy
 answers expose it too. Claude `/btw` continues using its connected parent.
 
 `DELETE /api/sessions/{session}/side-questions/{request}` cancels one request.
-`DELETE /api/sessions/{session}/side-chats/{side_chat}` closes the side chat.
+`DELETE /api/sessions/{session}/side-chats/{side_chat}` closes a legacy ephemeral
+side chat; synchronized chats use the singular Clear route above.
 Both are native-operator-only and scoped to the authenticated owner and parent.
 Clear, profile shutdown and server shutdown release owned resources. Synchronized Codex side
 conversations resume their persisted native thread after transport cleanup;

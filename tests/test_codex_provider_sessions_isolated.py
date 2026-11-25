@@ -66,6 +66,7 @@ def make_namespace(root: Path):
         "SERVER_MAINTENANCE_SESSIONS": set(), "SIDE_QUESTIONS": SimpleNamespace(active_session_ids=lambda: set()),
         "codex_session_has_live_subagents": Mock(return_value=False), "CODEX_GOAL_SYNC_GENERATIONS": {},
         "release_idle_codex_manager_session": AsyncMock(return_value=True), "release_codex_provider_writers": AsyncMock(),
+        "prepare_codex_provider_context": AsyncMock(return_value=True),
         "CODEX_SUBAGENT_INDEX_LOCK": threading.RLock(), "CODEX_SUBAGENT_STATE": {}, "CODEX_NATIVE_ACTION_TASKS": {}, "codex_normal_model_provider": lambda: "openai",
         "schedule_codex_subagent_limit_application": Mock(), "broadcast_provider_runtime_changed": AsyncMock(),
         "HTTPException": HTTPException, "codex_provider": codex_provider,

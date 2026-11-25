@@ -2044,6 +2044,71 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.previous_interaction_tasks
         )
 
+    async def test_provider_handoff_requires_native_checkpoint_and_successful_terminal(self) -> None:
+        context = {"thread_id": "thread", "id": "fixture-context"}
+        for checkpoint, status in ((True, "completed"), (False, "completed"), (True, "failed"), (True, "interrupted")):
+            with self.subTest(checkpoint=checkpoint, status=status):
+                notifications = [{"method": "turn/started", "params": {
+                    "threadId": "thread", "turn": {"id": "turn-compact"}}}]
+                if checkpoint:
+                    notifications.append({"method": "item/completed", "params": {
+                        "threadId": "thread", "turnId": "turn-compact",
+                        "item": {"id": "native-checkpoint", "type": "contextCompaction"}}})
+                notifications.append({"method": "turn/completed", "params": {
+                    "threadId": "thread", "turn": {"id": "turn-compact", "status": status}}})
+                subscription = GatedNativeSubscription(notifications, gate_at=-1)
+                with (patch.object(agent_server, "settle_codex_provider_context", AsyncMock()) as settle,
+                      patch.object(agent_server, "append_event", AsyncMock())):
+                    await agent_server.consume_codex_native_turn(
+                        "chat", "operation", "compaction", AsyncMock(), "thread", "control-operation", subscription,
+                        finalize_operation=False, provider_handoff_context=context)
+                settle.assert_awaited_once_with("chat", context, completed=checkpoint and status == "completed")
+                self.assertTrue(subscription.closed)
+
+    async def test_repeated_cancellation_during_checkpoint_save_still_releases_control(self) -> None:
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def persist_checkpoint(*args, **kwargs):
+            entered.set()
+            await release.wait()
+        subscription = GatedNativeSubscription([
+            {"method": "turn/started", "params": {"threadId": "thread", "turn": {"id": "turn-compact"}}},
+            {"method": "item/completed", "params": {"threadId": "thread", "turnId": "turn-compact",
+                "item": {"id": "checkpoint", "type": "contextCompaction"}}},
+            {"method": "turn/completed", "params": {"threadId": "thread",
+                "turn": {"id": "turn-compact", "status": "completed"}}},
+        ], gate_at=-1)
+        with (patch.object(agent_server, "settle_codex_provider_context", side_effect=persist_checkpoint),
+              patch.object(agent_server, "append_event", AsyncMock()),
+              patch.object(agent_server, "release_codex_control_thread", AsyncMock()) as cleanup):
+            task = asyncio.create_task(agent_server.consume_codex_native_turn(
+                "chat", "operation", "compaction", AsyncMock(), "thread", "control-operation", subscription,
+                provider_handoff_context={"thread_id": "thread", "id": "fixture-context"}))
+            await entered.wait()
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            release.set()
+            await task
+        self.assertTrue(subscription.closed)
+        cleanup.assert_awaited_once()
+
+    async def test_checkpoint_save_failure_still_releases_native_control(self) -> None:
+        subscription = GatedNativeSubscription([
+            {"method": "turn/started", "params": {"threadId": "thread", "turn": {"id": "turn-compact"}}},
+            {"method": "turn/completed", "params": {"threadId": "thread",
+                "turn": {"id": "turn-compact", "status": "completed"}}},
+        ], gate_at=-1)
+        with (patch.object(agent_server, "settle_codex_provider_context", AsyncMock(side_effect=OSError("synthetic disk failure"))),
+              patch.object(agent_server, "append_event", AsyncMock()),
+              patch.object(agent_server, "release_codex_control_thread", AsyncMock()) as cleanup,
+              patch.object(agent_server.logger, "exception") as logged):
+            await agent_server.consume_codex_native_turn(
+                "chat", "operation", "compaction", AsyncMock(), "thread", "control-operation", subscription,
+                provider_handoff_context={"thread_id": "thread", "id": "fixture-context"})
+        self.assertTrue(subscription.closed)
+        cleanup.assert_awaited_once()
+        logged.assert_called_once()
+
     async def test_compaction_captures_turn_and_waits_for_turn_completed(self) -> None:
         agent_server.ACTIVE["chat"].update(
             {

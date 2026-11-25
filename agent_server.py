@@ -11178,8 +11178,11 @@ class SessionStore:
                 sess.update(active_runtime)
                 if desired != active_runtime:
                     sess["_codex_provider_pending"] = desired
+                    if "codex_provider" in patch and (sess.get("_codex_provider_context") or {}).get("status") == "failed":
+                        sess.pop("_codex_provider_context", None)
                 else:
                     sess.pop("_codex_provider_pending", None)
+                    sess.pop("_codex_provider_context", None)
             # Ordinary/queued turns re-save their backend and may repeat model
             # or provider selections. Only an actual runtime change invalidates
             # the in-flight title; cancelling a no-op consumes its sole attempt.
@@ -22840,6 +22843,7 @@ def public_queued_turn(
         "position": position,
         "promoted": promoted,
         "paused": paused,
+        "send_when_idle": item.get("_send_when_idle") is True and not paused,
         "pause_reason": (
             "delivery_uncertain"
             if delivery_uncertain
@@ -25021,6 +25025,37 @@ async def _run_queued_turn_now_once(
         )
         interrupted = bool(stop_result.get("stopped")) and not deferred
         if deferred:
+            if stop_result.get("pending"):
+                # The interrupt is still owned by the current turn. Preserve
+                # this explicit Send now as the next queue row, without
+                # claiming provider acceptance or creating another stop loop.
+                message = "Waiting for the current turn to stop. This message will send automatically."
+                async with QUEUE_LOCK:
+                    queue_items = list(QUEUED_TURNS.get(session_id) or [])
+                    queue_items.insert(0, selected)
+                    if not selected.get("_send_when_idle") or selected_index != 0 or selected_was_paused:
+                        await append_durable_event(session_id, "turn_deferred", {
+                            "queued_id": queued_id,
+                            "message": message,
+                            "send_when_idle": True,
+                            "positions": queue_positions(deque(queue_items)),
+                            "remaining": len(queue_items),
+                        })
+                    selected["_send_when_idle"] = True
+                    selected.pop("_update_transitioning", None)
+                    QUEUED_TURNS[session_id] = deque(queue_items)
+                    RUN_NOW_TURNS.pop(session_id, None)
+                    STEERING_SESSIONS.discard(session_id)
+                # The normal exact-owner terminal path schedules this queue.
+                # Also reconcile once in case release raced the interrupt.
+                if session_id not in BUSY_SESSIONS:
+                    schedule_next_queued_turn(session_id)
+                return {
+                    "ok": False, "queued_id": queued_id, "interrupted": False,
+                    "deferred": True, "send_when_idle": True,
+                    "replays_interrupted_message": False, "message": message,
+                    "remaining": len(queue_items), "superseded_queued_ids": [],
+                }
             already_notified = bool(selected.get("_turn_deferred_notified"))
             selected["_turn_deferred_notified"] = True
             selected.pop("_update_transitioning", None)
@@ -25032,12 +25067,7 @@ async def _run_queued_turn_now_once(
                 queue_items.insert(insert_at, selected)
                 QUEUED_TURNS[session_id] = deque(queue_items)
                 remaining = len(queue_items)
-            if stop_result.get("pending"):
-                message = (
-                    "Stop is still finishing. This message remains queued; "
-                    "try Force Send again shortly."
-                )
-            elif stop_result.get("superseded"):
+            if stop_result.get("superseded"):
                 message = (
                     "The active turn changed before it could be stopped. "
                     "This message remains queued; try Force Send again shortly."
@@ -26387,6 +26417,16 @@ def scan_queued_turns_from_events(
                     paused_id = str(paused_id or "")
                     if paused_id in pending:
                         pending[paused_id]["_paused_after_stop"] = True
+                continue
+            if (event_type == "turn_deferred" and event.get("send_when_idle") is True
+                    and queued_id in pending):
+                # Explicit Force Send resumes only this row. A later Stop or
+                # uncertain delivery still wins through its own durable event.
+                pending[queued_id]["_paused_after_stop"] = False
+                pending[queued_id]["_send_when_idle"] = True
+                if queued_id in order:
+                    order.remove(queued_id)
+                order.insert(0, queued_id)
                 continue
             if event_type == "turn_queue_delivery_fenced" and queued_id:
                 if queued_id not in pending:
@@ -56144,6 +56184,10 @@ async def prepare_codex_login_turn(session: dict[str, Any]) -> None:
         if current is not None:
             session.update(codex_provider.runtime_selection(current))
             session.pop("_codex_provider_pending", None)
+    current = STORE.sessions.get(str(session.get("id") or "")) or session
+    if (isinstance(current.get("_codex_provider_pending"), dict)
+            and (current.get("_codex_provider_context") or {}).get("status") == "failed"):
+        raise HTTPException(409, "Codex could not prepare this chat's context on the current endpoint. Select the requested connection again to retry; the chat and draft are retained.")
     if codex_provider.session_choice(session.get("codex_provider")) == "custom":
         return
     await refresh_codex_app_server_login(source="turn_admission")
@@ -56969,6 +57013,7 @@ async def acquire_codex_control_thread(
     reserve_session: bool = False,
     allow_active_goal_mutation: bool = False,
     allow_active_control: bool = False,
+    prepare_provider: bool = True,
 ) -> tuple[CodexAppServerManager, str, dict[str, Any]]:
     """Load and pin a Codex thread for an explicit desktop control."""
     reservation_task = asyncio.current_task() if reserve_session else None
@@ -56990,7 +57035,7 @@ async def acquire_codex_control_thread(
             detail="Codex controls require the app-server transport",
         )
 
-    if reserve_session:
+    if reserve_session and prepare_provider:
         await prepare_codex_login_turn(session)
 
     reserved = False
@@ -58039,6 +58084,7 @@ async def consume_codex_native_turn(
     finalize_operation: bool = True,
     initial_sequence: int = 0,
     initial_pending_steer: dict[str, Any] | None = None,
+    provider_handoff_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Consume native work; an inline ordinary runner retains its own cleanup."""
     assistant_deltas: dict[str, list[str]] = {}
@@ -58047,6 +58093,7 @@ async def consume_codex_native_turn(
     completed_reasoning_items: set[str | tuple[str, str]] = set()
     terminal_status = "completed"
     terminal_error: str | None = None
+    compaction_checkpoint_completed = False
     schedule_queue = True
     goal_resume = operation == "goal_resume"
     shell_resume = operation == "shell_resume"
@@ -58503,6 +58550,7 @@ async def consume_codex_native_turn(
                         completed_reasoning_items.add(item_id)
                         await clear_reasoning_summary_stream(session_id, operation_id, item_id)
                 elif item_type == "contextCompaction" and operation == "compaction":
+                    compaction_checkpoint_completed = True
                     native_turn_id = str(params.get("turnId") or turn_id or "") or None
                     native_item_id = str(
                         params.get("itemId") or item.get("id") or ""
@@ -58621,6 +58669,21 @@ async def consume_codex_native_turn(
         terminal_status = "failed"
         terminal_error = concise_error_message(exc)
     finally:
+        if provider_handoff_context is not None:
+            checkpoint_task = asyncio.create_task(settle_codex_provider_context(
+                session_id, provider_handoff_context,
+                completed=(compaction_checkpoint_completed
+                    and terminal_status == "completed" and not terminal_error),
+            ))
+            try:
+                try:
+                    await asyncio.shield(checkpoint_task)
+                except asyncio.CancelledError:
+                    await join_task_despite_caller_cancellation(checkpoint_task)
+            except Exception:
+                # Never strand the native control slot when persistence fails.
+                # The unacknowledged checkpoint cannot authorize a handoff.
+                logger.exception("could not retain Codex provider context checkpoint session=%s", session_id)
         if (shell_owner is not None and ACTIVE.get(session_id) is shell_owner
                 and shell_owner.get("codex_shell_subscription") is subscription):
             shell_owner.pop("codex_shell_subscription", None)
@@ -85756,6 +85819,100 @@ async def release_codex_provider_writers(manager: CodexAppServerManager, session
         raise
 
 
+async def settle_codex_provider_context(
+    session_id: str, context: dict[str, Any], *, completed: bool,
+) -> None:
+    """A native checkpoint, never an RPC acknowledgement, authorizes handoff."""
+    if completed:
+        # Verify the actual native checkpoint instead of inferring portability
+        # from provider labels: remote compaction can retain encrypted content.
+        completed = await asyncio.to_thread(lambda: codex_provider.context_has_encrypted_items(
+            codex_rollout_path(str(context.get("thread_id") or "")))) is False
+    async with STORE._lock:
+        session = STORE.sessions.get(session_id)
+        if not session or session.get("_codex_provider_context") != context:
+            return
+        previous_context = session["_codex_provider_context"]
+        previous_reason = session.get("_codex_provider_pending_reason")
+        session["_codex_provider_context"] = {**context, "status": "ready" if completed else "failed"}
+        session["_codex_provider_pending_reason"] = "preparing_context" if completed else "context_preparation_failed"
+        try:
+            await STORE.save(durable=True)
+        except BaseException:
+            session["_codex_provider_context"] = previous_context
+            session["_codex_provider_pending_reason"] = previous_reason
+            raise
+    await broadcast_codex_provider_changed(session_id)
+
+
+async def prepare_codex_provider_context(session_id: str) -> bool:
+    """Use the old custom provider's native plaintext compaction checkpoint.
+
+    Responses reasoning is encrypted by its originating provider. Resuming the
+    same rollout with another provider does not translate those opaque items.
+    Native local compaction retains the original timeline and native identity,
+    and replaces only model-visible context with Codex's own summary. Normal
+    OpenAI remote compaction is encrypted too and is not used as a migration.
+    """
+    session = STORE.sessions.get(session_id) or {}
+    pending = session.get("_codex_provider_pending")
+    thread_id = session_codex_thread_id(session)
+    if (not isinstance(pending, dict) or not thread_id
+            or session.get("codex_provider") != "custom"
+            or pending.get("_codex_provider_removed")
+            or (pending.get("codex_provider") == "custom"
+                and ((session.get("codex_provider_revision") and pending.get("codex_provider_revision") == session.get("codex_provider_revision"))
+                     or (session.get("codex_provider_binding") and pending.get("codex_provider_binding") == session.get("codex_provider_binding"))))):
+        return True
+    source = {"thread_id": thread_id, "revision": session.get("codex_provider_revision")}
+    context = session.get("_codex_provider_context")
+    if isinstance(context, dict) and all(context.get(key) == value for key, value in source.items()):
+        # A stopped/failed preparation needs an explicit endpoint selection to
+        # retry; lifecycle callbacks must not create a provider retry loop.
+        if context.get("status") == "failed":
+            return False
+        task = CODEX_NATIVE_ACTION_TASKS.get((session_id, str(context.get("operation_id") or "")))
+        if task is not None and not task.done():
+            return False
+    # Plaintext threads need no extra model request. Only native rollout
+    # metadata/context is inspected; no transcript is reconstructed or edited.
+    encrypted = await asyncio.to_thread(lambda: codex_provider.context_has_encrypted_items(codex_rollout_path(thread_id)))
+    if encrypted is False:
+        return True
+    if isinstance(context, dict) and context.get("status") == "ready" and encrypted is None:
+        # A saved acknowledgement cannot authorize context we can no longer
+        # verify after restart, rollback or an external native writer.
+        await settle_codex_provider_context(session_id, context, completed=False)
+        return False
+    context = {**source, "id": uuid.uuid4().hex, "status": "running"}
+    async with STORE._lock:
+        session["_codex_provider_context"] = context
+        session["_codex_provider_pending_reason"] = "preparing_context"
+        await STORE.save(durable=True)
+    await broadcast_codex_provider_changed(session_id)
+    starter = asyncio.create_task(_post_codex_compact_locked(session_id, provider_handoff_context=context))
+    cancelled = False
+    try:
+        try:
+            result = await asyncio.shield(starter)
+        except asyncio.CancelledError:
+            # The native RPC may already have accepted compaction. Finish
+            # registering its consumer before releasing the lifecycle lock.
+            cancelled = True
+            result = await join_task_despite_caller_cancellation(starter)
+        # The consumer cannot finish until this caller releases the lifecycle
+        # lock. Its exact checkpoint token is retained across this update.
+        context["operation_id"] = result["operation_id"]
+        async with STORE._lock:
+            await STORE.save(durable=True)
+    except BaseException:
+        await settle_codex_provider_context(session_id, context, completed=False)
+        raise
+    if cancelled:
+        raise asyncio.CancelledError
+    return False
+
+
 async def apply_codex_provider_when_idle(session_id: str, *, ignore_task=None) -> bool:
     """Hand off exactly one idle chat, retaining its native history and goal.
 
@@ -85797,10 +85954,14 @@ async def apply_codex_provider_when_idle(session_id: str, *, ignore_task=None) -
         else None
     )
     if reason is not None:
+        if (session.get("_codex_provider_context") or {}).get("status") == "running":
+            reason = "preparing_context"
         if session.get("_codex_provider_pending_reason") != reason:
             session["_codex_provider_pending_reason"] = reason
             await broadcast_codex_provider_changed(session_id)
         logger.info("Codex provider selection deferred session=%s reason=%s", session_id, reason)
+        return False
+    if not await prepare_codex_provider_context(session_id):
         return False
     manager = existing_codex_app_server_manager(session)
     if manager is not None:
@@ -85824,6 +85985,7 @@ async def apply_codex_provider_when_idle(session_id: str, *, ignore_task=None) -
             session.update(pending)
             session.pop("_codex_provider_pending", None)
             session.pop("_codex_provider_pending_reason", None)
+            session.pop("_codex_provider_context", None)
             session["_codex_provider_switched"] = True
             session.pop("_codex_subagent_limit_applied", None)
             session["updated_at"] = now_iso()
@@ -92736,10 +92898,13 @@ async def post_codex_compact(session_id: str) -> dict[str, Any]:
         return await _post_codex_compact_locked(session_id)
 
 
-async def _post_codex_compact_locked(session_id: str) -> dict[str, Any]:
+async def _post_codex_compact_locked(
+    session_id: str, *, provider_handoff_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     manager, thread_id, control_session = await acquire_codex_control_thread(
         session_id,
         reserve_session=True,
+        **({"prepare_provider": False} if provider_handoff_context is not None else {}),
     )
     reservation_id = str(
         control_session.get("_codex_control_reservation_id") or ""
@@ -92772,6 +92937,7 @@ async def _post_codex_compact_locked(session_id: str) -> dict[str, Any]:
                 thread_id,
                 reservation_id,
                 subscription,
+                provider_handoff_context=provider_handoff_context,
             )
         )
         register_codex_native_action(session_id, operation_id, task)

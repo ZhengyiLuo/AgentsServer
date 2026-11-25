@@ -199,6 +199,40 @@ def session_choice(value) -> str:
 RUNTIME_FIELDS = ("codex_provider", "codex_provider_revision", "codex_provider_binding", "model", "effort", "_codex_provider_removed")
 
 
+def context_has_encrypted_items(path: Path | None) -> bool | None:
+    """Inspect one native rollout without exposing or modifying its contents.
+
+    Native compaction replaces model-visible history, while the original
+    timeline stays on disk. Unknown/legacy checkpoints and rollbacks are
+    deliberately inconclusive; they must not authorize a ciphertext handoff.
+    """
+    if path is None:
+        return None
+
+    def encrypted(value):
+        if isinstance(value, dict):
+            return bool(value.get("encrypted_content")) or any(encrypted(item) for item in value.values())
+        return isinstance(value, list) and any(encrypted(item) for item in value)
+
+    found: bool | None = False
+    try:
+        with path.open(encoding="utf-8") as stream:
+            for line in stream:
+                record = json.loads(line)
+                payload = record.get("payload")
+                if record.get("type") == "compacted":
+                    replacement = payload.get("replacement_history") if isinstance(payload, dict) else None
+                    found = encrypted(replacement) if isinstance(replacement, list) else None
+                elif record.get("type") == "response_item" and encrypted(payload):
+                    found = True
+                elif (record.get("type") == "event_msg" and isinstance(payload, dict)
+                      and payload.get("type") == "thread_rolled_back"):
+                    found = None
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    return found
+
+
 def requested_session(session: dict) -> dict:
     """Desired runtime is separate from the owner of an in-flight turn."""
     pending = session.get("_codex_provider_pending")

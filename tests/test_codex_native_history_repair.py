@@ -78,6 +78,130 @@ class CodexNativeHistoryRepairTests(unittest.TestCase):
         return filter_native_codex_history_items("chat", PROVIDER, self.events, items,
             source_path=self.source, root=self.root, sync_checkpoint=checkpoint, parse_item=self.parse)
 
+    def compacted_user_fixture(self, source_prompt, native_prompt=None):
+        self.raw[0]["payload"]["content"][0]["text"] = source_prompt
+        self.native[0]["prompt"] = source_prompt if native_prompt is None else native_prompt
+        self.fixture()
+        # Actual imports retain the parsed display text, not the provider's raw
+        # blank lines. Keep the checkpoint tied to the unchanged raw source.
+        for imported, source in zip(self.imports, self.raw):
+            if imported["type"] == "turn_started":
+                imported["prompt"] = self.parse(source)["text"]
+        imports = {row["id"]: row for row in self.imports}
+        rows = [json.loads(line) for line in self.events.read_text().splitlines()]
+        for row in rows:
+            if row.get("id") in imports:
+                row.update(imports[row["id"]])
+        self.events.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    def test_owned_user_blank_line_compaction_is_hidden_before_import_and_on_read(self):
+        self.compacted_user_fixture("First paragraph.\n\n\nSecond paragraph.")
+        before = self.events.read_bytes(), self.source.read_bytes()
+        items = [self.parse(row) for row in self.raw]
+        self.assertNotEqual(items[0]["text"], self.native[0]["prompt"])
+        self.assertNotIn("source_text_sha256", items[0])
+        filtered = self.filter_with_source(items)
+        self.assertEqual(filtered[0]["text"], "")
+        self.assertEqual(filtered[0]["provider_origin"]["native_event_id"], "native-input-1")
+        self.prepare()
+        projected = self.cache.project_event("chat", self.imports[0])
+        self.assertEqual(projected["prompt"], "")
+        self.assertEqual(projected["provider_origin"]["native_event_id"], "native-input-1")
+        self.assertEqual(before, (self.events.read_bytes(), self.source.read_bytes()))
+
+    def test_user_replay_does_not_collapse_other_whitespace(self):
+        self.compacted_user_fixture("Example:\n    indented\n\n\nEnd.",
+                                    "Example:\n  indented\n\n\nEnd.")
+        item = self.parse(self.raw[0])
+        self.assertEqual(" ".join(item["text"].split()), " ".join(self.native[0]["prompt"].split()))
+        self.assertEqual(self.filter_with_source([item]), [item])
+        self.prepare()
+        self.assertIsNone(self.cache.project_event("chat", self.imports[0]))
+
+    def test_blank_line_compaction_requires_exact_native_turn_owner(self):
+        original_native = self.native
+        for change in ("other-turn", "ambiguous-owner"):
+            with self.subTest(change=change):
+                self.native = [dict(row) for row in original_native]
+                self.cache.forget("chat")
+                if change == "other-turn":
+                    self.native[2]["provider_turn_id"] = "unrelated-turn"
+                else:
+                    self.native.append({**self.native[2], "seq": 7, "id": "other-end", "run_id": "other-run"})
+                self.compacted_user_fixture("First paragraph.\n\n\nSecond paragraph.")
+                item = self.parse(self.raw[0])
+                self.assertEqual(self.filter_with_source([item]), [item])
+                self.prepare()
+                self.assertIsNone(self.cache.project_event("chat", self.imports[0]))
+
+    def test_compacted_display_equality_does_not_replace_exact_source_bytes(self):
+        self.compacted_user_fixture("First paragraph.\n\nSecond paragraph.",
+                                    "First paragraph.\n\n\nSecond paragraph.")
+        item = self.parse(self.raw[0])
+        self.assertEqual(repair._native_user_import_text(self.native[0]["prompt"]), item["text"])
+        self.assertEqual(self.filter_with_source([item]), [item])
+        self.prepare()
+        self.assertIsNone(self.cache.project_event("chat", self.imports[0]))
+
+    def test_compacted_user_replay_requires_one_source_item_across_checkpoints(self):
+        prompt = "First paragraph.\n\n\nSecond paragraph."
+        self.compacted_user_fixture(prompt)
+        previous = self.source.read_bytes()
+        self.raw.append({**self.raw[0], "timestamp": "2026-09-11T12:01:30.000Z",
+            "payload": {**self.raw[0]["payload"], "id": "later-identical-user-item"}})
+        self.compacted_user_fixture(prompt)
+        rows = [json.loads(line) for line in self.events.read_text().splitlines()]
+        checkpoint = next(row["_history_sync_checkpoint"] for row in rows if row.get("type") == "history_imported")
+        checkpoint.update(previous_present=True, previous_source_offset=len(previous),
+            previous_source_digest=hashlib.sha256(previous).hexdigest())
+        self.assertEqual(self.source.read_bytes()[:len(previous)], previous)
+        item = self.parse(self.raw[-1])
+        self.assertEqual(self.filter_with_source([item], checkpoint), [item])
+        self.prepare()
+        self.assertIsNone(self.cache.project_event("chat", self.imports[0]))
+        self.assertIsNone(self.cache.project_event("chat", self.imports[-1]))
+
+    def compacted_continuation_fixture(self, *, initial_turn=True):
+        prompt = "First paragraph.\n\n\nSecond paragraph."
+        self.native[2]["provider_turn_id"] = "continuation-turn"
+        if initial_turn:
+            self.native[2]["provider_initial_turn_id"] = "turn-1"
+        self.compacted_user_fixture(prompt)
+        self.raw.append({**self.raw[0], "timestamp": "2026-09-11T12:01:30.000Z",
+            "payload": {**self.raw[0]["payload"], "id": "later-identical-user-item",
+                "internal_chat_message_metadata_passthrough": {"turn_id": "continuation-turn", "content_item_kinds": ["user.text"]}}})
+        self.compacted_user_fixture(prompt)
+
+    def test_compacted_user_repeat_in_same_run_continuation_stays_visible(self):
+        self.compacted_continuation_fixture()
+        item = self.parse(self.raw[-1])
+        self.assertEqual(self.filter_with_source([item]), [item])
+        self.prepare()
+        self.assertIsNone(self.cache.project_event("chat", self.imports[-1]))
+
+    def test_compacted_user_repeat_without_initial_turn_metadata_stays_visible(self):
+        self.compacted_continuation_fixture(initial_turn=False)
+        item = self.parse(self.raw[-1])
+        self.assertEqual(self.filter_with_source([item]), [item])
+        self.prepare()
+        self.assertIsNone(self.cache.project_event("chat", self.imports[-1]))
+
+    def test_identical_compacted_inputs_in_distinct_native_runs_are_reconciled(self):
+        prompt = "First paragraph.\n\n\nSecond paragraph."
+        self.raw[2]["payload"]["content"][0]["text"] = prompt
+        self.native[3]["prompt"] = prompt
+        self.compacted_user_fixture(prompt)
+        items = [self.parse(row) for row in self.raw]
+        filtered = self.filter_with_source(items)
+        self.assertEqual([item["text"] for item in filtered], ["", ""])
+        self.assertEqual([item["provider_origin"]["native_event_id"] for item in filtered],
+                         ["native-input-1", "native-input-2"])
+        self.prepare()
+        for imported, native_id in ((self.imports[0], "native-input-1"), (self.imports[2], "native-input-2")):
+            projected = self.cache.project_event("chat", imported)
+            self.assertEqual(projected["prompt"], "")
+            self.assertEqual(projected["provider_origin"]["native_event_id"], native_id)
+
     def test_repeated_goal_followup_across_checkpoints_stays_visible(self):
         self.goal_steer_fixture()
         previous = self.source.read_bytes()

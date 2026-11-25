@@ -250,6 +250,16 @@ def _native_assistant_text(text: str) -> str:
     return _NATIVE_LEADING_DECORATION_RE.sub("", str(text or "")).strip()
 
 
+def _native_user_import_text(text: str) -> str:
+    """Mirror untrimmed import presentation only to select exact source proof.
+
+    Display equality is not replay evidence: the verified provider record must
+    still contain the original native input bytes. Never normalize indentation
+    or truncate a user message here.
+    """
+    return re.sub(r"\n{3,}", "\n\n", text.strip())
+
+
 def _public_assistant_item_id(event: dict) -> str | None:
     item_id = event.get("item_id")
     public = event.get("type") == "assistant_text" or (
@@ -1255,8 +1265,8 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
                 raise _Unproven()
         if (item["kind"], key[2], key[3]) not in candidate_keys:
             continue
-        if item["kind"] == "user" and key[3] is not None:
-            # A display-trimmed input still has its complete source in this
+        if item["kind"] == "user":
+            # A display-compacted input still has its complete source in this
             # checkpoint-verified record. Compare those bytes to the original
             # native input, never a shared preview or an unverified hash.
             full_text = None
@@ -1267,8 +1277,10 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
                 if (isinstance(blocks, list) and len(blocks) == 1 and isinstance(blocks[0], dict)
                     and blocks[0].get("type") == "input_text"):
                     full_text = blocks[0].get("text")
-            if (isinstance(full_text, str) and full_text
-                and _text_key(" ".join(full_text.split())) == key[3]):
+            if (isinstance(full_text, str) and full_text and (
+                key[3] is not None and _text_key(" ".join(full_text.split())) == key[3]
+                or key[3] is None and _native_user_import_text(full_text) == item["text"]
+            )):
                 full_user_keys[key] = _text_key(full_text)
         if item["kind"] == "user" and (body := _cross_chat_delivery_body(item["text"])):
             delivery_bodies[key] = body
@@ -1278,10 +1290,11 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
                 assistant_native_keys[key] = _text_key(cleaned)
             if origin:
                 candidate_assistants.add((origin["event_id"], origin["turn_id"], origin["timestamp"]))
-        if origin:
+        if origin or item["kind"] == "user":
             ids = canonical.setdefault(key, {})
-            retained += origin["event_id"] not in ids
-            ids[origin["event_id"]] = origin
+            if origin:
+                retained += origin["event_id"] not in ids
+                ids[origin["event_id"]] = origin
         occurrences.setdefault((item["kind"], key[2], timestamp, key[3]), []).append((offset, key))
         retained += 1
         if retained > MAX_KEYS:
@@ -1289,6 +1302,28 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
     if require_verified_checkpoint and any((offset, expected) not in verified
         for offset, expectations in wanted.items() for expected in expectations):
         raise _Unproven()
+    # One logical run may own its initial turn and later continuations. Display
+    # compaction must not let its original input consume a genuine repeat in
+    # another owned turn. Keep at most two source identities per display key;
+    # unknown or ambiguous ownership cannot establish this additional proof.
+    compacted_user_sources: dict = {}
+    uncertain_user_sources: set[str] = set()
+    for source_key, source_ids in canonical.items():
+        budget.check()
+        if source_key[1] != "user" or source_key[3] is not None:
+            continue
+        source_owners = set(owners.get((thread, source_key[0]), set()))
+        for _offset, item_key in assistant_owner_evidence.get(source_key[0], ()):
+            if len(assistant_source_turns[item_key]) == 1:
+                source_owners.update(assistant_item_owners[item_key])
+        if len(source_owners) != 1 or not source_ids:
+            uncertain_user_sources.add(source_key[2])
+            continue
+        identities = compacted_user_sources.setdefault((next(iter(source_owners)), source_key[2]), set())
+        for source_id in source_ids:
+            if len(identities) >= 2:
+                break
+            identities.add((source_key[0], source_id))
     proofs = {}
     for target in candidates:
         budget.check()
@@ -1348,9 +1383,17 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
         if len(owned_runs) != 1:
             continue
         native_run = next(iter(owned_runs))
-        native_body_key = full_user_keys.get(key, body_key)
+        native_body_key = full_user_keys.get(key, body_key) if source_hash is not None else body_key
         native_matches = [event for event in native.get((native_run, kind, native_body_key), [])
                           if event.get("type") != "turn_steered" or event.get("provider_turn_id") == key[0]]
+        if (not native_matches and kind == "user" and source_hash is None and key in full_user_keys
+                and body_key not in uncertain_user_sources
+                and len(compacted_user_sources.get((native_run, body_key), ())) == 1):
+            original_key = full_user_keys[key]
+            original_matches = [event for event in native.get((native_run, kind, original_key), [])
+                                if event.get("type") != "turn_steered" or event.get("provider_turn_id") == key[0]]
+            if original_matches:
+                native_body_key, native_matches = original_key, original_matches
         if not native_matches and kind == "user" and source_hash is None:
             delivery = deliveries.match(session_id, thread, native_run, source_origin,
                                         delivery_bodies.get(key), delivery_source_ids.get(key[0], set()), body_key)
@@ -1466,7 +1509,8 @@ class CodexNativeHistoryRepairCache(CodexGoalHistoryRepairCache):
 def _prove_pending_native_inputs(session_id: str, provider_id: str, items: list[dict],
                                     source: Path, root: Path, checkpoint: dict, parse_item: Callable,
                                     previous_seq: int, owners: dict, deliveries: _AsyncDeliveryIndex,
-                                    budget: _NativeReadBudget, native_inputs: dict | None = None) -> dict:
+                                    budget: _NativeReadBudget, native_inputs: dict | None = None,
+                                    compacted_input_keys: set[str] | None = None) -> dict:
     """Reuse pinned-prefix proof before broadcast; the synthetic batch is never stored."""
     cursor = checkpoint.get("cursor")
     if (checkpoint.get("version") != 1 or not isinstance(cursor, dict) or cursor.get("version") != 1
@@ -1485,7 +1529,8 @@ def _prove_pending_native_inputs(session_id: str, provider_id: str, items: list[
             or origin.get("session_id", provider_id) != provider_id
             or not (item.get("source_text_sha256") is not None
                     or _cross_chat_delivery_body(item["text"]) or _text_key(item["text"]) in deliveries.status_body_keys
-                    or _text_key(item["text"]) in steer_keys)):
+                    or _text_key(item["text"]) in steer_keys
+                    or _text_key(item["text"]) in (compacted_input_keys or set()))):
             continue
         candidate = _replay_target({"seq": previous_seq + index + 2, "id": f"pending:{index}", "run_id": run,
             "type": "turn_started", "backend": "codex", "imported": True, "prompt": item["text"],
@@ -1544,6 +1589,7 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
                               and isinstance(item.get("text"), str))
         owners, native, assistant_items, wake_keys, native_count = {}, {}, {}, set(), 0
         native_inputs, steered_inputs = {}, {}
+        compacted_input_keys: set[str] = set()
         deliveries = _AsyncDeliveryIndex()
         goal_assistants = _NativeGoalAssistantReplays(provider_id)
         prove_deliveries = (source_path is not None and root is not None
@@ -1589,12 +1635,21 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
             body = event.get("prompt") if kind == "user" else event.get("result_text") if event.get("type") == "turn_finished" else event.get("text")
             wake_hash = _native_mailbox_wake_hash(event) if kind == "user" else None
             key = (kind, wake_hash or _text_key(body)) if kind and (isinstance(body, str) and body or wake_hash) else None
-            if key in candidate_keys or (isinstance(body, str) and
+            compacted_key = (_text_key(_native_user_import_text(body))
+                if prove_deliveries and kind == "user" and event.get("type") == "turn_started"
+                and isinstance(body, str) and body and wake_hash is None else None)
+            compacted_candidate = (compacted_key is not None and key != ("user", compacted_key)
+                and ("user", compacted_key) in candidate_keys)
+            if key in candidate_keys or compacted_candidate or (isinstance(body, str) and
                     (kind, _text_key(" ".join(body.split()))) in source_keys):
                 keys = steered_inputs.setdefault((run, steer_turn), {}) if steer_turn else native.setdefault(run, {})
                 native_count += key not in keys
                 if isinstance(event.get("id"), str) and 0 < len(event["id"]) <= 256:
                     keys.setdefault(key, event["id"])
+                    if compacted_candidate:
+                        # Only select a source-proof candidate. The native maps
+                        # retain the original bytes, never a display-text alias.
+                        compacted_input_keys.add(compacted_key)
                     if prove_deliveries and kind == "user" and isinstance(body, str) and body:
                         inputs = native_inputs.setdefault((run, kind, key[1]), [])
                         if not any(prior.get("type") == event.get("type")
@@ -1630,16 +1685,16 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
         for item_key, turns in assistant_source_turns.items():
             if len(turns) == 1:
                 owners.setdefault(next(iter(turns)), set()).update(assistant_item_owners[item_key])
-        if prove_deliveries and steered_inputs:
+        if prove_deliveries and (steered_inputs or compacted_input_keys):
             # The unmatched import can contain only follow-ups: its assistant
             # messages were already reconciled. Preserve public item identities
-            # for the source scan to recover earlier turns of a long goal run.
+            # for the source scan to recover earlier turns of a long native run.
             for (run, _item_id, body_key), event in assistant_items.items():
                 native_inputs.setdefault((run, "assistant", body_key), []).append(event)
         delivery_proofs = _prove_pending_native_inputs(
             session_id, provider_id, items, source_path, root, sync_checkpoint, parse_item,
-            previous_seq, owners, deliveries, budget, native_inputs,
-        ) if prove_deliveries and (deliveries.starts or steered_inputs or any(
+            previous_seq, owners, deliveries, budget, native_inputs, compacted_input_keys,
+        ) if prove_deliveries and (deliveries.starts or steered_inputs or compacted_input_keys or any(
             item.get("kind") == "user" and item.get("source_text_sha256") is not None for item in items)) else {}
         # A hidden wake has no public prompt body. Require a single exact source
         # item in this verified import range, in addition to native turn ownership.

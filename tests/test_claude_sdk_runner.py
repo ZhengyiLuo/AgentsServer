@@ -6724,8 +6724,8 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(runner, 0.5)
 
         self.assertTrue(any(
-            call.args[1] == "turn_deferred"
-            for call in append_event.await_args_list
+            call.args[1] == "turn_deferred" and call.args[2].get("send_when_idle") is True
+            for call in self.append_durable_event.await_args_list
         ))
 
     async def test_deletion_cleanup_waits_for_one_approval_not_sdk_receiver(self) -> None:
@@ -7257,16 +7257,98 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         stop.assert_not_called()
         self.assertEqual(handle.interrupt_calls, 0)
 
-    async def test_followup_new_route_never_falls_back_to_destructive_stop(self):
+    async def test_followup_separate_turn_action_sends_next_without_stop_or_error(self):
         handle, queue, request, manager = self.followup_fixture()
-        request["selected"]["chat_references"] = [{"session_id": "new-peer"}]
-        agent_server.QUEUED_TURNS["chat-claude"] = deque([request["selected"]])
+        selected = request["selected"]
+        selected["team_references"] = [{"id": "team"}]
+        selected["_paused_after_stop"] = True
+        neighbor = {"queued_id": "earlier", "prompt": "Earlier", "_paused_after_stop": True}
+        agent_server.QUEUED_TURNS["chat-claude"] = deque([neighbor, selected])
         with patch.object(agent_server, "stop_turn", AsyncMock()) as stop:
-            with self.assertRaises(HTTPException):
-                await agent_server._run_queued_turn_now_once("chat-claude", "queued-followup")
-        self.assertEqual(len(agent_server.QUEUED_TURNS["chat-claude"]), 1)
+            result = await agent_server._run_queued_turn_now_once("chat-claude", "queued-followup")
+        self.assertTrue(result["deferred"])
+        self.assertTrue(result["send_when_idle"])
+        self.assertFalse(selected["_paused_after_stop"])
+        self.assertTrue(neighbor["_paused_after_stop"])
+        self.assertEqual(list(agent_server.QUEUED_TURNS["chat-claude"]), [selected, neighbor])
+        self.assertTrue(self.append_durable_event.await_args.args[2]["send_when_idle"])
         stop.assert_not_called()
         self.assertEqual(handle.interrupt_calls, 0)
+
+    async def test_followup_startup_releases_stop_hold_and_readiness_sends_once(self):
+        handle, queue, request, manager = self.followup_fixture()
+        active = agent_server.ACTIVE["chat-claude"]
+        active["provider_turn_ready"] = False
+        selected = request["selected"]
+        selected["_paused_after_stop"] = True
+        agent_server.QUEUED_TURNS["chat-claude"] = deque([selected])
+        with patch.object(agent_server, "stop_turn", AsyncMock()) as stop:
+            result = await agent_server._run_queued_turn_now_once("chat-claude", "queued-followup")
+        self.assertTrue(result["send_when_idle"])
+        self.assertFalse(selected["_paused_after_stop"])
+        stop.assert_not_called()
+        with patch.object(agent_server, "run_queued_turn_now", AsyncMock()) as deliver:
+            await agent_server.mark_claude_sdk_turn_ready_after_ack("chat-claude", "run-claude", handle)
+            agent_server.schedule_requested_claude_followup("chat-claude")
+            await active["claude_send_now_task"]
+        deliver.assert_awaited_once_with("chat-claude", "queued-followup")
+
+    async def test_followup_send_now_during_stop_cleanup_remains_armed(self):
+        handle, queue, request, manager = self.followup_fixture()
+        selected = request["selected"]
+        selected["_paused_after_stop"] = True
+        agent_server.QUEUED_TURNS["chat-claude"] = deque([selected])
+        with patch.object(agent_server, "stop_cleanup_in_progress", return_value=True), patch.object(agent_server, "stop_turn", AsyncMock()) as stop:
+            result = await agent_server._run_queued_turn_now_once("chat-claude", "queued-followup")
+        self.assertTrue(result["send_when_idle"])
+        self.assertFalse(selected["_paused_after_stop"])
+        stop.assert_not_called()
+
+    async def test_followup_readiness_does_not_override_later_stop(self):
+        handle, queue, request, manager = self.followup_fixture()
+        active = agent_server.ACTIVE["chat-claude"]
+        request["selected"]["_claude_send_on_ready"] = True
+        agent_server.QUEUED_TURNS["chat-claude"] = deque([request["selected"]])
+        with patch.object(agent_server, "run_queued_turn_now", AsyncMock()) as deliver:
+            agent_server.schedule_requested_claude_followup("chat-claude")
+            active["stop_requested"] = True
+            await active["claude_send_now_task"]
+        deliver.assert_not_called()
+
+    async def test_followup_explicit_local_reference_keeps_native_run(self):
+        handle, queue, request, manager = self.followup_fixture()
+        request["selected"]["chat_references"] = [{"session_id": "peer", "action": "route", "grant_intent": True}]
+        prepared = {"routes": ()}
+        with patch.object(agent_server, "prepare_codex_goal_route_steer", AsyncMock(return_value=prepared)) as prepare, patch.object(agent_server, "commit_codex_goal_route_steer", AsyncMock(return_value=True)) as commit, patch.object(agent_server, "stop_turn", AsyncMock()) as stop:
+            result = await agent_server.send_claude_followup("chat-claude", "run-claude", manager, handle, "owner", "provider", queue, request)
+        self.assertTrue(result["native_followup"])
+        prepare.assert_awaited_once_with("chat-claude", "run-claude", request["selected"])
+        commit.assert_awaited_once_with("chat-claude", "run-claude", prepared)
+        stop.assert_not_called()
+        self.assertEqual(handle.interrupt_calls, 0)
+
+    async def test_followup_selected_skill_uses_native_prompt_without_stop(self):
+        handle, queue, request, manager = self.followup_fixture()
+        request["selected"].update({"prompt": "/review inspect my changes",
+            "skill_selection": {"id": "pcmd_" + "a" * 32, "revision": "pcmdrev_" + "b" * 32}})
+        with patch.object(agent_server, "resolve_provider_command_selection", AsyncMock()) as resolve, patch.object(agent_server, "stop_turn", AsyncMock()) as stop:
+            result = await agent_server.send_claude_followup("chat-claude", "run-claude", manager, handle, "owner", "provider", queue, request)
+        self.assertTrue(result["native_followup"])
+        resolve.assert_awaited_once()
+        self.assertEqual(resolve.await_args.kwargs["prompt"], "/review inspect my changes")
+        self.assertIn("/review inspect my changes", manager.steer_run.await_args.args[1])
+        stop.assert_not_called()
+
+    async def test_followup_readiness_does_not_send_into_replacement_run(self):
+        handle, queue, request, manager = self.followup_fixture()
+        active = agent_server.ACTIVE["chat-claude"]
+        request["selected"]["_claude_send_on_ready"] = True
+        agent_server.QUEUED_TURNS["chat-claude"] = deque([request["selected"]])
+        with patch.object(agent_server, "run_queued_turn_now", AsyncMock()) as deliver:
+            agent_server.schedule_requested_claude_followup("chat-claude")
+            active["run_id"] = "run-replacement"
+            await active["claude_send_now_task"]
+        deliver.assert_not_called()
 
     async def test_followup_runner_streams_children_during_ack_and_commits_before_terminal(self):
         await self.followup_runner_scenario(cancel_before_delivery=False)

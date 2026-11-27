@@ -24456,6 +24456,7 @@ async def _run_queued_turn_now_and_release(
         except BaseException:
             with suppress(BaseException):
                 await join_task_despite_caller_cancellation(settlement)
+        schedule_requested_claude_followup(session_id)
 
 
 def codex_goal_followup_requires_native(
@@ -24475,24 +24476,53 @@ def codex_goal_followup_requires_native(
     )
 
 
-def codex_goal_steer_selection_is_plain(selected: dict[str, Any]) -> bool:
-    """Claude's current native lane accepts text/files, not new route or skill grants."""
-    routes = selected.get("provider_cross_chat_route_snapshot")
-    return (
-        str(selected.get("prompt") or "").strip().split(maxsplit=1)[:1] != ["/mail"]
-        and selected.get("skill_selection") is None
-        and not any(
-            isinstance(route, dict)
-            and route.get("route_kind") == PROVIDER_CROSS_CHAT_ROUTE_KIND_REFERENCE
-            for route in (routes if isinstance(routes, list) else [])
-        )
-        and not any(selected.get(field) for field in (
-            "purpose", "chat_references", "team_references",
-            "secure_peer_route_snapshots", "cross_chat_obligation_ids",
-            "cross_chat_exchange_ids", "cross_chat_envelope_id",
-            "cross_chat_exchange_id", "cross_chat_exchange_leg_id",
-        ))
-    )
+def claude_followup_selection_is_supported(selected: dict[str, Any]) -> bool:
+    """Native user input, including selected local skills and @chat references."""
+    return codex_goal_steer_selection_is_supported(selected)
+
+
+def schedule_requested_claude_followup(session_id: str) -> None:
+    """Deliver an explicit Send now after readiness, without a retry timer."""
+    active = ACTIVE.get(session_id)
+    if (not active or active.get("transport") != CLAUDE_TRANSPORT_AGENT_SDK
+            or not active.get("provider_turn_ready") or active.get("stop_requested")
+            or active.get("claude_followup_queue") is None):
+        return
+    previous = active.get("claude_send_now_task")
+    if isinstance(previous, asyncio.Task) and not previous.done():
+        return
+    head = next(iter(QUEUED_TURNS.get(session_id) or ()), None)
+    if (not head or not head.get("_claude_send_on_ready") or head.get("_paused_after_stop")
+            or head.get("_native_delivery_fenced")
+            or not claude_followup_selection_is_supported(head)):
+        return
+    queued_id = str(head["queued_id"])
+    run_id = active.get("run_id")
+    provider_queue = active.get("claude_followup_queue")
+
+    async def deliver() -> None:
+        pending = RUN_NOW_REQUESTS.get(session_id)
+        if pending is not None:
+            with suppress(Exception):
+                await asyncio.shield(pending[1])
+        # Stop, replacement or removal after the click wins. This callback
+        # never grants permission to a different run or retries uncertain input.
+        if (ACTIVE.get(session_id) is not active or active.get("stop_requested")
+                or active.get("run_id") != run_id
+                or active.get("claude_followup_queue") is not provider_queue
+                or not active.get("provider_turn_ready")
+                or head.get("_paused_after_stop") or head.get("_native_delivery_fenced")
+                or next(iter(QUEUED_TURNS.get(session_id) or ()), None) is not head):
+            return
+        head.pop("_claude_send_on_ready", None)
+        try:
+            await run_queued_turn_now(session_id, queued_id)
+        except Exception:
+            # The delivery coordinator retains the durable row/error. A native
+            # terminal event can drain a definitely-unsent row normally.
+            logger.info("Deferred Claude Send now settled without acceptance session=%s", session_id)
+
+    active["claude_send_now_task"] = asyncio.create_task(deliver())
 
 
 def codex_goal_steer_selection_is_supported(selected: dict[str, Any]) -> bool:
@@ -24530,7 +24560,11 @@ async def _run_queued_turn_now_once(
 ) -> dict[str, Any]:
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
-    if stop_cleanup_in_progress(session_id):
+    claude_waiting_for_stop = bool(
+        stop_cleanup_in_progress(session_id)
+        and STORE.sessions[session_id].get("backend") == BACKEND_CLAUDE
+    )
+    if stop_cleanup_in_progress(session_id) and not claude_waiting_for_stop:
         raise HTTPException(
             status_code=409,
             detail="Stop is still finishing for this chat; retry Force Send shortly",
@@ -24688,6 +24722,7 @@ async def _run_queued_turn_now_once(
                 claude_followup = bool(
                     active_turn.get("transport") == CLAUDE_TRANSPORT_AGENT_SDK
                     and "claude_followup_queue" in active_turn
+                    or claude_waiting_for_stop
                 )
                 if claude_followup:
                     native_steer_queue_key = "claude_followup_queue"
@@ -24773,34 +24808,32 @@ async def _run_queued_turn_now_once(
                         selected_backend == BACKEND_CLAUDE
                         and active_turn.get("provider_turn_ready")
                         and not active_turn.get("stop_requested")
+                        and not claude_waiting_for_stop
                         and native_steer_queue is not None
-                        and codex_goal_steer_selection_is_plain(selected)
+                        and claude_followup_selection_is_supported(selected)
                     )
-                    if not native_steer and codex_goal_steer_selection_is_plain(selected):
-                        if not selected.get("_turn_deferred_notified"):
-                            selected["_turn_deferred_notified"] = True
-                            await append_event(session_id, "turn_deferred", {
-                                "queued_id": queued_id, "remaining": len(items),
-                                "message": "Claude is starting or finishing. Your message remains queued; running subagents have been kept alive.",
-                            })
+                    if not native_steer:
+                        # A click is a durable request to send this exact row,
+                        # even while Claude is starting/finishing. Never leave
+                        # a previous Stop hold in place or stop its children.
+                        reordered = [selected, *(item for item in items if item is not selected)]
+                        message = "Will send automatically when Claude is ready."
+                        await append_durable_event(session_id, "turn_deferred", {
+                            "queued_id": queued_id, "remaining": len(items),
+                            "message": message, "send_when_idle": True,
+                            "positions": queue_positions(deque(reordered)),
+                        })
+                        selected["_send_when_idle"] = True
+                        selected["_claude_send_on_ready"] = claude_followup_selection_is_supported(selected)
+                        selected["_paused_after_stop"] = False
+                        QUEUED_TURNS[session_id] = deque(reordered)
                         return {
                             "ok": False, "queued_id": queued_id, "interrupted": False,
-                            "deferred": True, "replays_interrupted_message": False,
+                            "deferred": True, "send_when_idle": True,
+                            "replays_interrupted_message": False,
                             "remaining": len(items), "superseded_queued_ids": [],
-                            "message": "Claude is starting or finishing. Your message remains queued; running subagents have been kept alive.",
+                            "message": message,
                         }
-                    if not native_steer:
-                        raise HTTPException(status_code=409, detail=force_send_conflict_detail(
-                            session_id, queued_id, guard="claude_followup_not_ready",
-                            message=(
-                                "This action needs a new Claude turn and remains queued. Running subagents have been kept alive."
-                                if not codex_goal_steer_selection_is_plain(selected) else
-                                "Claude is finishing or starting its turn. Your message remains queued."
-                            ),
-                            action="Send text or files now, or let this action run next.",
-                            retryable=codex_goal_steer_selection_is_plain(selected),
-                            owner_queued_id=queued_id,
-                        ))
                 if goal_followup and not native_steer:
                     unsupported_input = not codex_goal_steer_selection_is_supported(selected)
                     raise HTTPException(
@@ -31294,7 +31327,8 @@ async def mark_claude_sdk_turn_ready_after_ack(
         tools_ready = active.get("provider_tools_ready")
         if isinstance(tools_ready, asyncio.Event):
             tools_ready.set()
-        return True
+    schedule_requested_claude_followup(session_id)
+    return True
 
 
 def active_snapshot_input(active: dict[str, Any]) -> dict[str, Any]:
@@ -31307,6 +31341,7 @@ def active_snapshot_input(active: dict[str, Any]) -> dict[str, Any]:
             "native_steer_queue",
             "codex_goal_steer_queue",
             "codex_child_continuation_stop",
+            "claude_send_now_task",
             "owner_task",
         }
     }
@@ -57601,7 +57636,7 @@ async def prepare_codex_goal_route_steer(
             or reference.grant_intent is not True or reference.route_action is not None
             for reference in references
         ):
-            raise ValueError("Only explicit local @Chat access can be added to a running goal")
+            raise ValueError("Only explicit local @Chat access can be added to a running chat")
         references = validate_chat_references(
             session_id, prompt, references, selected.get("client_capabilities") or [],
         )
@@ -57645,7 +57680,7 @@ async def prepare_codex_goal_route_steer(
                     or float(matches[0][1].get("expires_at") or 0) <= time.time()
                 )):
             raise NativeSteerHandoffError(
-                "This running goal has no compatible chat-access authority; the follow-up remains queued",
+                "This chat’s current connection cannot accept the selected chat access yet; the message will send in its next turn",
                 safe_to_requeue=True,
             )
         token_hash, capability = matches[0] if matches else (None, None)
@@ -65899,7 +65934,7 @@ async def send_claude_followup(
                 and session_id not in STOP_REQUESTS
                 and session_id not in DELETING_SESSIONS
                 and run_id not in STOPPED_RUNS
-                and codex_goal_steer_selection_is_plain(selected)
+                and claude_followup_selection_is_supported(selected)
             )
         if not valid:
             raise NativeSteerHandoffError(
@@ -65909,6 +65944,16 @@ async def send_claude_followup(
 
     try:
         await before_send(ownership_token)
+        command_selection = selected.get("skill_selection")
+        if command_selection is not None:
+            await resolve_provider_command_selection(
+                session_id, STORE.sessions[session_id],
+                SkillSelection.model_validate(command_selection),
+                prompt=str(selected.get("prompt") or ""), purpose=None,
+                provider_context_mode="chat",
+                client_capabilities=list(selected.get("client_capabilities") or []),
+            )
+        route_steer = await prepare_codex_goal_route_steer(session_id, run_id, selected)
         prompt = build_user_provider_prompt(
             session_id, str(selected.get("prompt") or ""), list(selected.get("file_ids") or []),
         )
@@ -65920,6 +65965,7 @@ async def send_claude_followup(
             query_session_id=provider_id or None, on_before_send=before_send,
         )
         acknowledged = True
+        chat_access_applied = await commit_codex_goal_route_steer(session_id, run_id, route_steer)
         display_prompt = str(selected.get("display_prompt") if selected.get("display_prompt") is not None else selected.get("prompt") or "")
         display_files = list(selected.get("display_file_ids") if selected.get("display_file_ids") is not None else selected.get("file_ids") or [])
         # One accepted user message, one retained logical run. In particular,
@@ -65954,6 +66000,9 @@ async def send_claude_followup(
             "ok": True, "queued_id": selected.get("queued_id"), "run_id": run_id,
             "interrupted": False, "native_steer": True, "native_followup": True,
             "replays_interrupted_message": False, "superseded_queued_ids": [],
+            **({"chat_access_applied": chat_access_applied,
+                "message": "Message sent; selected chat access changed during delivery."}
+               if route_steer is not None and not chat_access_applied else {}),
         }
     except NativeSteerHandoffError:
         raise
@@ -66643,6 +66692,7 @@ async def run_claude_sdk(
     sdk_ownership_token = str(
         startup_active.get("claude_sdk_owner_token") or ""
     )
+    schedule_requested_claude_followup(session_id)
     if native_continuation_ready is not None and not native_continuation_ready.done():
         native_continuation_ready.set_result(True)
     current_run_id = run_id

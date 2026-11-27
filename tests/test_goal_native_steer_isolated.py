@@ -28,7 +28,7 @@ NAMES = {
     "NativeSteerHandoffError", "send_codex_goal_steer", "commit_codex_goal_steer",
     "suspend_codex_goal_steer_user_delegation", "settle_codex_goal_steer_user_delegation",
     "provider_capability_is_attached_to_live_run",
-    "consume_codex_native_turn", "codex_goal_steer_selection_is_plain",
+    "consume_codex_native_turn", "claude_followup_selection_is_supported",
     "codex_shell_intents_pending", "observe_codex_shell_notification",
     "publish_codex_shell_completions",
     "codex_goal_steer_selection_is_supported",

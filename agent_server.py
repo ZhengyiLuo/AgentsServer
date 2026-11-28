@@ -24560,16 +24560,6 @@ async def _run_queued_turn_now_once(
 ) -> dict[str, Any]:
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
-    claude_waiting_for_stop = bool(
-        stop_cleanup_in_progress(session_id)
-        and STORE.sessions[session_id].get("backend") == BACKEND_CLAUDE
-    )
-    if stop_cleanup_in_progress(session_id) and not claude_waiting_for_stop:
-        raise HTTPException(
-            status_code=409,
-            detail="Stop is still finishing for this chat; retry Force Send shortly",
-        )
-
     async with ACTIVE_LOCK:
         active_turn = dict(ACTIVE.get(session_id) or {})
         interrupted_turn = dict(CURRENT_TURNS.get(session_id) or {})
@@ -24703,6 +24693,31 @@ async def _run_queued_turn_now_once(
                     or STORE.sessions[session_id].get("backend")
                     or DEFAULT_BACKEND
                 )
+                if stop_cleanup_in_progress(session_id):
+                    # Accept the click while exact-owner teardown settles.
+                    # Its completion callback drains this durable queue; a
+                    # second click or another interrupt is not necessary.
+                    reordered = [selected, *(item for item in items if item is not selected)]
+                    message = "Waiting for the current turn to stop. This message will send automatically."
+                    await append_durable_event(session_id, "turn_deferred", {
+                        "queued_id": queued_id, "remaining": len(items),
+                        "message": message, "send_when_idle": True,
+                        "positions": queue_positions(deque(reordered)),
+                    })
+                    selected["_send_when_idle"] = True
+                    selected["_paused_after_stop"] = False
+                    QUEUED_TURNS[session_id] = deque(reordered)
+                    # Cover cleanup completing during the durable write. If
+                    # still stopping, queue admission leaves delivery to the
+                    # existing Stop completion callback.
+                    schedule_next_queued_turn(session_id)
+                    return {
+                        "ok": False, "queued_id": queued_id, "interrupted": False,
+                        "deferred": True, "send_when_idle": True,
+                        "replays_interrupted_message": False,
+                        "remaining": len(items), "superseded_queued_ids": [],
+                        "message": message,
+                    }
                 # QUEUE_LOCK admission and async message lookup can yield while
                 # the live provider creates a goal or replaces its turn. Read
                 # the latest owner here without an inverse ACTIVE/QUEUE lock
@@ -24722,7 +24737,6 @@ async def _run_queued_turn_now_once(
                 claude_followup = bool(
                     active_turn.get("transport") == CLAUDE_TRANSPORT_AGENT_SDK
                     and "claude_followup_queue" in active_turn
-                    or claude_waiting_for_stop
                 )
                 if claude_followup:
                     native_steer_queue_key = "claude_followup_queue"
@@ -24808,7 +24822,6 @@ async def _run_queued_turn_now_once(
                         selected_backend == BACKEND_CLAUDE
                         and active_turn.get("provider_turn_ready")
                         and not active_turn.get("stop_requested")
-                        and not claude_waiting_for_stop
                         and native_steer_queue is not None
                         and claude_followup_selection_is_supported(selected)
                     )

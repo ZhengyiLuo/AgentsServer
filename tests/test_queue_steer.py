@@ -3269,6 +3269,47 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
             ["queued-steer"],
         )
 
+    async def test_send_now_during_cleanup_is_armed_for_both_providers(self) -> None:
+        for backend in ("codex", "claude"):
+            with self.subTest(backend=backend):
+                agent_server.STORE.sessions["chat-1"]["backend"] = backend
+                selected = {"queued_id": "selected", "prompt": "Next", "backend": backend,
+                            "_paused_after_stop": True}
+                earlier = {"queued_id": "earlier", "prompt": "Earlier", "_paused_after_stop": True}
+                agent_server.QUEUED_TURNS["chat-1"] = deque([earlier, selected])
+                with (
+                    patch.object(agent_server, "stop_cleanup_in_progress", return_value=True),
+                    patch.object(agent_server, "stop_turn", AsyncMock()) as stop,
+                    patch.object(agent_server, "append_durable_event", AsyncMock()) as durable,
+                    patch.object(agent_server, "schedule_next_queued_turn") as wake,
+                ):
+                    result = await agent_server._run_queued_turn_now_once("chat-1", "selected")
+                self.assertTrue(result["send_when_idle"])
+                self.assertTrue(result["deferred"])
+                self.assertFalse(selected["_paused_after_stop"])
+                self.assertTrue(earlier["_paused_after_stop"])
+                self.assertEqual(list(agent_server.QUEUED_TURNS["chat-1"]), [selected, earlier])
+                self.assertTrue(durable.await_args.args[2]["send_when_idle"])
+                stop.assert_not_called()
+                wake.assert_called_once_with("chat-1")
+
+    async def test_cleanup_send_now_persistence_failure_does_not_change_queue(self) -> None:
+        selected = agent_server.QUEUED_TURNS["chat-1"][0]
+        selected["_paused_after_stop"] = True
+        earlier = {"queued_id": "earlier", "prompt": "Earlier"}
+        agent_server.QUEUED_TURNS["chat-1"] = deque([earlier, selected])
+        with (
+            patch.object(agent_server, "stop_cleanup_in_progress", return_value=True),
+            patch.object(agent_server, "append_durable_event", AsyncMock(side_effect=OSError("disk full"))),
+            patch.object(agent_server, "schedule_next_queued_turn") as wake,
+        ):
+            with self.assertRaises(OSError):
+                await agent_server._run_queued_turn_now_once("chat-1", "queued-steer")
+        self.assertEqual(list(agent_server.QUEUED_TURNS["chat-1"]), [earlier, selected])
+        self.assertTrue(selected["_paused_after_stop"])
+        self.assertNotIn("_send_when_idle", selected)
+        wake.assert_not_called()
+
     async def test_pending_stop_prioritizes_selected_without_claiming_promotion(self) -> None:
         selected = agent_server.QUEUED_TURNS["chat-1"][0]
         earlier = {"queued_id": "earlier", "prompt": "Earlier", "backend": "codex"}

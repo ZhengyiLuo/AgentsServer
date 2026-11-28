@@ -24,6 +24,7 @@ FUNCTIONS = {
     "codex_goal_steer_selection_is_supported",
     "_run_queued_turn_now_once",
     "async_route_queue_fields",
+    "queue_positions",
     "active_snapshot_input",
     "stop_turn",
     "canonical_provider_cross_chat_route_alias",
@@ -364,12 +365,30 @@ class GoalFollowupAdmissionTests(unittest.IsolatedAsyncioTestCase):
                     self.active.pop("codex_native_operation_kind", None)
                     self.current.pop("purpose", None)
 
-    async def test_explicit_stop_cleanup_rejects_without_releasing_pause(self):
-        self.ns["stop_cleanup_in_progress"].return_value = True
-        self.active["stop_requested"] = True
-        self.session["codex_goal"]["status"] = "paused"
-        await self.assert_rejected(guard=None)
-        self.ns["force_send_conflict_detail"].assert_not_called()
+    async def test_explicit_stop_cleanup_arms_followup_without_touching_goal_or_owner(self):
+        for require_native in (True, False):
+            with self.subTest(require_native=require_native):
+                self.setUp()
+                self.ns["stop_cleanup_in_progress"].return_value = True
+                self.active["stop_requested"] = True
+                self.session["codex_goal"]["status"] = "paused"
+                session, active, current = deepcopy(self.session), dict(self.active), deepcopy(self.current)
+                persist, wake = AsyncMock(), Mock()
+                self.ns.update(append_durable_event=persist, schedule_next_queued_turn=wake)
+                result = await self.ns["_run_queued_turn_now_once"](
+                    "chat", "q-followup", require_native=require_native,
+                )
+                self.assertTrue(result["send_when_idle"])
+                self.assertTrue(result["deferred"])
+                self.assertFalse(self.selected["_paused_after_stop"])
+                self.assertEqual(self.ns["QUEUED_TURNS"]["chat"][0], self.selected)
+                self.assertEqual(self.session, session)
+                self.assertEqual(self.active, active)
+                self.assertEqual(self.current, current)
+                persist.assert_awaited_once()
+                wake.assert_called_once_with("chat")
+                for forbidden in self.forbidden.values():
+                    forbidden.assert_not_called()
 
     async def test_unknown_delivery_row_cannot_be_replayed_or_unpaused(self):
         self.selected["_native_delivery_fenced"] = True
